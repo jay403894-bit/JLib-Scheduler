@@ -58,135 +58,84 @@ T_Threads was built as a hobby project to explore advanced parallelism in C++. I
 
 It’s designed for hobby projects, experiments, or as a foundation for building custom concurrent systems. I am currently using it in my game/simulation engine project 
 
-
-
-
-
+-----
 Usage
+-----
 
+----------------------
 Starting the Scheduler
+----------------------
+	TaskScheduler& scheduler = TaskScheduler::Instance();
 
-TaskScheduler& scheduler = TaskScheduler::instance();
-
-scheduler.startPool(uint8_t clock_worker);  // Launches worker threads
-
-
+	scheduler.StartPool(uint8_t clock_worker);  // Launches worker threads
 
 you must choose a core to run the clock and heap to notify workers and run periodic and delayed tasks
 
-
-
 The pool runs automatically and can optionally be joined:
 
-
-
-scheduler.Join();  // Stops all workers and joins threads
-
- 
+	scheduler.Join();  // Stops all workers and joins threads
 
 the pool will automatically rejoin on program exit -- HOWEVER any forked workers must be manually stopped by holding a reference to the task they run with the stop() function in the task->stop() otherwise it will hang on exit, once stopped they will rejoin the pool
 
-
-
+----------------
 Submitting Tasks
+----------------
 
+-----------
 Local Tasks
-
-
-
+-----------
 Assign tasks to a thread-local queue:
 
+	scheduler.SubmitLocal(task);         // Round-robin load balanced
+	scheduler.SubmitLocal(1, task);      // Assign to CPU core 1 specifically
 
+you can also directly type in a lambda instead of a task, but it will not be tracked unless you specifically
 
-scheduler.SubmitLocal(task);         // Round-robin load balanced
+save it as a task or lambdatask object 
 
-scheduler.SubmitLocal(1, task);      // Assign to CPU core 1 specifically
-
-// you can also directly type in a lambda instead of a task, but it will not be tracked unless you specifically
-
-//save it as a task or lambdatask object 
-
+-------------
 Priority Tasks
-
-
+-------------
 
 Submit tasks to a global priority queue (5 levels):
 
+	scheduler.SubmitPQ(task);             // Default priority (3)
+	scheduler.SubmitPQ(0, task);          // Specific priority (0–4)
 
-
-scheduler.SubmitPQ(task);             // Default priority (3)
-
-scheduler.SubmitPQ(0, task);          // Specific priority (0–4)
-
-
-
+------------
 Forked Tasks
-
-
+------------
 
 Fork a task outside the pool:
 
-
-
-scheduler.SubmitFork(coreID, task);
-
-
-
-
+	scheduler.SubmitFork(coreID, task);
 
 Forked tasks temporarily remove the thread from the pool. Any local work is redistributed before forking. Stop the worker to rejoin the pool.
 
-
-
 Lambda Tasks
 
+All submit methods accept lambda expressions, they do not track tasks and will simply be added to the garbage graveyard upon completion. you can store a new LambdaTask and track it that way.
 
+	scheduler.SubmitLocal([](){ std::cout << "Lambda task running!" << std::endl; });
 
-All submit methods accept lambda expressions:
-
-
-
-scheduler.SubmitLocal([](){ std::cout << "Lambda task running!" << std::endl; });
-
-scheduler.SubmitLocal(1, [](){ std::cout << "Pinned lambda!" << std::endl; });
-
-
+	scheduler.SubmitLocal(1, [](){ std::cout << "Pinned lambda!" << std::endl; });
 
 to stop a forked task 
 
+	scheduler.Stop(Task*); 
+	
+granted you have to setup stop conditions in the task this sets the flag though so main or another thread can request stop
 
 
-scheduler.Stop(Task*); // granted you have to setup stop conditions in the task
-
-//this sets the flag though so main or another thread can request stop
-
-
-
+-----------------
 Main Thread Tasks
-
-
-
+-----------------
 You can enqueue tasks from any thread to run on the main thread:
 
-
-
-scheduler.EnqueueToMain(task);
-
-scheduler.ProcessMainThread();  // Run all main-thread tasks
-
-
-
-Memory Management
-
-
+	scheduler.EnqueueToMain(task);
+	scheduler.ProcessMainThread();  // Run all main-thread tasks
 
 Tasks are usually heap-allocated.
-
-
-
-The scheduler deletes tasks after execution if auto_delete is true.
-
-
 
 To track completion safely, keep tasks in a vector and delete them after all tasks finish using waitall:
 
@@ -203,13 +152,15 @@ To track completion safely, keep tasks in a vector and delete them after all tas
             std::this_thread::yield();
         }
 		scheduler.WaitAll(tasks);
-std::vector<Task*> tasks;
-Task* t = new Task(taskfunc
-//delete old tasks/garbage collection
-//do this at the end of a frame or whenever a large amount of tasks are presumably 
 
-//as deferred cleanup
-scheduler.CollectGarbage();
+-----------------
+Memory Management
+-----------------
+delete old tasks/garbage collection
+do this at the end of a frame or whenever a large amount of tasks are presumably 
+as deferred cleanup
+		
+		scheduler.CollectGarbage();
 
 ____________________
 :::TO USE THE DAG:::
