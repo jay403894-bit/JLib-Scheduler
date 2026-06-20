@@ -2,7 +2,7 @@
 
 
 
-A high-performance, lightweight lockless-ish C++ task scheduler with thread affinity and work-stealing queues.
+A high-performance, lightweight lockfree C++ task scheduler with thread affinity and work-stealing queues.
 
 
 
@@ -32,7 +32,7 @@ Feel free to explore and experiment with the scheduler. Pull requests or ideas w
 
 - **Lambda Support:** Tasks can be submitted as function pointers or lambda expressions.
 
-- **Lightweight:** Minimal locking, mostly atomic operations for performance.
+- **Lightweight:** lockfree, atomic operations for performance.
 
 - **DAG:** Supports task dependency graphing with optional TaskDAG
 
