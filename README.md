@@ -176,48 +176,37 @@ Getting Started
 
 Use the TaskDAG as a factory for your nodes. The graph owns the nodes, simplifying memory management.
 
-
-
-C++
-
-TaskScheduler& sched = TaskScheduler::instance();
-
-TaskDAG dag(sched);
+	TaskScheduler& sched = TaskScheduler::instance();
+	TaskDAG dag(sched);
 
 
 
 // Create nodes with routing options
 
-TaskNode* nodeA = dag.createNode(new LambdaTask([](){ /* Work */ }), Queue::Default, ANY_CORE);
+	TaskNode* nodeA = dag.createNode(new LambdaTask([](){ /* Work */ }), 		Queue::Default, ANY_CORE);
 
-TaskNode* nodeB = dag.createNode(new LambdaTask([](){ /* Work */ }), Queue::Priority, 0);
+	TaskNode* nodeB = dag.createNode(new LambdaTask([](){ /* Work */ }), Queue::Priority, 0);
 
 
 
 // Define dependencies (B runs after A)
 
-dag.addDependency(nodeB, nodeA);
+	dag.addDependency(nodeB, nodeA);
 
 2. Executing the DAG
 
 Submit your entry-point node(s). The scheduler handles the propagation through the graph automatically.
 
-
-
-C++
-
-dag.submitIfReady(nodeA);
+	dag.submitIfReady(nodeA);
 
 3. Cleanup
 
 To maintain performance, the system utilizes a Main-Thread-Only garbage collection strategy.
 
-
-
-C++
-
-// Call this periodically (usually once per frame on the main thread)
-sched.collectGarbage();
+Call this periodically (usually once per frame on the main thread)
+		
+		sched.CollectGarbage(); //normal garbage collection call
+		dag.Clear(); //clear the dag nodes 
 
 ---------------------------
 Limitations / Known Issues
