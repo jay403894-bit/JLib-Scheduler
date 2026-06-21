@@ -134,20 +134,26 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="src\Epochs.cpp" />
     <ClCompile Include="src\TaskDAG.cpp" />
     <ClCompile Include="src\TaskScheduler.cpp" />
     <ClCompile Include="src\T_Thread.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\Arena.h" />
     <ClInclude Include="include\blockingconcurrentqueue.h" />
     <ClInclude Include="include\concurrentqueue.h" />
+    <ClInclude Include="include\Epochs.h" />
     <ClInclude Include="include\lightweightsemaphore.h" />
+    <ClInclude Include="include\LockFreeList.h" />
     <ClInclude Include="include\MPSCQueue.h" />
     <ClInclude Include="include\platform.h" />
     <ClInclude Include="include\SharedQueues.h" />
     <ClInclude Include="include\Task.h" />
     <ClInclude Include="include\TaskDAG.h" />
     <ClInclude Include="include\TaskDeque.h" />
+    <ClInclude Include="include\TaskList.h" />
+    <ClInclude Include="include\TaskNode.h" />
     <ClInclude Include="include\TaskScheduler.h" />
     <ClInclude Include="include\T_Thread.h" />
   </ItemGroup>
