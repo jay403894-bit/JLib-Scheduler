@@ -1,24 +1,15 @@
-﻿  Assembling src\ContextSwitch.asm...
-  main.cpp
-  Epochs.cpp
-  Fiber.cpp
-  FiberPool.cpp
-  TaskDAG.cpp
-  TaskScheduler.cpp
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(223,8): warning C4101: 'task': unreferenced local variable
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(353,27): warning C4267: 'argument': conversion from 'size_t' to 'const _Ty', possible loss of data
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(353,27): warning C4267:         with
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(353,27): warning C4267:         [
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(353,27): warning C4267:             _Ty=int
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(353,27): warning C4267:         ]
+﻿  TaskScheduler.cpp
+C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(232,8): warning C4101: 'task': unreferenced local variable
+C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(362,27): warning C4267: 'argument': conversion from 'size_t' to 'const _Ty', possible loss of data
+C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(362,27): warning C4267:         with
+C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(362,27): warning C4267:         [
+C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(362,27): warning C4267:             _Ty=int
+C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(362,27): warning C4267:         ]
 C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\memory(3666,56): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
   (compiling source file 'src/TaskScheduler.cpp')
       C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\memory(3666,56):
       the template instantiation context (the oldest one first) is
-          C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(148,20):
+          C:\Users\jay40\source\repos\T_Threads\T_Threads\src\TaskScheduler.cpp(157,20):
           see reference to function template instantiation 'std::unique_ptr<T_Threads::FiberPool,std::default_delete<T_Threads::FiberPool>> std::make_unique<T_Threads::FiberPool,size_t,0>(size_t &&)' being compiled
   
-  T_Thread.cpp
-C:\Users\jay40\source\repos\T_Threads\T_Threads\src\T_Thread.cpp(43,11): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
-  Generating Code...
   T_Threads.vcxproj -> C:\Users\jay40\source\repos\T_Threads\T_Threads\x64\Debug\T_Threads.lib

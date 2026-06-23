@@ -20,10 +20,7 @@ namespace T_Threads {
         void Signal(Task* t) {
             std::lock_guard<std::mutex> lock(mtx);
             if (waiters.erase(t)) {
-                // Leave status as SUSPENDED — Worker checks for SUSPENDED to
-                // resume the existing fiber context. Changing it to READY here
-                // would make Worker treat this as a new task, overwrite
-                // assignedFiber, and call Init() on the live suspended stack.
+                // Leave status as SUSPENDED — Worker checks for SUSPENDED 
                 TaskScheduler::Instance().Push(t);
             }
         }

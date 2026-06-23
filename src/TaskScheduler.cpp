@@ -90,25 +90,34 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 	}
 
 	if (created > 0) {
-		// 2. Intrusively chain the created tasks and submit as one batch.
-		for (int i = 0; i < created - 1; ++i) {
-			taskPtrs[i]->next.store(taskPtrs[i + 1], std::memory_order_relaxed);
-		}
-		taskPtrs[created - 1]->next.store(nullptr, std::memory_order_relaxed);
-
-		int chosen = PickNextWorker();
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			chosen = PickNextWorker();
-		}
 		runningTasks.fetch_add(created, std::memory_order_relaxed);
 
-		inboxes[chosen]->push_batch(taskPtrs[0], taskPtrs[created - 1], created);
-		workers[chosen]->NotifyWorker();
+		// 2. Distribute across all workers' inboxes (round-robin). Dumping the
+		//    whole batch on one worker pins it in the inbox->deque drain loop and
+		//    hangs when created > deque capacity (large range / small chunkSize)
+		//    or when there's only one worker. (push handles the next-link itself.)
+		size_t n = inboxes.size();
+		for (int i = 0; i < created; ++i) {
+			inboxes[i % n]->push(taskPtrs[i]);
+		}
+		NotifyAll();
 
-		// 3. Wait for completion of this batch.
+		// 3. Wait for completion, but HELP while waiting so the calling thread
+		//    makes progress too. Pure spinning deadlocks when ParallelFor runs on
+		//    a worker fiber (nested) or when there's only one worker. GetTask()
+		//    steals a task out of a deque -- removed exactly once -- so running it
+		//    here can't double-execute; we decrement runningTasks because the
+		//    owning worker will never see it.
 		for (int i = 0; i < created; ++i) {
 			while (!taskPtrs[i]->complete.load(std::memory_order_acquire)) {
-				std::this_thread::yield();
+				Task* helped = GetTask();
+				if (helped) {
+					helped->Execute();
+					runningTasks.fetch_sub(1, std::memory_order_acq_rel);
+				}
+				else {
+					std::this_thread::yield();
+				}
 			}
 		}
 	}
@@ -144,7 +153,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	stopFlag.store(false, std::memory_order_release);
 	nextWorker = 0;
 
-	const size_t fibersPerWorker = 64;
+	const size_t fibersPerWorker = 32;
 	globalPool = std::make_unique<FiberPool>(num_workers * fibersPerWorker);
 
 	workers.clear();
@@ -241,8 +250,8 @@ void TaskScheduler::Wait(const std::vector<Task*>& tasks) {
 		while (!t->complete.load(std::memory_order_acquire)) {
 			Task* task = GetTask();
 			if (task) {
-				task->Execute();
-				task->complete.store(true, std::memory_order_release);
+				task->Execute();   // Execute() sets complete; decrement since the
+				runningTasks.fetch_sub(1, std::memory_order_acq_rel); // worker won't
 			}
 			else
 				std::this_thread::yield();
@@ -259,20 +268,6 @@ Arena* TaskScheduler::GetArena() {
 	return taskArena.GetActive();
 }
 void TaskScheduler::RecycleArena() {
-	// Recycle the active task arena, but ONLY at a true quiescence point.
-	// runningTasks==0 is strictly stronger than every task's `complete` flag:
-	// a worker writes task->assignedFiber = nullptr (into the arena) AFTER it
-	// leaves its epoch but BEFORE it decrements runningTasks. Waiting for the
-	// counter to hit 0 guarantees every worker has finished touching the task
-	// memory, and that no other producer has tasks in flight in this arena.
-	// If the system isn't quiescent we simply defer recycling (no crash, just
-	// no reclaim until it is). Retire-at-epoch + Tick() further defers the
-	// actual clear() until all workers have advanced past this epoch.
-	//
-	// Bounded spin: at a fork-join barrier the per-task `complete` flag is set
-	// inside Execute, but the worker drives runningTasks to 0 a little later in
-	// its loop tail. Give it a moment to settle so the common (sole-producer)
-	// case actually reclaims; bail out if another producer keeps work in flight.
 	for (int spins = 0; spins < 4096; ++spins) {
 		if (runningTasks.load(std::memory_order_acquire) == 0) break;
 		std::this_thread::yield();
