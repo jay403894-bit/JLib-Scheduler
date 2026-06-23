@@ -92,5 +92,4 @@ Be mindful of raw pointers and task lifetimes
 Notes
 
 Local queues execute pinned tasks before stealing work.
-Priority queues are processed after local work is done.
 Feel free to experiment and submit pull requests!
