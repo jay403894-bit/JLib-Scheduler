@@ -4,12 +4,14 @@
 #include "Fiber.h"
 #include "FiberStackArena.h"
 #include "Context.h"
+#include "concurrentqueue.h"
+
 namespace T_Threads {
     class T_Thread;
     class GlobalFiberPool {
         mutable std::mutex poolMutex;
-        std::vector<Fiber*> availableFibers;
-
+        moodycamel::ConcurrentQueue<Fiber*> availableFibers;
+        unsigned int size = 0;
         // Ownership: arenas and fiber storage
         FiberStackArena standardArena;
         FiberStackArena heavyArena;

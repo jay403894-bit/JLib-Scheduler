@@ -5,7 +5,7 @@
 namespace T_Threads {
     struct TaskNode {
         Task* task;
-        List<TaskNode*>* dependents;
+        LockFreeList<TaskNode*>* dependents;
         std::atomic<int> dependencies_left;
         std::atomic<bool> submitted{ false };
         uint8_t cpuID = 0;
@@ -15,11 +15,11 @@ namespace T_Threads {
         void* mem;
         TaskNode(Task* t) : task(t), dependencies_left(0) {
 			void* mem =TaskScheduler::Instance().GetAllocator()->Alloc();
-            dependents = new (mem)List<TaskNode*>();
+            dependents = new (mem)LockFreeList<TaskNode*>();
         }
         ~TaskNode() {
             if (dependents) {
-                dependents->~List<TaskNode*>();
+                dependents->~LockFreeList<TaskNode*>();
 
                 TaskScheduler::Instance().GetAllocator()->Free(dependents);
             }

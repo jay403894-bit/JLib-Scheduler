@@ -1,6 +1,7 @@
 BSD 3-Clause License
 
-Copyright (c) 2026, Joshua Makler
+Copyright (c) 2026, Joshua Makler, moodycamel attributed in NOTICES for concurrentqueue.h, blockingconcurrentqueue.h and lightweightsemaphore.h which are  dual-licensed under the Simplified BSD License and the Boost Software License 
+(c) 2013-2015, Cameron Desrochers.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

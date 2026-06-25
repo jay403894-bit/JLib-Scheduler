@@ -4,42 +4,47 @@
 #include "GlobalFiberPool.h"
 
 namespace T_Threads {
-    //class GlobalFiberPool;  // forward declaration
-
-    struct ThreadLocalCache {
-        std::vector<Fiber*> localFibers;
+    template<size_t MaxCapacity = 256>
+    struct alignas(64) ThreadLocalCache {
+        Fiber* localFibers[MaxCapacity]; // Fixed array, stack-allocated or embedded in struct
+        size_t activeCapacity;            // Your calculated size
+        size_t count = 0;             // Track the number of items
         GlobalFiberPool* globalPool = nullptr;
-        static constexpr size_t MAX_CAPACITY = 64;
-
         // Set the global pool this cache refills from
-        void SetGlobalPool(GlobalFiberPool* pool) {
+        void Initialize(GlobalFiberPool* pool,size_t runtimeCapacity) {
+            activeCapacity = (runtimeCapacity <= MaxCapacity) ? runtimeCapacity : MaxCapacity;
             globalPool = pool;
         }
-
         void Push(Fiber* f) {
-            if (localFibers.size() < MAX_CAPACITY) {
-                localFibers.push_back(f);
+            if (count < activeCapacity) {
+                localFibers[count++] = f;
             }
             else if (globalPool) {
-                std::vector<Fiber*> batchToReturn;
-                size_t half = localFibers.size() / 2;
-                batchToReturn.insert(batchToReturn.end(), localFibers.begin(), localFibers.begin() + half);
-                localFibers.erase(localFibers.begin(), localFibers.begin() + half);
+                // 1. Batch return: Move half to a temporary vector
+                size_t half = activeCapacity / 2;
+                std::vector<Fiber*> batchToReturn(localFibers, localFibers + half);
 
+                // 2. Call your existing pool method
                 globalPool->ReturnBatch(batchToReturn);
-                localFibers.push_back(f);
+
+                // 3. Shift remaining items to front using memmove (fast and safe)
+                memmove(&localFibers[0], &localFibers[half], (activeCapacity - half) * sizeof(Fiber*));
+
+                // 4. Reset count and add the new fiber
+                count = (activeCapacity - half);
+                localFibers[count++] = f;
             }
         }
 
         Fiber* Pop() {
-            if (localFibers.empty() && globalPool) {
-                localFibers = globalPool->StealBatch(MAX_CAPACITY / 2);
+            if (count == 0 && globalPool) {
+                // Option: Keep your existing StealBatch which returns a vector
+                std::vector<Fiber*> batch = globalPool->StealBatch(activeCapacity / 2);
+                for (Fiber* f : batch) {
+                    localFibers[count++] = f;
+                }
             }
-            if (localFibers.empty()) return nullptr;
-
-            Fiber* f = localFibers.back();
-            localFibers.pop_back();
-            return f;
+            return (count > 0) ? localFibers[--count] : nullptr;
         }
     };
-}
+};

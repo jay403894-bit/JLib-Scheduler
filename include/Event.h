@@ -10,39 +10,41 @@ namespace T_Threads {
         std::unordered_set<Task*> waiters;
 
     public:
+        // Register a waiter. Does NOT touch fiber status -- WaitOnEvent already put the
+        // fiber in WANTS_SUSPEND before calling this. The mutex serializes registration
+        // against Signal/SignalAll, so a signal landing after we register will find us.
         void AddWaiter(Task* t) {
             std::lock_guard<std::mutex> lock(mtx);
-            t->assignedFiber->status.store(FiberStatus::SUSPENDED, std::memory_order_release);
             waiters.insert(t);
         }
-
-        // Wake up one specific task
+		// Remove a waiter. Does NOT touch fiber status -- the fiber is already resumed or
+		// canceled. The mutex serializes removal against Signal/SignalAll, so a signal landing
+		// after we remove will not find us.
+        void RemoveWaiter(Task* t) {
+            std::lock_guard<std::mutex> lock(mtx);
+            waiters.erase(t);
+        }
+        // Wake up one specific task via the fiber suspend/resume primitive.
         void Signal(Task* t) {
             {
                 std::lock_guard<std::mutex> lock(mtx);
-                if (!waiters.erase(t)) return; // Task wasn't waiting
-
-                // Mark as READY while holding the lock
-                t->assignedFiber->status.store(FiberStatus::READY, std::memory_order_release);
+                if (!waiters.erase(t)) return; // wasn't waiting
             }
-            // Now push to scheduler outside the lock to minimize contention
-            TaskScheduler::Instance().Push(t);
+            // Resume() handles the SUSPENDED/WANTS_SUSPEND race and re-queues via Requeue
+            // (no pendingTasks double-count). Done outside the lock.
+            t->assignedFiber->Resume();
         }
 
-        // Wake up everyone waiting on this specific event
+        // Wake up everyone waiting on this event.
         void SignalAll() {
             std::vector<Task*> to_wake;
             {
                 std::lock_guard<std::mutex> lock(mtx);
-                for (auto* t : waiters) {
-                    t->assignedFiber->status.store(FiberStatus::READY, std::memory_order_release);
-                    to_wake.push_back(t);
-                }
+                to_wake.assign(waiters.begin(), waiters.end());
                 waiters.clear();
             }
-
             for (auto* t : to_wake) {
-                TaskScheduler::Instance().Push(t);
+                t->assignedFiber->Resume();
             }
         }
     };

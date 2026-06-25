@@ -48,7 +48,7 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
@@ -143,6 +143,7 @@
     <ClCompile Include="src\T_Thread.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\concurrentqueue.h" />
     <ClInclude Include="include\Context.h" />
     <ClInclude Include="include\Epochs.h" />
     <ClInclude Include="include\Event.h" />
@@ -150,7 +151,7 @@
     <ClInclude Include="include\FiberStackArena.h" />
     <ClInclude Include="include\GlobalFiberPool.h" />
     <ClInclude Include="include\LockFreeList.h" />
-    <ClInclude Include="include\MPSCQueue.h" />
+    <ClInclude Include="include\TaskMPSCQueue.h" />
     <ClInclude Include="include\platform.h" />
     <ClInclude Include="include\Task.h" />
     <ClInclude Include="include\TaskAllocator.h" />

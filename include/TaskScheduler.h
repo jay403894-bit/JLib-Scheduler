@@ -1,7 +1,7 @@
 #pragma once
 #define NOMINMAX
 #include "Task.h"
-#include "MPSCQueue.h"
+#include "TaskMPSCQueue.h"
 #include "Epochs.h"
 #include "TaskDeque.h"
 #include "TaskAllocator.h"
@@ -24,7 +24,10 @@ namespace T_Threads {
 	class TaskScheduler {
 		friend class T_Thread;
 		friend class GlobalFiberPool;
+
+
 	public:
+
 		static TaskScheduler& Instance() {
 			if (!instance)
 				throw std::runtime_error("Call TaskScheduler::Init() before Instance()!");
@@ -40,6 +43,7 @@ namespace T_Threads {
 		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		bool Push(Task* task);
+		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
 		bool Requeue(Task* task);
 		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0);
@@ -50,7 +54,6 @@ namespace T_Threads {
 		void Pause();
 		void Resume();
 		void Stop(Task* worker_task);
-		void Wait(const std::vector<Task*>& tasks);
 		TaskAllocator* GetAllocator();
 		void WaitAll();
 		 
@@ -92,12 +95,12 @@ namespace T_Threads {
 		std::vector<std::unique_ptr<std::atomic<bool>>> immediateCoresInUse;
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> threadQs;
-		std::vector<std::unique_ptr<MPSCQueue<Task*>>> inboxes;
+		std::vector<std::unique_ptr<TaskMPSCQueue>> inboxes;
 		static GlobalFiberPool* globalPool;
 		// -----------------------------------------------
 
 
-
+		void RunCounted(WaitGroup& wg, Task* t);
 		static size_t GetSafeTC();
 		Task* GetTask();
 		void StartPool(size_t poolSize);
@@ -107,14 +110,13 @@ namespace T_Threads {
 
 		static TaskScheduler* instance;
 		TaskAllocator taskAllocator{ 1024 * 1024 }; // 1M tasks
-
 		std::unordered_map<std::string, std::unique_ptr<Event>> eventRegistry;
 		std::mutex registryMtx;
 		std::atomic<bool> poolActive{ false };
 		std::atomic<int> nextWorker{ 0 };
 		std::atomic<bool> stopFlag{ false };
 		std::vector<std::shared_ptr<T_Thread>> workers;
-		MPSCQueue<Task*> mainQ;
+		TaskMPSCQueue mainQ;
 		std::mutex poolMutex;
 	};
 }

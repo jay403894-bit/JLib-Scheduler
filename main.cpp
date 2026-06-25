@@ -6,6 +6,7 @@
 #include "include/T_Thread.h"
 #include "include/TaskScheduler.h"  
 #include "include/TaskDAG.h"
+#include "include/Task.h"
 using T_Threads::Task;
 using T_Threads::TaskScheduler;
 
@@ -139,15 +140,17 @@ int main() {
     int ctr = 0;
 
     std::vector<Task*> tasks;
+    T_Threads::WaitGroup wg;
     for (int it = 0; it < iterations; ++it) {
         for (int t = 0; t < tasksPerIteration; ++t) {
 
             int* id = new int(t);
 
             Task* task = scheduler.CreateTask(simpleTaskFn, id);
+            task->waitGroup = &wg;
             scheduler.Push(task);
-             tasks.push_back(task);
-             std::this_thread::yield();
+			wg.n.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::yield();
         }
         std::this_thread::yield();
     }    
@@ -155,7 +158,7 @@ int main() {
     fork();
 
 
-    scheduler.Wait(tasks);
+    scheduler.WaitFor(wg);
     RunDAGTest(); 
     scheduler.ParallelFor(start, end, chunkSize, MyWorkFunction);
 

@@ -18,7 +18,10 @@ void T_Thread::StartWorker(size_t cpu_affinity)
 		while (!ready->load(std::memory_order_acquire)) std::this_thread::yield();
 		instance = this;
 		thread_id = thread_counter.fetch_add(1);
-		localCache.SetGlobalPool(&scheduler->GetGlobalPool());
+		unsigned int workerThreads = (scheduler->workers.size() > 1) ? scheduler->workers.size() : 1;
+		size_t idealCapacity = ((workerThreads * 72) / workerThreads) * 0.5;
+		if (idealCapacity < 16) idealCapacity = 16;
+		localCache.Initialize(&scheduler->GetGlobalPool(),idealCapacity);
 		this->Worker();
 		});
 	nativeHandle = thread.native_handle();
@@ -129,6 +132,12 @@ uint32_t T_Thread::FastRand() {
 	x ^= x << 5;
 	return x;
 }
+Task* T_Threads::T_Thread::AcquireWork(bool& isFork)
+{
+	return nullptr;
+}
+void T_Threads::T_Thread::RunTask(Task* task, bool isFork)
+{}
 void T_Thread::Worker() {
 	running.store(true, std::memory_order_release);
 	const size_t BATCH_SIZE = 64;
@@ -136,10 +145,10 @@ void T_Thread::Worker() {
 
 	while (running.load(std::memory_order_acquire)) {
 		Task* task_to_run = nullptr;
-		
+
 		ready.store(true, std::memory_order_release);
-		
-		
+
+
 		auto& inbox = scheduler->inboxes[qIndex];
 		auto& local_deque = scheduler->threadQs[qIndex];
 
@@ -198,19 +207,29 @@ void T_Thread::Worker() {
 			}
 			// --- 4. Work stealing ---
 			if (!task_to_run) {
-				std::uniform_int_distribution<> dist(1, scheduler->workers.size()-1);
-				int res = FastRand() % (scheduler->workers.size() - 1);
-				while (res == qIndex) {
-					res = FastRand() % (scheduler->workers.size() - 1);
-				}
-				auto stolen = scheduler->threadQs[res]->steal();
+				//try a local neighbor on the same logical core first
+				size_t stride = 1; // Assume 2 is the distance to a different physical core, 1 is your neighbor(hyperthread)
+				size_t neighbor = (qIndex + stride) % scheduler->workers.size();
+
+				auto stolen = scheduler->threadQs[neighbor]->steal();
 				if (stolen.has_value()) {
 					task_to_run = *stolen;
 					current_task = task_to_run;
 				}
+				else
+				{
+					//try a random neighbor second
+					int res = FastRand() % (scheduler->workers.size() - 1);
+					if (res == qIndex) res++;
+					auto stolen = scheduler->threadQs[res]->steal();
+					if (stolen.has_value()) {
+						task_to_run = *stolen;
+						current_task = task_to_run;
+					}
+				}
 			}
 		}
-	
+
 
 		// --- 6. Execute task if found ---
 		if (task_to_run) {
@@ -223,8 +242,19 @@ void T_Thread::Worker() {
 			else {
 				f = AcquireFiber(task_to_run);
 				if (!f) {
-					std::cerr << "CRITICAL: Fiber pool exhausted!" << std::endl;
-					scheduler->threadQs[qIndex]->push_bottom(task_to_run);
+					// No fiber available right now (transient -- fibers are in use and will
+					// free up). Re-queue WITHOUT losing the task's origin:
+					//  - A forked/immediate task is pinned to THIS core, so restore it as the
+					//    immediate task and leave immediateCoresInUse[qIndex] set (it's still
+					//    pending here, and that flag also stops a new fork from clobbering it).
+					//  - A regular task goes back on the local deque to be retried or stolen.
+					if (is_handling_fork) {
+						immediateTask = task_to_run;
+						immediate.store(true, std::memory_order_release);
+					}
+					else {
+						scheduler->threadQs[qIndex]->push_bottom(task_to_run);
+					}
 					std::this_thread::yield();
 					continue;
 				}
@@ -265,8 +295,19 @@ void T_Thread::Worker() {
 				currentRunningTask = nullptr;
 			}
 			else {
-				// WANTS_SUSPEND: publish SUSPENDED now that the context is saved. 
-				f->status.store(FiberStatus::SUSPENDED, std::memory_order_release);
+				// WANTS_SUSPEND: the context is now safely saved, so publish SUSPENDED.
+				// But a Signal/Resume may have raced in during WANTS_SUSPEND and flipped us
+				// to SUSPEND_SIGNALED -- in that case DON'T park (the wakeup would be lost);
+				// resume immediately instead. The CAS makes the park-vs-signal decision atomic.
+				FiberStatus exp = FiberStatus::WANTS_SUSPEND;
+				if (f->status.compare_exchange_strong(exp, FiberStatus::SUSPENDED, std::memory_order_acq_rel)) {
+					// parked; a later Signal/Resume re-queues it (SUSPENDED -> READY)
+				}
+				else if (exp == FiberStatus::SUSPEND_SIGNALED) {
+					// signal beat us here: wake now instead of parking
+					f->status.store(FiberStatus::READY, std::memory_order_release);
+					scheduler->Requeue(task_to_run);
+				}
 				currentFiber = nullptr;
 				currentRunningTask = nullptr;
 			}
@@ -283,14 +324,15 @@ void T_Thread::Worker() {
 			}
 			{
 				std::unique_lock<std::mutex> lock(workerMutex);
-				cv.wait_for(lock, std::chrono::milliseconds(1), [this]() {
+				cv.wait(lock, [this]() {
 					return !running.load(std::memory_order_acquire)
 						|| immediate.load(std::memory_order_acquire)
-						|| (!scheduler->paused.load(std::memory_order_acquire) );
+						|| (!scheduler->paused.load(std::memory_order_acquire) && scheduler->pendingTasks.load() > 0);
 					});
 
 				if (!running.load(std::memory_order_acquire)) break;
 			}
+			continue;
 		}
 	}
 	running.store(false, std::memory_order_release);

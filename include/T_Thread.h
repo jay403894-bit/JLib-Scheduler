@@ -57,14 +57,14 @@ namespace T_Threads {
         uint32_t FastRand();
         void WaitBackoff(int& spin_count);
         void ExecuteTask(Task* task);
-        AcquireWorkRes TryAcquireWork();
-
+        Task* AcquireWork(bool& isFork);   // inbox drain + immediate + localQ + pop_bottom + steal
+        void  RunTask(Task* task, bool isFork);  // acquire/resume fiber, switch, handle DEAD/YIELD/SUSPEND
         void Worker();
 
         TaskScheduler* scheduler;
         std::vector<Fiber*> localFiberCache;
-        static List<Fiber*> suspendedFibers;
-        ThreadLocalCache localCache;
+        static LockFreeList<Fiber*> suspendedFibers;
+        ThreadLocalCache<> localCache;
         static thread_local T_Thread* instance;
 
         std::atomic<bool> immediate{ false };

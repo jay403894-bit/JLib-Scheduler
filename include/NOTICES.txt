@@ -1,1 +1,0 @@
-"Files concurrentqueue.h, blockingcocncurrentqueue.h and lightweightsemaphore.h are licensed under the Simplified BSD License, copyright (c) 2013-2020 Cameron Desrochers. All other files in this directory are BSD 3-clause. both licenses are permissive BSD"

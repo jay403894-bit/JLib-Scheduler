@@ -3,6 +3,8 @@
 #include <atomic>
 namespace T_Threads {
     struct Fiber;
+    struct WaitGroup { std::atomic<int> n{ 0 }; };
+
     enum class FiberSize { Standard, Heavy };
     struct Task {
         using Func = void(*)(void*);
@@ -15,6 +17,7 @@ namespace T_Threads {
         std::atomic<bool> complete{ false };
         std::atomic<bool> callbackFlag{ false };
         std::atomic<Task*> next{ nullptr };
+        WaitGroup* waitGroup = nullptr;
 		bool ownedBySlab = false; // If true, the task is allocated from the slab and should be reclaimed there
         FiberSize requiredSize = FiberSize::Standard;
         Task() : next(nullptr), complete(false), fn(nullptr), data(nullptr), assignedFiber(nullptr) {}
@@ -25,9 +28,8 @@ namespace T_Threads {
 
         inline void Execute() noexcept {
              fn(data);
-             if (onComplete && !callbackFlag.load(std::memory_order_acquire)) {
-                 onComplete();
-             }
+             if (onComplete && !callbackFlag.load(std::memory_order_acquire)) onComplete();
+             if (waitGroup) waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
             complete.store(true, std::memory_order_release);
         }
 

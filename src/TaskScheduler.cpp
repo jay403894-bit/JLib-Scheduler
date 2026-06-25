@@ -22,6 +22,7 @@ void TaskScheduler::Init(size_t poolSize) {
 	if (instance != nullptr)
 		throw std::runtime_error("TaskScheduler already initialized!");
 	instance = new TaskScheduler(poolSize);
+
 }
 GlobalFiberPool& T_Threads::TaskScheduler::GetGlobalPool()
 {
@@ -50,7 +51,7 @@ void TaskScheduler::ProcessMainThread() {
 }
 void TaskScheduler::Join() {
 	if (!poolActive) return;
-
+	
 	stopFlag.store(true, std::memory_order_release);
 
 	{
@@ -172,23 +173,28 @@ void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::functi
 }
 void TaskScheduler::StartPool(size_t poolSize) {
 	std::lock_guard<std::mutex> lock(poolMutex);
-
+	thread_counter.store(0, std::memory_order_release);
 	if (poolSize == 0)
 		poolSize = GetSafeTC();
 	if (poolSize > GetSafeTC())
 		poolSize = GetSafeTC();
 
 	unsigned int num_workers = static_cast<unsigned int>(poolSize);
-	EpochManager::Instance().Init(num_workers);
+	// +1 for the main/submitting thread: it takes thread_id == num_workers at the end
+	// of StartPool and uses epochs too (e.g. DAG AddDependency -> EnterEpoch). Sizing to
+	// just num_workers leaves that slot out of bounds -> AV in Enter/LeaveEpoch.
+	EpochManager::Instance().Init(num_workers + 1);
 	stopFlag.store(false, std::memory_order_release);
 	nextWorker = 0;
 
-	unsigned int coreCount = std::thread::hardware_concurrency();
+	unsigned int coreCount = std::thread::hardware_concurrency()-1;
 	if (coreCount == 0) coreCount = 4; // Fallback
 
 	size_t standardFiberCount = coreCount * 64;
 	size_t heavyFiberCount = coreCount * 8;
 
+	// 3. Ensure a minimum to avoid "thrashing"
+	
 	// GlobalFiberPool now owns all fibers and stack allocation
 	globalPool = GlobalFiberPool::Create(standardFiberCount, heavyFiberCount);
 	workers.clear();
@@ -203,7 +209,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		immediateCoresInUse.push_back(std::make_unique<std::atomic<bool>>(false));
 		threadQs.push_back(std::make_unique<TaskDeque>());
-		inboxes.push_back(std::make_unique<MPSCQueue<Task*>>());
+		inboxes.push_back(std::make_unique<TaskMPSCQueue>());
 	}
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		auto worker = std::make_shared<T_Thread>(*this);
@@ -215,6 +221,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		while (!w->Ready())
 			std::this_thread::yield();
 	}
+	thread_id = thread_counter.fetch_add(1);
 	poolActive.store(true, std::memory_order_release);
 }
 
@@ -224,6 +231,13 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName) {
 	Fiber* myFiber = myTask->assignedFiber;
 
 	auto& event = GetEvent(eventName);
+
+	// Order matters. Become parkable (WANTS_SUSPEND) BEFORE registering, so any signal
+	// that races in sees a resumable state (Resume() flips WANTS_SUSPEND->SUSPEND_SIGNALED
+	// and the worker wakes us after the switch). AddWaiter only inserts -- it no longer
+	// touches status. The event mutex serializes AddWaiter against Signal/SignalAll, so a
+	// signal that lands after we register is guaranteed to find and wake us.
+	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
 
 	// Return via the fiber's homeCtx (the worker stamps it before each switch-in),
@@ -234,7 +248,23 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName) {
 bool TaskScheduler::Push(Task* task) {
 	return PushLocal(task);
 }
+struct WaitGroup { std::atomic<int> n{ 0 }; };
 
+
+
+void TaskScheduler::RunCounted(WaitGroup& wg, Task* t) {
+	wg.n.fetch_add(1, std::memory_order_relaxed);
+	t->waitGroup = &wg;
+	Push(t);
+}
+
+void TaskScheduler::WaitFor(WaitGroup& wg) {
+	while (wg.n.load(std::memory_order_acquire) > 0) {
+		Task* h = GetTask();
+		if (h) { h->Execute(); pendingTasks.fetch_sub(1, std::memory_order_acq_rel); }
+		else std::this_thread::yield();
+	}
+}
 void T_Threads::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity)
 {
 	// 1. Manually link them locally: Task A -> Task B -> Task C
@@ -308,20 +338,7 @@ Task* TaskScheduler::GetTask() {
 
 	return task_to_run;
 }
-void TaskScheduler::Wait(const std::vector<Task*>& tasks) {
-	for (auto* t : tasks) {
-		while (!t->complete.load(std::memory_order_acquire)) {
-			Task* task = GetTask();
-			if (task) {
-				task->Execute();   // Execute() sets complete; decrement since the
-				pendingTasks.fetch_sub(1, std::memory_order_acq_rel); // worker won't
-			}
-			else
-				std::this_thread::yield();
-		}
-	}
-	// Tasks waited on are done; recycle if the system is quiescent.
-}
+
 TaskAllocator* TaskScheduler::GetAllocator() {
 	return &taskAllocator;
 }

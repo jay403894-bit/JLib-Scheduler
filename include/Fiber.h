@@ -9,6 +9,7 @@ namespace T_Threads {
 		RUNNING,       // Currently executing on a worker
 		WANTS_YIELD,   // Fiber asked to yield; worker re-queues it AFTER its ctx is saved
 		WANTS_SUSPEND, // Fiber asked to suspend; worker marks SUSPENDED after its ctx is saved
+		SUSPEND_SIGNALED, // A signal/Resume raced in during WANTS_SUSPEND; worker wakes it instead of parking
 		SUSPENDED,     // Parked, not queued; only now may Resume() make it READY + re-queue
 		DEAD           // Finished, pending cleanup/reclamation
 	};

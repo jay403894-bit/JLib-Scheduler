@@ -47,8 +47,13 @@ namespace T_Threads {
 			threadEpochs.clear();
 		}
 		static EpochManager& Instance() {
-			static EpochManager mgr;
-			return mgr;
+			// Intentionally leaked (never destructed). Worker threads can outlive main
+			// in this design (the scheduler instance is heap-allocated and not deleted),
+			// so a Meyers-singleton destructor would run at static teardown while a
+			// worker still calls Enter/LeaveEpoch -> threadEpochs[tid] freed -> read AV.
+			// Leaking the manager lets the OS reclaim it at process exit instead.
+			static EpochManager* mgr = new EpochManager();
+			return *mgr;
 		}
 		void Tick()
 		{

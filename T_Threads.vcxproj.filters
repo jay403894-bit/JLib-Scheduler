@@ -38,7 +38,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\MPSCQueue.h">
+    <ClInclude Include="include\TaskMPSCQueue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\platform.h">
@@ -87,6 +87,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\GlobalFiberPool.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\concurrentqueue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

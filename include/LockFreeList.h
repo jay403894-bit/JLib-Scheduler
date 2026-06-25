@@ -88,15 +88,15 @@ namespace T_Threads {
 	};
 	template<typename T>
 	struct LNode : LNodeBase {
-		T data;  // actual payload
-		LNode(uint64_t k, T d) {  // accept T by value
+		T data;  // actual payload (the list's element type, e.g. TaskNode* or Fiber*)
+		LNode(uint64_t k, T d) {  // accept the payload by value
 			key = k;
 			data = d;
 		}
 	};
 
 	template <typename T>
-	class List {
+	class LockFreeList {
 		struct Window {
 			LNodeBase* pred;
 			LNodeBase* curr;
@@ -141,7 +141,7 @@ namespace T_Threads {
 		}
 		static void heapDeleter(void* ptr) {
 			auto* node = static_cast<LNode<T>*>(ptr);
-			// 1. Manually call the destructor of the data if T is a complex object
+			// 1. Manually call the destructor of the data if Task*is a complex object
 			node->data.~T();
 			// 2. Use 'delete' since you used 'new'
 			delete node;
@@ -149,14 +149,14 @@ namespace T_Threads {
 		LNodeBase* head;
 		LNodeBase* tail;
 	public:
-		List() {
+		LockFreeList() {
 			void* mem = TaskScheduler::Instance().GetAllocator()->Alloc();
 			void* mem2 = TaskScheduler::Instance().GetAllocator()->Alloc();
 			head = new (mem) LNode<T>(0, T());
 			tail = new (mem2) LNode<T>(UINT64_MAX, T());
 			head->next.set(tail, false);
 		}
-		~List() {
+		~LockFreeList() {
 			TaskScheduler::Instance().GetAllocator()->Free(head);
 			TaskScheduler::Instance().GetAllocator()->Free(tail);
 		}
@@ -201,7 +201,7 @@ namespace T_Threads {
 					EpochManager::Instance().RetirePtr(
 						curr,
 						EpochManager::Instance().CurrentEpoch(),
-						&List<T>::slabDeleter
+						&LockFreeList<T>::slabDeleter
 					);					
 					EpochManager::Instance().LeaveEpoch(thread_id); // leave epoch
 					return true;

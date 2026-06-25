@@ -26,6 +26,8 @@ void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
     // Add the dependent node to the dependency's list
     // We use the pointer address as the key
     uint64_t key = reinterpret_cast<uintptr_t>(dependent);
+    // Store the dependent NODE (not its Task): OnTaskFinished's for_each reads
+    // dep->dependencies_left, so the list must hold TaskNode*, matching LockFreeList<TaskNode*>.
     dependency->dependents->add(key, dependent);
 }
 

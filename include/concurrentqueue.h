@@ -762,7 +762,7 @@ public:
 		nextExplicitConsumerId(other.nextExplicitConsumerId.load(std::memory_order_relaxed)),
 		globalExplicitConsumerOffset(other.globalExplicitConsumerOffset.load(std::memory_order_relaxed))
 	{
-		// ApplyPhysics the other one into this, and leave the other one as an empty queue
+		// Move the other one into this, and leave the other one as an empty queue
 		implicitProducerHashResizeInProgress.clear(std::memory_order_relaxed);
 		populate_initial_implicit_producer_hash();
 		swap_implicit_producer_hashes(other);
@@ -1657,7 +1657,7 @@ private:
 						i = static_cast<size_t>(this->headIndex.load(std::memory_order_relaxed) & static_cast<index_t>(BLOCK_SIZE - 1));
 					}
 					
-					// Walk through all the items in the block; if this is the tail block, we need to Stop when we reach the tail index
+					// Walk through all the items in the block; if this is the tail block, we need to stop when we reach the tail index
 					auto lastValidIndex = (this->tailIndex.load(std::memory_order_relaxed) & static_cast<index_t>(BLOCK_SIZE - 1)) == 0 ? BLOCK_SIZE : static_cast<size_t>(this->tailIndex.load(std::memory_order_relaxed) & static_cast<index_t>(BLOCK_SIZE - 1));
 					while (i != BLOCK_SIZE && (block != this->tailBlock || i != lastValidIndex)) {
 						(*block)[i++]->~T();
@@ -3097,7 +3097,7 @@ private:
 	
 	void reown_producers()
 	{
-		// After another Instance is moved-into/swapped-with this one, all the
+		// After another instance is moved-into/swapped-with this one, all the
 		// producers we stole still think their parents are the other queue.
 		// So fix them up!
 		for (auto ptr = producerListTail.load(std::memory_order_relaxed); ptr != nullptr; ptr = ptr->next_prod()) {
