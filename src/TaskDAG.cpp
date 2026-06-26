@@ -7,7 +7,7 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
     if (!mem) return nullptr;
 
     // Use placement new
-    TaskNode* node = new (mem) TaskNode(t);
+    TaskNode* node = new (mem) TaskNode(t, *scheduler.GetAllocator());
 
     // Set properties
     node->isLocal = (priority == NONE);

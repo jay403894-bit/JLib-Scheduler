@@ -7,7 +7,7 @@
 #include <limits>
 #include <cstdint>
 #include "Epochs.h"
-#include "TaskScheduler.h"
+#include "TaskAllocator.h"
 namespace T_Threads {
 	struct LNodeBase; // forward declaration
 
@@ -129,6 +129,7 @@ namespace T_Threads {
 				}
 			}
 		};
+		TaskAllocator& allocator;
 
 		static void slabDeleter(void* ptr) {
 			auto* node = static_cast<LNode<T>*>(ptr);
@@ -137,7 +138,7 @@ namespace T_Threads {
 			node->data.~T();
 
 			// 2. Return the raw memory block to the EXACT allocator that gave it to you
-			TaskScheduler::Instance().GetAllocator()->Free(node);
+			allocator.Free(node);
 		}
 		static void heapDeleter(void* ptr) {
 			auto* node = static_cast<LNode<T>*>(ptr);
@@ -149,16 +150,16 @@ namespace T_Threads {
 		LNodeBase* head;
 		LNodeBase* tail;
 	public:
-		LockFreeList() {
-			void* mem = TaskScheduler::Instance().GetAllocator()->Alloc();
-			void* mem2 = TaskScheduler::Instance().GetAllocator()->Alloc();
+		LockFreeList(TaskAllocator& alloc) : allocator(alloc) {
+			void* mem = allocator.Alloc();
+			void* mem2 = allocator.Alloc();
 			head = new (mem) LNode<T>(0, T());
 			tail = new (mem2) LNode<T>(UINT64_MAX, T());
 			head->next.set(tail, false);
 		}
 		~LockFreeList() {
-			TaskScheduler::Instance().GetAllocator()->Free(head);
-			TaskScheduler::Instance().GetAllocator()->Free(tail);
+			allocator.Free(head);
+			allocator.Free(tail);
 		}
 		bool add(uint64_t key, T item) {
 			EpochManager::Instance().EnterEpoch(thread_id);
@@ -171,7 +172,7 @@ namespace T_Threads {
 					EpochManager::Instance().LeaveEpoch(thread_id); // leave epoch
 					return false;
 				}
-				void* mem = TaskScheduler::Instance().GetAllocator()->Alloc();
+				void* mem =allocator.Alloc();
 				LNode<T>* node = new (mem) LNode<T>(key, item);
 				node->next.set(curr, false);
 

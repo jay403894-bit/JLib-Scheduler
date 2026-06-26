@@ -20,7 +20,7 @@ A high-performance, lightweight C++17 fibers-based task scheduler / job system w
 
 ## Memory Management (Updated)
 
-Memory is **fully automated** using arena allocators combined with an **epoch-based garbage collection** system.
+Memory is **fully automated** using slab allocator combined with an **epoch-based garbage collection** system.
 
 You only need to call `Tick()` periodically from the **main thread**:
 
