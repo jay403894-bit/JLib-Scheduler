@@ -2,7 +2,7 @@
 using namespace T_Threads;
 
 TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
-    // Allocate the node memory from the scheduler's arena
+    // Allocate the node memory from the scheduler's allocator
     void* mem = scheduler.GetAllocator()->Alloc();
     if (!mem) return nullptr;
 
@@ -14,28 +14,73 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
     node->priority = (priority == NONE) ? 0 : priority;
     node->cpuID = cpu_id;
 
-    // Optional: Keep a reference if you really need to, 
-    // but you don't need unique_ptr anymore!
+    nodes.push_back(node);   // track for cycle detection / root discovery (build-time only)
     return node;
 }
 
-void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
-    // Increment the dependency count
-    dependent->dependencies_left.fetch_add(1, std::memory_order_relaxed);
+bool TaskDAG::HasCycle() {
+    // Kahn's topological sort on a COPY of the in-degrees (the real ones drive
+    // execution). If we can't drain every node, the survivors are exactly the nodes
+    // tangled in (or downstream of) a cycle.
+    std::unordered_map<TaskNode*, int> indeg;
+    indeg.reserve(nodes.size());
+    for (auto* n : nodes)
+        indeg[n] = n->dependencies_left.load(std::memory_order_relaxed);
 
-    // Add the dependent node to the dependency's list
-    // We use the pointer address as the key
+    std::vector<TaskNode*> ready;
+    for (auto* n : nodes)
+        if (indeg[n] == 0) ready.push_back(n);
+
+    size_t processed = 0;
+    while (!ready.empty()) {
+        TaskNode* n = ready.back(); ready.pop_back();
+        ++processed;
+        n->dependents->for_each([&](TaskNode* dep) {   // forward edges
+            if (--indeg[dep] == 0) ready.push_back(dep);
+        });
+    }
+    return processed != nodes.size();
+}
+
+bool TaskDAG::Submit() {
+    if (HasCycle()) {
+        // A cyclic node never runs, so it never self-frees via OnTaskFinished -- reclaim
+        // here (node + its task) so a rejected DAG doesn't leak. Caller should fix the graph.
+        for (auto* n : nodes) {
+            Task* t = n->task;
+            n->~TaskNode();
+            scheduler.GetAllocator()->Free(n);
+            if (t) {
+                bool slab = t->ownedBySlab;
+                t->~Task();
+                if (slab) scheduler.GetAllocator()->Free(t);
+                else      ::operator delete(t);
+            }
+        }
+        nodes.clear();
+        return false;
+    }
+
+    // Collect roots BEFORE submitting anything: once a node is submitted it can complete
+    // and self-free on a worker, so we must not touch the tracking vector afterward.
+    std::vector<TaskNode*> roots;
+    for (auto* n : nodes)
+        if (n->dependencies_left.load(std::memory_order_acquire) == 0)
+            roots.push_back(n);
+
+    nodes.clear();   
+    for (auto* r : roots)
+        SubmitToScheduler(r);
+    return true;
+}
+
+void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
+    dependent->dependencies_left.fetch_add(1, std::memory_order_relaxed);
     uint64_t key = reinterpret_cast<uintptr_t>(dependent);
-    // Store the dependent NODE (not its Task): OnTaskFinished's for_each reads
-    // dep->dependencies_left, so the list must hold TaskNode*, matching LockFreeList<TaskNode*>.
     dependency->dependents->add(key, dependent);
 }
 
-void TaskDAG::SubmitIfReady(TaskNode* node) {
-    if (node->dependencies_left.load(std::memory_order_acquire) == 0) {
-        SubmitToScheduler(node);
-    }
-}
+
 void TaskDAG::OnTaskFinished(TaskNode* node) {
     // Traverse the lock-Free list and trigger dependents
     node->dependents->for_each([this](TaskNode* dep) {

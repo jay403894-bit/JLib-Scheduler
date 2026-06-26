@@ -3,40 +3,50 @@
 #include "../include/TaskScheduler.h"
 using namespace T_Threads;
 std::atomic<uint64_t> T_Threads::Fiber::idGenerator{ 0 };
+
+// Defined in ContextSwitch.asm. The restore lands on this at a 16-aligned RSP; it
+// 'call's the entry point we stash in RBX, which re-establishes the ABI 8-mod-16 entry.
+extern "C" void FiberTrampoline();
+
 void Fiber::Init(void(*entryPoint)())
 {
 	// 16-byte-align the very top of this fiber's stack.
 	uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
 	uintptr_t* sp = (uintptr_t*)top;
 
-	// Windows x64 ABI: the CALLER must leave 32 bytes of shadow space ABOVE the
-	// return address for the callee to spill its register params. When
-	// ContextSwitch 'ret's into entryPoint, that shadow space is whatever sits
-	// above the entry RSP. Reserve it HERE, inside this fiber's own stack --
-	// otherwise the entry function writes past stackTop, which is either the
-	// next fiber's base (silent corruption) or, for the last fiber, unmapped
-	// memory (0xC0000005 write AV at the stack-region boundary).
-	sp -= 4;                              // 32 bytes shadow space (owned by this fiber)
-	*(--sp) = 0;                          // landing slot: entry RSP points here (unused)
-	*(--sp) = (uintptr_t)entryPoint;      // return address consumed by ContextSwitch 'ret'
+	// Windows x64 ABI: a called function gets 32 bytes of shadow space ABOVE its return
+	// address for its callees to spill register params. The trampoline 'call's the C++
+	// entry, so reserve that shadow at the very top, inside this fiber's own stack --
+	// otherwise the entry function writes past stackTop (next fiber's base => silent
+	// corruption, or unmapped memory => write AV at the stack-region boundary).
+	sp -= 4;                                 // 32 bytes shadow space
 
-	// 8 callee-saved registers consumed by ContextSwitch's pops (r15 is lowest).
-	*(--sp) = 0; // rbx
-	*(--sp) = 0; // rbp
-	*(--sp) = 0; // rdi
-	*(--sp) = 0; // rsi
-	*(--sp) = 0; // r12
-	*(--sp) = 0; // r13
-	*(--sp) = 0; // r14
-	*(--sp) = 0; // r15
+	// Return address consumed by ContextSwitch's final 'ret': the trampoline. It runs at
+	// a 16-aligned RSP and 'call's the real entry (in RBX) to land it at ABI 8-mod-16.
+	*(--sp) = (uintptr_t)&FiberTrampoline;
 
-	// 160 bytes for non-volatile XMM6-15 (10 * 16). ContextSwitch restores these
-	// (movdqu) and then does `add rsp,160` BEFORE the pops, so this block must sit
-	// below the GPR slots and ctx.rsp must point at its base. Zero-initialized;
-	// a fresh fiber has no meaningful incoming XMM state.
+	// 8 callee-saved GPR slots. ContextSwitch pops them r15..rbx, so rbx (popped last)
+	// is the highest slot -- we seed it with the entry point for the trampoline's
+	// `call rbx`. The rest are zero; a fresh fiber has no meaningful GPR state.
+	*(--sp) = (uintptr_t)entryPoint; // rbx
+	*(--sp) = 0;                     // rbp
+	*(--sp) = 0;                     // rdi
+	*(--sp) = 0;                     // rsi
+	*(--sp) = 0;                     // r12
+	*(--sp) = 0;                     // r13
+	*(--sp) = 0;                     // r14
+	*(--sp) = 0;                     // r15
+
+	// 8-byte dummy that realigns the XMM block to 16 -- mirrors ContextSwitch's
+	// `sub rsp, 168` (= 160 XMM + 8 dummy). Without it ctx.rsp would be 8 mod 16 and
+	// the restore's movdqa would #GP.
+	*(--sp) = 0;
+
+	// 160 bytes for non-volatile XMM6-15 (10 * 16). Restored with movdqa, so this block
+	// -- and ctx.rsp -- must be 16-aligned. Zero-initialized; no incoming XMM state.
 	for (int k = 0; k < 20; ++k) *(--sp) = 0; // 20 * 8 = 160 bytes
 
-	ctx.rsp = (void*)sp; // ContextSwitch loads RSP here (base of the XMM block)
+	ctx.rsp = (void*)sp; // 16-aligned base of the XMM block; ContextSwitch loads RSP here
 }
 
 void Fiber::CoYield() {
