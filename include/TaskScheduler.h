@@ -16,7 +16,6 @@
 #include <thread>
 #include <immintrin.h>
 #include "GlobalFiberPool.h"
-
 namespace T_Threads {
 	class T_Thread;
 	class Event;

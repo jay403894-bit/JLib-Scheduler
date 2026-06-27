@@ -1,11 +1,24 @@
 #pragma once
 #include "Task.h"
-#include "TaskAllocator.h"   // <- instead of TaskScheduler.h; the node only needs the allocator
+#include "TaskAllocator.h"   // the node only needs the allocator, not the whole scheduler
 #include "LockFreeList.h"
+
 namespace T_Threads {
     struct TaskNode {
-        TaskAllocator& alloc;                // injected; node's list allocates from this
-        Task* task;
+        TaskAllocator& alloc;                 // injected; the node's list allocates from this
+        Task* task;                           // nullptr for a gate (see isGate)
+
+        // How this node decides it's ready, given its direct predecessors:
+        //   AND -> fire once ALL predecessors finish (dependencies_left counts down to 0)
+        //   OR  -> fire on the FIRST predecessor (the `submitted` exchange dedups the rest)
+        enum LogicType { AND, OR };
+        LogicType gateType = AND;
+
+        // A gate has no task: when its trigger fires it propagates INSTANTLY (runs its own
+        // OnTaskFinished) instead of scheduling work. Compose gates to build arbitrary
+        // boolean expressions, e.g. (A && B) || C.
+        bool isGate = false;
+
         LockFreeList<TaskNode*>* dependents;
         std::atomic<int> dependencies_left;
         std::atomic<bool> submitted{ false };
@@ -15,10 +28,10 @@ namespace T_Threads {
         bool isFork = false;
 
         TaskNode(Task* t, TaskAllocator& allocator)
-            : alloc(allocator), task(t), dependencies_left(0)   // <- reference bound here
+            : alloc(allocator), task(t), dependencies_left(0)   // reference bound here
         {
             void* m = alloc.Alloc();
-            dependents = new (m) LockFreeList<TaskNode*>(alloc);  // pass the ref straight through
+            dependents = new (m) LockFreeList<TaskNode*>(alloc);
         }
 
         ~TaskNode() {

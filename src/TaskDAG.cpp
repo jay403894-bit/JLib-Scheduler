@@ -18,6 +18,17 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
     return node;
 }
 
+TaskNode* TaskDAG::CreateGate(TaskNode::LogicType type) {
+    void* mem = scheduler.GetAllocator()->Alloc();
+    if (!mem) return nullptr;
+    // A gate carries no task; it just propagates readiness. Same allocator/list as a node.
+    TaskNode* node = new (mem) TaskNode(nullptr, *scheduler.GetAllocator());
+    node->isGate = true;
+    node->gateType = type;
+    nodes.push_back(node);
+    return node;
+}
+
 bool TaskDAG::HasCycle() {
     // Kahn's topological sort on a COPY of the in-degrees (the real ones drive
     // execution). If we can't drain every node, the survivors are exactly the nodes
@@ -66,9 +77,9 @@ bool TaskDAG::Submit() {
         if (n->dependencies_left.load(std::memory_order_acquire) == 0)
             roots.push_back(n);
 
-    nodes.clear();   
+    nodes.clear();
     for (auto* r : roots)
-        SubmitToScheduler(r);
+        Fire(r);
     return true;
 }
 
@@ -80,23 +91,43 @@ void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
 
 
 void TaskDAG::OnTaskFinished(TaskNode* node) {
-    // Traverse the lock-Free list and trigger dependents
+    // Trigger each dependent. AND fires when its countdown reaches 0; OR fires on the
+    // FIRST predecessor -- Fire's `submitted` exchange turns later predecessors into no-ops.
     node->dependents->for_each([this](TaskNode* dep) {
-        int val = dep->dependencies_left.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        if (val == 0) {
-            SubmitToScheduler(dep);
-        }
+        bool ready = (dep->gateType == TaskNode::OR)
+            ? true
+            : (dep->dependencies_left.fetch_sub(1, std::memory_order_acq_rel) - 1 == 0);
+        if (ready) Fire(dep);
         });
-    node->~TaskNode();
-	scheduler.GetAllocator()->Free(node);
+    // Retire (don't immediately free): an OR dependent fires on its FIRST predecessor and
+    // then runs + finishes, but LATER predecessors still hold this node in their dependents
+    // lists and read it inside their (epoch-guarded) for_each. EBR keeps it alive until no
+    // such reader can still see it. (AND is safe either way, but uniform retire is simplest.)
+    EpochManager::Instance().RetirePtr(node, EpochManager::Instance().CurrentEpoch(), &TaskDAG::NodeDeleter);
+}
+
+void TaskDAG::NodeDeleter(void* p) {
+    auto* n = static_cast<TaskNode*>(p);
+    TaskAllocator* a = &n->alloc;   // grab the allocator before destroying the node
+    n->~TaskNode();
+    a->Free(n);
 }
 
 
-void TaskDAG::SubmitToScheduler(TaskNode* node) {
+void TaskDAG::Fire(TaskNode* node) {
 
     if (node->submitted.exchange(true, std::memory_order_acq_rel)) {
-        return; // Already submitted by another thread, do nothing!
+        return; // already fired by another predecessor (dedups OR, and AND races)
     }
+
+    if (node->isGate) {
+        // No task to schedule: the gate "completes" instantly, so propagate to its own
+        // dependents right now. This recurses through chains of gates (depth = the depth
+        // of the boolean expression), all on the firing thread.
+        OnTaskFinished(node);
+        return;
+    }
+
     auto* ctx = new TaskFinishedContext{ this, node };
     node->task->onComplete = &OnTaskFinishedWrapper;
     node->task->onCompleteData = ctx;
@@ -110,5 +141,5 @@ void TaskDAG::SubmitToScheduler(TaskNode* node) {
         else
             scheduler.Push(node->cpuID, node->task);
     }
-  
+
 }

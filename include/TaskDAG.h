@@ -22,6 +22,9 @@ namespace T_Threads {
     public:
         TaskDAG(TaskScheduler& sched) : scheduler(sched) {};
         TaskNode* CreateNode(Task* t, uint8_t priority = NONE, uint8_t cpu_id = NONE);
+        // A gate has no task; it fires its dependents instantly when its trigger is met.
+        // Compose gates to express arbitrary boolean readiness, e.g. (A && B) || C.
+        TaskNode* CreateGate(TaskNode::LogicType type);
          void AddDependency(TaskNode* dependent, TaskNode* dependency);
 
          static void OnTaskFinishedWrapper(void* data) {
@@ -52,6 +55,7 @@ namespace T_Threads {
         // so it is cleared there and never iterated post-submit.
         std::vector<TaskNode*> nodes;
 
-        void SubmitToScheduler(TaskNode* node);
+        void Fire(TaskNode* node);   // run the node (or, for a gate, propagate instantly)
+        static void NodeDeleter(void* p);   // EBR deleter: ~TaskNode + return its slot to the slab
     };
 };
