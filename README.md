@@ -22,13 +22,17 @@ A high-performance, lightweight C++17 fibers-based task scheduler / job system w
 
 Memory is **fully automated** using slab allocator combined with an **epoch-based garbage collection** system.
 
-You only need to call `Tick()` periodically from the **main thread**:
 
-
+----------
 Motivation
+----------
+
 T_Threads was built as a hobby project to explore advanced parallelism in C++. It is currently used in my personal game/simulation engine.
 
+-----
 Usage
+-----
+
 Starting the Scheduler
 C++// Initialize (optional: specify number of workers)
 ```cpp
@@ -42,6 +46,11 @@ C++// Lambda style
 auto* task = scheduler.CreateTask([]() {
     printf("Hello from task!\n");
 });
+
+-- if you want a task to be hi priority set HiPri to true when creating the task!
+its one of the CreateTask Parameters, autoset to false
+-- if you have a deep callstack set FiberSize to FiberSize::Heavy -- there are less
+heavy fibers than light fibers but heavy fibers get 512k stack vs 64
 
 // Or function pointer style
 void MyTask(void* data) { ... }
