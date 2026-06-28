@@ -126,7 +126,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 					pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 				}
 				else {
-					std::this_thread::yield();
+					_mm_pause();
 				}
 			}
 		}
@@ -140,9 +140,6 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 			func(i, i + 1);
 		}
 	}
-	// 4. Batch is done and no longer referenced by us. Recycle the arena it
-	//    came from — but only if the whole system is quiescent (see RecycleArena).
-	//RecycleArena();
 }
 void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
 	chunkSize = std::max(1, chunkSize);
