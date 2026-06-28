@@ -29,7 +29,10 @@ Motivation
 
 T_Threads was built as a hobby project to explore advanced parallelism in C++. It is currently used in my personal game/simulation engine.
 
+-----
 Usage
+-----
+
 Starting the Scheduler
 C++// Initialize (optional: specify number of workers)
 ```cpp
