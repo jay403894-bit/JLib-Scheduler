@@ -37,10 +37,13 @@ void Fiber::Init(void(*entryPoint)())
 	*(--sp) = 0;                     // r14
 	*(--sp) = 0;                     // r15
 
-	// 8-byte dummy that realigns the XMM block to 16 -- mirrors ContextSwitch's
-	// `sub rsp, 168` (= 160 XMM + 8 dummy). Without it ctx.rsp would be 8 mod 16 and
-	// the restore's movdqa would #GP.
-	*(--sp) = 0;
+	// 8-byte slot that realigns the XMM block to 16 -- mirrors ContextSwitch's
+	// `sub rsp, 168` (= 160 XMM + 8). Without it ctx.rsp would be 8 mod 16 and the
+	// restore's movdqa would #GP. ContextSwitch also stashes the FP control state here:
+	// MXCSR at [base+160] (low 4 bytes), x87 FCW at [base+164] (next 2). Seed the ABI
+	// defaults so the first switch-in's ldmxcsr/fldcw load a sane masked state instead
+	// of garbage: MXCSR 0x1F80 (all FP exceptions masked, round-to-nearest), FCW 0x037F.
+	*(--sp) = 0x0000037F00001F80ULL;
 
 	// 160 bytes for non-volatile XMM6-15 (10 * 16). Restored with movdqa, so this block
 	// -- and ctx.rsp -- must be 16-aligned. Zero-initialized; no incoming XMM state.
