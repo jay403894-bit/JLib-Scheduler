@@ -4,57 +4,47 @@
 #include "GlobalFiberPool.h"
 
 namespace T_Threads {
+    // Per-worker fiber free-list. Single-threaded: only the owning worker touches it.
+    // Pure LIFO stack over localFibers[0..count); no wrapping, no separate head/tail.
+    // (The old head/tail+count ring mixed LIFO Push/Pop with a head-based overflow drain;
+    //  the indices drifted out of sync and it handed the global pool fibers that were
+    //  still live in the cache -> the same fiber got acquired by two workers -> two
+    //  workers ran one stack -> corruption. It also dropped the fiber being pushed.)
     template<size_t MaxCapacity = 256>
     struct alignas(64) ThreadLocalCache {
-        Fiber* localFibers[MaxCapacity]; // Fixed array, stack-allocated or embedded in struct
-        size_t activeCapacity;            // Your calculated size
-        size_t count = 0;             // Track the number of items
-        size_t head = 0;
-        size_t tail = 0;
+        Fiber* localFibers[MaxCapacity];
+        size_t activeCapacity = 0;
+        size_t count = 0;
         GlobalFiberPool* globalPool = nullptr;
-        // Set the global pool this cache refills from
-        void Initialize(GlobalFiberPool* pool,size_t runtimeCapacity) {
+
+        void Initialize(GlobalFiberPool* pool, size_t runtimeCapacity) {
             activeCapacity = (runtimeCapacity <= MaxCapacity) ? runtimeCapacity : MaxCapacity;
+            if (activeCapacity < 2) activeCapacity = 2; // need room to return a half + keep f
             globalPool = pool;
         }
+
         void Push(Fiber* f) {
-            if (count < activeCapacity) {
-                localFibers[tail] = f;
-                tail = (tail + 1) % activeCapacity;
-                count++;
-            }
-            else {
-                // Just return half via a pointer, NO SHIFT, NO VECTOR!
-                size_t half = count / 2;
-                globalPool->ReturnBatch(&localFibers[head], half);
-                head = (head + half) % activeCapacity;
+            if (count >= activeCapacity) {
+                // Full: spill the TOP half back to the global pool. The top half is the
+                // contiguous range [count-half, count); returning it needs no shift and
+                // leaves the bottom half [0, count-half) untouched. Disjoint regions =>
+                // no fiber is ever both spilled and kept.
+                size_t half = activeCapacity / 2;
+                globalPool->ReturnBatch(&localFibers[count - half], half);
                 count -= half;
-                // add new fiber...
             }
+            localFibers[count++] = f; // always store f (the old code forgot this on overflow)
         }
 
         Fiber* Pop() {
-            // 1. Refill if empty
             if (count == 0 && globalPool) {
-                Fiber* temp[64];
-                size_t stolenCount = globalPool->StealInto(temp, 64);
-
-                for (size_t i = 0; i < stolenCount; ++i) {
-                    localFibers[tail] = temp[i]; // Push to tail
-                    tail = (tail + 1) % activeCapacity;
-                    count++;
-                }
+                // Refill from the global pool, bounded by our capacity so we never
+                // overrun localFibers.
+                size_t got = globalPool->StealInto(localFibers, activeCapacity);
+                count = got;
             }
-
-            // 2. Return nullptr if still empty
             if (count == 0) return nullptr;
-
-            // 3. Pop from the SAME end (LIFO)
-            // Decrement tail to get the most recently added fiber
-            tail = (tail == 0) ? (activeCapacity - 1) : (tail - 1);
-            Fiber* f = localFibers[tail];
-            count--;
-            return f;
+            return localFibers[--count];
         }
     };
 };
