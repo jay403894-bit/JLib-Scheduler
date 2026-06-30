@@ -142,119 +142,12 @@ void T_Thread::Worker() {
 	running.store(true, std::memory_order_release);
 	const size_t BATCH_SIZE = 64;
 	Task* batch[BATCH_SIZE];
-
+	static thread_local Task* task_to_run = nullptr;
+	static thread_local bool is_handling_fork = false;
 	while (running.load(std::memory_order_acquire)) {
-		Task* task_to_run = nullptr;
 
 		ready.store(true, std::memory_order_release);
-		auto& hiPriInbox = scheduler->hiPriInboxes[qIndex];
-		auto& hiPriQ = scheduler->hiPri[qIndex];
-
-		size_t count = 0;
-		// Collect available tasks into the local buffer
-		while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
-			count++;
-		}
-
-		// Use your existing push_bottom_batch for an atomic update
-		if (count > 0) {
-			if (!scheduler->hiPri[qIndex]->push_bottom_batch(batch, count)) {
-				// If deque is full, handle overflow (e.g., push back to hiPriInbox or wait)
-				std::cerr << "hiPri Deque full, overflow handling needed!" << std::endl;
-			}
-		}
-
-		auto& loPriInbox = scheduler->loPriInboxes[qIndex];
-		auto& loPriQ = scheduler->loPri[qIndex];
-
-		count = 0;
-		// Collect available tasks into the local buffer
-		while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count])) {
-			count++;
-		}
-
-		// Use your existing push_bottom_batch for an atomic update
-		if (count > 0) {
-			if (!scheduler->loPri[qIndex]->push_bottom_batch(batch, count)) {
-				// If deque is full, handle overflow (e.g., push back to loPriInbox or wait)
-				std::cerr << "loPri Deque full, overflow handling needed!" << std::endl;
-			}
-		}
-
-		// --- 1. Immediate task execution ---
-		bool is_handling_fork = false;
-		{
-			if (immediateTask != nullptr) {
-				task_to_run = immediateTask;
-				current_task = immediateTask;
-				immediateTask = nullptr;
-				immediate.store(false, std::memory_order_release);
-				is_handling_fork = true;
-			}
-		}
-		{
-			// --- 3. Local  queues ---
-			if (!task_to_run) {
-				auto opt = scheduler->hiPri[qIndex]->pop_bottom();
-				if (opt) {
-					Task* task = *opt;
-					if (!task) {
-						std::cerr << "[worker " << qIndex << "] Null task from pop_bottom!" << std::endl;
-					}
-					else {
-						task_to_run = task;
-						current_task = task;
-					}
-				}
-			}
-			if (!task_to_run) {
-				auto opt = scheduler->loPri[qIndex]->pop_bottom();
-				if (opt) {
-					Task* task = *opt;
-					if (!task) {
-						std::cerr << "[worker " << qIndex << "] Null task from pop_bottom!" << std::endl;
-					}
-					else {
-						task_to_run = task;
-						current_task = task;
-					}
-				}
-			}
-		}
-		{
-			// --- 4. Work stealing ---
-			if (!task_to_run) {
-				size_t stride = 1;
-				size_t neighbor = (qIndex + stride) % scheduler->workers.size();
-
-				// 1. Try to steal High Priority from the immediate neighbor first
-				if (auto stolen = scheduler->hiPri[neighbor]->steal()) {
-					task_to_run = *stolen;
-				}
-				// 2. If no HiPri, try to steal Low Priority from the neighbor
-				else if (auto stolen = scheduler->loPri[neighbor]->steal()) {
-					task_to_run = *stolen;
-				}
-				else {
-					// 3. Try to steal from a random worker
-					int res = FastRand() % (scheduler->workers.size() - 1);
-					if (res == qIndex) res++;
-
-					// Again: HiPri first, then LoPri
-					if (auto stolen = scheduler->hiPri[res]->steal()) {
-						task_to_run = *stolen;
-					}
-					else if (auto stolen = scheduler->loPri[res]->steal()) {
-						task_to_run = *stolen;
-					}
-				}
-
-				if (task_to_run) {
-					current_task = task_to_run;
-				}
-			}
-		}
-		// --- 6. Execute task if found ---
+		// --- 1. Execute task if found ---
 		if (task_to_run) {
 			Fiber* existingFiber = task_to_run->assignedFiber;
 
@@ -340,17 +233,133 @@ void T_Thread::Worker() {
 			if (EpochManager::Instance().RetiredCount() > 512) {
 				EpochManager::Instance().Tick();
 			}
-			{
-				std::unique_lock<std::mutex> lock(workerMutex);
-				cv.wait(lock, [this]() {
-					return !running.load(std::memory_order_acquire)
-						|| immediate.load(std::memory_order_acquire)
-						|| (!scheduler->paused.load(std::memory_order_acquire) && scheduler->pendingTasks.load() > 0);
-					});
 
-				if (!running.load(std::memory_order_acquire)) break;
+			task_to_run = nullptr;
+		}
+		// --- 2. Immediate task execution ---
+		{
+			if (immediateTask != nullptr) {
+				task_to_run = immediateTask;
+				current_task = immediateTask;
+				immediateTask = nullptr;
+				immediate.store(false, std::memory_order_release);
+				is_handling_fork = true;
+				continue;
 			}
+		}
+		{
+			// --- 3. Local  queues ---
+			if (!task_to_run) {
+				auto opt = scheduler->hiPri[qIndex]->pop_bottom();
+				if (opt) {
+					Task* task = *opt;
+					if (!task) {
+						std::cerr << "[worker " << qIndex << "] Null task from pop_bottom!" << std::endl;
+					}
+					else {
+						task_to_run = task;
+						current_task = task;
+						continue;
+					}
+				}
+			}
+			if (!task_to_run) {
+				auto opt = scheduler->loPri[qIndex]->pop_bottom();
+				if (opt) {
+					Task* task = *opt;
+					if (!task) {
+						std::cerr << "[worker " << qIndex << "] Null task from pop_bottom!" << std::endl;
+					}
+					else {
+						task_to_run = task;
+						current_task = task;
+						continue;
+					}
+				}
+			}
+		}
+		{
+			// --- 4. Work stealing ---
+			if (!task_to_run) {
+				size_t stride = 1;
+				size_t neighbor = (qIndex + stride) % scheduler->workers.size();
+
+				// 1. Try to steal High Priority from the immediate neighbor first
+				if (auto stolen = scheduler->hiPri[neighbor]->steal()) {
+					task_to_run = *stolen;
+				}
+				// 2. If no HiPri, try to steal Low Priority from the neighbor
+				else if (auto stolen = scheduler->loPri[neighbor]->steal()) {
+					task_to_run = *stolen;
+				}
+				else {
+					// 3. Try to steal from a random worker
+					int res = FastRand() % (scheduler->workers.size() - 1);
+					if (res == qIndex) res++;
+
+					// Again: HiPri first, then LoPri
+					if (auto stolen = scheduler->hiPri[res]->steal()) {
+						task_to_run = *stolen;
+					}
+					else if (auto stolen = scheduler->loPri[res]->steal()) {
+						task_to_run = *stolen;
+					}
+				}
+
+				if (task_to_run) {
+					current_task = task_to_run;
+					continue;
+				}
+			}
+		}
+		
+
+		// 5. --- Pull from inboxes before sleep (drain them so nothing gets stuck) ---
+		if (!task_to_run) {
+			size_t count = 0;
+			while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
+				count++;
+			}
+			if (count > 0) {
+				if (scheduler->hiPri[qIndex]->push_bottom_batch(batch, count)) {
+					auto opt = scheduler->hiPri[qIndex]->pop_bottom();
+					if (opt) {
+						task_to_run = *opt;
+						continue;
+					}
+				}
+			}
+
+			if (!task_to_run) {
+				count = 0;
+				while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count])) {
+					count++;
+				}
+				if (count > 0) {
+					if (scheduler->loPri[qIndex]->push_bottom_batch(batch, count)) {
+						auto opt = scheduler->loPri[qIndex]->pop_bottom();
+						if (opt) {
+							task_to_run = *opt;
+							continue;
+						}
+					}
+				}
+			}
+		}
+
+		// --- Sleep only if no task is ready (no 1ms timeout needed, inbox was drained) ---
+		if (task_to_run) {
 			continue;
+		}
+		else {
+			std::unique_lock<std::mutex> lock(workerMutex);
+			cv.wait(lock, [this]() {
+				return !running.load(std::memory_order_acquire)
+					|| immediate.load(std::memory_order_acquire)
+					|| (!scheduler->paused.load(std::memory_order_acquire) && scheduler->pendingTasks.load(std::memory_order_acquire) > 0);
+				});
+
+			if (!running.load(std::memory_order_acquire)) break;
 		}
 	}
 	running.store(false, std::memory_order_release);

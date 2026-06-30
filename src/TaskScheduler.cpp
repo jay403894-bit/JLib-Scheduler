@@ -292,6 +292,31 @@ bool TaskScheduler::PushFork(uint8_t cpu_affinity, Task* task) {
 	if (!task) return false;
 	return Push(cpu_affinity, task);
 }
+void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::function<void()>& arm) {
+	auto* thread = T_Thread::GetCurrent();
+	Task* myTask = thread->currentRunningTask;
+	Fiber* myFiber = myTask->assignedFiber;
+
+	auto& event = GetEvent(eventName);
+
+	// Same ordering as WaitOnEvent: become parkable, then register as a waiter, so a signal
+	// that races in is not lost (Resume flips WANTS_SUSPEND->SUSPEND_SIGNALED and the worker
+	// wakes us after the switch). Crucially, run 'arm' only AFTER both -- the arm callback
+	// hooks the external wakeup (e.g. a GPU fence), and must not be able to fire SignalAll
+	// before this fiber is a discoverable, resumable waiter.
+	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
+	event.AddWaiter(myTask);
+
+	if (arm) arm();
+
+	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
+}
+
+bool TaskScheduler::IsOnFiber() {
+	auto* t = T_Thread::GetCurrent();
+	return t != nullptr && t->currentRunningTask != nullptr;
+}
+
 Event& TaskScheduler::GetEvent(const std::string& name) {
 	std::lock_guard<std::mutex> lock(registryMtx);
 	if (eventRegistry.find(name) == eventRegistry.end())
@@ -360,15 +385,17 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 	if (cpuaffinity > 0 && (size_t)(cpuaffinity - 1) < num_workers) {
 		size_t idx = (size_t)(cpuaffinity - 1);
 		if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
-			pendingTasks.fetch_add(1, std::memory_order_relaxed);
 			loPriInboxes[idx]->push(task);
+			// Use release semantics so a worker that loads pendingTasks in its predicate
+			// sees the increment BEFORE it sees any subsequent notify. This pairs with the
+			// worker's load in its predicate check, closing the notify-loss race.
+			pendingTasks.fetch_add(1, std::memory_order_release);
 			NotifyAll();
 		}
 		else
 			return false;
 	}
 	else {
-		pendingTasks.fetch_add(1, std::memory_order_relaxed);
 		uint8_t chosen = PickNextWorker();
 		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			chosen = PickNextWorker();
@@ -377,6 +404,8 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 			hiPriInboxes[chosen]->push(task);
 		else
 			loPriInboxes[chosen]->push(task);
+		// Use release semantics (see comment above).
+		pendingTasks.fetch_add(1, std::memory_order_release);
 		workers[chosen]->NotifyWorker();
 
 	}

@@ -50,6 +50,15 @@ namespace T_Threads {
 		GlobalFiberPool& GetGlobalPool();
 		Event& GetEvent(const std::string& name);
 		void WaitOnEvent(const std::string& eventName);
+		// Like WaitOnEvent, but runs 'arm' AFTER this fiber is registered as a waiter and
+		// marked parkable (WANTS_SUSPEND), and BEFORE it actually suspends. Use it to arm an
+		// external wakeup (e.g. a GPU-fence completion callback that will SignalAll this
+		// event) with no lost-wakeup race: any signal that fires once 'arm' has run is
+		// guaranteed to find a registered, resumable waiter. Must be called from a fiber.
+		void WaitOnEventArmed(const std::string& eventName, const std::function<void()>& arm);
+		// True if the caller is currently a worker running a task on a fiber (so it is safe
+		// to WaitOnEvent / WaitOnEventArmed). False on the main thread or any non-worker.
+		bool IsOnFiber();
 		void Pause();
 		void Resume();
 		void Stop(Task* worker_task);
