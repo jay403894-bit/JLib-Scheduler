@@ -320,6 +320,30 @@ void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::fu
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 }
 
+void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*)>& arm) {
+	auto* thread = T_Thread::GetCurrent();
+	Task* myTask = thread->currentRunningTask;
+	Fiber* myFiber = myTask->assignedFiber;
+
+	DirectEvent* e = eventPool.Acquire();   // pool sized for max concurrent waits (never null in practice)
+
+	// Ordering is load-bearing and identical in spirit to WaitOnEventArmed:
+	//  1. become parkable FIRST -- if we published the waiter first, a signal could Resume() us
+	//     while still RUNNING, and Resume() is a no-op for unrecognized states -> LOST wakeup.
+	//  2. publish the waiter, so a signal that lands now finds a resumable target.
+	//  3. arm the external wakeup only AFTER both.
+	//  4. suspend.
+	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
+	e->waiter.store(myTask, std::memory_order_release);
+
+	if (arm) arm(e);
+
+	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
+
+	// Resumed: WE own release. Signal() already exchanged waiter->null and will not touch e again.
+	eventPool.Release(e);
+}
+
 bool TaskScheduler::IsOnFiber() {
 	auto* t = T_Thread::GetCurrent();
 	return t != nullptr && t->currentRunningTask != nullptr;

@@ -363,7 +363,6 @@ void T_Thread::Worker() {
 			}
 		}
 
-		// --- Sleep only if no task is ready (no 1ms timeout needed, inbox was drained) ---
 		if (task_to_run) {
 			continue;
 		}

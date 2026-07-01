@@ -16,6 +16,7 @@
 #include <thread>
 #include <immintrin.h>
 #include "GlobalFiberPool.h"
+#include "DirectEvent.h"
 namespace T_Threads {
 	class T_Thread;
 	class Event;
@@ -56,6 +57,11 @@ namespace T_Threads {
 		// event) with no lost-wakeup race: any signal that fires once 'arm' has run is
 		// guaranteed to find a registered, resumable waiter. Must be called from a fiber.
 		void WaitOnEventArmed(const std::string& eventName, const std::function<void()>& arm);
+		// Direct/handle variant of WaitOnEventArmed: no name, no registry, no global lock. Takes
+		// a pooled DirectEvent and hands its pointer to 'arm' so the external signaler can wake
+		// this fiber via DirectEvent::Signal() with a direct pointer. Preferred for the common
+		// "signaler shares context with the waiter" case (fences, IO). Must be called on a fiber.
+		void WaitOnEventDirectArmed(const std::function<void(DirectEvent*)>& arm);
 		// True if the caller is currently a worker running a task on a fiber (so it is safe
 		// to WaitOnEvent / WaitOnEventArmed). False on the main thread or any non-worker.
 		bool IsOnFiber();
@@ -123,6 +129,7 @@ namespace T_Threads {
 		TaskAllocator taskAllocator{ 1024 * 1024 }; // 1M tasks
 		std::unordered_map<std::string, std::unique_ptr<Event>> eventRegistry;
 		std::mutex registryMtx;
+		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
 		std::atomic<bool> poolActive{ false };
 		std::atomic<int> nextWorker{ 0 };
 		std::atomic<bool> stopFlag{ false };
