@@ -35,7 +35,7 @@ TaskScheduler::~TaskScheduler() {
 	if (!stopFlag)
 		Join();
 }
-bool TaskScheduler::EnqueueToMain(Task* task) {
+bool TaskScheduler::PushMain(Task* task) {
 	if (!poolActive) return false;
 	if (!task) return false;
 	mainQ.push(task);
@@ -47,6 +47,18 @@ void TaskScheduler::ProcessMainThread() {
 	while (mainQ.pop(t)) {
 		if (!t) continue;
 		t->Execute();
+		// Worker() frees a DEAD task after running it (see its FiberStatus::DEAD branch) --
+		// this path was missing the equivalent, so every PushMain'd task leaked its slab.
+		// Latent/unnoticed while PushMain was barely used; would leak fast once frame tasks
+		// (StartFrame/Submit-producers/PresentFrame) route through here every frame.
+		t->~Task();
+		taskAllocator.Free(t);
+	}
+}
+void TaskScheduler::WaitForMain(WaitGroup& wg) {
+	while (wg.n.load(std::memory_order_acquire) > 0) {
+		ProcessMainThread();  // drain any ready main-affinity DAG nodes
+		std::this_thread::yield();
 	}
 }
 void TaskScheduler::Join() {
@@ -194,6 +206,14 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	immediateCoresInUse.reserve(num_workers);
 	loPriInboxes.reserve(num_workers);
 	hiPriInboxes.reserve(num_workers);
+
+	// mainQ (used by PushMain/ProcessMainThread, e.g. TaskDAG main-affinity nodes) was NEVER
+	// init()'d -- its default ctor leaves head_/tail_/stub_ uninitialized. Harmless as long as
+	// nothing actually called PushMain, which nothing did until real work started routing
+	// through it (TaskDAG::Fire's isMain branch): TaskMPSCQueue::append() then wrote through a
+	// garbage head_/prev pointer -> write access violation. One-time init, same as every other
+	// TaskMPSCQueue (see loPriInboxes/hiPriInboxes below).
+	mainQ.init(&taskAllocator);
 
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		immediateCoresInUse.push_back(std::make_unique<std::atomic<bool>>(false));

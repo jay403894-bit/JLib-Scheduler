@@ -18,6 +18,12 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
     return node;
 }
 
+TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
+    TaskNode* node = CreateNode(t, priority, NONE);
+    if (node) node->isMain = true;
+    return node;
+}
+
 TaskNode* TaskDAG::CreateGate(TaskNode::LogicType type) {
     void* mem = scheduler.GetAllocator()->Alloc();
     if (!mem) return nullptr;
@@ -132,7 +138,10 @@ void TaskDAG::Fire(TaskNode* node) {
     node->task->onComplete = &OnTaskFinishedWrapper;
     node->task->onCompleteData = ctx;
 
-    if (node->isFork) {
+    if (node->isMain) {
+        scheduler.PushMain(node->task);
+    }
+    else if (node->isFork) {
         scheduler.PushFork(node->cpuID, node->task);
     }
     else if (node->isLocal) {

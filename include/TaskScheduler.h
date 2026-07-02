@@ -36,8 +36,14 @@ namespace T_Threads {
 		static void Init(size_t poolSize = 0); // 0 = auto-detect
 
 		~TaskScheduler();
-		bool EnqueueToMain(Task* task);
+		bool PushMain(Task* task);
 		void ProcessMainThread();
+		// Waits on wg like WaitFor(), but ALSO drains mainQ (ProcessMainThread) each spin.
+		// REQUIRED if the WaitGroup covers any TaskDAG main-affinity node (see TaskNode::isMain)
+		// -- those tasks only ever run when something calls ProcessMainThread, so a plain
+		// WaitFor() would spin forever waiting on a task nothing is servicing. Caller must BE
+		// the main thread (only it should call ProcessMainThread).
+		void WaitForMain(WaitGroup& wg);
 		void Join();
 		void NotifyAll();
 		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);

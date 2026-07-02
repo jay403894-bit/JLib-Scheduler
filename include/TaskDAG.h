@@ -22,6 +22,13 @@ namespace T_Threads {
     public:
         TaskDAG(TaskScheduler& sched) : scheduler(sched) {};
         TaskNode* CreateNode(Task* t, uint8_t priority = NONE, uint8_t cpu_id = NONE);
+        // Like CreateNode, but the task runs via TaskScheduler::PushMain (only progresses when
+        // the main thread calls ProcessMainThread) instead of the worker pool. Use for anything
+        // that must run on the main thread -- e.g. Submit() calls in this renderer, which push
+        // into Renderer::m_WorkerLocalStorage/m_Buckets and are only safe single-threaded today.
+        // Whoever waits on this DAG's completion MUST use TaskScheduler::WaitForMain, not
+        // WaitFor, or a main-affinity node (and everything downstream of it) hangs forever.
+        TaskNode* CreateMainNode(Task* t, uint8_t priority = NONE);
         // A gate has no task; it fires its dependents instantly when its trigger is met.
         // Compose gates to express arbitrary boolean readiness, e.g. (A && B) || C.
         TaskNode* CreateGate(TaskNode::LogicType type);

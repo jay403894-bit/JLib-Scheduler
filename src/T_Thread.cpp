@@ -363,6 +363,15 @@ void T_Thread::Worker() {
 			}
 		}
 
+		// --- Sleep only if no task is ready ---
+		// BOUNDED wait (1ms), NOT a plain cv.wait: pendingTasks is bumped OUTSIDE workerMutex
+		// in the push path, so a notify can fire between this predicate check and the actual
+		// block -> LOST WAKEUP. With plain cv.wait the worker then sleeps forever holding the
+		// last task in its queue, every other worker idle-sleeps too (nobody steals it), and
+		// main yields in WaitFor forever -> full hang (observed ~53min in). The 1ms timeout
+		// makes every worker re-check pendingTasks and drain its inbox, self-healing the missed
+		// wakeup at ~0% CPU. Do NOT remove this timeout -- "inbox was drained" does not hold
+		// under the lost-wakeup race. (Regression of the 2026-06-30 fix.)
 		if (task_to_run) {
 			continue;
 		}

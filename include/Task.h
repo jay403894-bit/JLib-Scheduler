@@ -12,10 +12,18 @@ namespace T_Threads {
 
         Func fn;
         void* data = nullptr;
-        Fiber* assignedFiber = nullptr; 
+        Fiber* assignedFiber = nullptr;
         std::atomic<uint8_t> stopFlag{ false };
-        Func onComplete;
-        void* onCompleteData;
+        // MUST default to nullptr: TaskAllocator recycles slab memory WITHOUT zeroing it (a
+        // pure intrusive free-list), and neither constructor below sets these. Without an
+        // explicit default, a task placement-new'd into a slot PREVIOUSLY used by a TaskDAG
+        // node (which sets onComplete=&OnTaskFinishedWrapper) inherits that STALE pointer --
+        // its Execute() then calls onComplete with a dangling onCompleteData (an already-
+        // deleted TaskFinishedContext*), reading garbage -> crash. Only mattered once TaskDAG
+        // started actually setting onComplete (2026-07-01); every other task type shares this
+        // same allocator/slab pool and never explicitly clears it.
+        Func onComplete = nullptr;
+        void* onCompleteData = nullptr;
         std::atomic<uint8_t> callbackFlag{ false };
         std::atomic<Task*> next{ nullptr };
         WaitGroup* waitGroup = nullptr;

@@ -26,6 +26,10 @@ namespace T_Threads {
         uint8_t priority = 0;
         bool isLocal = true;
         bool isFork = false;
+        // Runs via TaskScheduler::PushMain (drained by ProcessMainThread) instead of the
+        // worker pool. Whoever waits on a WaitGroup covering this node's completion MUST use
+        // WaitForMain, not WaitFor -- see WaitForMain's declaration comment.
+        bool isMain = false;
 
         TaskNode(Task* t, TaskAllocator& allocator)
             : alloc(allocator), task(t), dependencies_left(0)   // reference bound here
