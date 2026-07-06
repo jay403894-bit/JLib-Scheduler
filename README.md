@@ -1,4 +1,4 @@
-# Jlib 
+# Jlib Scheduler
 
 JLib Scheduler. A high-performance, lightweight C++17 fibers-based task scheduler / job system with thread affinity, and work-stealing queues
 
