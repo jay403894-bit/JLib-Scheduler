@@ -3,6 +3,16 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2026-07-17
+- **Fiber stack guard pages** (`FiberStackArena::AllocateStack`): the lowest 4KB page of
+  every fiber stack is now `PAGE_NOACCESS`. Stacks are carved contiguously from one
+  reservation, so an overflow previously wrote straight into the NEXT fiber's stack with
+  no fault — silent cross-fiber corruption. It now raises an access violation at the
+  faulting instruction. Costs 4KB of usable stack per fiber (standard 64KB → 60KB usable,
+  heavy 512KB → 508KB) and one `VirtualProtect` per fiber at pool init; zero per-switch
+  cost. No recovery/stack-growth — a guard hit is a deliberate hard fault. Porters note
+  (Linux): equivalent is `mprotect(PROT_NONE)` on the lowest page.
+
 ## 2026-07-16
 - **TaskDAG runtime is now genuinely zero-allocation**: the per-fire heap-allocated
   `TaskFinishedContext` (one `new`/`delete` per node per submission — the DAG's only heap

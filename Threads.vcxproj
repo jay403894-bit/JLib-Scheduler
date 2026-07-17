@@ -22,7 +22,7 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{dab96225-cb15-4f33-b85a-950db429df85}</ProjectGuid>
-    <RootNamespace>T_Threads</RootNamespace>
+    <RootNamespace>Threads</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <ProjectName>Threads</ProjectName>
   </PropertyGroup>
@@ -133,7 +133,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
     <ClCompile Include="src\Epochs.cpp" />
     <ClCompile Include="src\Fiber.cpp" />
     <ClCompile Include="src\GlobalFiberPool.cpp" />
