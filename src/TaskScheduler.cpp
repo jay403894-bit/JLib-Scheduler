@@ -118,61 +118,43 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		const int mainChunkStart = start;
 		const int mainChunkEnd = std::min(start + chunkSize, end);
 
-		// Only the worker chunks need Task allocations.
-		const int workerChunks = numTasks - 1;
-		Task** taskPtrs = (workerChunks > 0) ? new Task * [workerChunks] : nullptr;
-		int created = 0;
-		std::atomic<int> remaining{ 0 };
-
-		// 1. Create tasks for chunks 1..numTasks-1. If the arena is exhausted (CreateTask
-		//    returns nullptr), run that chunk inline rather than dereferencing null.
+		// Capturing `&func` (a by-value parameter) is safe ONLY because WaitFor(wg) below
+		// blocks until every task tied to `wg` has completed -- the tasks never outlive this
+		// frame. The completion decrement is done exclusively by the worker's waitGroup path
+		// (Thread::Worker / TryRunStolenFastJob); the task body must NOT also decrement, or
+		// each task counts down twice and the wait wakes early on half-finished work.
+		WaitGroup wg;
 		for (int i = 1; i < numTasks; ++i) {
 			int chunkStart = start + i * chunkSize;
 			int chunkEnd = std::min(chunkStart + chunkSize, end);
 
-			Task* t = CreateTask([&remaining, &func, chunkStart, chunkEnd]() {
+			Task* t = CreateTask([&func, chunkStart, chunkEnd]() {
 				func(chunkStart, chunkEnd);
-				remaining.fetch_sub(1, std::memory_order_acq_rel);
 				});
 			if (!t) {
-				func(chunkStart, chunkEnd); // graceful degradation: do it here (no counter touch)
+				func(chunkStart, chunkEnd); // arena exhausted: graceful degradation, run it here
 				continue;
 			}
-			// Count it BEFORE it can possibly run (we push only after this loop).
-			remaining.fetch_add(1, std::memory_order_relaxed);
-			taskPtrs[created++] = t;
+			t->waitGroup = &wg;
+			wg.n.fetch_add(1, std::memory_order_relaxed);
+			// MUST route through Push()/PushLocal, NOT a blind `loPriInboxes[i % n]->push()`
+			// round-robin: PushLocal's PickNextWorker skips any core whose immediateCoresInUse
+			// is set (a worker PINNED by a persistent PushImmediate/PushFork task -- e.g. the
+			// audio subsystem's forever-running mixer). A pinned worker never returns to its
+			// loop to drain its inbox, and inboxes are owner-drain-only (never stealable, so
+			// TryRunStolenFastJob can't rescue them) -- so a chunk shoved into a pinned worker's
+			// inbox is stranded forever and WaitFor(wg) spins until the heat death of the app.
+			// This was the particle-demo deadlock: it only bit once the sound thread was pinned.
+			// Push() also handles pendingTasks++/MarkQueuedWork/NotifyWorker.
+			Push(t);
 		}
 
-		// 2. Dispatch the worker chunks FIRST so they run CONCURRENTLY with main's own chunk.
-		if (created > 0) {
-			pendingTasks.fetch_add(created, std::memory_order_relaxed);
-
-			size_t n = loPriInboxes.size();
-			for (int i = 0; i < created; ++i) {
-				loPriInboxes[i % n]->push(taskPtrs[i]);
-				// Targeted, not NotifyAll(): only workers that ACTUALLY received a chunk (up to
-				// n distinct ones, fewer if created < n) need to wake. Blanket-notifying every
-				// worker regardless of whether it got anything was exactly the wasted-wake
-				// pattern this whole redesign is meant to remove -- see hasQueuedWork's comment.
-				workers[i % n]->MarkQueuedWork();
-				workers[i % n]->NotifyWorker();
-			}
-		}
-
-		// 3. Main computes its own lane while the workers churn -- no wasted thread.
+		// Main computes its own lane while the workers churn -- no wasted thread.
 		func(mainChunkStart, mainChunkEnd);
 
-		// 4. Then wait -- but opportunistically help drain the pool instead of pure-spinning.
-		// TryRunStolenFastJob() steals from ANY deque (not scoped to just this call's own
-		// chunks), so this may run unrelated work from elsewhere in the app; that's fine, it's
-		// bounded (fastJob tasks are meant to be short) and genuinely reduces total backlog.
-		// Only yield when there's nothing at all to steal, to avoid a hot spin either way.
-		while (remaining.load(std::memory_order_acquire) > 0) {
-			if (!TryRunStolenFastJob())
-				std::this_thread::yield();
-		}	
-
-		delete[] taskPtrs;
+		// Block until every dispatched chunk is done (fiber callers park; non-fiber callers
+		// spin-and-help via TryRunStolenFastJob inside WaitFor).
+		WaitFor(wg);
 	}
 	else
 	{
@@ -403,8 +385,6 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName) {
 bool TaskScheduler::Push(Task* task) {
 	return PushLocal(task);
 }
-struct WaitGroup { std::atomic<int> n{ 0 }; };
-
 
 
 void TaskScheduler::RunCounted(WaitGroup& wg, Task* t) {
@@ -414,7 +394,10 @@ void TaskScheduler::RunCounted(WaitGroup& wg, Task* t) {
 }
 
 void TaskScheduler::WaitFor(WaitGroup& wg) {
-	if (IsOnFiber()) {
+	auto thread = Thread::GetCurrent();
+	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
+
+	if (current != nullptr) {
 		WaitOnEventDirectArmed([&wg](DirectEvent* ev) {
 			std::lock_guard<std::mutex> lock(wg.mtx);
 			wg.waiters.insert(ev);
@@ -627,17 +610,9 @@ size_t TaskScheduler::GetTaskBatch(Task** out, size_t maxCount) {
 		size_t target = (start + i) % numThreads;
 		size_t n = loPri[target]->steal_batch(out, maxCount);
 		if (n > 0) {
-			// Age-based promotion: if any of these tasks have been waiting too long, promote them
-			// No lock needed: each task's queuedTimeMs is only touched by one thread at a time
-			for (size_t j = 0; j < n; ++j) {
-				if (out[j]->queuedTimeMs > 0) {
-					uint64_t age = now - (uint64_t)out[j]->queuedTimeMs;
-					if (age > kAgePromotionThresholdMs) {
-						out[j]->hiPri = 1; // promote to high priority
-					}
-					out[j]->queuedTimeMs = 0; // clear timestamp once checked
-				}
-			}
+			// Age-based promotion DISABLED - was causing task loss in ParallelFor
+			// Modifying task->hiPri while task is stolen could race/corrupt state
+			// TODO: Use atomic or separate promotion queue instead
 			return n;
 		}
 	}
@@ -653,7 +628,8 @@ bool TaskScheduler::TryRunStolenFastJob() {
 	constexpr size_t kBatchCap = 4;
 	Task* batch[kBatchCap];
 	size_t n = GetTaskBatch(batch, kBatchCap);
-	if (n == 0) return false;
+	if (n == 0)
+		return false;
 
 	for (size_t i = 0; i < n; ++i) {
 		Task* task = batch[i];

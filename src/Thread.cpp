@@ -97,6 +97,14 @@ void Thread::Suspend(Fiber* targetFiber){
 	 return scheduler->nextId.fetch_add(1, std::memory_order_relaxed);
  }
 void Thread::NotifyWorker(){
+	// The empty lock is load-bearing: cv.notify_one() without synchronizing on workerMutex
+	// can land in the window AFTER Worker()'s sleep predicate evaluated false but BEFORE it
+	// actually blocks -- the notify is dropped, the flag store is never re-checked, and the
+	// worker sleeps on a non-empty inbox forever. Inboxes are only drainable by their owner
+	// (steals never scan them), so one lost wakeup = that task stranded permanently (this was
+	// the ParallelFor heisen-deadlock). Acquiring the mutex forces the notify to land either
+	// before the predicate runs (it sees the flag) or after the worker is blocked (it wakes).
+	{ std::lock_guard<std::mutex> g(workerMutex); }
 	cv.notify_one();
 }
 
