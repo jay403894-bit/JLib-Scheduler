@@ -16,10 +16,10 @@ namespace JLib {
     // NO BATCHED STEAL (decided 2026-07-22): a lock-free batch steal is NOT possible here. A batch
     // would claim a range [t, t+n) guarded by one top_ CAS, but the owner's pop_bottom takes from
     // the bottom and does NOT touch top_ for non-last items -- so a batch could double-claim a task
-    // the owner also popped (-> use-after-free / double-free: the source of a real heisenbug). Making
-    // it correct needs either a lock (hot-path cost) or a block-based deque (complex + unverifiable
-    // without race testing). Not worth it -- single-item stealing is standard and fast. steal_batch
-    // is kept ONLY as an interface shim so call sites don't change; it grabs at most ONE task.
+    // the owner also popped (-> use-after-free / double-free: this was a real heisenbug). Making it
+    // correct needs either a lock (hot-path cost) or a block-based deque (complex + unverifiable
+    // without race testing). Not worth it -- single-item stealing is standard and fast, so there is
+    // no steal_batch: callers steal one task at a time via steal().
     class alignas(64) TaskDeque {
     public:
         explicit TaskDeque(size_t capacity = 32768)
@@ -137,17 +137,6 @@ namespace JLib {
                 }
             }
             return std::nullopt;
-        }
-
-        // Interface shim ONLY -- there is no real batched steal here (see the class note on why a
-        // lock-free range claim is unsafe). Grabs at most one task via the correct single steal().
-        // Callers keep their batched-style loops; they just get one task per attempt.
-        size_t steal_batch(Task** out, size_t maxCount) {
-            if (maxCount == 0) return 0;
-            std::optional<Task*> s = steal();
-            if (!s) return 0;
-            out[0] = *s;
-            return 1;
         }
 
         size_t size() const {

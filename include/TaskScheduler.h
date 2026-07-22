@@ -154,9 +154,11 @@ namespace JLib {
 		static GlobalFiberPool* globalPool;
 		// -----------------------------------------------
 
-		// ---- Starvation prevention (age-based promotion + fairness) ----
-		// Queued timestamps now stored directly on Task.queuedTimeMs (no lock needed)
-		static constexpr uint64_t kAgePromotionThresholdMs = 50; // promote loPri if waiting > 50ms
+		// ---- loPri starvation prevention: steal fairness ----
+		// After kStealFairnessWindow consecutive hiPri steals, GetTask() forces a loPri scan so a
+		// steady stream of hiPri work can't starve loPri tasks. (There used to also be age-based
+		// promotion -- boost old loPri tasks to hiPri -- but it's redundant now that stealing is
+		// single-item: a stolen task runs immediately, so the steal itself un-starves it.)
 		int consecutiveHiPriSteals = 0;
 		static constexpr int kStealFairnessWindow = 8; // after 8 hiPri steals, force a loPri scan
 		uint64_t GetCurrentTimeMs() const;
@@ -169,14 +171,9 @@ namespace JLib {
 
 		void RunCounted(WaitGroup& wg, Task* t);
 		static size_t GetSafeTC();
-		// Batch version of GetTask() -- see definition for details.
-		size_t GetTaskBatch(Task** out, size_t maxCount);
-		// Age-based promotion applied to a batch the caller has just EXCLUSIVELY acquired via a
-		// steal_batch CAS (post-steal ownership = race-free; see definition). Shared by BOTH
-		// steal sites -- GetTaskBatch (main's spin helper) AND Thread::Worker's own steal path --
-		// so promotion isn't limited to the rare main-thread-spinning case. Call only with tasks
-		// stolen from a loPri deque (a hiPri steal is already top priority).
-		void PromoteAgedStolen(Task** batch, size_t n);
+		// Steals ONE task (hiPri-then-loPri, with steal fairness) for a non-worker helper. nullptr
+		// if nothing stealable. See definition.
+		Task* GetTask();
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
 		bool PushToCore(size_t core_id, Task* task);

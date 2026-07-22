@@ -576,100 +576,62 @@ void TaskScheduler::Stop(Task* worker_task) {
 }
 
 
-// Batch version of GetTask() -- same random-start, hiPri-then-loPri scan, but pulls up to
-// maxCount items from whichever deque's steal_batch() actually hits, amortizing the CAS cost
-// across the batch instead of paying one CAS per stolen task. Caller (there's no per-caller
-// "own deque" assumption here -- this is used by non-workers too, e.g. main) is responsible
-// for what happens to items beyond out[0].
-// NOW INCLUDES: fairness (alternate hiPri/loPri scans) and age-based promotion (boost old loPri tasks).
-size_t TaskScheduler::GetTaskBatch(Task** out, size_t maxCount) {
-	uint64_t now = GetCurrentTimeMs();
-
-	// Fairness: after kStealFairnessWindow consecutive hiPri steals, force a loPri scan
+// Steals ONE task for a NON-worker helper (e.g. main spinning in WaitFor, or a fastJob spinning
+// on a SchedulerMutex). Random-start, hiPri-then-loPri scan with fairness: after
+// kStealFairnessWindow consecutive hiPri steals it forces a loPri scan so loPri work can't starve
+// behind a stream of hiPri steals. Single-item steal() is the only correct steal in the lock-free
+// deque (see TaskDeque.h). Returns nullptr if nothing was stealable anywhere.
+Task* TaskScheduler::GetTask() {
 	bool forceLoPri = (consecutiveHiPriSteals >= kStealFairnessWindow);
 
 	if (!forceLoPri) {
-		// Normal priority: try hiPri first
 		size_t numThreads = hiPri.size();
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
 			size_t target = (start + i) % numThreads;
-			size_t n = hiPri[target]->steal_batch(out, maxCount);
-			if (n > 0) {
+			if (auto s = hiPri[target]->steal()) {
 				consecutiveHiPriSteals++;
-				return n;
+				return *s;
 			}
 		}
 	}
 
-	// Try loPri (either forced or as fallback)
-	consecutiveHiPriSteals = 0; // reset fairness counter when we actually steal from loPri
+	// loPri: forced by fairness, or the hiPri-miss fallback.
+	consecutiveHiPriSteals = 0; // reset the fairness counter whenever we scan loPri
 	size_t numThreads = loPri.size();
 	size_t start = rand() % numThreads;
 	for (size_t i = 0; i < numThreads; ++i) {
 		size_t target = (start + i) % numThreads;
-		size_t n = loPri[target]->steal_batch(out, maxCount);
-		if (n > 0) {
-			PromoteAgedStolen(out, n);
-			return n;
-		}
+		if (auto s = loPri[target]->steal())
+			return *s;
 	}
 
-	return 0;
-}
-
-void TaskScheduler::PromoteAgedStolen(Task** batch, size_t n) {
-	// RACE-FREE by construction: the caller reached here only after a steal_batch CAS removed
-	// batch[0..n) from a deque, so this thread now EXCLUSIVELY owns them -- no other worker or
-	// thief can read/write these tasks until we hand them back, and that handoff (Requeue /
-	// push_bottom) publishes this plain write via the queue's own release/acquire atomics.
-	// (The old disabled-code fears were both wrong: no mid-steal race exists post-CAS, and the
-	// "task loss in ParallelFor" it was blamed for was the pinned-core inbox-stranding deadlock.)
-	//
-	// Setting hiPri only MATTERS at a priority-aware enqueue -- a task's DEQUE is its priority;
-	// steal/pop/push_bottom never read the flag. So callers MUST route a promoted task to the
-	// hiPri deque/inbox afterward (GetTaskBatch's non-fastJob leftovers go via Requeue, which is
-	// hiPri-aware; Thread::Worker routes its leftovers by hiPri explicitly) or the boost is inert.
-	//
-	// uint32 wall-clock diff: queuedTimeMs is a truncated uint32 stamp, so compare in uint32 too
-	// (wraparound-safe for the small ages involved).
-	uint32_t nowMs = (uint32_t)GetCurrentTimeMs();
-	for (size_t k = 0; k < n; ++k) {
-		if (!batch[k]->hiPri &&
-			(nowMs - batch[k]->queuedTimeMs) > kAgePromotionThresholdMs) {
-			batch[k]->hiPri = 1;
-		}
-	}
+	return nullptr;
 }
 
 bool TaskScheduler::TryRunStolenFastJob() {
-	// Steal up to 4 in one CAS instead of one steal() per task -- everything beyond the first
-	// is bonus work found "for free" alongside it. Each item still gets the SAME per-item
-	// contract as before: fastJob runs inline with full completion bookkeeping, non-fastJob
-	// goes back via Requeue() (can't safely run here -- no fiber).
-	constexpr size_t kBatchCap = 4;
-	Task* batch[kBatchCap];
-	size_t n = GetTaskBatch(batch, kBatchCap);
-	if (n == 0)
-		return false;
+	// Steal ONE task. If it's a fastJob, run it to completion right here with the full completion
+	// bookkeeping Worker()'s fast path does. A non-fastJob task could suspend, and there's no fiber
+	// under this (non-worker) caller to switch away to, so hand it back to a real worker via
+	// Requeue() instead.
+	Task* task = GetTask();
+	if (!task) return false;
 
-	for (size_t i = 0; i < n; ++i) {
-		Task* task = batch[i];
-		if (!task->fastJob) {
-			// Requeue does NOT touch pendingTasks -- it's only relocating an already-counted task.
-			Requeue(task);
-			continue;
-		}
-		task->Execute();
-		if (task->waitGroup) {
-			int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-			if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-				task->waitGroup->WakeAll();   // only touches wg if someone registered
-		}
-		task->~Task();
-		taskAllocator.Free(task);
-		pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+	if (!task->fastJob) {
+		// Requeue does NOT touch pendingTasks -- it's only relocating an already-counted task.
+		Requeue(task);
+		return true;
 	}
+
+	task->Execute();
+	if (task->waitGroup) {
+		int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+		if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+			task->waitGroup->WakeAll();   // only touches wg if someone registered
+	}
+	task->~Task();
+	taskAllocator.Free(task);
+	pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 
 	if (EpochManager::Instance().RetiredCount() > 512) {
 		EpochManager::Instance().Tick();
@@ -695,11 +657,6 @@ Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, Fib
 
 bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 	if (!task) return false;
-
-	// Record queuedTime for age-based promotion (no lock needed: only this thread touches this task)
-	if (!task->hiPri) {
-		task->queuedTimeMs = (uint32_t)GetCurrentTimeMs();
-	}
 
 	size_t num_workers = workers.size();
 	if (cpuaffinity > 0 && (size_t)(cpuaffinity - 1) < num_workers) {
