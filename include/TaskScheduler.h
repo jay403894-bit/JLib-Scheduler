@@ -171,6 +171,12 @@ namespace JLib {
 		static size_t GetSafeTC();
 		// Batch version of GetTask() -- see definition for details.
 		size_t GetTaskBatch(Task** out, size_t maxCount);
+		// Age-based promotion applied to a batch the caller has just EXCLUSIVELY acquired via a
+		// steal_batch CAS (post-steal ownership = race-free; see definition). Shared by BOTH
+		// steal sites -- GetTaskBatch (main's spin helper) AND Thread::Worker's own steal path --
+		// so promotion isn't limited to the rare main-thread-spinning case. Call only with tasks
+		// stolen from a loPri deque (a hiPri steal is already top priority).
+		void PromoteAgedStolen(Task** batch, size_t n);
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
 		bool PushToCore(size_t core_id, Task* task);

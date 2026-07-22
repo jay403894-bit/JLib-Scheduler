@@ -1,14 +1,25 @@
-﻿#pragma once
+#pragma once
 #include <atomic>
 #include <cstddef>
 #include <optional>
 #include <iostream>
+#include <stdexcept>
 #include <algorithm>
 
 #include "Task.h"
 
 namespace JLib {
 
+    // Lock-free Chase-Lev work-stealing deque. Owner uses push_bottom/pop_bottom (LIFO, one end);
+    // thieves use steal() (FIFO, other end). This is the classic, correct single-item protocol.
+    //
+    // NO BATCHED STEAL (decided 2026-07-22): a lock-free batch steal is NOT possible here. A batch
+    // would claim a range [t, t+n) guarded by one top_ CAS, but the owner's pop_bottom takes from
+    // the bottom and does NOT touch top_ for non-last items -- so a batch could double-claim a task
+    // the owner also popped (-> use-after-free / double-free: the source of a real heisenbug). Making
+    // it correct needs either a lock (hot-path cost) or a block-based deque (complex + unverifiable
+    // without race testing). Not worth it -- single-item stealing is standard and fast. steal_batch
+    // is kept ONLY as an interface shim so call sites don't change; it grabs at most ONE task.
     class alignas(64) TaskDeque {
     public:
         explicit TaskDeque(size_t capacity = 32768)
@@ -30,7 +41,7 @@ namespace JLib {
             delete[] buffer_;
         }
 
-        // Owner-only PushToPQ
+        // Owner-only push.
         bool push_bottom(Task* item) {
             if (!item) {
                 std::cerr << "[TaskDeque::push_bottom] ERROR: pushing null item!\n";
@@ -46,31 +57,32 @@ namespace JLib {
             bottom_.store(b + 1, std::memory_order_release);
             return true;
         }
+
+        // Owner-only bulk push (owner is the sole producer at the bottom, so this is safe: no
+        // stealer ever writes the buffer, only advances top_).
         bool push_bottom_batch(Task** items, size_t count) {
             size_t b = bottom_.load(std::memory_order_relaxed);
             size_t t = top_.load(std::memory_order_acquire);
 
-            // Ensure there is enough space in one atomic burst
             if ((b + count) - t > capacity_) {
                 return false;
             }
 
-            // Write all tasks into the buffer
             for (size_t i = 0; i < count; ++i) {
                 buffer_[(b + i) & mask_] = items[i];
             }
 
-            // Release once after all writes are done
             std::atomic_thread_fence(std::memory_order_release);
             bottom_.store(b + count, std::memory_order_release);
             return true;
         }
-        // Owner-only pop
+
+        // Owner-only pop (LIFO). Standard Chase-Lev: the last-item race with a stealer is resolved
+        // by both sides CASing top_.
         std::optional<Task*> pop_bottom() {
             size_t b = bottom_.load(std::memory_order_relaxed);
             size_t t = top_.load(std::memory_order_acquire);
 
-            // Check if empty FIRST, before modifying bottom_
             if (t >= b) {
                 return std::nullopt;  // Empty
             }
@@ -83,34 +95,32 @@ namespace JLib {
             t = top_.load(std::memory_order_acquire);
 
             if (t <= b) {
-                // Not empty
                 Task* item = buffer_[b & mask_];
-                if (!item) {
-                    std::cerr << "[TaskDeque::pop_bottom] WARNING: read nullptr from buffer at index " << (b & mask_) << " (b=" << b << " t=" << t << ")\n";
-                }
                 if (t == b) {
-                    // Last item race
+                    // Last item: race the stealer for it.
                     if (!top_.compare_exchange_strong(
                         t, t + 1,
                         std::memory_order_acq_rel,
                         std::memory_order_relaxed))
                     {
-                        // Stealer won
+                        // Stealer won.
                         bottom_.store(b + 1, std::memory_order_relaxed);
                         return std::nullopt;
                     }
-                    // Owner wins
+                    // Owner won.
                     bottom_.store(b + 1, std::memory_order_relaxed);
                 }
                 return item;
             }
             else {
-                // Empty
+                // Empty.
                 bottom_.store(t, std::memory_order_relaxed);
                 return std::nullopt;
             }
         }
 
+        // Thief: takes the OLDEST task. Claims exactly ONE item and resolves the sole collision with
+        // pop_bottom (the last item) via the top_ CAS -- the only correct steal in this deque.
         std::optional<Task*> steal() {
             size_t t = top_.load(std::memory_order_acquire);
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -129,35 +139,15 @@ namespace JLib {
             return std::nullopt;
         }
 
-        // Steals up to maxCount items in ONE CAS instead of one-CAS-per-item -- the whole point
-        // is amortizing the atomic RMW cost across a batch. "Steal half" (not "take everything
-        // up to maxCount"): draining a victim to zero just relocates who's starving next: it'd
-        // have nothing left and immediately need to go steal from someone else in turn. Taking
-        // half keeps both sides supplied. Returns how many were actually written to out[]; 0 on
-        // an empty deque OR lost the race (owner's pop_bottom or another thief beat this CAS) --
-        // caller should treat 0 exactly like steal() returning nullopt and try elsewhere.
+        // Interface shim ONLY -- there is no real batched steal here (see the class note on why a
+        // lock-free range claim is unsafe). Grabs at most one task via the correct single steal().
+        // Callers keep their batched-style loops; they just get one task per attempt.
         size_t steal_batch(Task** out, size_t maxCount) {
-            size_t t = top_.load(std::memory_order_acquire);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            size_t b = bottom_.load(std::memory_order_acquire);
-
-            if (t >= b) return 0; // empty
-
-            size_t available = b - t;
-            size_t n = std::min(maxCount, (available + 1) / 2);
-            if (n == 0) return 0;
-
-            // Read ALL n items speculatively BEFORE the CAS -- same discipline as steal()
-            // reading its one item before confirming ownership. If the CAS below fails,
-            // everything read here is simply discarded (correct under the same circular-
-            // buffer capacity assumptions the single-item steal() already relies on).
-            for (size_t i = 0; i < n; ++i)
-                out[i] = buffer_[(t + i) & mask_];
-
-            if (top_.compare_exchange_strong(t, t + n, std::memory_order_acq_rel, std::memory_order_relaxed))
-                return n;
-
-            return 0; // lost the race
+            if (maxCount == 0) return 0;
+            std::optional<Task*> s = steal();
+            if (!s) return 0;
+            out[0] = *s;
+            return 1;
         }
 
         size_t size() const {

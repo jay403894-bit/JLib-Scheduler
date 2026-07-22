@@ -405,29 +405,19 @@ void Thread::Worker() {
 				//     this core's execution ports, so stealing its work wouldn't recruit any
 				//     new throughput, just pile more work onto an already-contended core.
 				//  3. Fall back to the old global-random steal across everyone.
-				// Steal up to 4 in one CAS instead of one steal() per task -- amortizes the
-				// atomic RMW cost across the batch. Only out[0] becomes task_to_run; anything
-				// else stolen alongside it lands on THIS worker's own deque (matching priority
-				// tier) via push_bottom_batch, so it's immediately available locally without
-				// needing more remote CAS traffic -- or, in the near-impossible case that this
-				// worker's own deque is somehow full, Requeue() so it's never simply lost.
-				constexpr size_t kStealBatchCap = 4;
-				auto tryStealBatchFrom = [&](int target) -> bool {
-					Task* stolen[kStealBatchCap];
-					TaskDeque* ownDeque = scheduler->hiPri[qIndex].get();
-					size_t n = scheduler->hiPri[target]->steal_batch(stolen, kStealBatchCap);
-					if (n == 0) {
-						n = scheduler->loPri[target]->steal_batch(stolen, kStealBatchCap);
-						ownDeque = scheduler->loPri[qIndex].get();
-					}
-					if (n == 0) return false;
-
-					task_to_run = stolen[0];
-					if (n > 1 && !ownDeque->push_bottom_batch(&stolen[1], n - 1)) {
-						for (size_t i = 1; i < n; ++i) {
-							if (!ownDeque->push_bottom(stolen[i])) scheduler->Requeue(stolen[i]);
-						}
-					}
+				// Steal ONE task from `target`: try its hiPri deque first, then loPri. Single-item
+				// steal() is the ONLY correct steal in this lock-free deque -- a batched range steal
+				// double-claims tasks the owner concurrently pops (use-after-free; see TaskDeque.h).
+				// So there is no batch and no leftovers to re-home: whatever we steal becomes
+				// task_to_run and runs on THIS worker immediately. (No age-promotion here either --
+				// promoting an aged loPri task only helps if it gets REQUEUED into the hiPri lane,
+				// but a task stolen for immediate execution is already un-starved by the steal, so
+				// flipping its priority would be a no-op.)
+				auto tryStealFrom = [&](int target) -> bool {
+					auto s = scheduler->hiPri[target]->steal();
+					if (!s) s = scheduler->loPri[target]->steal();
+					if (!s) return false;
+					task_to_run = *s;
 					return true;
 				};
 
@@ -438,21 +428,21 @@ void Thread::Worker() {
 					size_t mstart = FastRand() % mates.size();
 					for (size_t i = 0; i < probeLimit; ++i) {
 						int target = mates[(mstart + i) % mates.size()];
-						if (tryStealBatchFrom(target)) break;
+						if (tryStealFrom(target)) break;
 					}
 				}
 
 				if (!task_to_run) {
 					int sibling = scheduler->siblingQIndex[qIndex];
 					if (sibling >= 0 && !scheduler->workers[sibling]->busy.load(std::memory_order_relaxed)) {
-						tryStealBatchFrom(sibling);
+						tryStealFrom(sibling);
 					}
 				}
 
 				if (!task_to_run) {
 					int res = FastRand() % (scheduler->workers.size() - 1);
 					if (res == qIndex) res++;
-					tryStealBatchFrom(res);
+					tryStealFrom(res);
 				}
 
 				if (task_to_run) {

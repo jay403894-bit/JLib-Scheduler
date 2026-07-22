@@ -610,29 +610,36 @@ size_t TaskScheduler::GetTaskBatch(Task** out, size_t maxCount) {
 		size_t target = (start + i) % numThreads;
 		size_t n = loPri[target]->steal_batch(out, maxCount);
 		if (n > 0) {
-			// Age-based promotion, RE-ENABLED 2026-07-21 and now provably race-free. The old
-			// "modifying task->hiPri while the task is stolen could race/corrupt" fear was
-			// unfounded: steal_batch has ALREADY CAS-removed out[0..n) from the deque, so this
-			// thread now EXCLUSIVELY owns them -- no other worker or thief can read/write these
-			// tasks until we hand them back. (Its blame for "task loss in ParallelFor" was also
-			// wrong -- that was the pinned-core inbox-stranding deadlock, fixed same day.)
-			// Flipping hiPri here makes any task we DON'T run inline (a non-fastJob leftover
-			// handed back via Requeue, which is hiPri-aware) land in the hiPri lane so it's
-			// scanned first next round instead of starving behind freshly-pushed hiPri work.
-			// uint32 wall-clock diff: queuedTimeMs is a truncated uint32 stamp, so compare in
-			// uint32 too (wraparound-safe for the small ages involved).
-			uint32_t nowMs = (uint32_t)now;
-			for (size_t k = 0; k < n; ++k) {
-				if (!out[k]->hiPri &&
-					(nowMs - out[k]->queuedTimeMs) > kAgePromotionThresholdMs) {
-					out[k]->hiPri = 1;
-				}
-			}
+			PromoteAgedStolen(out, n);
 			return n;
 		}
 	}
 
 	return 0;
+}
+
+void TaskScheduler::PromoteAgedStolen(Task** batch, size_t n) {
+	// RACE-FREE by construction: the caller reached here only after a steal_batch CAS removed
+	// batch[0..n) from a deque, so this thread now EXCLUSIVELY owns them -- no other worker or
+	// thief can read/write these tasks until we hand them back, and that handoff (Requeue /
+	// push_bottom) publishes this plain write via the queue's own release/acquire atomics.
+	// (The old disabled-code fears were both wrong: no mid-steal race exists post-CAS, and the
+	// "task loss in ParallelFor" it was blamed for was the pinned-core inbox-stranding deadlock.)
+	//
+	// Setting hiPri only MATTERS at a priority-aware enqueue -- a task's DEQUE is its priority;
+	// steal/pop/push_bottom never read the flag. So callers MUST route a promoted task to the
+	// hiPri deque/inbox afterward (GetTaskBatch's non-fastJob leftovers go via Requeue, which is
+	// hiPri-aware; Thread::Worker routes its leftovers by hiPri explicitly) or the boost is inert.
+	//
+	// uint32 wall-clock diff: queuedTimeMs is a truncated uint32 stamp, so compare in uint32 too
+	// (wraparound-safe for the small ages involved).
+	uint32_t nowMs = (uint32_t)GetCurrentTimeMs();
+	for (size_t k = 0; k < n; ++k) {
+		if (!batch[k]->hiPri &&
+			(nowMs - batch[k]->queuedTimeMs) > kAgePromotionThresholdMs) {
+			batch[k]->hiPri = 1;
+		}
+	}
 }
 
 bool TaskScheduler::TryRunStolenFastJob() {
