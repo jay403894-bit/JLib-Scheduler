@@ -208,18 +208,6 @@ void TaskScheduler::ParallelForFJ(int start, int end, int grain, std::function<v
 	WaitFor(wg);
 }
 
-void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
-	chunkSize = std::max(1, chunkSize);
-	int totalItems = end - start;
-	if (totalItems <= 0) return;
-
-	int numTasks = (totalItems + chunkSize - 1) / chunkSize;
-	for (int i = 0; i < numTasks; ++i) {
-		int chunkStart = start + i * chunkSize;
-		int chunkEnd = std::min(chunkStart + chunkSize, end);
-		Push([=]() { func(chunkStart, chunkEnd); });
-	}
-}
 // Queries real Windows topology (GetLogicalProcessorInformationEx) and fills siblingQIndex/
 // clusterMates from it -- NOT from the sequential affinity scheme assumption (worker qIndex i
 // is pinned to logical CPU i+1, main sits on 0). That mapping tells you what you ASKED the OS

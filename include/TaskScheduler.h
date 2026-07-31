@@ -58,7 +58,6 @@ namespace JLib {
 		// inline; `grain` is the base-case size. Parallelizes task CREATION (the tree is built by many
 		// workers) instead of the caller spawning every chunk serially.
 		void ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func);
-		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
