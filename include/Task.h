@@ -19,6 +19,25 @@ namespace JLib {
     };
 
     enum class FiberSize : uint8_t { Standard, Heavy };
+
+    // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). FULLY ORTHOGONAL to hiPri by
+    // design: hiPri is QUEUE ORDER (drained/stolen first) and NOTHING ELSE; placement is governed SOLELY
+    // by this field -- priority never implies a core class (a loPri P-core task and a hiPri E-core task
+    // are both legitimate). Unset (Default) means no preference: the full-pool round-robin, the
+    // scheduler's original placement behavior. Preference is a HINT, not a constraint: PickNextWorker
+    // spills to the other class when the preferred one is unavailable, and stealing stays deliberately
+    // preference-blind (work-conserving). Non-hybrid CPUs: all workers are P-labeled, so every value
+    // routes to the full pool -- zero behavior difference.
+    enum class CorePref : uint8_t {
+        Default = 0,   // unspecified -- behaves as Any (no class preference, full-pool round-robin)
+        P       = 1,   // prefer Performance cores (latency-sensitive, chunky critical-path work)
+        E       = 2,   // prefer Efficiency cores (background/bulk work; preserves P headroom)
+        Wide    = 3,   // explicit no-preference, burst intent: round-robin the FULL pool (e.g. heavy
+                       // physics -- wants all cores at once and isn't latency-tiered)
+        Any     = 3,   // alias of Wide -- "I genuinely don't care which core class runs this." Same
+                       // mechanism today; separate NAME so intent reads at call sites and the two can
+                       // diverge later without API churn.
+    };
     struct alignas(16) Task {
         using Func = void(*)(void*);
 
@@ -40,6 +59,9 @@ namespace JLib {
         uint8_t fastJob = 0;
         uint8_t isForked = 0;  // Set by PushFork, cleared when task completes
         uint8_t priorityBoost = 0;  // Original priority before boost (0 = no boost, otherwise original hiPri)
+        // P/E-core placement hint (see CorePref above). Lives in what was tail PADDING -- FiberSize is
+        // uint8_t, so the byte block ends at offset 53 with 11 spare bytes under the 64-byte assert.
+        CorePref corePref = CorePref::Default;
 
         Task() : next(nullptr), fn(nullptr), data(nullptr), assignedFiber(nullptr) { ; }
         Task(Func f, void* d = nullptr, uint8_t hipri =false, FiberSize size = FiberSize::Standard)

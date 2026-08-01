@@ -58,6 +58,7 @@ namespace JLib {
 		// inline; `grain` is the base-case size. Parallelizes task CREATION (the tree is built by many
 		// workers) instead of the caller spawning every chunk serially.
 		void ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func);
+		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
@@ -107,10 +108,10 @@ namespace JLib {
 		// to steal -- callers should yield() on false to avoid a hot spin.
 		bool TryRunStolenFastJob();
 
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true);
+		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true, CorePref corePref = CorePref::Default);
 
 		template<typename F>
-		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true) {
+		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			static_assert(sizeof(L) <= TaskAllocator::SLOT, "lambda too big for a slot");
 			static_assert(alignof(L) <= 16, "lambda over-aligned for the slot");
@@ -120,6 +121,7 @@ namespace JLib {
  			t->hiPri = hipri;
 			t->requiredSize = size;
 			t->fastJob = fastJob;
+			t->corePref = corePref;
 			return t;
 		}
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
@@ -181,7 +183,11 @@ namespace JLib {
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
 		bool PushToCore(size_t core_id, Task* task);
-		int PickNextWorker();
+		// Picks a worker from the requested class set (P/E), SPILLING to the other class if unavailable;
+		// Default/Any/Wide (and non-hybrid / all-pinned) use the original full-pool round-robin. Placement
+		// is governed SOLELY by CorePref -- hiPri is queue order only, never consulted for placement.
+		// Preference is a hint -- never a constraint.
+		int PickNextWorker(CorePref pref = CorePref::Default);
 
 		// ---------- topology-aware steal biasing ----------
 		// Queried ONCE at StartPool() time via GetLogicalProcessorInformationEx -- real
@@ -200,6 +206,13 @@ namespace JLib {
 		// sibling shares this worker's execution ports, so stealing its work doesn't recruit
 		// any additional throughput, just adds queued work to an already-contended core.
 		std::vector<int> siblingQIndex;
+		// isPCore[qIndex] -- 1 if this worker is pinned to a PERFORMANCE core, 0 for an EFFICIENCY core
+		// (Intel hybrid, e.g. i9-13900K = 8 P + 16 E). Derived in BuildTopology from each core's
+		// PROCESSOR_RELATIONSHIP.EfficiencyClass (highest class present = P). Non-hybrid CPU -> all 1
+		// (harmless). DATA ONLY for now: nothing schedules on it yet. Foundation for P/E-aware routing
+		// (hiPri->P, loPri/bulk->E) + a P/E-aware core reserve -- needed manually because the pool is
+		// HARD-PINNED (Thread::StartWorker SetThreadAffinityMask), so the OS can't place work P/E for us.
+		std::vector<char> isPCore;
 		// -----------------------------------------------
 
 		static TaskScheduler* instance;
@@ -209,6 +222,12 @@ namespace JLib {
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
 		std::atomic<bool> poolActive{ false };
 		std::atomic<int> nextWorker{ 0 };
+		// P/E routing (see PickNextWorker): worker qIndices split by efficiency class (from isPCore),
+		// each with its own round-robin cursor. Built in StartPool. Preference is a HINT -- PickNextWorker
+		// spills to the other class if the preferred one has no available worker, and an empty set (non-
+		// hybrid CPU) just falls through to the full pool. Nothing here is a hard constraint.
+		std::vector<int> pWorkers, eWorkers;
+		std::atomic<size_t> nextPWorker{ 0 }, nextEWorker{ 0 };
 		std::atomic<bool> stopFlag{ false };
 		std::vector<std::shared_ptr<Thread>> workers;
 		TaskMPSCQueue mainQ;

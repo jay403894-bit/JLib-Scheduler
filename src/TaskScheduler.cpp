@@ -17,10 +17,17 @@ TaskScheduler::TaskScheduler(size_t poolSize) {
 	StartPool(poolSize);
 }
 size_t TaskScheduler::GetSafeTC() {
+	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-2. The old hw-1 left NO core actually
+	// free -- main pins to CPU 0 and workers to CPUs 1..hw-1, so the process claimed every logical core
+	// 1:1 and foreign threads the app can't control (GameInput's in-proc pollers, GPU driver, audio, OS
+	// pools) had nowhere unclaimed to land -> transient oversubscription (VTune, 2026-07-31). hw-2 keeps
+	// one core genuinely unclaimed; with the sequential pin scheme that's the HIGHEST-numbered logical
+	// CPU -- an E-core on hybrid parts, exactly where background pollers belong. Apps that profile a
+	// different sweet spot pass an EXPLICIT poolSize to Init/StartPool (that's the config surface --
+	// deliberately no env var); explicit sizes may claim up to full hw, see the clamp in StartPool.
 	unsigned int cores = std::thread::hardware_concurrency();
-	if (cores == 0) return 1;
-	if (cores == 1) return 1;
-	return static_cast<size_t>(cores - 1);
+	if (cores <= 2) return 1;
+	return static_cast<size_t>(cores - 2);
 }
 void TaskScheduler::Init(size_t poolSize) {
 	if (instance != nullptr)
@@ -208,6 +215,18 @@ void TaskScheduler::ParallelForFJ(int start, int end, int grain, std::function<v
 	WaitFor(wg);
 }
 
+void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
+	chunkSize = std::max(1, chunkSize);
+	int totalItems = end - start;
+	if (totalItems <= 0) return;
+
+	int numTasks = (totalItems + chunkSize - 1) / chunkSize;
+	for (int i = 0; i < numTasks; ++i) {
+		int chunkStart = start + i * chunkSize;
+		int chunkEnd = std::min(chunkStart + chunkSize, end);
+		Push([=]() { func(chunkStart, chunkEnd); });
+	}
+}
 // Queries real Windows topology (GetLogicalProcessorInformationEx) and fills siblingQIndex/
 // clusterMates from it -- NOT from the sequential affinity scheme assumption (worker qIndex i
 // is pinned to logical CPU i+1, main sits on 0). That mapping tells you what you ASKED the OS
@@ -253,6 +272,46 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 		unsigned int q = (unsigned int)(logicalCpu - 1);
 		return (q < num_workers) ? (int)q : -1;
 	};
+
+	// --- P/E-core labels (Intel hybrid). DATA ONLY -- nothing schedules on this yet. Read each physical
+	// core's PROCESSOR_RELATIONSHIP.EfficiencyClass; the HIGHEST class present is a Performance core, any
+	// lower class is an Efficiency core. Default everyone to P (1): correct for a non-hybrid CPU, and a safe
+	// fallback if the query fails -- only demote workers we positively identify as lower-class. ---
+	isPCore.assign(num_workers, 1);
+	{
+		DWORD len = 0;
+		GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+		if (len > 0) {
+			std::vector<std::byte> buf(len);
+			auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+			if (GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
+				std::vector<int> effOf(num_workers, -1);   // this worker's core efficiency class, -1 = unknown
+				int maxEff = -1;
+				DWORD off = 0;
+				while (off < len) {
+					auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+					if (info->Relationship == RelationProcessorCore) {
+						const PROCESSOR_RELATIONSHIP& proc = info->Processor;
+						int eff = (int)proc.EfficiencyClass;
+						if (eff > maxEff) maxEff = eff;
+						for (WORD g = 0; g < proc.GroupCount; ++g) {
+							if (proc.GroupMask[g].Group != 0) continue;   // group 0 only (see the >64-CPU note)
+							ULONG_PTR mask = proc.GroupMask[g].Mask;
+							for (int cpu = 0; cpu < 64; ++cpu)
+								if (mask & (ULONG_PTR(1) << cpu)) {
+									int q = qIndexOf(cpu);
+									if (q >= 0) effOf[q] = eff;
+								}
+						}
+					}
+					off += info->Size;
+				}
+				// A worker is an E-core only if its class is KNOWN and strictly below the top class seen.
+				for (unsigned int q = 0; q < num_workers; ++q)
+					if (effOf[q] >= 0 && effOf[q] < maxEff) isPCore[q] = 0;
+			}
+		}
+	}
 
 	std::vector<ULONG_PTR> coreMasks;    // one entry per physical core -- SMT sibling groups
 	std::vector<ULONG_PTR> cacheMasks;   // one entry per LLC instance -- cluster groups
@@ -320,10 +379,18 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 void TaskScheduler::StartPool(size_t poolSize) {
 	poolMutex.lock();
 	thread_counter.store(0, std::memory_order_release);
+	// poolSize == 0 -> auto (hw-1, see GetSafeTC). An EXPLICIT poolSize is honored as given -- the app's
+	// declared choice wins -- clamped only to the physical ceiling (hw), so a caller may claim the whole
+	// CPU. Note the pinning scheme (worker i -> logical CPU i+1, main on 0): at poolSize == hw the LAST
+	// worker's SetThreadAffinityMask targets a CPU past the topology and fails -> that worker just floats
+	// unpinned (OS places it); harmless, but P/E labeling won't cover it.
 	if (poolSize == 0)
 		poolSize = GetSafeTC();
-	if (poolSize > GetSafeTC())
-		poolSize = GetSafeTC();
+	{
+		unsigned int hw = std::thread::hardware_concurrency();
+		if (hw == 0) hw = 4;
+		if (poolSize > hw) poolSize = hw;
+	}
 
 	unsigned int num_workers = static_cast<unsigned int>(poolSize);
 	// +1 for the main/submitting thread: it takes thread_id == num_workers at the end
@@ -331,6 +398,12 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// just num_workers leaves that slot out of bounds -> AV in Enter/LeaveEpoch.
 	EpochManager::Instance().Init(num_workers + 1);
 	BuildTopology(num_workers);
+	// Split workers into P/E sets for PickNextWorker's tier routing (isPCore was filled by BuildTopology).
+	// Non-hybrid CPU -> every worker labeled P -> eWorkers empty -> routing falls through to the full pool.
+	pWorkers.clear(); eWorkers.clear();
+	nextPWorker.store(0); nextEWorker.store(0);
+	for (unsigned int q = 0; q < num_workers; ++q)
+		(isPCore[q] ? pWorkers : eWorkers).push_back((int)q);
 	stopFlag.store(false, std::memory_order_release);
 	nextWorker = 0;
 	unsigned int coreCount = std::thread::hardware_concurrency()-1;
@@ -507,7 +580,7 @@ bool TaskScheduler::PushFork(Task* task) {
 		is_local_push = true;  // Pushing to current worker, skip busy check
 	}
 	else {
-		worker_id = PickNextWorker();
+		worker_id = PickNextWorker(task->corePref);
 		if (worker_id < 0) return false;
 	}
 
@@ -679,11 +752,12 @@ void TaskScheduler::WaitAll() {
 		std::this_thread::yield();
 }
 
-Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t fastJob) {
+Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t fastJob, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;
 	Task* t = ::new (mem) Task(fn, data, hipri, size);
 	t->fastJob = fastJob;
+	t->corePref = corePref;
 	return t;
 }
 
@@ -708,9 +782,9 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 			return false;
 	}
 	else {
-		uint8_t chosen = PickNextWorker();
+		uint8_t chosen = PickNextWorker(task->corePref);
 		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			chosen = PickNextWorker();
+			chosen = PickNextWorker(task->corePref);
 		}
 		if(task->hiPri)
 			hiPriInboxes[chosen]->push(task);
@@ -729,9 +803,9 @@ bool TaskScheduler::Requeue(Task* task) {
 	// bump pendingTasks -- the task was already counted at its original submission and
 	// is only resuming, not newly created. (The yield path does the same, via the
 	// worker's push_bottom.) Otherwise every suspend->resume cycle leaks +1.
-	uint8_t chosen = PickNextWorker();
+	uint8_t chosen = PickNextWorker(task->corePref);
 	while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-		chosen = PickNextWorker();
+		chosen = PickNextWorker(task->corePref);
 	}
 	if(task->hiPri)
 		hiPriInboxes[chosen]->push(task);
@@ -767,13 +841,47 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	workers[idx]->NotifyWorker();
 	return true;
 }
-int TaskScheduler::PickNextWorker() {
+int TaskScheduler::PickNextWorker(CorePref pref) {
+	// Placement is governed SOLELY by CorePref (see Task.h) -- queue priority (hiPri) is never consulted
+	// here; the two axes are fully orthogonal by design. Default/Any/Wide all mean "no class preference"
+	// and fall through to the original full-pool round-robin below.
+
+	// Round-robin a worker subset, returning the first NON-pinned worker (immediateCoresInUse = a
+	// persistent PushImmediate/PushFork claim), or -1 if the set is empty or every worker in it is pinned
+	// -- which tells the caller to SPILL to the other class rather than block on an unavailable core.
+	auto pickFrom = [this](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
+		size_t m = set.size();
+		if (m == 0) return -1;
+		size_t start = cur.load(std::memory_order_relaxed);
+		for (size_t i = 0; i < m; ++i) {
+			int idx = set[(start + i) % m];
+			if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
+				cur.store((start + i + 1) % m, std::memory_order_relaxed);
+				return idx;
+			}
+		}
+		return -1;
+	};
+
+	// Preference is a HINT, not a constraint (per the "don't wait when another core is free" rule): try the
+	// preferred class, then SPILL to the other. On top of this, work-conserving stealing (an idle worker
+	// steals a hiPri task off a busy one) covers the class-backlog-while-other-idle case at run time -- so
+	// a task never sits queued while any core is idle.
+	if (pref == CorePref::P || pref == CorePref::E) {
+		const bool preferP = (pref == CorePref::P);
+		int idx = preferP ? pickFrom(pWorkers, nextPWorker) : pickFrom(eWorkers, nextEWorker);
+		if (idx < 0) idx = preferP ? pickFrom(eWorkers, nextEWorker) : pickFrom(pWorkers, nextPWorker);
+		if (idx >= 0) return idx;
+	}
+
+	// Default/Any/Wide land here directly (no class preference); for P/E it's the last resort -- sets
+	// empty (not built) or EVERY worker pinned. The original full-pool round-robin, unchanged.
 	size_t n = workers.size();
 	for (size_t i = 0; i < n; ++i) {
-		size_t idx = (nextWorker + i) % n;
-		if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
-			nextWorker = (idx + 1) % n;
-			return static_cast<int>(idx);
+		size_t j = (nextWorker + i) % n;
+		if (!immediateCoresInUse[j]->load(std::memory_order_acquire)) {
+			nextWorker = (j + 1) % n;
+			return static_cast<int>(j);
 		}
 	}
 	int fallback = static_cast<int>(nextWorker);
