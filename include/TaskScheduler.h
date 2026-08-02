@@ -93,20 +93,31 @@ namespace JLib {
 		void WaitAll();
 
 		// Lets a non-worker caller (e.g. main, while spinning on a WaitGroup/counter) safely
-		// help drain the pool instead of pure-spinning. Steals ONE task via GetTask() (plain
-		// steal() across every deque -- safe for any number of concurrent thieves, worker or
-		// not) and either runs it or hands it back:
-		//  - fastJob (the common case, see Task::fastJob): runs Execute() inline right here,
-		//    then frees it with the EXACT SAME sequence Worker()'s fast path uses (~Task(),
-		//    Free(), pendingTasks decrement, EBR tick check) -- required so the slab and
-		//    pendingTasks/WaitAll() stay correct; skipping any one of these either leaks a
-		//    slab slot or hangs a WaitAll().
-		//  - NOT fastJob: this caller has no fiber to suspend it on if it ever calls
-		//    WaitOnEvent*, so it's handed back via Requeue() (does NOT touch pendingTasks --
-		//    the task was already counted, it's only relocating) for a real worker to run.
-		// Returns true if it did anything (ran or requeued a task), false if there was nothing
-		// to steal -- callers should yield() on false to avoid a hot spin.
+		// help drain the pool instead of pure-spinning. Steals ONE FASTJOB via GetTask(), which
+		// vets fastJob-ness AT THE DEQUE (TaskDeque::steal_if) -- a non-fastJob is never claimed
+		// by this fiberless caller at all (it could suspend, and there's no fiber to switch away
+		// to), so it stays queued for a real worker. This replaced the old steal-then-Requeue
+		// relocation, which was pure contention churn (claim CAS + re-push + notify, task moved
+		// nowhere). On a successful steal: runs Execute() inline, then frees with the EXACT SAME
+		// sequence Worker()'s fast path uses (~Task(), Free(), pendingTasks decrement, EBR tick
+		// check) -- required so the slab and pendingTasks/WaitAll() stay correct; skipping any
+		// one of these either leaks a slab slot or hangs a WaitAll().
+		// Returns true if it ran a task, false if nothing stealable -- callers should yield()
+		// on false to avoid a hot spin.
 		bool TryRunStolenFastJob();
+
+		// Steal-time class compatibility (used with TaskDeque::steal_if -- vet BEFORE claiming, never
+		// steal-then-Requeue, which is pure deque contention + worker thrash). Placement policy at steal
+		// mirrors push: Default/Any/Wide tasks are stealable by EVERY worker (work-conserving for the
+		// common case); explicit P/E tasks are only stolen by a matching-class thief -- corePref is the
+		// sole placement authority, including across steals. degenerateTopology (non-hybrid CPU: one
+		// class set empty) disables class checks entirely so nothing is ever unstealable.
+		static bool StealClassCompatible(const Task* t, bool thiefIsP, bool degenerateTopology) {
+			const CorePref p = t->corePref;
+			if (p == CorePref::Default || p == CorePref::Wide) return true;   // Any aliases Wide
+			if (degenerateTopology) return true;
+			return (p == CorePref::P) ? thiefIsP : !thiefIsP;
+		}
 
 		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true, CorePref corePref = CorePref::Default);
 
@@ -200,6 +211,14 @@ namespace JLib {
 		// needs the extra "only if idle" check). Tried first, in random order, before falling
 		// back to the existing global-random steal.
 		std::vector<std::vector<int>> clusterMates;
+		// Class-split views of clusterMates (built in BuildTopology once isPCore is known): a thief
+		// probes victims IT CAN STEAL FROM first -- same-class mates, then the idle SMT sibling (same
+		// physical core = same class by construction), then foreign-class mates as the last local
+		// phase, then a global random fallback (also same-class-first). With every task at Default
+		// this only reorders identical coverage; with class-pinned work it kills futile decline
+		// probes at the source (scan order matches steal legality) and raises steal hit rate.
+		// Non-hybrid: matesOtherClass is empty everywhere -> behavior identical to the classic order.
+		std::vector<std::vector<int>> matesSameClass, matesOtherClass;
 		// siblingQIndex[qIndex] -- the OTHER worker qIndex sharing this worker's physical core
 		// (SMT sibling), or -1 if none (no SMT, or the sibling logical CPU isn't a pool worker
 		// -- e.g. it's main's). Only stolen from if idle (see Thread::busy) -- a busy SMT
@@ -213,6 +232,13 @@ namespace JLib {
 		// (hiPri->P, loPri/bulk->E) + a P/E-aware core reserve -- needed manually because the pool is
 		// HARD-PINNED (Thread::StartWorker SetThreadAffinityMask), so the OS can't place work P/E for us.
 		std::vector<char> isPCore;
+		// isPCpu[logical CPU] -- P/E class of every logical processor (group 0), same EfficiencyClass
+		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenFastJob's
+		// callers include NON-worker, possibly UNPINNED threads (main, or any app thread hitting a
+		// SchedulerMutex/SchedulerConditionVariable spin): their class can't be assumed -- it's looked
+		// up via GetCurrentProcessorNumber() at steal time ("the fastJob would run HERE, right now").
+		// Workers keep the cheaper static isPCore[qIndex] lookup (hard-pinned, class never changes).
+		std::vector<char> isPCpu;
 		// -----------------------------------------------
 
 		static TaskScheduler* instance;

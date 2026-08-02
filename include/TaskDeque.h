@@ -139,6 +139,43 @@ namespace JLib {
             return std::nullopt;
         }
 
+        // PREDICATED steal: vet the candidate BEFORE claiming it, in one operation. Exists because
+        // separate peek-then-steal is a TOCTOU race (between the peek and the steal-CAS another thief
+        // can advance top_, and the steal would then claim a DIFFERENT, unvetted task) -- and because
+        // the alternative, steal-then-Requeue on a mismatch, is pure contention churn (a CAS claim +
+        // a full re-push + a notify, to move a task nowhere). Protocol is IDENTICAL to steal() with
+        // the predicate evaluated between the buffer read and the CAS: pred false -> return nullopt
+        // WITHOUT CASing (task stays put for a compatible thief); pred true -> CAS claims exactly the
+        // slot that was vetted.
+        //
+        // SAFETY of the pre-CAS dereference (pred reads fields of a task we don't own yet): (1) Tasks
+        // live in TaskAllocator slab slots that are NEVER unmapped, so the loads can't fault -- worst
+        // case they read a recycled slot's bytes. (2) If the CAS then SUCCEEDS, top_ never moved, so
+        // no consumer claimed slot t in between (the owner only touches slot t when it's the LAST item,
+        // and resolves that via this same top_ CAS) -- i.e. CAS success PROVES the vetted read was of
+        // the live, still-queued task. (3) If pred declines or the CAS fails, no claim occurred and
+        // the (possibly stale) read influenced nothing but a skipped steal -- benign by construction.
+        template <class Pred>
+        std::optional<Task*> steal_if(Pred&& pred) {
+            size_t t = top_.load(std::memory_order_acquire);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            size_t b = bottom_.load(std::memory_order_acquire);
+
+            if (t < b) {
+                Task* item = buffer_[t & mask_];
+                if (!pred(item))
+                    return std::nullopt;   // incompatible: leave it for a matching thief, NO claim
+                if (top_.compare_exchange_strong(
+                    t, t + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+                {
+                    return item;
+                }
+            }
+            return std::nullopt;
+        }
+
         size_t size() const {
             size_t t = top_.load(std::memory_order_acquire);
             size_t b = bottom_.load(std::memory_order_acquire);

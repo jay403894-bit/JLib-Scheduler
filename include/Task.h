@@ -28,6 +28,12 @@ namespace JLib {
     // spills to the other class when the preferred one is unavailable, and stealing stays deliberately
     // preference-blind (work-conserving). Non-hybrid CPUs: all workers are P-labeled, so every value
     // routes to the full pool -- zero behavior difference.
+    // SCOPE OF ENFORCEMENT (deliberate): corePref is vetted at PUSH placement (PickNextWorker) and at
+    // STEAL (TaskDeque::steal_if via StealClassCompatible) -- but an OWNER always runs whatever is in
+    // its own deque/inboxes unvetted: spill (preferred class unavailable at push) transfers ownership,
+    // and explicit CPU affinity (Push(cpu,..)/PushImmediate/PushToCore/DAG isFork/isMain) OVERRIDES
+    // corePref entirely -- pinning to a specific core is a stronger, more explicit request than a
+    // class preference. Do not add owner-pop vetting: a task a worker owns must run, else it strands.
     enum class CorePref : uint8_t {
         Default = 0,   // unspecified -- behaves as Any (no class preference, full-pool round-robin)
         P       = 1,   // prefer Performance cores (latency-sensitive, chunky critical-path work)

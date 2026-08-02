@@ -406,31 +406,51 @@ void Thread::Worker() {
 				//     new throughput, just pile more work onto an already-contended core.
 				//  3. Fall back to the old global-random steal across everyone.
 				// Steal ONE task from `target`: try its hiPri deque first, then loPri. Single-item
-				// steal() is the ONLY correct steal in this lock-free deque -- a batched range steal
+				// steal is the ONLY correct steal in this lock-free deque -- a batched range steal
 				// double-claims tasks the owner concurrently pops (use-after-free; see TaskDeque.h).
 				// So there is no batch and no leftovers to re-home: whatever we steal becomes
 				// task_to_run and runs on THIS worker immediately. (No age-promotion here either --
 				// promoting an aged loPri task only helps if it gets REQUEUED into the hiPri lane,
 				// but a task stolen for immediate execution is already un-starved by the steal, so
 				// flipping its priority would be a no-op.)
+				// CLASS-AWARE via steal_if: vet corePref BEFORE claiming (see StealClassCompatible) --
+				// an explicit P/E task is left in place for a matching-class thief instead of being
+				// stolen-then-Requeued (requeue on mismatch = deque contention + thrash, by design
+				// rejected). Default/Any/Wide tasks (the common case) remain stealable by everyone.
+				const bool iAmP  = scheduler->isPCore[qIndex] != 0;
+				const bool degen = scheduler->pWorkers.empty() || scheduler->eWorkers.empty();
+				bool sawDecline  = false;   // saw a task this sweep that exists but isn't ours (class mismatch)
+				auto classOK = [&](Task* t) {
+					if (TaskScheduler::StealClassCompatible(t, iAmP, degen)) return true;
+					sawDecline = true;
+					return false;
+				};
 				auto tryStealFrom = [&](int target) -> bool {
-					auto s = scheduler->hiPri[target]->steal();
-					if (!s) s = scheduler->loPri[target]->steal();
+					auto s = scheduler->hiPri[target]->steal_if(classOK);
+					if (!s) s = scheduler->loPri[target]->steal_if(classOK);
 					if (!s) return false;
 					task_to_run = *s;
 					return true;
 				};
 
-				const auto& mates = scheduler->clusterMates[qIndex];
-				if (!mates.empty()) {
+				// CLASS-FIRST victim ordering: probe the victims this worker can actually steal
+				// class-pinned work from BEFORE the ones it might have to decline -- scan order
+				// matches steal legality. Phases: same-class LLC mates -> idle SMT sibling (same
+				// physical core = same class by construction) -> foreign-class mates -> global
+				// random, same-class set first. Same total coverage as the old order (the two mate
+				// lists ARE clusterMates, split); on non-hybrid CPUs matesOtherClass is empty and
+				// this degrades to exactly the classic scan.
+				auto probeList = [&](const std::vector<int>& list) {
+					if (list.empty() || task_to_run) return;
 					size_t probeLimit = (consecutiveMisses < kBackoffMissThreshold)
-						? mates.size() : (size_t)1;
-					size_t mstart = FastRand() % mates.size();
+						? list.size() : (size_t)1;
+					size_t s = FastRand() % list.size();
 					for (size_t i = 0; i < probeLimit; ++i) {
-						int target = mates[(mstart + i) % mates.size()];
-						if (tryStealFrom(target)) break;
+						if (tryStealFrom(list[(s + i) % list.size()])) break;
 					}
-				}
+				};
+
+				probeList(scheduler->matesSameClass[qIndex]);
 
 				if (!task_to_run) {
 					int sibling = scheduler->siblingQIndex[qIndex];
@@ -439,10 +459,18 @@ void Thread::Worker() {
 					}
 				}
 
+				probeList(scheduler->matesOtherClass[qIndex]);
+
 				if (!task_to_run) {
-					int res = FastRand() % (scheduler->workers.size() - 1);
-					if (res == qIndex) res++;
-					tryStealFrom(res);
+					// Global fallback: one random probe from the same-class set, then one from the
+					// other class -- covers workers outside this LLC cluster (multi-CCD parts).
+					auto tryRandomFrom = [&](const std::vector<int>& set) {
+						if (set.empty() || task_to_run) return;
+						int t = set[FastRand() % set.size()];
+						if (t != qIndex) tryStealFrom(t);
+					};
+					tryRandomFrom(iAmP ? scheduler->pWorkers : scheduler->eWorkers);
+					tryRandomFrom(iAmP ? scheduler->eWorkers : scheduler->pWorkers);
 				}
 
 				if (task_to_run) {
@@ -451,7 +479,15 @@ void Thread::Worker() {
 					continue;
 				}
 				else {
-					++consecutiveMisses;
+					// A class-DECLINED sweep is not emptiness: work exists, it just isn't ours. The
+					// backoff counter exists to damp CAS storms from probing EMPTY deques -- and a
+					// steal_if decline performs NO CAS -- so declines must not shrink future probe
+					// width (that would blind this worker to compatible stragglers next sweep).
+					// Neither is it success, so no reset. Parking is unaffected either way: sleep
+					// was always per-sweep (cv.wait below), and class-targeted push notifies cover
+					// new compatible work while we're parked.
+					if (!sawDecline)
+						++consecutiveMisses;
 				}
 			}
 		}

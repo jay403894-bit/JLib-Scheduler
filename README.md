@@ -1,313 +1,327 @@
 # 🧵 JLib::TaskScheduler
 
-An advanced, low-overhead C++17 cooperative runtime engine. By leveraging custom assembly/C++ fibers, work-stealing deques, and a slab-allocated task DAG, it abstracts physical CPU topology into a high-performance, starvation-free execution matrix designed for real-time engines.
+A fiber-based, work-stealing task scheduler for real-time engines. Hand-written x64 context switching, lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and hybrid-core (P/E) aware placement — built for Windows, on purpose.
+
+**Windows x64 · MSVC · C++20 · BSD licensed**
+
+---
+
+## 📈 Measured (i9-13900K, Release)
+
+| Metric | Number |
+|---|---|
+| Task enqueue → dequeue latency | **6.3 µs** |
+| 5-node frame DAG (build + validate + execute) | **31.9 µs** |
+| `Task` struct size | **exactly 64 bytes** (one cache line, `static_assert`-enforced) |
+| Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
+| Steal protocol | single-item Chase-Lev CAS (see *Design Decisions* for why there is no batch steal) |
+
+## 🎯 Why this exists
+
+Public C++ job systems make you choose: task graphs **without** fibers ([Taskflow], enkiTS), fibers **without** maintenance (marl — archived), or GDC-talk fiber schedulers that never ship outside their studios. This is the missing combination, maintained and BSD-licensed:
+
+|  | enkiTS | Taskflow | marl | **JLib::TaskScheduler** |
+|---|---|---|---|---|
+| Work-stealing | ✅ | ✅ | ✅ | ✅ |
+| Fibers (suspend/resume *inside* tasks) | ❌ | ❌ | ✅ | ✅ |
+| Dependency DAG w/ AND/OR gates | partial | ✅ | ❌ | ✅ |
+| Cache/SMT topology-aware stealing | ❌ | ❌ | ❌ | ✅ |
+| Hybrid P/E-core placement | ❌ | ❌ | ❌ | ✅ |
+| Maintained | ✅ | ✅ | ❌ archived | ✅ |
+
+The trade: **Windows x64 + MSVC only, modern hardware assumed.** Constraining the problem is what makes one-person excellence possible — see *Requirements*.
 
 ---
 
 ## 📋 Table of Contents
 
-1. [Execution Paradigm & Component Map](#1-execution-paradigm--component-map)
-2. [Starvation Prevention](#2-starvation-prevention)
-3. [Task Execution Modalities](#3-task-execution-modalities)
-4. [Critical Integration Contracts](#4-critical-integration-contracts)
-5. [Core API & Workflow Architectures](#5-core-api--workflow-architectures)
-6. [Synchronization & Memory Safety](#6-synchronization--memory-safety)
-7. [JLib::TaskDAG](#7-jlibtaskdag)
+1. [Requirements & Honest Limitations](#1-requirements--honest-limitations)
+2. [Quick Start](#2-quick-start)
+3. [Execution Paradigm & Component Map](#3-execution-paradigm--component-map)
+4. [Hybrid P/E-Core Placement (CorePref)](#4-hybrid-pe-core-placement-corepref)
+5. [Starvation Prevention](#5-starvation-prevention)
+6. [Task Execution Modalities](#6-task-execution-modalities)
+7. [Critical Integration Contracts](#7-critical-integration-contracts)
+8. [Core API & Workflow Architectures](#8-core-api--workflow-architectures)
+9. [Synchronization & Memory Safety](#9-synchronization--memory-safety)
+10. [JLib::TaskDAG](#10-jlibtaskdag)
+11. [Design Decisions (and the bugs that taught them)](#11-design-decisions-and-the-bugs-that-taught-them)
 
 ---
 
-## 🏗️ 1. Execution Paradigm & Component Map
+## ⚙️ 1. Requirements & Honest Limitations
+
+**Requirements:** Windows 10+ · x64 · MSVC (builds as C++20) · MASM (`ml64`, ships with VS) for the context-switch assembly.
+
+**Deliberate limitations — read before adopting:**
+
+- **Windows x64 / MSVC only.** The context switch is hand-written x64 MASM against the Windows ABI; fibers, affinity, and topology queries are Win32. A Linux port is a real port (community fork exists), not a flag.
+- **Workers are hard-pinned** (worker *i* → logical CPU *i+1*, main on CPU 0). This is what makes the topology maps (SMT sibling, LLC cluster, P/E class) *true* rather than guesses — the OS cannot migrate workers. See *Design Decisions*.
+- **Auto pool size is `hardware_concurrency − 1`** (main on CPU 0, workers on the rest) — and this is only safe because the JLib stack keeps foreign busy-threads at zero: input runs GameInput in **manual-dispatch mode** (zero threads; the app pumps its work per frame), and the remaining foreign threads (driver, audio callback, OS pools) are low-duty wakers that time-slice fine — measured, not assumed. **Apps with a persistent foreign worker thread (e.g. default-mode GameInput) should pass `Init(hw − 2)`** — we measured exactly that scenario costing one core. `Init(N)` honors explicit sizes up to full `hardware_concurrency`.
+- **Processor group 0 only** (≤ 64 logical CPUs). Fine for desktops/workstations; dual-socket monsters need work this project doesn't do.
+- **Tasks are 256-byte slab slots.** Lambda captures beyond ~192 bytes fail a `static_assert` — capture pointers, not payloads.
+
+---
+
+## 🚀 2. Quick Start
+
+Build + deploy the static lib (both configs) with the included script, or just add `src/*` + `ContextSwitch.asm` to your project.
+
+```cpp
+#include <TaskScheduler.h>
+
+int main() {
+    JLib::TaskScheduler::Init();               // auto pool size (hw-2); or Init(N) explicit
+    auto& sched = JLib::TaskScheduler::Instance();
+
+    // Fire-and-forget fastJob (default): pure compute, runs inline on a worker
+    sched.Push([] { HeavyMath(); });
+
+    // Fork-join: create tasks against a WaitGroup, then wait (fiber-suspends if
+    // called from a task; spin-helps by stealing fastJobs if called from main)
+    JLib::WaitGroup wg;
+    for (int i = 0; i < 8; ++i) {
+        auto* t = sched.CreateTask([i] { Chunk(i); });   // hiPri=false, fastJob=true defaults
+        t->waitGroup = &wg;
+        wg.n.fetch_add(1, std::memory_order_release);
+        sched.Push(t);
+    }
+    sched.WaitFor(wg);
+
+    // Data-parallel loop: auto-selects flat vs fork-join dispatch by measured crossover
+    sched.ParallelFor(0, 1'000'000, 4096, [](int a, int b) {
+        for (int i = a; i < b; ++i) out[i] = std::sqrt((float)i);
+    });
+
+    sched.Join();
+}
+```
+
+---
+
+## 🏗️ 3. Execution Paradigm & Component Map
 
 The scheduler maps physical hardware cores to logical workers, utilizing specialized allocation and queuing mechanisms to eliminate system call overhead.
 
 ### Topology Awareness
-On `Initialize()`, the system maps the host CPU's Last Level Cache (LLC) clusters and SMT (Hyper-threaded) siblings. Work-stealing operations prioritize columns within the same cache domain before reaching across hardware boundaries.
+On `Init()`, the system queries the **real** CPU topology (`GetLogicalProcessorInformationEx`, not numbering assumptions): Last Level Cache (LLC) clusters, SMT siblings, and per-core **EfficiencyClass** (P-core vs E-core on hybrid parts). Work-stealing prioritizes victims in the same cache domain before reaching across hardware boundaries, skips busy SMT siblings (stealing from a busy sibling recruits no new execution ports), and respects core-class placement (see §4).
 
 ### Slab Allocator & Local Caches
-Standard `new` and `delete` operations are explicitly deleted from Task allocations. Tasks are provisioned out of a custom thread-local slab allocator, ensuring perfect cache alignment and zero runtime heap fragmentation.
+Standard `new`/`delete` are explicitly deleted on `Task`. Tasks are provisioned from a fixed-slot slab allocator with epoch-based reclamation — zero runtime heap traffic, perfect alignment, and `sizeof(Task) == 64` enforced at compile time.
 
 ### Dual-Queue Priorities
-Each worker maintains split high/low priority deques. Work is stolen with hierarchical preference: same-core siblings → LLC-local peers → global random steal. Low-priority tasks receive fair CPU access through starvation prevention (see section 2).
+Each worker maintains split high/low priority deques plus MPSC inboxes (owner-drained). Work is stolen with hierarchical preference: LLC-local peers → idle SMT sibling → global random. **Priority is queue order only** — it never determines which core class runs a task (§4).
 
 ---
 
-## 🛡️ 2. Starvation Prevention
+## ⚡ 4. Hybrid P/E-Core Placement (CorePref)
 
-The scheduler implements three complementary mechanisms to ensure no priority level starves indefinitely:
-
-### Age-Based Promotion
-**What it does:** Low-priority tasks waiting in queue > 50ms are automatically promoted to high-priority.
-
-**Why it matters:** Without aging, a continuous flood of high-priority work could starve low-priority background tasks forever.
-
-**Implementation:**
-- `taskQueuedTime` map tracks when each loPri task was pushed
-- `GetTaskBatch()` checks age when stealing; old tasks get promoted
-- Timestamps cleaned up on task completion
+Modern consumer CPUs are hybrid (Intel 12th-gen+: performance + efficiency cores). Because workers are hard-pinned, the OS cannot place work by class — so the scheduler does it, explicitly and orthogonally to priority:
 
 ```cpp
-// Automatic: when a loPri task waits > 50ms, it gets promoted
-size_t age = now - taskQueuedTime[task];
-if (age > kAgePromotionThresholdMs) {
-    task->hiPri = 1;  // promoted
-}
+enum class CorePref : uint8_t {
+    Default,   // no preference (full-pool round-robin) -- the default for every task
+    P,         // prefer Performance cores (latency-critical, chunky work)
+    E,         // prefer Efficiency cores (background/bulk; preserves P headroom)
+    Wide,      // explicit no-preference: wide throughput bursts that want ALL cores
+    Any = Wide // alias: "genuinely don't care" -- same mechanism, honest name
+};
+
+sched.CreateTask(fn, data, /*hiPri*/ false, FiberSize::Standard, /*fastJob*/ true, CorePref::E);
 ```
+
+**The rules (deliberate, and worth copying):**
+
+- **Priority ⊥ placement.** `hiPri` orders queues; `corePref` places work. They are never coupled — a coupled design (hiPri→P, loPri→E) creates a structural starvation gradient: sustained high-priority load spills into the efficiency cores' lanes and starves bulk work from *both* directions at once.
+- **Preference is a hint at push** — placement spills to the other class rather than ever waiting on an unavailable one.
+- **Preference is a rule at steal** — thieves vet a candidate's class *before* claiming it (`TaskDeque::steal_if`: predicate evaluated between the buffer read and the CAS, so declining costs **zero** atomics and never claims an unvetted task). `Default/Any/Wide` tasks remain stealable by everyone.
+- **A declined steal is not a miss.** Steal-backoff exists to damp CAS storms; a class-decline performs no CAS, so it neither shrinks probe width nor resets it.
+- **Owners run what they own.** Spill transfers ownership; explicit CPU pinning (`PushImmediate`, DAG fork nodes) overrides class preference entirely.
+- **Non-hybrid CPUs:** every worker labels P, class checks disable, behavior is identical to the classic full-pool scheduler.
+
+---
+
+## 🛡️ 5. Starvation Prevention
+
+Two complementary mechanisms guarantee no priority level starves:
 
 ### Steal Fairness
-**What it does:** After 8 consecutive hiPri steals, the scheduler forces a loPri scan.
-
-**Why it matters:** Without fairness, stealing logic could scan hiPri queues indefinitely while loPri work sits untouched.
-
-**Implementation:**
-- `consecutiveHiPriSteals` counter tracks the streak
-- After threshold, forces one loPri scan before resuming hiPri preference
-- Resets counter whenever loPri work is actually stolen
-
-```cpp
-// Force fairness every N steals
-if (consecutiveHiPriSteals >= kStealFairnessWindow) {
-    // Scan loPri queues this round
-    consecutiveHiPriSteals = 0;
-}
-```
+After 8 consecutive hiPri steals, the scheduler forces a loPri scan before resuming hiPri preference. Without this, a hiPri stream could keep every thief busy while loPri work sits untouched.
 
 ### Priority Inheritance (SchedulerMutex)
-**What it does:** When a high-priority task tries to acquire a lock held by a low-priority task, the lock holder's priority is temporarily boosted.
+When a high-priority task contends a lock held by a low-priority task, the holder is temporarily boosted (and restored on unlock) — the classic priority-inversion fix, fiber-aware via `Thread::GetCurrent()->currentRunningTask`.
 
-**Why it matters:** Without inheritance, priority inversion deadlock can occur: hiPri task waits on loPri holder; loPri starves while waiting; hiPri never proceeds.
-
-**Implementation:**
-- `SchedulerMutex` wrapper around `std::mutex`
-- On `lock()` contention, boosts the current holder
-- On `unlock()`, restores original priority
-- Uses `Thread::GetCurrent()->currentRunningTask` for fiber-aware tracking
-
-```cpp
-// Safe lock that prevents priority inversion
-SchedulerMutex lock;
-
-lock.lock();    // Auto-boosts holder if contended
-// critical section
-lock.unlock();  // Restores priority
-```
+> **Where did age-based promotion go?** Removed, deliberately. An earlier version promoted loPri tasks after 50 ms in queue — measurement showed it was vestigial: single-item stealing *already* un-starves a task the moment any thief takes it (promotion only helps work that gets re-queued, and stolen work runs immediately). The fairness window above is the real anti-starvation. Kept out until a profile says otherwise.
 
 ---
 
-## 🎮 3. Task Execution Modalities
+## 🎮 6. Task Execution Modalities
 
 The scheduler operates two distinct execution pathways. **Selecting the wrong pathway will result in immediate deadlocks or queue corruption.**
 
 | Execution Mode | fastJob | Allocation | Thread Model | Use Case |
 |---|---|---|---|---|
-| **Standard Task** | `true` (Default) | Raw Thread Loop | Non-Cooperative | Bulk math, raycasts, data sweeps |
-| **Fiber Task** | `false` | Custom ASM/C++ Fiber Stack | Cooperative | Fork-join patterns, wait-able work |
+| **Standard Task** | `true` (Default) | Raw worker stack | Non-cooperative, run-to-completion | Bulk math, raycasts, data sweeps, physics jobs |
+| **Fiber Task** | `false` | Custom ASM/C++ fiber stack | Cooperative (may `WaitOnEvent`/suspend) | Fork-join patterns, waitable work |
+
+fastJobs skip fiber allocation and context switching entirely — this is why per-job overhead stays microscopic for pure-compute workloads (e.g., an entire physics engine's job graph).
 
 ---
 
-## 🚦 4. Critical Integration Contracts
+## 🚦 7. Critical Integration Contracts
 
 ### Contract 1: The Fork-Join / PushFork Rule
 
-When employing a fork-join parallelism architecture, tasks must cooperatively yield their execution contexts during wait cycles rather than blocking the physical thread.
+When employing fork-join parallelism, tasks must cooperatively yield their execution contexts during wait cycles rather than blocking the physical thread.
 
 **The Rule:** You **MUST** pass `fastJob = false` inside `CreateTask` when pushing to `PushFork`.
 
-**The Trap:** If a task enters `PushFork` with `fastJob = true`, the scheduler runs it as a standard thread-bound job. When that job calls `WaitFor()`, it will attempt to execute fiber suspension mechanics on a naked thread, resulting in an immediate hard deadlock.
+**The Trap:** If a task enters `PushFork` with `fastJob = true`, the scheduler runs it as a standard thread-bound job. When that job calls `WaitFor()`, it will attempt fiber suspension mechanics on a naked thread — immediate hard deadlock.
 
 ### Contract 2: Long-Running Services vs. Immediate Mode
 
-`PushImmediate(cpu_affinity, task)` strips a worker thread from the general pool, forcing it to offload its current queue to neighboring cores and lock onto a dedicated loop.
+`PushImmediate(cpu_affinity, task)` strips a worker from the general pool, offloads its queue to neighbors, and locks it to a dedicated loop.
 
-**The Rule:** Service tasks (e.g., Audio processing loops, Networking listeners) launched via `PushImmediate` must be configured with `fastJob = true`.
+**The Rule:** Service tasks (audio processing loops, network listeners) launched via `PushImmediate` must be `fastJob = true`.
 
-**The Trap:** Immediate-mode tasks are structurally isolated from the fiber scheduling pool. If an immediate task triggers a fiber suspend/resume sequence, the synchronization state tracking the active worker queue boundaries will break down, causing metadata corruption.
+**The Trap:** Immediate-mode tasks are structurally isolated from the fiber pool. If one triggers a fiber suspend/resume, the worker-queue boundary tracking corrupts.
+
+### Contract 3: Fiber-Suspending Tasks Never Block Threads
+
+A fiber task that calls `WaitOnEvent`/`WaitForFenceValue`-style primitives suspends the *fiber*; the worker thread immediately picks up other work. This is the property that lets GPU-fence waits, physics barriers, and IO ride the same pool as compute without stalling cores — and it's the reason fibers exist in this scheduler at all.
 
 ---
 
-## 🚀 5. Core API & Workflow Architectures
+## 🔧 8. Core API & Workflow Architectures
 
 ### The Fork-Join Pattern (Fibers)
 
-Used when a parent task must spin up sub-tasks and wait for them to finish before proceeding.
-
 ```cpp
-// 1. Instantiate the coordination tracker
 JLib::WaitGroup wg;
 
-// 2. Provision tasks via the Slab Allocator (fastJob MUST be false for Fibers)
-Task* parent = scheduler.CreateTask([]() { /* ... */ }, hiPri, FiberSize, false);
+// fastJob MUST be false: this task suspends while waiting on children
+Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, /*fastJob*/ false);
+parent->waitGroup = &wg;
+wg.n.fetch_add(1, std::memory_order_release);   // count BEFORE push -- workers decrement on completion
+sched.PushFork(parent);
 
-// Increment counter BEFORE dispatching
-wg.Increment(1); 
-scheduler.PushFork(parent);
-
-// 3. Suspend current context until worker execution concludes
-scheduler.WaitFor(wg);
+sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing fastJobs
 ```
 
-### The Immediate Mode Pattern (Threads)
-
-Used to pin critical engine subsystems to specific CPU cores.
+### The Immediate Mode Pattern (Pinned Services)
 
 ```cpp
-// Service tasks run raw on the thread (fastJob MUST be true)
-Task* audioService = scheduler.CreateTask([]() {
-    while(engineRunning) {
-        UpdateAudioBuffers();
-        // Uses OS sleeps or custom atomics, NEVER fiber yields!
+// Service tasks run raw on the pinned thread (fastJob MUST be true)
+Task* audioService = sched.CreateTask([](void*) {
+    while (engineRunning) {
+        UpdateAudioBuffers();   // uses OS waits or atomics -- NEVER fiber yields
     }
-}, hiPri, FiberSize::Standard, true);
+}, nullptr, /*hiPri*/ 1, FiberSize::Standard, /*fastJob*/ true);
 
-// Evicts core work and locks the thread to this execution loop
-scheduler.PushImmediate(CoreAffinity::Mask_Core2, audioService);
+sched.PushImmediate(/*coreID*/ 2, audioService);   // evicts core 2's queue, locks the loop to it
 ```
+
+### ParallelFor (hybrid dispatch)
+
+`ParallelFor(start, end, chunk, fn)` auto-selects between flat dispatch (caller spawns chunks — wins ≤ ~2 tasks/worker) and recursive fork-join splitting (the tree is built *by* the pool — measured 8× faster at fine grain, 15k+ tasks). Ranges ≤ 10k items run serially: dispatch overhead would dominate.
 
 ---
 
-## 🛡️ 6. Synchronization & Memory Safety
+## 🛡️ 9. Synchronization & Memory Safety
 
 ### Priority Inheritance (SchedulerMutex)
 
-Use `SchedulerMutex` instead of `std::mutex` when a lock might be held by a low-priority task while a high-priority task waits on it.
-
-```cpp
-// Instead of: std::mutex lock;
-SchedulerMutex lock;
-
-// In your fiber-executed task:
-lock.lock();
-{
-    // Critical section
-    // If another task contends on this lock, the lock holder's priority
-    // is temporarily boosted to prevent starvation of this task
-}
-lock.unlock();
-```
+Use `SchedulerMutex` instead of `std::mutex` when a lock might be held by a low-priority task while a high-priority task waits.
 
 **When to use:**
 - ✅ Locks shared between hiPri and loPri tasks
 - ✅ Resource pools where hiPri work might wait on loPri holders
 - ❌ Scheduler-internal locks (already fast, no fiber wait)
-- ❌ Locks only used within hiPri tasks (no inversion risk)
+- ❌ Locks only used within one priority level (no inversion possible)
+
+While spinning on a contended `SchedulerMutex` or `SchedulerConditionVariable`, the spinner **helps drain the pool** by stealing fastJobs (class-vetted against the core it's actually standing on) instead of burning cycles.
 
 ### Memory Lifecycle Ownership
 
-You **never** call `delete` on a task. Once a task completion gate resolves, the scheduler automatically returns its memory layout block to the thread-local slab allocation pool. This is enforced: `operator delete` is explicitly deleted in the `Task` class.
+You **never** call `delete` on a task. On completion the scheduler returns the slot to the slab (epoch-based reclamation guards the lock-free structures). This is enforced: `operator delete` is deleted on `Task`.
 
 ---
 
-## 📊 7. JLib::TaskDAG
+## 📊 10. JLib::TaskDAG
 
-The TaskDAG manages complex, multi-threaded task dependencies. It provides structural synchronization across your worker threads, allowing you to establish explicit execution orders (e.g., ensuring Physics updates finish before Rendering commands are submitted) without using blocking mutexes or thread-stalling primitives.
+The TaskDAG manages multi-threaded task dependencies — explicit execution order (Physics before Render submission) without blocking primitives.
 
-### 🧠 Memory Architecture & Cache Line Optimization
+### 🧠 Memory Architecture
 
-To maximize execution throughput, TaskDAG acts as a zero-allocation database manager during runtime:
+**The 64-Byte Cache Target:** Completion hooks live in the `TaskNode` (the node doubles as the trampoline's context and outlives it), keeping `Task` at exactly 64 bytes. Firing a node performs **zero heap allocations** — nodes come from the slab.
 
-**The 64-Byte Cache Target:** Standard task graphs often bloat tasks by attaching completion callback variables. TaskDAG eliminates this bloat entirely. Completion hooks live embedded in the `TaskNode` itself (the node doubles as the trampoline's context and always outlives it), so the core `Task` struct is optimized down to exactly 64 bytes and firing a node performs **zero heap allocations** — nodes come from the slab, and nothing else is allocated. This guarantees that a task payload matches a CPU cache line perfectly, eliminating cache line splitting.
+**Epoch-Based Reclamation:** Completed nodes retire through the EBR pipeline back to the slab — safe against concurrent readers in the lock-free dependents lists.
 
-**Epoch-Based Reclamation (EBR):** Nodes are not deleted using standard `free()` hooks. When a task completes, the static `NodeDeleter` registers it with an EBR pipeline, cleanly returning its slot back to a dedicated thread-safe slab allocator.
+**Transient build vector:** Root discovery and cycle checking use a single-threaded build-phase vector, cleared inside `Submit()`. Post-submission the graph is fully decentralized; nodes are autonomous and self-free.
 
-**Transient Tracking Vector (nodes):** The internal tracking vector is optimized strictly for a single-threaded build phase. It is used to discover roots and execute cycle checking, then it is cleared completely inside `Submit()`. Post-submission, the graph is entirely decentralized; nodes are autonomous and self-free upon execution.
+### 🔀 Node Typologies
 
-### 🔀 Node Typologies & Logical Gates
+**1. Standard Worker Nodes (`CreateNode`)** — distributed across the work-stealing pool; optional priority and explicit `cpu_id` pinning.
 
-The DAG framework provides three specialized execution nodes created via the factory interface:
+**2. Main-Thread Nodes (`CreateMainNode`)** — route exclusively through `PushMain`; execute only when the main thread pumps `ProcessMainThread`.
+**Critical Rule:** whoever awaits a graph containing a main node **MUST** use `WaitForMain` — plain `WaitFor` hangs forever on the un-pumped node.
 
-**1. Standard Worker Nodes (`CreateNode`)**
-- **Behavior:** Distributed broadly across the general work-stealing thread pool.
-- **Affinity Control:** Supports optional priority levels and explicit `cpu_id` hardware pinning tags.
+**3. Logic Gates (`CreateGate`)** — structural nodes with no payload:
+- **AND** — fires when *every* dependency completes.
+- **OR** — fires on the *first* dependency, short-circuiting the rest.
+- Gates nest: `(A && B) || C` pipelines compose naturally.
 
-**2. Main-Thread Affinitized Nodes (`CreateMainNode`)**
-- **Behavior:** Routes tasks exclusively to `TaskScheduler::PushMain`. These tasks will only execute when the primary thread explicitly runs `ProcessMainThread`.
-- **Critical Rule:** Whoever awaits a graph containing a main-thread node **MUST** use `TaskScheduler::WaitForMain`. Calling the standard `WaitFor` will trap worker threads while the main-thread node sits un-pumped in the queue, resulting in a permanent engine hang.
-
-**3. Logic Gates (`CreateGate`)**
-- **Purpose:** A structural control node that carries no computational task payload. Instead, it serves as a conditional gate to evaluate complex boolean readiness states.
-- **AND Gates:** The node remains locked until every single dependency broadcasts a completion signal.
-- **OR Gates:** The node triggers the exact moment the first dependency finishes, short-circuiting the remaining timeline and releasing downstream dependents immediately.
-- **Composition:** Gates can be nested to construct complex conditional pipelines (e.g., evaluating `(System_A && System_B) || System_C`).
-
-### 🔄 Lifecycle & Execution Pipeline
-
-The lifecycle of an engine frame's task graph progresses through four strict phases:
+### 🔄 Lifecycle
 
 ```
 [ Build Phase ] ──► [ HasCycle Check ] ──► [ Submit() ] ──► [ Trampoline Core Loop ]
-(Add Dependencies)   (Kahn's Validation)    (Fire Roots)     (OnTaskFinishedWrapper)
+(AddDependency)     (Kahn's validation)    (fire roots)     (OnTaskFinishedWrapper)
 ```
 
-**Phase 1: The Build Phase**
-You instantiate your execution units and establish directional boundaries using `AddDependency(dependent, dependency)`.
-
-**Phase 2: Structural Validation (HasCycle)**
-Before execution begins, the system executes an offline Kahn's Algorithm Cycle Check. It walks the graph topology to confirm that no circular references exist (e.g., Node A waiting for Node B, which is waiting for Node A). If a cycle is detected, the graph fails validation safely, preventing an in-flight thread freeze.
-
-**Phase 3: The Launch (Submit)**
-Calling `Submit()` triggers validation. If successful, the engine discovers all "root" nodes (nodes with 0 incoming dependencies) and invokes `Fire()`.
-
-**Phase 4: The Trampoline Loop (OnTaskFinishedWrapper)**
-When a node runs, the DAG intercepts its execution using a static trampoline hook:
-1. `Fire()` replaces the task's function pointer with `OnTaskFinishedWrapper`
-2. The worker thread executes the node's actual stored payload (`origFn(origData)`)
-3. The moment the math finishes, it calls `OnTaskFinished()`, which atomically decrements child dependency counters
-4. If a child's logic rules are satisfied, it immediately calls `Fire()` on that child, cascading work through the pool
+1. `Fire()` wraps the task's fn/data with the completion trampoline
+2. A worker executes the original payload
+3. `OnTaskFinished()` atomically decrements dependents' counters
+4. Satisfied dependents `Fire()` immediately — work cascades through the pool with no coordinator
 
 ### 💻 Integration Example
 
 ```cpp
-// 1. Instantiate the graph container bound to your engine scheduler
-JLib::TaskDAG graph(engineScheduler);
+JLib::TaskDAG graph(sched);
 
-// 2. Provision raw tasks out of the slab allocator
-Task* inputTask   = engineScheduler.CreateTask(UpdateInput, hiPri, FiberSize::Standard, true);
-Task* physicsTask = engineScheduler.CreateTask(IntegratePhysics, hiPri, FiberSize::Standard, true);
-Task* renderTask  = engineScheduler.CreateTask(SubmitRenderCommands, hiPri, FiberSize::Standard, true);
+Task* inputTask   = sched.CreateTask(UpdateInput,         nullptr, 1, FiberSize::Standard, true);
+Task* physicsTask = sched.CreateTask(IntegratePhysics,    nullptr, 1, FiberSize::Standard, true);
+Task* renderTask  = sched.CreateTask(SubmitRenderCommands,nullptr, 1, FiberSize::Standard, true);
 
-// 3. Wrap tasks into DAG Nodes
 TaskNode* inputNode   = graph.CreateNode(inputTask);
 TaskNode* physicsNode = graph.CreateNode(physicsTask);
+TaskNode* renderNode  = graph.CreateMainNode(renderTask);  // graphics context wants the main thread
 
-// The render submission must run on the main thread due to graphics context locking
-TaskNode* renderNode  = graph.CreateMainNode(renderTask);
-
-// 4. Construct the Dependency Matrix
-// Render waits for BOTH Input and Physics to resolve (Implicit AND behavior)
-graph.AddDependency(renderNode, inputNode);
+graph.AddDependency(renderNode, inputNode);    // render waits on BOTH (implicit AND)
 graph.AddDependency(renderNode, physicsNode);
 
-// 5. Kick off the pipeline
-// This validates the graph structure, fires the roots, and safely recycles nodes.
-bool success = graph.Submit();
-if (!success) {
-    // Handle cycle detection or validation failure
-}
+if (!graph.Submit()) { /* cycle detected -- graph refused safely */ }
 ```
 
 ---
 
-## 🚀 Getting Started
+## 🔬 11. Design Decisions (and the bugs that taught them)
 
-```cpp
-#include "TaskScheduler.h"
+Negative results with receipts — the section most libraries won't write.
 
-int main() {
-    // Initialize with auto-detected core count
-    JLib::TaskScheduler::Init();
-    auto& sched = JLib::TaskScheduler::Instance();
-    
-    // Create and push a high-priority fiber task
-    auto* task = sched.CreateTask([]() {
-        std::cout << "Running on fiber!\n";
-    }, 1, JLib::FiberSize::Standard, false);  // hiPri, not fastJob
-    
-    sched.Push(task);
-    sched.WaitAll();
-    
-    return 0;
-}
-```
+**No batch steal.** A lock-free batch steal claims `[t, t+n)` under one `top` CAS, but the owner's `pop_bottom` takes from the *other* end without touching `top` for non-last items — a batch can double-claim a task the owner also popped. That was a real use-after-free heisenbug, not a thought experiment. Single-item stealing is standard, fast, and *correct*; there is no `steal_batch`.
+
+**Age-based promotion removed.** See §5 — promotion was vestigial once stealing went single-item. Features earn their place with profiles here.
+
+**Priority ⊥ placement.** The first P/E design coupled hiPri→P / loPri→E. Analysis killed it before it shipped: under sustained hiPri load, spill floods the E-workers' hiPri lanes, and since every worker drains hiPri first, bulk work gets squeezed by placement *and* priority simultaneously — a structural starvation gradient. Worse, it silently invalidated the reasoning that justified removing age-promotion. Orthogonal axes, always.
+
+**Predicated steal, not peek-then-steal.** Class-aware stealing needs to vet candidates — but a separate peek + steal is a TOCTOU race (another thief advances `top` in between, and you claim a task you never inspected). `steal_if` evaluates the predicate between the buffer read and the CAS: declines cost zero atomics, claims are exactly the vetted slot.
+
+**Hard pinning, with the foreign-thread problem solved at the source.** Pinning makes the topology maps true (sibling/cluster/P-E stealing is only meaningful when workers can't migrate) at one real cost: pinned threads can't dodge foreign threads landing on their core. Profiling a real game process found the one persistent offender — GameInput's internal worker (opaque count, varies by machine; dose-response testing showed exactly one core of deficit). Rather than permanently reserving a core for it, the JLib input layer switches GameInput to **manual-dispatch mode** (`IGameInputDispatcher`): its async work runs inside the app's per-frame input update, on a known thread, costing zero threads. The census becomes exact — workers + main + nothing — and the auto pool size stays `hw−1`. Apps that can't do this reserve explicitly (`Init(hw−2)`).
 
 ---
 
-**Built for real-time engines. Proven under concurrent load.**
+## 📄 License
+
+BSD. Use it, fork it, ship it. A community Linux fork exists — upstreaming is welcome.
+
+**Built for real-time engines. Proven under concurrent load — and under profilers.**

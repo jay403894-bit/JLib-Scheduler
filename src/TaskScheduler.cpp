@@ -17,17 +17,20 @@ TaskScheduler::TaskScheduler(size_t poolSize) {
 	StartPool(poolSize);
 }
 size_t TaskScheduler::GetSafeTC() {
-	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-2. The old hw-1 left NO core actually
-	// free -- main pins to CPU 0 and workers to CPUs 1..hw-1, so the process claimed every logical core
-	// 1:1 and foreign threads the app can't control (GameInput's in-proc pollers, GPU driver, audio, OS
-	// pools) had nowhere unclaimed to land -> transient oversubscription (VTune, 2026-07-31). hw-2 keeps
-	// one core genuinely unclaimed; with the sequential pin scheme that's the HIGHEST-numbered logical
-	// CPU -- an E-core on hybrid parts, exactly where background pollers belong. Apps that profile a
-	// different sweet spot pass an EXPLICIT poolSize to Init/StartPool (that's the config surface --
-	// deliberately no env var); explicit sizes may claim up to full hw, see the clamp in StartPool.
+	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin
+	// CPUs 1..hw-1. HISTORY (don't relive it): this was briefly hw-2 (2026-07-31) because GameInput's
+	// internal worker thread (ABOVE_NORMAL priority, opaque count) was one persistent foreign claimant
+	// with nowhere unclaimed to land -> measured oversubscription-by-one (VTune + dose-response: -3/-4
+	// reserves didn't help, so the deficit was exactly one). That claimant is now GONE: JLib::Input runs
+	// GameInput in MANUAL DISPATCH mode (IGameInputDispatcher held; InputManager::Update pumps
+	// Dispatch() per frame on main), so its async work costs ZERO threads. Census: workers + main + 0
+	// = exact fit at hw-1. Remaining foreign threads (GPU driver, audio callback, OS pools) are
+	// low-duty-cycle wakers that time-slice fine -- measured, not assumed. Apps whose profile disagrees
+	// (or that DON'T use manual-dispatch input) pass an EXPLICIT poolSize to Init (e.g. hw-2) -- that's
+	// the config surface, deliberately no env var; explicit sizes may claim up to full hw (StartPool).
 	unsigned int cores = std::thread::hardware_concurrency();
-	if (cores <= 2) return 1;
-	return static_cast<size_t>(cores - 2);
+	if (cores <= 1) return 1;
+	return static_cast<size_t>(cores - 1);
 }
 void TaskScheduler::Init(size_t poolSize) {
 	if (instance != nullptr)
@@ -278,6 +281,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	// lower class is an Efficiency core. Default everyone to P (1): correct for a non-hybrid CPU, and a safe
 	// fallback if the query fails -- only demote workers we positively identify as lower-class. ---
 	isPCore.assign(num_workers, 1);
+	isPCpu.assign(64, 1);   // per-LOGICAL-CPU class (group 0); default all-P (non-hybrid / query-fail safe)
 	{
 		DWORD len = 0;
 		GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
@@ -286,6 +290,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 			auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
 			if (GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
 				std::vector<int> effOf(num_workers, -1);   // this worker's core efficiency class, -1 = unknown
+				int effOfCpu[64]; for (int i = 0; i < 64; ++i) effOfCpu[i] = -1;
 				int maxEff = -1;
 				DWORD off = 0;
 				while (off < len) {
@@ -299,6 +304,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 							ULONG_PTR mask = proc.GroupMask[g].Mask;
 							for (int cpu = 0; cpu < 64; ++cpu)
 								if (mask & (ULONG_PTR(1) << cpu)) {
+									effOfCpu[cpu] = eff;
 									int q = qIndexOf(cpu);
 									if (q >= 0) effOf[q] = eff;
 								}
@@ -306,9 +312,12 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 					}
 					off += info->Size;
 				}
-				// A worker is an E-core only if its class is KNOWN and strictly below the top class seen.
+				// E only if the class is KNOWN and strictly below the top class seen (workers AND raw CPUs
+				// -- the CPU table serves unpinned/non-worker threads, see isPCpu in the header).
 				for (unsigned int q = 0; q < num_workers; ++q)
 					if (effOf[q] >= 0 && effOf[q] < maxEff) isPCore[q] = 0;
+				for (int cpu = 0; cpu < 64; ++cpu)
+					if (effOfCpu[cpu] >= 0 && effOfCpu[cpu] < maxEff) isPCpu[cpu] = 0;
 			}
 		}
 	}
@@ -374,6 +383,16 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 			}
 		}
 	}
+
+	// Split each worker's mates by core class (see matesSameClass in the header): the steal scan probes
+	// same-class victims FIRST because those are the only ones an explicit-class task can be taken from
+	// -- scan order should match steal legality. Same total coverage, reordered; non-hybrid CPUs put
+	// everyone in matesSameClass and the foreign phase disappears.
+	matesSameClass.assign(num_workers, {});
+	matesOtherClass.assign(num_workers, {});
+	for (unsigned int q = 0; q < num_workers; ++q)
+		for (int m : clusterMates[q])
+			((isPCore[m] == isPCore[q]) ? matesSameClass[q] : matesOtherClass[q]).push_back(m);
 }
 
 void TaskScheduler::StartPool(size_t poolSize) {
@@ -530,6 +549,11 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	// The last task's next is already handled by the queue's exchange logic
 	pendingTasks.fetch_add(count, std::memory_order_relaxed);
 	// 2. Submit the pointers directly - NO wrappers, NO heap allocation
+	// NOTE (corePref): the whole batch is placed at CorePref::Default (full-pool round-robin) onto ONE
+	// worker regardless of members' individual corePrefs -- a batch is assumed homogeneous/Default.
+	// Class-pinned tasks should go through Push() individually; once batched here, the receiving OWNER
+	// runs them unvetted (see the enforcement-scope note in Task.h), though class-aware STEALING still
+	// applies to whatever other workers try to take from this deque.
 	if (cpuaffinity == 0)
 	{
 		int chosen = PickNextWorker();
@@ -689,12 +713,34 @@ void TaskScheduler::Stop(Task* worker_task) {
 Task* TaskScheduler::GetTask() {
 	bool forceLoPri = (consecutiveHiPriSteals >= kStealFairnessWindow);
 
+	// FASTJOB- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenFastJob,
+	// whose fiberless caller can't run anything that might suspend. Previously this stole blind and
+	// Requeued non-fastJobs -- a claim-CAS + full re-push + notify to move a task nowhere (deque
+	// contention + thrash). Now a non-fastJob is never claimed at all: it stays put for a real worker,
+	// and the scan just moves to the next victim. Class matters too because TRSFJ's callers vary: the
+	// SchedulerMutex spin path invokes it FROM WORKERS (thief class = that worker's), while main/WaitFor
+	// helpers are non-workers pinned to CPU 0 -- a P-core -- so they vet as P. corePref is the sole
+	// placement authority EVERYWHERE, including helper steals.
+	// Thief class, NOT assumed: a worker (SchedulerMutex/CV spin inside a fastJob lands here from
+	// workers too) uses its pinned class; any NON-worker thread (main, or an arbitrary app thread
+	// hitting a scheduler primitive -- possibly unpinned and floating) asks the OS where it is RIGHT
+	// NOW via GetCurrentProcessorNumber + the per-CPU class table. "Would this fastJob run on a P or
+	// E core?" is answered by where the caller is actually standing.
+	Thread* thief = Thread::GetCurrent();
+	const bool thiefIsP = thief
+		? (isPCore[thief->qIndex] != 0)
+		: (isPCpu[GetCurrentProcessorNumber() & 63] != 0);
+	const bool degen = pWorkers.empty() || eWorkers.empty();
+	auto fastOnly = [&](Task* t) {
+		return t->fastJob != 0 && StealClassCompatible(t, thiefIsP, degen);
+	};
+
 	if (!forceLoPri) {
 		size_t numThreads = hiPri.size();
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
 			size_t target = (start + i) % numThreads;
-			if (auto s = hiPri[target]->steal()) {
+			if (auto s = hiPri[target]->steal_if(fastOnly)) {
 				consecutiveHiPriSteals++;
 				return *s;
 			}
@@ -707,7 +753,7 @@ Task* TaskScheduler::GetTask() {
 	size_t start = rand() % numThreads;
 	for (size_t i = 0; i < numThreads; ++i) {
 		size_t target = (start + i) % numThreads;
-		if (auto s = loPri[target]->steal())
+		if (auto s = loPri[target]->steal_if(fastOnly))
 			return *s;
 	}
 
@@ -715,18 +761,12 @@ Task* TaskScheduler::GetTask() {
 }
 
 bool TaskScheduler::TryRunStolenFastJob() {
-	// Steal ONE task. If it's a fastJob, run it to completion right here with the full completion
-	// bookkeeping Worker()'s fast path does. A non-fastJob task could suspend, and there's no fiber
-	// under this (non-worker) caller to switch away to, so hand it back to a real worker via
-	// Requeue() instead.
+	// Steal ONE fastJob and run it to completion right here with the full completion bookkeeping
+	// Worker()'s fast path does. GetTask vets fastJob-ness AT THE DEQUE (steal_if) -- a non-fastJob
+	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue
+	// relocation path (claim CAS + re-push + notify = contention/thrash) no longer exists.
 	Task* task = GetTask();
 	if (!task) return false;
-
-	if (!task->fastJob) {
-		// Requeue does NOT touch pendingTasks -- it's only relocating an already-counted task.
-		Requeue(task);
-		return true;
-	}
 
 	task->Execute();
 	if (task->waitGroup) {
