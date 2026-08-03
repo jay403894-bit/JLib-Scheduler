@@ -2,7 +2,7 @@
 
 A fiber-based, work-stealing task scheduler for real-time engines. Hand-written x64 context switching, lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and hybrid-core (P/E) aware placement — built for Windows, on purpose.
 
-**Windows x64 · MSVC · C++20 · BSD licensed**
+**Windows x64 · MSVC · C++17 · BSD licensed**
 
 ---
 
@@ -51,7 +51,7 @@ The trade: **Windows x64 + MSVC only, modern hardware assumed.** Constraining th
 
 ## ⚙️ 1. Requirements & Honest Limitations
 
-**Requirements:** Windows 10+ · x64 · MSVC (builds as C++20) · MASM (`ml64`, ships with VS) for the context-switch assembly.
+**Requirements:** Windows 10+ · x64 · MSVC (C++17 or later) · MASM (`ml64`, ships with VS) for the context-switch assembly.
 
 **Deliberate limitations — read before adopting:**
 
