@@ -123,7 +123,61 @@ void TaskScheduler::NotifyAll() {
 // 75us sits in the measured cluster. The error is asymmetric -- being slightly too eager can cost
 // multiples, being slightly too cautious costs a few percent near the boundary -- so when in doubt
 // this leans serial.
-static constexpr double kParallelWorthwhileUs = 75.0;
+// Keyed on OPTIMIZATION, not on NDEBUG alone. A "Development"/RelWithDebInfo build is optimized but
+// deliberately keeps assertions live, so it does NOT define NDEBUG -- testing NDEBUG by itself would
+// hand an optimized build the unoptimized threshold and serialize work that should be parallel.
+#if defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+static constexpr double kDefaultParallelWorthwhileUs = 75.0;
+#else
+// DEBUG BUILDS PAY A MUCH HIGHER DISPATCH COST and the 75us figure was measured in RELEASE. Unoptimized
+// std::function indirection, _ITERATOR_DEBUG_LEVEL on the containers, and un-inlined task allocation
+// make building a fork-join tree roughly an order of magnitude more expensive, while the constant is
+// *only* a measure of that overhead. Leaving it at 75 made Game01's physics loop -- hundreds of
+// elements, previously always serial under the old >10000 gate -- start parallelizing in Debug and
+// drop the game to 2 FPS, while Release stayed in the hundreds. Same threshold, wrong build.
+// Not a guess at a ratio: it is deliberately conservative, because in a Debug build being slightly too
+// serial costs nothing anyone measures, and being too eager costs an unusable frame rate.
+static constexpr double kDefaultParallelWorthwhileUs = 750.0;
+#endif
+
+// Runtime-settable so this can be BISECTED without a rebuild: set it absurdly high and every
+// ParallelFor runs serial, which answers "is ParallelFor responsible for this?" in one run instead of
+// a recompile per guess. Also legitimately useful beyond debugging -- the right value is a property of
+// the machine and the build, and an app that has profiled its own workload knows better than a
+// hard-coded constant. Plain double, written once at startup and only read afterwards.
+// Worker binding policy. Read once per worker at thread creation (Thread.cpp), so it must be set
+// before Init(); a plain global is correct here -- no cross-thread mutation after startup.
+// DEFAULT = Ideal, changed from Hard 2026-08-05 on measurement (bench.exe hard|physical|ideal|none,
+// 32-logical hybrid, idle):
+//
+//   policy    throughput   ParallelFor   latency    frame DAG
+//   hard        0.83 M/s      3.28x      6.93 us    41.94 us/graph
+//   physical    0.83 M/s      3.44x      8.32 us    36.56 us/graph
+//   ideal       0.79 M/s      3.72x      4.64 us    21.59 us/graph
+//   none        0.80 M/s      2.95x      4.58 us    21.73 us/graph
+//
+// Hard binding buys ~4% on bulk throughput (cache locality) and costs ~45% on WAKE LATENCY: a pinned
+// worker can only be woken onto its own core, so every sync point waits for that specific core to be
+// free. The frame DAG -- a chain of tiny nodes with a WaitFor between each, i.e. the shape of a real
+// frame -- is dominated by that, and it is where hard affinity loses nearly 2x.
+//
+// PhysicalOnly was added to test whether the loss was SMT contention (the old scheme pins workers to
+// logical CPUs 1..N, deliberately doubling up on physical cores). It helped -- 15 physically-pinned
+// workers roughly match 31 logically-pinned ones, so sibling contention IS real -- but it did not
+// close the gap to unpinned. So the dominant cost is binding itself, not the sibling mapping.
+//
+// Ideal keeps locality intent and the topology map meaningful while letting Windows move a worker
+// when its core is busy, which is the case that hurt. Hard remains available for a machine the app
+// genuinely owns, where predictable placement beats latency.
+// CAVEAT: measured on ONE idle hybrid machine with a synthetic bench. Re-measure under load and on
+// a non-hybrid CPU before treating this as universal.
+static TaskScheduler::AffinityPolicy g_affinityPolicy = TaskScheduler::AffinityPolicy::Ideal;
+void TaskScheduler::SetAffinityPolicy(AffinityPolicy p) { g_affinityPolicy = p; }
+TaskScheduler::AffinityPolicy TaskScheduler::GetAffinityPolicy() { return g_affinityPolicy; }
+
+static double g_parallelWorthwhileUs = kDefaultParallelWorthwhileUs;
+void TaskScheduler::SetParallelForThresholdUs(double us) { g_parallelWorthwhileUs = us; }
+double TaskScheduler::GetParallelForThresholdUs() { return g_parallelWorthwhileUs; }
 
 void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func) {
 	chunkSize = std::max(1, chunkSize);
@@ -156,7 +210,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 	}
 
 	const double estRemainingUs = probeUs * ((double)totalItems / (double)probeCount);
-	if (estRemainingUs >= kParallelWorthwhileUs) {
+	if (estRemainingUs >= g_parallelWorthwhileUs) {
 		int numTasks = (totalItems + chunkSize - 1) / chunkSize;
 
 		// HYBRID dispatch (same spirit as the scheduler's other hybrids -- fastJob-vs-fiber,
@@ -451,6 +505,34 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		if (poolSize > hw) poolSize = hw;
 	}
 
+	// PhysicalOnly: one worker per PHYSICAL core, pinned to that core's FIRST logical CPU, leaving
+	// every SMT sibling empty.
+	//
+	// This exists because the default scheme (worker i -> logical CPU i+1) deliberately places two
+	// workers on most physical cores as hyperthread siblings, where they contend for the same
+	// execution units. Benchmarking showed hard affinity ~1.8x WORSE than unpinned on the frame DAG,
+	// and this is the hypothesis for why: the problem may be the naive logical-index mapping rather
+	// than pinning itself. Windows' own scheduler spreads across distinct physical cores first and
+	// only doubles up when it has to.
+	//
+	// Note this necessarily HALVES the pool on an SMT machine -- so it changes two variables at once
+	// (placement AND worker count). That is inherent: you cannot put 31 workers on 16 physical cores
+	// without doubling up. Sizing a pool to physical rather than logical cores is a legitimate
+	// configuration in its own right, which is why it is worth measuring rather than avoiding.
+	std::vector<int> physicalCpus;   // empty unless PhysicalOnly; entry 0 is reserved for main
+	if (GetAffinityPolicy() == AffinityPolicy::PhysicalOnly) {
+		std::vector<ULONG_PTR> coreMasks;
+		if (GetGroupMasksForRelation(RelationProcessorCore, coreMasks)) {
+			for (ULONG_PTR m : coreMasks)
+				for (int cpu = 0; cpu < 64; ++cpu)
+					if (m & (ULONG_PTR(1) << cpu)) { physicalCpus.push_back(cpu); break; }
+		}
+		if (physicalCpus.size() >= 2)
+			poolSize = physicalCpus.size() - 1;   // one physical core left to main
+		else
+			physicalCpus.clear();                 // topology unavailable -> fall back to the normal scheme
+	}
+
 	unsigned int num_workers = static_cast<unsigned int>(poolSize);
 	// +1 for the main/submitting thread: it takes thread_id == num_workers at the end
 	// of StartPool and uses epochs too (e.g. DAG AddDependency -> EnterEpoch). Sizing to
@@ -509,7 +591,9 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		auto worker = std::make_shared<Thread>(*this);
 		worker->SetQueueIndex(i);
 		workers.push_back(worker);
-		worker->StartWorker(i + 1);
+		// Default scheme: worker i -> logical CPU i+1 (main keeps 0). PhysicalOnly instead walks the
+		// list of distinct physical cores, so no two workers share a core's execution units.
+		worker->StartWorker(physicalCpus.empty() ? (i + 1) : (size_t)physicalCpus[i + 1]);
 	}
 	for (auto& w : workers) {
 		while (!w->Ready())

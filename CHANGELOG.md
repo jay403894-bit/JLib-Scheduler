@@ -3,6 +3,43 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2026-08-05
+- **[BEHAVIOUR CHANGE] Worker affinity default is now `Ideal`, not hard pinning.** New
+  `TaskScheduler::SetAffinityPolicy(AffinityPolicy)` — `Hard` (`SetThreadAffinityMask`),
+  `Ideal` (`SetThreadIdealProcessor`, the new default), `None`, `PhysicalOnly` (one worker per
+  physical core, SMT siblings left empty). Must be set **before** `Init()`; binding happens at
+  thread creation.
+
+  Measured (`bench.exe hard|physical|ideal|none`, 32-logical hybrid, idle):
+
+  | policy | throughput | ParallelFor | latency | frame DAG |
+  |---|---|---|---|---|
+  | hard | 0.83 M/s | 3.28× | 6.93 µs | 41.94 µs/graph |
+  | physical | 0.83 M/s | 3.44× | 8.32 µs | 36.56 µs/graph |
+  | ideal | 0.79 M/s | 3.72× | **4.64 µs** | **21.59 µs/graph** |
+  | none | 0.80 M/s | 2.95× | 4.58 µs | 21.73 µs/graph |
+
+  Hard binding buys ~4% on bulk throughput and costs **~45% on wake latency**: a pinned worker can
+  only be woken onto its own core, so every sync point waits for that core specifically. The frame
+  DAG — a chain of small nodes with a `WaitFor` between each, i.e. the shape of an actual frame — is
+  dominated by that and loses nearly 2×. This contradicts the usual "engines pin their worker pool"
+  advice, which is why it's recorded with numbers rather than asserted.
+
+  `PhysicalOnly` exists because the previous scheme pinned workers to logical CPUs 1…N, deliberately
+  doubling up on physical cores. It confirmed SMT contention is real — 15 physically-pinned workers
+  roughly match 31 logically-pinned ones — but did **not** close the gap to unpinned, so the dominant
+  cost is binding itself rather than the sibling mapping.
+
+  **Caveat, deliberately not buried:** one idle hybrid machine, synthetic benchmark. Re-measure under
+  load and on a non-hybrid CPU before treating it as universal. `Hard` remains available and is still
+  the right choice for an application that genuinely owns the machine.
+- **`SetParallelForThresholdUs` / `GetParallelForThresholdUs`**: the ParallelFor work threshold is now
+  settable at runtime (defaults 75 µs optimized / 750 µs unoptimized). Set it enormous to force every
+  `ParallelFor` serial — the fastest way to answer "is ParallelFor causing this?" without a rebuild.
+- The threshold now keys on `NDEBUG || JLIB_DEVELOPMENT` rather than `NDEBUG` alone, so an optimized
+  build that deliberately keeps assertions live (RelWithDebInfo-style) doesn't get the unoptimized
+  value.
+
 ## 2026-08-04
 - **Renamed the build artifact `Threads` → `Scheduler`.** `Threads.lib` in `C:\libs\Threads` was the
   last leftover of the original "T_Threads" name and disagreed with both the repo (`jlib-scheduler`)
@@ -10,11 +47,13 @@ downstream users (forks/ports) should treat those as must-pull.
   `Scheduler.vcxproj`/`Scheduler.sln`, output is `Scheduler.lib`, canonical install is
   `C:\libs\Scheduler`. The namespace and class names are **unchanged** (`JLib::TaskScheduler`); this
   is purely the artifact.
-  **Not a breaking change:** `deploy_lib.bat` also emits the old `Threads.lib` into `C:\libs\Threads`
-  as a compatibility shim, so unmigrated consumers keep linking while projects move over one at a
-  time. Downstream forks: switch your linker input to `Scheduler.lib` and include path to
-  `C:\libs\Scheduler\include` when convenient — the shim will be dropped once the umbrella repo
-  lands, and will not survive it.
+  **[BREAKING for downstream]** `Threads.lib` and `C:\libs\Threads` are **gone**, not deprecated. A
+  compatibility shim emitting both names existed briefly during the migration and was removed the
+  same day once every consumer here was moved and verified — carrying a dead path just to avoid a
+  one-line edit isn't worth the confusion of two names meaning the same thing, and pre-1.0 is exactly
+  when a clean break is cheapest. **Forks: change your linker input to `Scheduler.lib` and your
+  include path to `C:\libs\Scheduler\include`.** That is the whole migration; nothing in the API
+  moved.
 - **`bench/` is now in the repo** (`bench.cpp` + `build_bench.bat`). It was previously local-only,
   which made the measurements below unreproducible by anyone else.
 - **`ParallelFor` now decides serial-vs-parallel by MEASURING, not by element count.** The old gate

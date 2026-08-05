@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #define NOMINMAX
 #include "Task.h"
 #include "TaskMPSCQueue.h"
@@ -60,6 +60,42 @@ namespace JLib {
 		// parallelized cheap loops that then ran 11x slower and serialized expensive ones that would
 		// have run 12x faster. `chunkSize` is the grain; it is floored so the range can't be split into
 		// more than ~4 chunks per worker no matter how small a value is passed.
+		// How workers are bound to logical CPUs. Set BEFORE Init(); changing it afterwards does
+		// nothing, since binding happens at thread creation.
+		//
+		//   Hard  (default) -- SetThreadAffinityMask. A worker runs on its own core or nowhere. Best
+		//                      cache locality, and the only mode where you DECIDE where
+		//                      oversubscription lands instead of discovering it. This is what shipping
+		//                      engines do, because a game largely owns the machine.
+		//   Ideal           -- SetThreadIdealProcessor: a strong hint. Keeps locality and keeps the
+		//                      topology map meaningful, but Windows may migrate a worker under
+		//                      contention from ANOTHER PROCESS, or for thermal/core-parking reasons --
+		//                      the cases where hard affinity's worst case bites. A good default if the
+		//                      host application does not own the machine.
+		//   None            -- placement entirely up to Windows. For embedding inside an application
+		//                      that manages thread placement itself.
+		//
+		// Locality-aware stealing (SMT sibling, then cache cluster) only means anything under Hard or
+		// Ideal: if threads migrate freely, "my sibling" stops describing where data is. Pinning and
+		// topology-aware stealing are one decision, not two.
+		//   PhysicalOnly    -- one worker per PHYSICAL core, pinned to that core's first logical CPU with
+//                      every SMT sibling left empty. HALVES the pool on an SMT machine, so it varies
+//                      placement AND worker count together -- that is unavoidable, and sizing a pool
+//                      to physical cores is a normal configuration in its own right.
+        enum class AffinityPolicy : uint8_t { Hard = 0, Ideal, None, PhysicalOnly };
+		static void           SetAffinityPolicy(AffinityPolicy p);
+		static AffinityPolicy GetAffinityPolicy();
+
+		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
+		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
+		// dispatch+join overhead, and an unoptimized build pays roughly an order of magnitude more of it.
+		// Exposed because it is a property of the machine and build, not a universal truth; an app that
+		// has profiled its own workload knows better. Set it enormous (1e12) to force every ParallelFor
+		// serial, which is the fastest way to answer "is ParallelFor causing this?" without a rebuild.
+		// Set once at startup; read-only thereafter.
+		static void   SetParallelForThresholdUs(double us);
+		static double GetParallelForThresholdUs();
+
 		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		// Fork-join (recursive-split) variant of ParallelFor -- experimental, benchmarked against the
 		// flat one. Splits the range in half, spawns the right half as a task, recurses on the left
@@ -336,3 +372,4 @@ namespace JLib {
 		void Notify_All();
 	};
 }
+

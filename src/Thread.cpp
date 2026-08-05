@@ -1,4 +1,4 @@
-#include "../include/Thread.h"
+﻿#include "../include/Thread.h"
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
 #include <chrono>
@@ -26,7 +26,34 @@ void Thread::StartWorker(size_t cpu_affinity)
 		});
 	nativeHandle = thread.native_handle();
 #ifdef _WIN32
-	SetThreadAffinityMask(nativeHandle, 1ULL << cpu_affinity);
+	// HOW this worker is bound to its core, per TaskScheduler::SetAffinityPolicy.
+	//
+	// Hard  -- SetThreadAffinityMask: the thread runs on that logical CPU or nowhere. Best cache
+	//          locality and the only mode where "where does oversubscription land" is a decision
+	//          rather than a discovery. Worst case: another process pins something to the same core
+	//          and this worker is stuck behind it with no escape.
+	// Ideal -- SetThreadIdealProcessor: a strong HINT. Windows keeps the thread there when it can,
+	//          so cache locality and the topology map still hold, but it may migrate under contention
+	//          or thermal pressure. Notably it also leaves core parking and Thread Director able to
+	//          do their jobs.
+	// None  -- leave placement entirely to Windows. Only sensible if this library is embedded in an
+	//          application that owns thread placement itself, which is a real consideration for a
+	//          LIBRARY that would otherwise hard-pin N threads inside someone else's process.
+	//
+	// NOTE the topology-aware steal ordering (SMT sibling first, then cache cluster) is only
+	// meaningful under Hard or Ideal: if threads migrate freely, "my sibling" no longer describes
+	// where any data actually is. Pinning and locality-aware stealing are ONE decision, not two.
+	switch (scheduler->GetAffinityPolicy()) {
+	case TaskScheduler::AffinityPolicy::PhysicalOnly:   // one worker per physical core -- still a hard bind
+	case TaskScheduler::AffinityPolicy::Hard:
+		SetThreadAffinityMask(nativeHandle, 1ULL << cpu_affinity);
+		break;
+	case TaskScheduler::AffinityPolicy::Ideal:
+		SetThreadIdealProcessor(nativeHandle, (DWORD)cpu_affinity);
+		break;
+	case TaskScheduler::AffinityPolicy::None:
+		break;
+	}
 #endif
 	ready->store(true, std::memory_order_release);
 };
@@ -552,3 +579,4 @@ void Thread::Worker() {
 	running.store(false, std::memory_order_release);
 	cvWorkerDone.notify_all();
 }
+
