@@ -1,0 +1,8 @@
+# Deliberately NARROW. This repo does not blanket-ignore build output, because some JLib repos
+# intentionally commit their x64/ folders so a clone can build without a separate deploy step.
+# Only the bench's local artifacts are ignored here: bench.exe is a few hundred KB of binary that
+# would bloat history for no benefit, and it is rebuilt by bench/build_bench.bat in seconds.
+bench/*.exe
+bench/*.obj
+bench/*.pdb
+bench/*.ilk

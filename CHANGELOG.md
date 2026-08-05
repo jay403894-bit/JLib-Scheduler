@@ -4,6 +4,19 @@ Correctness fixes are marked **[CRITICAL]** with a note on what breaks without t
 downstream users (forks/ports) should treat those as must-pull.
 
 ## 2026-08-04
+- **Renamed the build artifact `Threads` → `Scheduler`.** `Threads.lib` in `C:\libs\Threads` was the
+  last leftover of the original "T_Threads" name and disagreed with both the repo (`jlib-scheduler`)
+  and the class (`JLib::TaskScheduler`) — three names for one library. Now: project/solution are
+  `Scheduler.vcxproj`/`Scheduler.sln`, output is `Scheduler.lib`, canonical install is
+  `C:\libs\Scheduler`. The namespace and class names are **unchanged** (`JLib::TaskScheduler`); this
+  is purely the artifact.
+  **Not a breaking change:** `deploy_lib.bat` also emits the old `Threads.lib` into `C:\libs\Threads`
+  as a compatibility shim, so unmigrated consumers keep linking while projects move over one at a
+  time. Downstream forks: switch your linker input to `Scheduler.lib` and include path to
+  `C:\libs\Scheduler\include` when convenient — the shim will be dropped once the umbrella repo
+  lands, and will not survive it.
+- **`bench/` is now in the repo** (`bench.cpp` + `build_bench.bat`). It was previously local-only,
+  which made the measurements below unreproducible by anyone else.
 - **`ParallelFor` now decides serial-vs-parallel by MEASURING, not by element count.** The old gate
   was `totalItems > 10000` — a constant set before fork-join existed and never re-measured. A sweep
   of per-element cost (1/8/64/512 flops) against N (256…200,000) found the crossover *element count*
