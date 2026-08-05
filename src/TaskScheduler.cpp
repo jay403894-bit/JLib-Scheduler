@@ -113,11 +113,50 @@ void TaskScheduler::NotifyAll() {
 	for (auto& w : workers)
 		w->NotifyWorker();
 }
+// How much SERIAL WORK a loop must represent before splitting it pays for itself. Measured, not
+// guessed (bench.exe, BenchParallelForCrossover): sweeping per-element cost over four orders of
+// magnitude, the crossover ELEMENT COUNT moves 400x (200,000 for a trivial body down to ~400 for an
+// expensive one) while the crossover WORK stays pinned at 70-92us. That constant is the fork-join
+// dispatch+join overhead, and it is the only thing that generalizes -- which is why the old
+// `totalItems > 10000` gate was wrong in BOTH directions: it let a trivial body parallelize at 10k
+// where it ran 11x SLOWER, and forced an expensive body serial at 4k where parallel was 12x faster.
+// 75us sits in the measured cluster. The error is asymmetric -- being slightly too eager can cost
+// multiples, being slightly too cautious costs a few percent near the boundary -- so when in doubt
+// this leans serial.
+static constexpr double kParallelWorthwhileUs = 75.0;
+
 void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func) {
 	chunkSize = std::max(1, chunkSize);
 	int totalItems = end - start;
 	if (totalItems <= 0) return;
-	if (totalItems > 10000) {
+
+	// PROBE: the scheduler cannot know what an element costs, and the caller usually cannot say in a
+	// portable way either -- so measure it. Run a small prefix serially, time it, and extrapolate to
+	// the rest. The probe is not overhead: it is loop work that had to happen regardless, just done
+	// here instead of in a chunk. Sized as a fraction of the range so an expensive body cannot burn
+	// the whole budget deciding (32 heavy elements is ~19us, well under the threshold it is testing).
+	const int probeCount = std::min(totalItems, std::max(32, std::min(1024, totalItems / 64)));
+	const auto probeT0 = std::chrono::steady_clock::now();
+	func(start, start + probeCount);
+	const double probeUs =
+		std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - probeT0).count();
+
+	start += probeCount;
+	totalItems -= probeCount;
+	if (totalItems <= 0) return;   // the probe was the whole range
+
+	// Floor the chunk size so the range can't be shattered into more pieces than the pool can use.
+	// A caller passing a small chunkSize is expressing "split this finely", but past ~4 chunks per
+	// worker extra pieces buy no more load balancing and cost a task each -- 256 elements at
+	// chunkSize 2 builds 128 tasks to do ~250us of work, and measured 0.49x (i.e. 2x SLOWER) purely
+	// on tree overhead. 4 per worker keeps enough pieces to even out a ragged body.
+	{
+		const int maxUsefulTasks = (int)std::max<size_t>(1, workers.size() * 4);
+		chunkSize = std::max(chunkSize, (totalItems + maxUsefulTasks - 1) / maxUsefulTasks);
+	}
+
+	const double estRemainingUs = probeUs * ((double)totalItems / (double)probeCount);
+	if (estRemainingUs >= kParallelWorthwhileUs) {
 		int numTasks = (totalItems + chunkSize - 1) / chunkSize;
 
 		// HYBRID dispatch (same spirit as the scheduler's other hybrids -- fastJob-vs-fiber,
@@ -180,8 +219,9 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 	}
 	else
 	{
-		// Too small to parallelize -- dispatch overhead would dominate. One whole-range call is
-		// equivalent to the old per-item func(i, i+1) loop for a range-processing func, and cheaper.
+		// Not enough work left to pay for dispatch -- finish the remainder inline. One whole-range
+		// call is equivalent to the old per-item func(i, i+1) loop for a range-processing func,
+		// and cheaper.
 		func(start, end);
 	}
 }

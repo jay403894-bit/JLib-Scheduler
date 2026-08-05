@@ -52,6 +52,14 @@ namespace JLib {
 		void WaitForMain(WaitGroup& wg);
 		void Join();
 		void NotifyAll();
+		// Parallel range loop. Decides serial-vs-parallel by MEASURING, not by element count: it runs a
+		// small prefix inline, times it, and parallelizes the rest only if the extrapolated work clears
+		// ~75us. That constant is the fork-join dispatch overhead and is the only thing that
+		// generalizes -- the crossover ELEMENT COUNT moves 400x with per-element cost (see
+		// bench.exe's crossover sweep), which is why the old fixed `> 10000` gate simultaneously
+		// parallelized cheap loops that then ran 11x slower and serialized expensive ones that would
+		// have run 12x faster. `chunkSize` is the grain; it is floored so the range can't be split into
+		// more than ~4 chunks per worker no matter how small a value is passed.
 		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		// Fork-join (recursive-split) variant of ParallelFor -- experimental, benchmarked against the
 		// flat one. Splits the range in half, spawns the right half as a task, recurses on the left

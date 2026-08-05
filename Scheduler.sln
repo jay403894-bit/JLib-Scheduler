@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
 VisualStudioVersion = 18.6.11822.322 stable
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "T_Threads", "T_Threads.vcxproj", "{DAB96225-CB15-4F33-B85A-950DB429DF85}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Scheduler", "Scheduler.vcxproj", "{DAB96225-CB15-4F33-B85A-950DB429DF85}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -29,3 +29,5 @@ Global
 		SolutionGuid = {73776BC2-DA2F-4D5C-976E-E3E426966F90}
 	EndGlobalSection
 EndGlobal
+
+

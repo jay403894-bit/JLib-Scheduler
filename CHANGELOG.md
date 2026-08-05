@@ -3,6 +3,72 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2026-08-04
+- **`ParallelFor` now decides serial-vs-parallel by MEASURING, not by element count.** The old gate
+  was `totalItems > 10000` — a constant set before fork-join existed and never re-measured. A sweep
+  of per-element cost (1/8/64/512 flops) against N (256…200,000) found the crossover *element count*
+  moves **400×** with body cost (200,000 for a trivial body, ~400 for an expensive one) while the
+  crossover *work* stays pinned at **70–92 µs**. Element count was never the right unit: what races
+  dispatch overhead is count × cost-per-element. The fixed gate was therefore wrong in **both**
+  directions — a trivial body at N=10,001 was parallelized and ran **8–11× slower**, while a heavy
+  body at N=4,000 was forced serial when parallel was **12.6× faster**.
+  `ParallelFor` now runs a small prefix inline, times it, extrapolates, and parallelizes the
+  remainder only if the estimate clears `kParallelWorthwhileUs = 75.0`. The probe is not overhead —
+  it is loop work that had to happen anyway, done before the split instead of inside a chunk.
+  Measured after: a trivial body went from 0.01–0.12× to a flat ~1.00× across the range (correctly
+  choosing serial), while a heavy body keeps 5–19× from N=512 up.
+  API-neutral — the signature is unchanged and no caller needs editing, but **callers with cheap
+  bodies over 10k elements were silently losing several times over and will speed up on relink.**
+- **`chunkSize` is now floored** so a range can't be split into more than ~4 chunks per worker.
+  Past that, extra pieces buy no more load balancing and cost a task each: 256 elements at
+  `chunkSize=2` built 128 tasks and measured 0.49× (2× *slower*) on tree overhead alone.
+- **Crossover sweep added to the bench** (`bench/bench.cpp` → `BenchParallelForCrossover`), so the
+  next time the dispatch path changes this constant can be re-derived instead of re-guessed.
+- **C++17 compatibility is now enforced by the build**, not merely asserted: `deploy_lib.bat`
+  compiles with `/std:c++17` (was `/std:c++20`). The scheduler never needed C++20 — it started
+  compiling as such only because a newer Visual Studio defaults that way. Verified clean.
+
+## 2026-08-02
+- **Stealing policy made P/E-core aware.** A thief now prefers victims of its own core class, and a
+  task with an explicit P/E preference is only stolen by a matching-class thief — so placement
+  survives work-stealing instead of being undone by the first steal.
+- **Pool sizing policy documented and settled**: reserve one core per *shipped, persistent, busy*
+  thread — `hw-2` when the audio device thread is present, `hw-1` otherwise. The rule is about
+  measured busy time, not thread existence; a thread that exists but sleeps costs nothing to
+  schedule around. Transient oversubscription is accepted deliberately and is not a bug to chase:
+  driver and OS threads the process does not own will always exist, profilers count spin-waiting
+  workers as running, and neither is actionable from inside a scheduler.
+
+## 2026-08-01
+- **`Task::corePref` — P-core / E-core placement.** `CorePref::{Default, P, E, Wide}`, living in what
+  was tail padding on `Task`, so it costs no extra bytes. **Priority and placement are deliberately
+  orthogonal**: priority controls queue *order* only, placement is decided solely by `corePref`.
+  Enforced at push placement (`PickNextWorker`) and at steal time; an explicit core affinity
+  overrides it, being the stronger and more explicit request. Class-based routing is **opt-in and
+  dormant** — everything is `Default` until a profiled caller asks otherwise, so behaviour is
+  unchanged for existing code.
+
+## 2026-07-23
+- **`ParallelFor` dispatch is now hybrid flat/fork-join.** The flat path has the caller spawn every
+  chunk serially — fine, and ~14% faster, when there are few tasks — but its O(#tasks) serial
+  `CreateTask`+`Push`+`NotifyWorker` on one thread collapses at fine grain (~8× slower at ~15k
+  tasks, with each notify also taking the worker mutex from the lost-wakeup fix). Fork-join spreads
+  task *creation* across the pool and wins decisively past a few dozen tasks. Crossover: ~2 tasks
+  per worker.
+- **`TaskAllocator` optimized.**
+
+## 2026-07-22
+- **Batch stealing removed** (`stealbatch`, plus a follow-up sweep for vestigial remnants) — stealing
+  is single-item now. Downstream note: this is what makes the promotion removal below correct.
+- **Age-based promotion REMOVED** — this supersedes the mechanism described in the 2026-07-15 entry
+  below. (It was briefly re-enabled on 07-21, which is why the history shows it twice; removing batch
+  stealing the next day is what settled the question.) It became vestigial once stealing went
+  single-item: a steal un-starves a loPri task
+  immediately, so the 50 ms promotion timer never had anything left to rescue. The steal-fairness
+  window (a forced loPri scan after 8 consecutive hiPri steals) is the real anti-starvation
+  mechanism and remains. Do not re-add promotion without a profile showing starvation the fairness
+  window misses. Downstream forks: dropping it is safe; keeping it is merely dead weight.
+
 ## 2026-07-20
 - **Fiber-aware synchronization toolkit** (SchedulerMutex, SchedulerSemaphore,
   SchedulerConditionVariable): three complementary primitives built on spinlocks and
