@@ -9,6 +9,13 @@
 namespace JLib {
     class Thread;
     class GlobalFiberPool {
+        // Per-fiber stack sizes. Each is used three times below (arena capacity, the
+        // AllocateStack request, and Fiber::stackSize) -- keep them here so tuning one
+        // cannot leave the arena sized for a stack the fibers no longer use. The lowest
+        // 4KB page of each stack is the guard page, so usable depth is 4KB less.
+        static constexpr size_t kStandardStackSize = 64 * 1024;
+        static constexpr size_t kHeavyStackSize = 512 * 1024;
+
         mutable std::mutex poolMutex;
         moodycamel::ConcurrentQueue<Fiber*> availableFibers;
         unsigned int size = 0;

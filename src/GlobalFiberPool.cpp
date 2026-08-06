@@ -4,21 +4,21 @@
 using namespace JLib;
 
 GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
-	: standardArena(standardCount * 64 * 1024),
-	heavyArena(heavyCount * 512 * 1024),
+	: standardArena(standardCount * kStandardStackSize),
+	heavyArena(heavyCount * kHeavyStackSize),
 	availableFibers(standardCount + heavyCount),
 	size(standardCount + heavyCount) // Initialize queue with total capacity
 {
 	// 1. Initialize standard fibers
 	standardFibers.reserve(standardCount);
 	for (size_t i = 0; i < standardCount; ++i) {
-		void* stackMem = standardArena.AllocateStack(64 * 1024);
+		void* stackMem = standardArena.AllocateStack(kStandardStackSize);
 		if (!stackMem) throw std::runtime_error("Failed to allocate stack");
 
 		standardFibers.emplace_back();
 		Fiber& f = standardFibers.back();
 		f.stackBase = stackMem;
-		f.stackSize = 64 * 1024;
+		f.stackSize = kStandardStackSize;
 
 		// Register this fiber's EBR slot ONCE. Fibers live for the whole program (the
 		// pool is leaked, the vector is reserve()'d so it never reallocates), so the
@@ -32,13 +32,13 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
 	// 2. Initialize heavy fibers
 	heavyFibers.reserve(heavyCount);
 	for (size_t i = 0; i < heavyCount; ++i) {
-		void* stackMem = heavyArena.AllocateStack(512 * 1024);
+		void* stackMem = heavyArena.AllocateStack(kHeavyStackSize);
 		if (!stackMem) throw std::runtime_error("Failed to allocate stack");
 
 		heavyFibers.emplace_back();
 		Fiber& f = heavyFibers.back();
 		f.stackBase = stackMem;
-		f.stackSize = 512 * 1024;
+		f.stackSize = kHeavyStackSize;
 
 		EpochManager::Instance().RegisterParticipant(&f.localEpoch);  // see standard loop
 
