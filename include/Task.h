@@ -3,6 +3,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
+#include <cassert>   // the slab-allocation guard in operator delete below
 
 namespace JLib {
     struct Fiber;
@@ -77,9 +78,24 @@ namespace JLib {
 
         }
 
+        // Tasks come from TaskAllocator's slabs and are returned there; they are never new'd or
+        // deleted. `new` stays DELETED -- that is the half that matters, since it stops a Task
+        // being heap-allocated in the first place.
+        //
+        // `operator delete` CANNOT be deleted alongside it, and that is not a style choice: Task
+        // has a VIRTUAL destructor, so the compiler emits a *deleting* destructor into the vtable,
+        // and that requires an accessible operator delete whether or not any code ever calls it.
+        // MSVC tolerates the deleted form; GCC rejects it, and the standard is on GCC's side.
+        // Found by compiling for Linux -- non-conforming code that happened to build, which is the
+        // category that breaks on a compiler upgrade rather than only on a new platform.
+        //
+        // Defined and forbidden at runtime instead: same guarantee, enforcement moved from compile
+        // time to a debug assert.
         void* operator new(std::size_t) = delete;
         void* operator new[](std::size_t) = delete;
-        void operator delete(void*) = delete;
+        void operator delete(void*) noexcept {
+            assert(false && "Task is slab-allocated by TaskAllocator; never delete one");
+        }
         void operator delete[](void*) = delete;
 
         inline void Execute() noexcept {
@@ -103,9 +119,13 @@ namespace JLib {
         }
 		~LambdaTask() {
 		}
+        // Same reasoning as Task's, and for the same reason: this destructor is virtual by
+        // inheritance, so its deleting destructor needs an accessible operator delete.
         void* operator new(std::size_t) = delete;
         void* operator new[](std::size_t) = delete;
-        void operator delete(void*) = delete;
+        void operator delete(void*) noexcept {
+            assert(false && "LambdaTask is slab-allocated by TaskAllocator; never delete one");
+        }
         void operator delete[](void*) = delete;
 
     private:

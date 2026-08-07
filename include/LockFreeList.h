@@ -3,7 +3,8 @@
 #include <vector>
 #include <atomic>
 #include <iostream>
-#include <intrin.h>
+// <intrin.h> was here and is MSVC-only. Removed rather than guarded: nothing in this header uses
+// an intrinsic from it -- it was a leftover include that only ever cost a Linux build.
 #include <limits>
 #include <cstdint>
 #include "Epochs.h"
@@ -99,6 +100,18 @@ namespace JLib {
 	struct LNodeBase {
 		LMarkablePointer next;   // always points to NodeBase*
 		uint64_t key;           // keep the key here for traversal/comparison
+		// The allocator this node came from, so it can be returned to the RIGHT one.
+		//
+		// Needed because reclamation goes through EpochManager::RetirePtr, whose callback is a
+		// plain void(*)(void*) with no context -- so the deleter is necessarily a STATIC function
+		// and cannot see the owning list's `allocator` member. Carrying the pointer per node is
+		// the cheapest way to give the callback that context.
+		//
+		// Previously slabDeleter simply referenced the instance member from a static function.
+		// MSVC never caught it because nothing instantiated remove() on a slab-backed list; GCC
+		// rejects it outright. It was a landmine rather than dead code -- the first caller of
+		// remove() would have broken the build on both compilers.
+		TaskAllocator* owner = nullptr;
 	};
 	template<typename T>
 	struct LNode : LNodeBase {
@@ -151,8 +164,9 @@ namespace JLib {
 			// 1. If you used placement new, explicitly destroy
 			node->data.~T();
 
-			// 2. Return the raw memory block to the EXACT allocator that gave it to you
-			allocator.Free(node);
+			// 2. Return the raw memory block to the EXACT allocator that gave it to you -- read
+			// back off the node, since a static callback has no instance to ask.
+			if (node->owner) node->owner->Free(node);
 		}
 		static void heapDeleter(void* ptr) {
 			auto* node = static_cast<LNode<T>*>(ptr);
@@ -169,6 +183,8 @@ namespace JLib {
 			void* mem2 = allocator.Alloc();
 			head = new (mem) LNode<T>(0, T());
 			tail = new (mem2) LNode<T>(UINT64_MAX, T());
+			head->owner = &allocator;
+			tail->owner = &allocator;
 			head->next.set(tail, false);
 		}
 		~LockFreeList() {
@@ -204,6 +220,7 @@ namespace JLib {
 				}
 				void* mem = allocator.Alloc();
 				LNode<T>* node = new (mem) LNode<T>(key, item);
+				node->owner = &allocator;   // so slabDeleter can return it on retire
 				node->next.set(curr, false);
 
 				if (pred->next.compareAndSet(curr, node, false, false)) {

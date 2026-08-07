@@ -2,6 +2,7 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/platform.h"
+#include "../include/Topology.h"
 #include <stdexcept>
 #include <vector>
 #include <chrono>
@@ -324,41 +325,19 @@ void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::functi
 		Push([=]() { func(chunkStart, chunkEnd); });
 	}
 }
-// Queries real Windows topology (GetLogicalProcessorInformationEx) and fills siblingQIndex/
-// clusterMates from it -- NOT from the sequential affinity scheme assumption (worker qIndex i
-// is pinned to logical CPU i+1, main sits on 0). That mapping tells you what you ASKED the OS
-// for, not what the hardware actually looks like (adjacent logical CPU numbers being SMT/cache
-// neighbors is a common convention, never a guarantee). Limitation: only considers processor
-// GROUP 0 (fine for the vast majority of desktop/workstation hardware, i.e. <=64 logical CPUs;
-// a true >64-logical-CPU multi-group machine would need GROUP_AFFINITY.Group handled too).
-// On ANY failure (API unsupported, nothing returned, etc.) falls back to safe defaults: no SMT
-// sibling for anyone, and everyone in one big cluster -- equivalent to the old plain-random
-// behavior, just never wrong.
-static bool GetGroupMasksForRelation(LOGICAL_PROCESSOR_RELATIONSHIP relation, std::vector<ULONG_PTR>& outMasks) {
-	DWORD len = 0;
-	GetLogicalProcessorInformationEx(relation, nullptr, &len);
-	if (len == 0) return false;
-
-	std::vector<std::byte> buffer(len);
-	auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-	if (!GetLogicalProcessorInformationEx(relation, base, &len)) return false;
-
-	DWORD offset = 0;
-	while (offset < len) {
-		auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
-		if (info->Relationship == relation) {
-			const PROCESSOR_RELATIONSHIP& proc = info->Processor;
-			for (WORD g = 0; g < proc.GroupCount; ++g) {
-				if (proc.GroupMask[g].Group == 0) {
-					outMasks.push_back(proc.GroupMask[g].Mask);
-				}
-			}
-		}
-		offset += info->Size;
-	}
-	return true;
-}
-
+// Fills siblingQIndex/clusterMates from REAL hardware topology -- NOT from the sequential affinity
+// scheme assumption (worker qIndex i is pinned to logical CPU i+1, main sits on 0). That mapping
+// tells you what you ASKED the OS for, not what the hardware actually looks like (adjacent logical
+// CPU numbers being SMT/cache neighbors is a common convention, never a guarantee).
+//
+// ACQUIRING the topology is platform-specific and lives in src/win32/Topology.cpp (a Win32 API)
+// and src/posix/Topology.cpp (sysfs text). DERIVING relationships from it is not platform-specific
+// and stays here -- the "exactly two workers share this core" rule, the widest-group-is-LLC
+// heuristic and the P/E demotion rule are the subtle parts, and there is one copy of each.
+//
+// On ANY failure (API unsupported, sysfs absent, nothing returned) this falls back to safe
+// defaults: no SMT sibling for anyone, and everyone in one big cluster -- equivalent to plain
+// random stealing, just never wrong.
 void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	siblingQIndex.assign(num_workers, -1);
 	clusterMates.assign(num_workers, {});
@@ -376,56 +355,35 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	// fallback if the query fails -- only demote workers we positively identify as lower-class. ---
 	isPCore.assign(num_workers, 1);
 	isPCpu.assign(64, 1);   // per-LOGICAL-CPU class (group 0); default all-P (non-hybrid / query-fail safe)
+
+	topology::Info topo;
+	topology::Query(topo);
+
 	{
-		DWORD len = 0;
-		GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-		if (len > 0) {
-			std::vector<std::byte> buf(len);
-			auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
-			if (GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
-				std::vector<int> effOf(num_workers, -1);   // this worker's core efficiency class, -1 = unknown
-				int effOfCpu[64]; for (int i = 0; i < 64; ++i) effOfCpu[i] = -1;
-				int maxEff = -1;
-				DWORD off = 0;
-				while (off < len) {
-					auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
-					if (info->Relationship == RelationProcessorCore) {
-						const PROCESSOR_RELATIONSHIP& proc = info->Processor;
-						int eff = (int)proc.EfficiencyClass;
-						if (eff > maxEff) maxEff = eff;
-						for (WORD g = 0; g < proc.GroupCount; ++g) {
-							if (proc.GroupMask[g].Group != 0) continue;   // group 0 only (see the >64-CPU note)
-							ULONG_PTR mask = proc.GroupMask[g].Mask;
-							for (int cpu = 0; cpu < 64; ++cpu)
-								if (mask & (ULONG_PTR(1) << cpu)) {
-									effOfCpu[cpu] = eff;
-									int q = qIndexOf(cpu);
-									if (q >= 0) effOf[q] = eff;
-								}
-						}
-					}
-					off += info->Size;
-				}
-				// E only if the class is KNOWN and strictly below the top class seen (workers AND raw CPUs
-				// -- the CPU table serves unpinned/non-worker threads, see isPCpu in the header).
-				for (unsigned int q = 0; q < num_workers; ++q)
-					if (effOf[q] >= 0 && effOf[q] < maxEff) isPCore[q] = 0;
-				for (int cpu = 0; cpu < 64; ++cpu)
-					if (effOfCpu[cpu] >= 0 && effOfCpu[cpu] < maxEff) isPCpu[cpu] = 0;
+		// E only if the class is KNOWN and strictly below the top class seen (workers AND raw CPUs
+		// -- the CPU table serves unpinned/non-worker threads, see isPCpu in the header). Linux
+		// reports all-unknown today, so every core stays P there, which is what dormant class
+		// routing wants.
+		for (int cpu = 0; cpu < 64; ++cpu) {
+			const int eff = topo.efficiencyClass[cpu];
+			if (eff >= 0 && eff < topo.maxClass) {
+				isPCpu[cpu] = 0;
+				int q = qIndexOf(cpu);
+				if (q >= 0) isPCore[q] = 0;
 			}
 		}
 	}
 
-	std::vector<ULONG_PTR> coreMasks;    // one entry per physical core -- SMT sibling groups
-	std::vector<ULONG_PTR> cacheMasks;   // one entry per LLC instance -- cluster groups
-	bool haveCores = GetGroupMasksForRelation(RelationProcessorCore, coreMasks);
-	bool haveCache = GetGroupMasksForRelation(RelationCache, cacheMasks);
+	const std::vector<uint64_t>& coreMasks  = topo.coreMasks;    // one per physical core -- SMT groups
+	const std::vector<uint64_t>& cacheMasks = topo.cacheMasks;   // one per cache instance -- clusters
+	const bool haveCores = topo.haveCores;
+	const bool haveCache = topo.haveCache;
 
 	if (haveCores) {
-		for (ULONG_PTR mask : coreMasks) {
+		for (uint64_t mask : coreMasks) {
 			std::vector<int> qsInGroup;
 			for (int cpu = 0; cpu < 64; ++cpu) {
-				if (mask & (ULONG_PTR(1) << cpu)) {
+				if (mask & (uint64_t(1) << cpu)) {
 					int q = qIndexOf(cpu);
 					if (q >= 0) qsInGroup.push_back(q);
 				}
@@ -441,7 +399,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	}
 
 	if (haveCache) {
-		for (ULONG_PTR mask : cacheMasks) {
+		for (uint64_t mask : cacheMasks) {
 			// RelationCache returns one record PER cache instance PER level (L1/L2/L3 all
 			// come back through this same query) -- we only want the last-level one(s), which
 			// in practice are the masks covering the MOST logical CPUs. Filtering by "biggest
@@ -450,7 +408,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 			// mask here and pick the highest-CPU-count group per worker afterward.
 			std::vector<int> qsInGroup;
 			for (int cpu = 0; cpu < 64; ++cpu) {
-				if (mask & (ULONG_PTR(1) << cpu)) {
+				if (mask & (uint64_t(1) << cpu)) {
 					int q = qIndexOf(cpu);
 					if (q >= 0) qsInGroup.push_back(q);
 				}
@@ -474,6 +432,26 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 		for (unsigned int q = 0; q < num_workers; ++q) {
 			for (unsigned int other = 0; other < num_workers; ++other) {
 				if (other != q && (int)other != siblingQIndex[q]) clusterMates[q].push_back((int)other);
+			}
+		}
+	}
+
+	// Per-worker LLC domain mask, for the Ideal policy on platforms whose affinity API takes a mask
+	// (see llcMaskOfWorker in the header). The widest cache group containing this worker's logical
+	// CPU is its last-level cache -- the same "widest wins" rule the cluster derivation above uses,
+	// so a worker's mask and its clusterMates always describe the same domain.
+	llcMaskOfWorker.assign(num_workers, 0);
+	if (haveCache) {
+		for (unsigned int q = 0; q < num_workers; ++q) {
+			const int cpu = (int)q + 1;              // the sequential pinning scheme: main on 0
+			if (cpu >= 64) continue;
+			const uint64_t bit = uint64_t(1) << cpu;
+			int best = 0;
+			for (uint64_t mask : cacheMasks) {
+				if (!(mask & bit)) continue;
+				int n = 0;
+				for (int c = 0; c < 64; ++c) if (mask & (uint64_t(1) << c)) ++n;
+				if (n > best) { best = n; llcMaskOfWorker[q] = mask; }
 			}
 		}
 	}
@@ -521,11 +499,15 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// configuration in its own right, which is why it is worth measuring rather than avoiding.
 	std::vector<int> physicalCpus;   // empty unless PhysicalOnly; entry 0 is reserved for main
 	if (GetAffinityPolicy() == AffinityPolicy::PhysicalOnly) {
-		std::vector<ULONG_PTR> coreMasks;
-		if (GetGroupMasksForRelation(RelationProcessorCore, coreMasks)) {
-			for (ULONG_PTR m : coreMasks)
+		topology::Info topo;
+		topology::Query(topo);
+		if (topo.haveCores) {
+			// One representative logical CPU per physical core: the lowest-numbered member of each
+			// SMT group. Deliberately the SAME masks BuildTopology consumes, so "physical core"
+			// means one thing across the whole scheduler.
+			for (uint64_t m : topo.coreMasks)
 				for (int cpu = 0; cpu < 64; ++cpu)
-					if (m & (ULONG_PTR(1) << cpu)) { physicalCpus.push_back(cpu); break; }
+					if (m & (uint64_t(1) << cpu)) { physicalCpus.push_back(cpu); break; }
 		}
 		if (physicalCpus.size() >= 2)
 			poolSize = physicalCpus.size() - 1;   // one physical core left to main
@@ -853,7 +835,7 @@ Task* TaskScheduler::GetTask() {
 	Thread* thief = Thread::GetCurrent();
 	const bool thiefIsP = thief
 		? (isPCore[thief->qIndex] != 0)
-		: (isPCpu[GetCurrentProcessorNumber() & 63] != 0);
+		: (isPCpu[JLib::platform::CurrentCpu() & 63] != 0);
 	const bool degen = pWorkers.empty() || eWorkers.empty();
 	auto fastOnly = [&](Task* t) {
 		return t->fastJob != 0 && StealClassCompatible(t, thiefIsP, degen);

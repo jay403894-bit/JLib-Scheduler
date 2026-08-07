@@ -3,6 +3,72 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2026-08-07
+
+### Linux support — the scheduler now builds and runs on Linux x86-64
+Every benchmark passes on Ubuntu 24.04 / GCC 13, including recursive fork-join, i.e. fibers
+suspending and resuming through the hand-written context switch under the real scheduler. Windows
+is unchanged and unaffected.
+
+- **Hand-written System V AMD64 context switch** (`src/posix/ContextSwitch.s`, GAS, Intel syntax).
+  **`ucontext` was rejected on a MEASUREMENT, not on its POSIX deprecation:** `swapcontext` saves
+  and restores the signal mask, which is a `sigprocmask` **syscall on every switch** — measured at
+  **120.3 ns vs 8.0 ns for this implementation, 15× slower**. Boost.Context was declined to keep
+  the dependency count where it is.
+  The SysV switch is *shorter* than the Win64 one: callee-saved is `rbx/rbp/r12–r15` only (RDI and
+  RSI are argument registers here), **every XMM register is caller-saved so the whole 160-byte
+  `xmm6–15` block disappears**, there is no shadow space and no TEB stack-bounds fixup. MXCSR and
+  the x87 control word *are* still preserved — they are one physical register pair shared by every
+  fiber on a worker, so a fiber that sets a rounding mode and yields would otherwise leak it.
+- **Platform split by DIRECTORY** — `src/win32/` and `src/posix/`, each holding `ContextSwitch`,
+  `FiberInit` and `Topology`. `include/platform.h` is the single place that tests the OS
+  (`JLIB_PLATFORM_WINDOWS` / `JLIB_PLATFORM_POSIX`) and wraps the virtual-memory primitives, so
+  `FiberStackArena` — alignment rule, bounds check, guard-page reasoning — exists **once** for both
+  platforms. `Fiber::Init` sits next to its platform's assembly because the two are one contract.
+- **`Ideal` on Linux binds to the whole LLC domain, not one core.** Linux has no equivalent of
+  `SetThreadIdealProcessor`, but `sched_setaffinity` takes a **mask**, so the same intent — keep
+  locality true with minimum rigidity — is expressed at domain granularity. This is what keeps
+  `clusterMates` honest: the mask and the mate list derive from the same cache group, so the
+  topology map is true by construction. Unmeasured on real hardware.
+- **CMake build**, valid both standalone and as a subdirectory of the JLib umbrella, with
+  `find_package(JLibScheduler)` support. A classic `Scheduler.sln` ships alongside for Visual
+  Studio versions that cannot open the newer `.slnx` format.
+
+### [CRITICAL] Four latent defects, all found by porting
+Every one of these compiled on MSVC and is non-conforming C++ — the category that breaks on a
+compiler *upgrade*, not only on a new platform. **Forks should pull these regardless of platform.**
+
+- **`Task` / `LambdaTask` declared `operator delete` as `= delete` while having a virtual
+  destructor.** Ill-formed: the vtable's *deleting* destructor requires an accessible
+  `operator delete` whether or not any code calls it. Now defined with an assert, so the
+  "slab-allocated, never heap-deleted" guarantee survives with runtime rather than compile-time
+  enforcement.
+- **`LockFreeList::slabDeleter` — a `static` function — referenced the instance member
+  `allocator`.** It is used as an `EpochManager::RetirePtr` callback, so it must be static and
+  genuinely could not reach it. It compiled only because nothing instantiated `remove()` on a
+  slab-backed list; **the first caller would have broken the build.** Fixed by carrying a
+  `TaskAllocator* owner` on `LNodeBase`.
+- **`LockFreeList.h` included MSVC-only `<intrin.h>`** and used nothing from it.
+- **`Thread.cpp` used `std::memset` without `<cstring>`**; `bench.cpp` used `_stricmp`.
+
+### [CRITICAL] LLC-aware work stealing never actually ran on Windows
+`GetGroupMasksForRelation` read `info->Processor` for *every* relation, but
+`SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` is a **union** — `RelationCache` must be read as
+`info->Cache`, which has a completely different layout. Reading `.Processor.GroupCount` off a cache
+record landed in reserved bytes, read 0, and the loop never executed. Every cache query returned an
+empty mask list **while still reporting success**, so `clusterMates` stayed empty and the
+locality-first steal phase silently fell through to random on every Windows machine.
+
+Found by porting: the new Linux sysfs implementation reported 17 cache instances on the same box
+where Windows reported 0. Two independent implementations of one query disagreeing is what made it
+visible after it had gone unnoticed for as long as the feature existed.
+
+**Measured impact on a single-LLC Intel: none** (4.73 → 4.81 µs latency, 23.04 → 22.75 µs/graph —
+noise). That machine's last-level cache spans all 32 logical CPUs, so "cluster mates" means
+everyone and locality-first picks what random would. **It matters on multi-L3 hardware** — Ryzen
+with 2+ CCDs, Threadripper, EPYC, multi-socket — where `clusterMates` becomes a real subset. Do not
+read the flat numbers as "the fix was pointless"; read them as "that box cannot show it."
+
 ## 2026-08-05
 - **[BEHAVIOUR CHANGE] Worker affinity default is now `Ideal`, not hard pinning.** New
   `TaskScheduler::SetAffinityPolicy(AffinityPolicy)` — `Hard` (`SetThreadAffinityMask`),

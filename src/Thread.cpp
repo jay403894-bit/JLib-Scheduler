@@ -3,6 +3,7 @@
 #include "../include/TaskScheduler.h"
 #include <chrono>
 #include <iostream>
+#include <cstring>   // std::memset -- MSVC pulls this in transitively, libstdc++ does not
 using namespace JLib;
 thread_local Thread* Thread::instance = nullptr;
 
@@ -25,7 +26,7 @@ void Thread::StartWorker(size_t cpu_affinity)
 		this->Worker();
 		});
 	nativeHandle = thread.native_handle();
-#ifdef _WIN32
+#if JLIB_PLATFORM_WINDOWS
 	// HOW this worker is bound to its core, per TaskScheduler::SetAffinityPolicy.
 	//
 	// Hard  -- SetThreadAffinityMask: the thread runs on that logical CPU or nowhere. Best cache
@@ -51,6 +52,60 @@ void Thread::StartWorker(size_t cpu_affinity)
 	case TaskScheduler::AffinityPolicy::Ideal:
 		SetThreadIdealProcessor(nativeHandle, (DWORD)cpu_affinity);
 		break;
+	case TaskScheduler::AffinityPolicy::None:
+		break;
+	}
+#else
+	// Linux. Same four policies, but only ONE of them has anything to do.
+	//
+	// Hard/PhysicalOnly -> pthread_setaffinity_np with a single-CPU set: the direct analogue of
+	//                      SetThreadAffinityMask, with the same tradeoff (best locality, no escape
+	//                      if something else lands on that core).
+	//
+	// Ideal -> bind to this worker's WHOLE LLC DOMAIN, not to one core. Linux has no equivalent of
+	//          SetThreadIdealProcessor: affinity here is all-or-nothing per CPU, with no "hint".
+	//          But sched_setaffinity takes a MASK, so the same INTENT -- keep locality true with
+	//          minimum rigidity -- is expressed at a coarser granularity than Windows can. The
+	//          kernel may place the thread on any core in the domain, so a wake lands on one that
+	//          is already awake rather than waiting for a specific parked core, which is where
+	//          hard pinning's ~45% wake-latency cost came from.
+	//
+	//          This also keeps the topology subsystem HONEST. With no binding, clusterMates and
+	//          siblingQIndex describe a machine state that does not exist and locality-aware
+	//          stealing is decoration. Binding to the domain makes clusterMates true BY
+	//          CONSTRUCTION -- the mask and the mate list are derived from the same cache group.
+	//
+	//          So the POLICY means the same thing on both platforms and only the MECHANISM differs.
+	//          UNMEASURED on real Linux hardware: WSL virtualises topology and has no real core
+	//          parking, so the placement effect cannot be benchmarked there. Falls back to no
+	//          binding if topology was unavailable (mask 0), which is the old behaviour.
+	//
+	// None -> nothing, same as Windows.
+	switch (scheduler->GetAffinityPolicy()) {
+	case TaskScheduler::AffinityPolicy::PhysicalOnly:
+	case TaskScheduler::AffinityPolicy::Hard: {
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET((int)cpu_affinity, &set);
+		// Failure is deliberately ignored, matching the Windows path: a container or cgroup can
+		// legitimately forbid the CPU, and an unpinned worker is a performance question rather
+		// than a correctness one. The scheduler stays correct either way.
+		(void)pthread_setaffinity_np(nativeHandle, sizeof(cpu_set_t), &set);
+		break;
+	}
+	case TaskScheduler::AffinityPolicy::Ideal: {
+		const size_t qi = (size_t)qIndex;   // set by SetQueueIndex before StartWorker
+		const uint64_t llc = (qi < scheduler->llcMaskOfWorker.size())
+		                   ? scheduler->llcMaskOfWorker[qi] : 0;
+		if (llc) {
+			cpu_set_t set;
+			CPU_ZERO(&set);
+			for (int c = 0; c < 64; ++c)
+				if (llc & (uint64_t(1) << c)) CPU_SET(c, &set);
+			(void)pthread_setaffinity_np(nativeHandle, sizeof(cpu_set_t), &set);
+		}
+		break;
+	}
 	case TaskScheduler::AffinityPolicy::None:
 		break;
 	}

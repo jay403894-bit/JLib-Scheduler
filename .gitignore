@@ -6,3 +6,21 @@ bench/*.exe
 bench/*.obj
 bench/*.pdb
 bench/*.ilk
+
+# CMake, added 2026-08-07 with the Linux port. Unlike the x64/ folders above these are never worth
+# committing: the generated tree is machine- and generator-specific, so a clone that inherited one
+# would fail to configure rather than save anyone a step.
+build/
+cmake-build*/
+out/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+
+# MSBuild scratch. $(SolutionDir) resolves differently depending on whether this repo is built
+# standalone or as part of the JLib umbrella, so intermediates can land in either place.
+.vs/
+x64/
+Scheduler/x64/
+*.user

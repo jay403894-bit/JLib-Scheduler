@@ -269,6 +269,23 @@ namespace JLib {
 		// sibling shares this worker's execution ports, so stealing its work doesn't recruit
 		// any additional throughput, just adds queued work to an already-contended core.
 		std::vector<int> siblingQIndex;
+
+		// llcMaskOfWorker[qIndex] -- the set of logical CPUs sharing this worker's last-level cache,
+		// as a bitmask. 0 if topology was unavailable. POSIX ONLY in effect: it exists so the Ideal
+		// policy can bind a worker to its whole LLC DOMAIN rather than to one core.
+		//
+		// Windows expresses "keep locality without rigidity" through SetThreadIdealProcessor, a hint.
+		// Linux has no hint -- affinity is all or nothing per CPU -- but sched_setaffinity takes a
+		// MASK, so the same intent is expressed by binding to the domain instead of the core. The
+		// kernel may then place the thread on any core in that domain, so a wake lands on one that
+		// is already awake instead of waiting for a specific parked core, which is where hard
+		// pinning's ~45% wake-latency cost came from.
+		//
+		// This is what keeps clusterMates HONEST on Linux. With no binding at all those relationships
+		// describe a machine state that does not exist, and locality-aware stealing becomes
+		// decoration. UNMEASURED on real Linux hardware -- WSL virtualises topology and has no real
+		// core parking, so the placement effect cannot be benchmarked there.
+		std::vector<uint64_t> llcMaskOfWorker;
 		// isPCore[qIndex] -- 1 if this worker is pinned to a PERFORMANCE core, 0 for an EFFICIENCY core
 		// (Intel hybrid, e.g. i9-13900K = 8 P + 16 E). Derived in BuildTopology from each core's
 		// PROCESSOR_RELATIONSHIP.EfficiencyClass (highest class present = P). Non-hybrid CPU -> all 1

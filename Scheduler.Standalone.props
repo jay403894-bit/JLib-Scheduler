@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Fallback settings for building this library OUTSIDE the JLib umbrella solution.
+
+  Scheduler/ is published twice: as part of JLib, and as the standalone JLib-Scheduler repository
+  for people who want the scheduler and nothing else. The SOURCES are identical in both - that is
+  the point - so the project file has to work in both places, or the two copies start to drift and
+  the whole arrangement becomes the two-working-copies trap it was meant to avoid.
+
+  Scheduler.vcxproj imports JLib.Common.props when it exists (umbrella) and this file when it does
+  not (standalone). Exactly one of the two is ever active, so nothing can double up.
+
+  What this supplies is only what the umbrella would otherwise have provided: the Development
+  configuration's actual settings. Without it, a standalone Development build silently produces an
+  UNOPTIMIZED binary with no JLIB_DEVELOPMENT defined - it would still compile and link, which is
+  the dangerous part, because the failure is a benchmark that reads 10x slow rather than an error.
+
+  Output location is deliberately NOT set here: standalone, the Visual Studio default of
+  x64\<Config>\ is the least surprising thing for someone who just cloned one repository.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Condition="'$(Configuration)'=='Development'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Development'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <!-- NOT NDEBUG: assertions stay live. That is what Development is for. -->
+      <PreprocessorDefinitions>JLIB_DEVELOPMENT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>

@@ -1,8 +1,8 @@
 # 🧵 JLib::TaskScheduler
 
-A fiber-based, work-stealing task scheduler for real-time engines. Hand-written x64 context switching, lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and hybrid-core (P/E) aware placement — built for Windows, on purpose.
+A fiber-based, work-stealing task scheduler for real-time engines. Hand-written x64 context switching, lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and hybrid-core (P/E) aware placement.
 
-**Windows x64 · MSVC · C++17 · BSD licensed**
+**Windows x64 (MSVC) · Linux x86-64 (GCC/Clang) · C++17 · BSD licensed**
 
 ---
 
@@ -51,12 +51,13 @@ The trade: **Windows x64 + MSVC only, modern hardware assumed.** Constraining th
 
 ## ⚙️ 1. Requirements & Honest Limitations
 
-**Requirements:** Windows 10+ · x64 · MSVC (C++17 or later) · MASM (`ml64`, ships with VS) for the context-switch assembly.
+**Requirements:** x86-64, and either **Windows 10+ with MSVC** (C++17+, MASM `ml64` ships with VS) or **Linux with GCC/Clang** (C++17+, GAS for the context switch). CMake 3.21+ optional on both.
 
 **Deliberate limitations — read before adopting:**
 
-- **Windows x64 / MSVC only.** The context switch is hand-written x64 MASM against the Windows ABI; fibers, affinity, and topology queries are Win32. A Linux port is a real port (community fork exists), not a flag.
-- **Workers are hard-pinned** (worker *i* → logical CPU *i+1*, main on CPU 0). This is what makes the topology maps (SMT sibling, LLC cluster, P/E class) *true* rather than guesses — the OS cannot migrate workers. See *Design Decisions*.
+- **x86-64 only, Windows or Linux.** The context switch is hand-written assembly per ABI — MASM for Win64, GAS for System V — so a new *platform* needs a new `ContextSwitch`, not a compiler flag. macOS and ARM are not supported. Everything platform-specific lives in `src/win32/` and `src/posix/`, with `include/platform.h` the single place that tests the OS.
+- **`ucontext` is not used, and that is a measurement.** `swapcontext` saves and restores the signal mask — a `sigprocmask` **syscall per switch** — at **120 ns against 8 ns** for the hand-written version. Its POSIX deprecation is the lesser reason.
+- **Workers are bound to their core** (worker *i* → logical CPU *i+1*, main on CPU 0) under `Hard`/`PhysicalOnly`. This is what makes the topology maps (SMT sibling, LLC cluster, P/E class) *true* rather than guesses. Under the default `Ideal`, Windows uses `SetThreadIdealProcessor` (a hint) and Linux binds to the whole **LLC domain** — coarser than a core, so the kernel can still pick an already-awake CPU, but tight enough that `clusterMates` stays true by construction. See *Design Decisions*.
 - **Auto pool size is `hardware_concurrency − 1`** (main on CPU 0, workers on the rest) — and this is only safe because the JLib stack keeps *busy* foreign threads at zero by construction: input is Raw Input riding the app's message pump (zero threads; gamepad support is opt-in and dynamically loaded precisely because XInput spawns its own). **The rule: reserve one core per foreign thread with *measured busy time* — not per thread that merely exists.** The one time a library earned a reservation (GameInput's always-polling worker), dose-response testing showed exactly one core of deficit; JLib audio's remaining foreign thread (its backend's device-IO thread) is the opposite case — event-driven, ~100 wakes/s, microseconds of memcpy per wake — and measurably costs nothing, so audio does **not** change the default. `Init(N)` honors explicit sizes up to full `hardware_concurrency`.
 - **Transient oversubscription is accepted, on purpose.** Pinned workers can't dodge the threads no user-mode process controls — GPU driver workers, DXGI, DWM — which wake for microseconds at unpredictable times in *every* process on the machine. Desktop Windows has no core isolation (that's a console feature), so the only correct handling is the one the OS already provides: brief preemption. Profilers will faithfully report this: VTune's *Thread Oversubscription* metric counts spin-waiting threads as running, and in a mostly-idle game nearly all CPU time **is** short spin/wake bursts — so the metric reads high while sampled concurrency never approaches core count and frame times don't move with pool size. The number is real by Intel's definition; it describes a designed trade (spin-waits buy the latency figures above), not a defect.
 - **Processor group 0 only** (≤ 64 logical CPUs). Fine for desktops/workstations; dual-socket monsters need work this project doesn't do.
@@ -66,7 +67,22 @@ The trade: **Windows x64 + MSVC only, modern hardware assumed.** Constraining th
 
 ## 🚀 2. Quick Start
 
-Build + deploy the static lib (both configs) with the included script, or just add `src/*` + `ContextSwitch.asm` to your project.
+**CMake, either platform:**
+
+```
+cmake -B build -DCMAKE_BUILD_TYPE=Development
+cmake --build build -j
+```
+
+**Or Visual Studio:** open `Scheduler.sln` and press Build.
+
+**Or drop it in your own build:** add `src/*.cpp`, plus **exactly one** platform directory —
+`src/win32/` (with `ContextSwitch.asm`) or `src/posix/` (with `ContextSwitch.s`). Never both: they
+define the same symbols.
+
+To consume an installed copy from CMake, `find_package(JLibScheduler)` then link
+`JLib::Scheduler`. Three build types are available — `Debug`, `Release`, and **`Development`**
+(optimized, with symbols *and* assertions live; it deliberately does not define `NDEBUG`).
 
 ```cpp
 #include <TaskScheduler.h>

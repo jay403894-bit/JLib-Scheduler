@@ -1,6 +1,6 @@
-﻿// Scheduler microbenchmark -- standalone console app linked against the DEPLOYED release
-// Threads.lib (C:\libs\Threads), so it measures exactly the bits every game links, not a
-// special build. Build with build_bench.bat, run bench.exe.
+﻿// Scheduler microbenchmark -- console app built by the umbrella solution (Bench.vcxproj takes a
+// ProjectReference on Scheduler), so it measures exactly the library every game links, not a
+// special build. Build JLib.slnx, run build\x64\<Config>\SchedulerBench.exe.
 //
 // Four benches, chosen to mirror how the games actually use the scheduler:
 //   1. throughput   -- how many no-op tasks/sec the pool can drain (create+push+steal+run+free)
@@ -13,6 +13,16 @@
 #include <TaskDAG.h>
 #include <chrono>
 #include <cstdio>
+
+// Case-insensitive compare for the affinity-policy argument. The two platforms spell it
+// differently and neither name is standard C++: MSVC has _stricmp, POSIX has strcasecmp.
+#if defined(_WIN32)
+  #include <cstring>
+  #define JLIB_STRICMP _stricmp
+#else
+  #include <strings.h>
+  #define JLIB_STRICMP strcasecmp
+#endif
 #include <cstdint>
 #include <vector>
 #include <thread>
@@ -241,13 +251,13 @@ int main(int argc, char** argv) {
     const char* policyName = "hard";
     auto policy = JLib::TaskScheduler::AffinityPolicy::Hard;
     if (argc > 1) {
-        if (_stricmp(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
-        else if (_stricmp(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
-        else if (_stricmp(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
+        if (JLIB_STRICMP(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
+        else if (JLIB_STRICMP(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
+        else if (JLIB_STRICMP(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
     }
     JLib::TaskScheduler::SetAffinityPolicy(policy);
 
-    printf("T_Threads scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s)\n",
+    printf("JLib::Scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s)\n",
         sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName);
     printf("----------------------------------------------------------------\n");
 
