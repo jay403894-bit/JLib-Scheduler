@@ -569,13 +569,29 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		loPriInboxes[i]->init(&taskAllocator);
 		hiPriInboxes[i]->init(&taskAllocator);
 	}
+	// TWO PASSES, and the split is load-bearing. Creating a worker and STARTING it in the same
+	// iteration meant worker 0 was running -- and reading `workers` in its own startup path
+	// (Thread::StartWorker reads scheduler->workers.size()) -- while this loop was still
+	// push_back()ing workers 1..N-1. That is a genuine data race on the vector: concurrent read
+	// against a write that can REALLOCATE, so the reader can walk a buffer being freed underneath
+	// it. reserve() alone does not fix it; a concurrent read of size() against a concurrent write
+	// is still a race even when no reallocation occurs. Populating fully and starting afterwards
+	// removes the overlap instead of narrowing it.
+	//
+	// Nothing needed a worker running before the vector was complete, so this costs nothing.
+	// Found by ThreadSanitizer (bench/tsan_probe.cpp) on Linux; it is SHARED code, so the bug was
+	// equally present on Windows -- it survived on x86 by timing luck, and is exactly the class
+	// that turns into intermittent corruption under weaker memory ordering.
+	workers.reserve(num_workers);
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		auto worker = std::make_shared<Thread>(*this);
 		worker->SetQueueIndex(i);
 		workers.push_back(worker);
+	}
+	for (unsigned int i = 0; i < num_workers; ++i) {
 		// Default scheme: worker i -> logical CPU i+1 (main keeps 0). PhysicalOnly instead walks the
 		// list of distinct physical cores, so no two workers share a core's execution units.
-		worker->StartWorker(physicalCpus.empty() ? (i + 1) : (size_t)physicalCpus[i + 1]);
+		workers[i]->StartWorker(physicalCpus.empty() ? (i + 1) : (size_t)physicalCpus[i + 1]);
 	}
 	for (auto& w : workers) {
 		while (!w->Ready())

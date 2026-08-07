@@ -34,6 +34,28 @@ is unchanged and unaffected.
   `find_package(JLibScheduler)` support. A classic `Scheduler.sln` ships alongside for Visual
   Studio versions that cannot open the newer `.slnx` format.
 
+### [CRITICAL] Data race in `StartPool` — worker startup vs. the `workers` vector
+`StartPool` created a worker, pushed it into `workers`, and **started its thread in the same loop
+iteration**. The worker's own startup path reads `scheduler->workers.size()`, so worker 0 was
+reading the vector while the main thread was still `push_back`ing workers 1…N−1 — a concurrent read
+against a write that can **reallocate**, letting the reader walk a buffer being freed underneath it.
+
+Fixed by populating the vector fully and starting the threads in a second pass. `reserve()` alone
+would *not* have been sufficient: a concurrent read of `size()` against a concurrent write is a race
+even when no reallocation occurs. Nothing required a running worker before the vector was complete,
+so the split costs nothing.
+
+**This is shared code — the bug was equally present on Windows**, where it survived on timing luck
+(the reallocation window is narrow and x86's memory model is forgiving). It is exactly the class
+that becomes intermittent corruption under weaker ordering, so **forks on any platform should pull
+it**, and it is the single strongest argument for auditing before any ARM work.
+
+Found by ThreadSanitizer via the new `bench/tsan_probe.cpp` — a small harness that exercises each
+lock-free structure a few hundred times rather than the benchmark's millions, since a race is
+reported on first observation and volume only buys instrumentation cost. Post-fix the probe reports
+**zero races**. Its header documents two TSAN blind spots to expect: `atomic_thread_fence` (which
+TSAN cannot model, so `TaskDeque` reports are suspect) and unannotated fiber switches.
+
 ### [CRITICAL] Four latent defects, all found by porting
 Every one of these compiled on MSVC and is non-conforming C++ — the category that breaks on a
 compiler *upgrade*, not only on a new platform. **Forks should pull these regardless of platform.**
