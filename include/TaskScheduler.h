@@ -281,10 +281,13 @@ namespace JLib {
 		// is already awake instead of waiting for a specific parked core, which is where hard
 		// pinning's ~45% wake-latency cost came from.
 		//
-		// This is what keeps clusterMates HONEST on Linux. With no binding at all those relationships
-		// describe a machine state that does not exist, and locality-aware stealing becomes
-		// decoration. UNMEASURED on real Linux hardware -- WSL virtualises topology and has no real
-		// core parking, so the placement effect cannot be benchmarked there.
+		// The mask is exactly as tight as the hardware warrants. On MULTI-L3 parts (Ryzen CCDs,
+		// Threadripper, EPYC) it genuinely binds, which is where it matters -- migrating across
+		// cache domains costs inter-die latency per steal and makes clusterMates describe a machine
+		// that does not exist. On SINGLE-L3 parts the domain is every CPU, so it binds nothing:
+		// correct rather than missing, since there is no domain to protect and binding would only
+		// add the rigidity that measured ~45% worse. UNMEASURED on real Linux hardware -- WSL
+		// virtualises topology and has no real core parking.
 		std::vector<uint64_t> llcMaskOfWorker;
 		// isPCore[qIndex] -- 1 if this worker is pinned to a PERFORMANCE core, 0 for an EFFICIENCY core
 		// (Intel hybrid, e.g. i9-13900K = 8 P + 16 E). Derived in BuildTopology from each core's

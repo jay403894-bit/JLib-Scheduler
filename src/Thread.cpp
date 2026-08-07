@@ -70,10 +70,19 @@ void Thread::StartWorker(size_t cpu_affinity)
 	//          is already awake rather than waiting for a specific parked core, which is where
 	//          hard pinning's ~45% wake-latency cost came from.
 	//
-	//          This also keeps the topology subsystem HONEST. With no binding, clusterMates and
-	//          siblingQIndex describe a machine state that does not exist and locality-aware
-	//          stealing is decoration. Binding to the domain makes clusterMates true BY
-	//          CONSTRUCTION -- the mask and the mate list are derived from the same cache group.
+	//          The mask ends up EXACTLY AS TIGHT AS THE HARDWARE WARRANTS, which is the point:
+	//            - Multi-L3 (Ryzen CCDs, Threadripper, EPYC, multi-socket): it genuinely binds, and
+	//              that is where it matters. An unbound worker migrating across cache domains pays
+	//              inter-die latency on every steal AND makes clusterMates describe a machine state
+	//              that does not exist.
+	//            - Single-L3 (most Intel desktop): the domain is every CPU, so the mask binds
+	//              nothing. Correct, not a gap -- there is no cache domain to protect, and binding
+	//              anyway would only add the rigidity that measured ~45% worse on wake latency.
+	//
+	//          What this does NOT protect is siblingQIndex: the kernel can still migrate between
+	//          physical cores inside the LLC, so "my SMT sibling" stays approximate on Linux.
+	//          Deliberate. Tightening to a 2-CPU SMT-pair mask would buy a steal-ORDERING
+	//          preference at close to hard pinning's cost -- the wrong side of that trade.
 	//
 	//          So the POLICY means the same thing on both platforms and only the MECHANISM differs.
 	//          UNMEASURED on real Linux hardware: WSL virtualises topology and has no real core
