@@ -29,8 +29,6 @@ Public C++ job systems make you choose: task graphs **without** fibers ([Taskflo
 | Hybrid P/E-core placement | ❌ | ❌ | ❌ | ✅ |
 | Maintained | ✅ | ✅ | ❌ archived | ✅ |
 
-The trade: **Windows x64 + MSVC only, modern hardware assumed.** Constraining the problem is what makes one-person excellence possible — see *Requirements*.
-
 ---
 
 ## 📋 Table of Contents
