@@ -13,7 +13,10 @@ is unchanged and unaffected.
 - **Hand-written System V AMD64 context switch** (`src/posix/ContextSwitch.s`, GAS, Intel syntax).
   **`ucontext` was rejected on a MEASUREMENT, not on its POSIX deprecation:** `swapcontext` saves
   and restores the signal mask, which is a `sigprocmask` **syscall on every switch** — measured at
-  **120.3 ns vs 8.0 ns for this implementation, 15× slower**. Boost.Context was declined to keep
+  **120.3 ns vs 8.0 ns for this implementation** — roughly an order of magnitude. Treat that ratio
+  as indicative rather than exact: it compares a pure user-mode register swap against a **syscall**,
+  measured under WSL where kernel transitions are inflated, so bare metal would narrow the gap. The
+  mechanism is the point and does not change. Boost.Context was declined to keep
   the dependency count where it is.
   The SysV switch is *shorter* than the Win64 one: callee-saved is `rbx/rbp/r12–r15` only (RDI and
   RSI are argument registers here), **every XMM register is caller-saved so the whole 160-byte
