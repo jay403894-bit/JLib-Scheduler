@@ -3,7 +3,7 @@
 A fiber-based, work-stealing task scheduler for real-time engines. Hand-written x64 context switching, lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and hybrid-core (P/E) aware placement.
 
 **Windows x64 (MSVC) · Linux x86-64 (GCC/Clang) · C++17 · BSD licensed**
-
+**looking for an alternative to marl?**
 ---
 
 ## 📈 Measured (i9-13900K, Release)
