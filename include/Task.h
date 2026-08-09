@@ -66,7 +66,17 @@ namespace JLib {
         WaitGroup* waitGroup = nullptr;
         uint8_t hiPri = false;
         FiberSize requiredSize = FiberSize::Standard;
-        uint8_t fastJob = 0;
+        // Run directly on the worker with NO fiber underneath: no fiber acquired, no context switch,
+        // no 64KB stack. Cheaper, and the right default for the overwhelmingly common short task.
+        //
+        // THE CONSTRAINT: such a task MUST NOT SUSPEND -- no WaitFor, no WaitOnEvent, no CoYield.
+        // There is no context to switch away from, so suspending throws inside a noexcept Execute()
+        // and fail-fasts (STATUS_STACK_BUFFER_OVERRUN on Windows) with no message. CreateTask
+        // defaults this to TRUE, so any task that waits on anything must opt out explicitly.
+        //
+        // (Named fastJob until 1.0. "noFiber" states what is checkable -- whether a fiber exists --
+        // rather than advertising a benefit, and it puts the constraint in view at the call site.)
+        uint8_t noFiber = 0;
         uint8_t isForked = 0;  // Set by PushFork, cleared when task completes
         uint8_t priorityBoost = 0;  // Original priority before boost (0 = no boost, otherwise original hiPri)
         // P/E-core placement hint (see CorePref above). Lives in what was tail PADDING -- FiberSize is

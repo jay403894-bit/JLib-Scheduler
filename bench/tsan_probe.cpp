@@ -29,7 +29,7 @@ int main() {
     JLib::TaskScheduler::Init();
     auto& sched = JLib::TaskScheduler::Instance();
 
-    // 1. fastJob fan-out: worker deques, the task allocator, and WaitGroup completion. fastJob runs
+    // 1. noFiber fan-out: worker deques, the task allocator, and WaitGroup completion. noFiber runs
     //    on the worker's own OS stack, so these paths involve NO fiber switch -- anything reported
     //    here is real, not a fiber-attribution artifact.
     {
@@ -79,7 +79,7 @@ int main() {
         for (int i = 0; i < kF; ++i) {
             JLib::Task* t = sched.CreateTask(+[](void*) {
                 g_counter.fetch_add(1, std::memory_order_relaxed);
-            }, nullptr, /*hipri*/0, JLib::FiberSize::Standard, /*fastJob*/0);
+            }, nullptr, /*hipri*/0, JLib::FiberSize::Standard, /*noFiber*/0);
             t->waitGroup = &wg;
             sched.Push(t);
         }

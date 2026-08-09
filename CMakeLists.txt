@@ -73,6 +73,21 @@ endif()
 
 # Normalise the many spellings a toolchain may use for the same instruction set.
 if(WIN32)
+    # Windows is x64-only, and this refuses ARM64 rather than quietly handing the x64 MASM file to
+    # an ARM64 build (which fails deep inside ml64 with nothing pointing at the real cause).
+    #
+    # Windows-on-ARM is NOT "the Linux AAPCS64 switch with a different #ifdef". It needs a THIRD
+    # hand-written switch, because (1) MSVC's ARM64 assembler is armasm64, whose syntax is unrelated
+    # to the GAS syntax src/posix/aarch64/ContextSwitch.S is written in, and (2) a Windows fiber
+    # switch must update the TEB's StackBase/StackLimit -- the fixup the x64 MASM does and the
+    # Linux/macOS AAPCS64 switch deliberately omits because it has no equivalent. x18 is also
+    # reserved as the TEB pointer there (the current switch happens not to touch it).
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$" OR CMAKE_GENERATOR_PLATFORM MATCHES "^(ARM64|arm64)$")
+        message(FATAL_ERROR
+            "Windows on ARM64 is not supported: the context switch is MASM for x64 only. It needs a "
+            "third ContextSwitch (armasm64 syntax, plus the TEB stack-bounds fixup), not a compiler "
+            "flag. Linux and macOS on AArch64 ARE supported -- see src/posix/aarch64/.")
+    endif()
     set(JLIBSCHED_ARCH "x86_64")   # the MASM switch is x64-only; the MSVC guard above is the gate
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     set(JLIBSCHED_ARCH "x86_64")
@@ -189,7 +204,10 @@ if(JLIBSCHED_STANDALONE)
 
     write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfigVersion.cmake"
-        VERSION 0.1.0 COMPATIBILITY SameMajorVersion)
+        # SameMajorVersion: a consumer writing find_package(JLibScheduler 1.0) accepts any 1.x,
+        # which is the semver promise this version number is making -- no breaking API change
+        # without a 2.0.
+        VERSION 1.0.0 COMPATIBILITY SameMajorVersion)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake.in"
 "@PACKAGE_INIT@\ninclude(CMakeFindDependencyMacro)\nif(NOT WIN32)\n  find_dependency(Threads)\nendif()\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/JLibSchedulerTargets.cmake\")\ncheck_required_components(JLibScheduler)\n")
     configure_package_config_file(

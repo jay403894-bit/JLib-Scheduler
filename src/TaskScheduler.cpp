@@ -7,6 +7,7 @@
 #include "../include/platform.h"
 #include "../include/Topology.h"
 #include <stdexcept>
+#include <cstdio>      // fprintf -- the debug-only event-registry tripwire in GetEvent
 #include <vector>
 #include <chrono>
 using namespace JLib;
@@ -217,7 +218,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 	if (estRemainingUs >= g_parallelWorthwhileUs) {
 		int numTasks = (totalItems + chunkSize - 1) / chunkSize;
 
-		// HYBRID dispatch (same spirit as the scheduler's other hybrids -- fastJob-vs-fiber,
+		// HYBRID dispatch (same spirit as the scheduler's other hybrids -- fiberless-vs-fiber,
 		// main-spin-help, locality-then-random steal): the FLAT path below has the CALLER spawn every
 		// chunk serially -- fine and ~14% faster when there are few tasks, but its O(#tasks) serial
 		// CreateTask+Push+NotifyWorker on ONE thread blows up at fine grain (benchmarked ~8x slower at
@@ -610,10 +611,10 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName) {
 	Task* myTask = thread->currentRunningTask;
 	Fiber* myFiber = myTask->assignedFiber;
 	if (!myFiber) {
-		// A fastJob task (see Task::fastJob) runs with no fiber underneath it -- there's
+		// A noFiber task (see Task::noFiber) runs with no fiber underneath it -- there's
 		// nothing to switch away to. This is a contract violation, not a transient failure.
 		throw std::runtime_error("WaitOnEvent called from a task with no assigned fiber -- "
-			"fastJob tasks must never suspend.");
+			"noFiber tasks must never suspend.");
 	}
 
 	auto& event = GetEvent(eventName);
@@ -752,7 +753,7 @@ void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::fu
 	Fiber* myFiber = myTask->assignedFiber;
 	if (!myFiber) {
 		throw std::runtime_error("WaitOnEventArmed called from a task with no assigned fiber -- "
-			"fastJob tasks must never suspend.");
+			"noFiber tasks must never suspend.");
 	}
 
 	auto& event = GetEvent(eventName);
@@ -776,7 +777,7 @@ void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*
 	Fiber* myFiber = myTask->assignedFiber;
 	if (!myFiber) {
 		throw std::runtime_error("WaitOnEventDirectArmed called from a task with no assigned "
-			"fiber -- fastJob tasks must never suspend.");
+			"fiber -- noFiber tasks must never suspend.");
 	}
 
 	DirectEvent* e = eventPool.Acquire();   // pool sized for max concurrent waits (never null in practice)
@@ -800,9 +801,9 @@ void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*
 
 bool TaskScheduler::IsOnFiber() {
 	auto* t = Thread::GetCurrent();
-	// currentRunningTask alone isn't enough -- a fastJob task sets it too (see Worker()'s fast
+	// currentRunningTask alone isn't enough -- a noFiber task sets it too (see Worker()'s fast
 	// path) but deliberately never gets a fiber. Callers use this to decide whether
-	// WaitOnEvent*-style suspension is safe, so it must be false for a fastJob task.
+	// WaitOnEvent*-style suspension is safe, so it must be false for a noFiber task.
 	return t != nullptr && t->currentRunningTask != nullptr && t->currentFiber != nullptr;
 }
 
@@ -811,6 +812,22 @@ Event& TaskScheduler::GetEvent(const std::string& name) {
 	if (eventRegistry.find(name) == eventRegistry.end())
 		eventRegistry[name] = std::make_unique<Event>();
 	Event& event = *eventRegistry[name];
+
+	// Debug tripwire for the misuse documented on the declaration: a caller minting a fresh name
+	// per operation. Left to grow, that ends as a registryMtx convoy after ~an hour of uptime that
+	// looks like a deadlock and is miserable to diagnose from the symptom. One warning turns that
+	// into a sentence naming the cause. Threshold is far above any plausible static name set.
+	// Debug-only: this is a caller bug, not a condition the library should pay to check in release.
+#if defined(_DEBUG) || defined(JLIB_DEVELOPMENT)
+	if (eventRegistry.size() == 4096)
+		fprintf(stderr,
+			"[JLib::Scheduler] WARNING: event registry has reached 4096 named events. Named events "
+			"are for a BOUNDED set of rendezvous points; a name minted per operation (e.g. "
+			"\"fence_\" + counter) grows this map without bound and will convoy on registryMtx. "
+			"Use WaitOnEventDirectArmed for per-operation waits. Last inserted: \"%s\"\n",
+			name.c_str());
+#endif
+
 	registryMtx.unlock();
 	return event;
 }
@@ -830,7 +847,7 @@ void TaskScheduler::Stop(Task* worker_task) {
 }
 
 
-// Steals ONE task for a NON-worker helper (e.g. main spinning in WaitFor, or a fastJob spinning
+// Steals ONE task for a NON-worker helper (e.g. main spinning in WaitFor, or a noFiber spinning
 // on a SchedulerMutex). Random-start, hiPri-then-loPri scan with fairness: after
 // kStealFairnessWindow consecutive hiPri steals it forces a loPri scan so loPri work can't starve
 // behind a stream of hiPri steals. Single-item steal() is the only correct steal in the lock-free
@@ -840,16 +857,16 @@ Task* TaskScheduler::GetTask() {
 
 	// FASTJOB- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenFastJob,
 	// whose fiberless caller can't run anything that might suspend. Previously this stole blind and
-	// Requeued non-fastJobs -- a claim-CAS + full re-push + notify to move a task nowhere (deque
-	// contention + thrash). Now a non-fastJob is never claimed at all: it stays put for a real worker,
+	// Requeued fiber-backed tasks -- a claim-CAS + full re-push + notify to move a task nowhere (deque
+	// contention + thrash). Now a fiber-backed task is never claimed at all: it stays put for a real worker,
 	// and the scan just moves to the next victim. Class matters too because TRSFJ's callers vary: the
 	// SchedulerMutex spin path invokes it FROM WORKERS (thief class = that worker's), while main/WaitFor
 	// helpers are non-workers pinned to CPU 0 -- a P-core -- so they vet as P. corePref is the sole
 	// placement authority EVERYWHERE, including helper steals.
-	// Thief class, NOT assumed: a worker (SchedulerMutex/CV spin inside a fastJob lands here from
+	// Thief class, NOT assumed: a worker (SchedulerMutex/CV spin inside a noFiber lands here from
 	// workers too) uses its pinned class; any NON-worker thread (main, or an arbitrary app thread
 	// hitting a scheduler primitive -- possibly unpinned and floating) asks the OS where it is RIGHT
-	// NOW via GetCurrentProcessorNumber + the per-CPU class table. "Would this fastJob run on a P or
+	// NOW via GetCurrentProcessorNumber + the per-CPU class table. "Would this noFiber run on a P or
 	// E core?" is answered by where the caller is actually standing.
 	Thread* thief = Thread::GetCurrent();
 	const bool thiefIsP = thief
@@ -857,7 +874,7 @@ Task* TaskScheduler::GetTask() {
 		: (isPCpu[JLib::platform::CurrentCpu() & 63] != 0);
 	const bool degen = pWorkers.empty() || eWorkers.empty();
 	auto fastOnly = [&](Task* t) {
-		return t->fastJob != 0 && StealClassCompatible(t, thiefIsP, degen);
+		return t->noFiber != 0 && StealClassCompatible(t, thiefIsP, degen);
 	};
 
 	if (!forceLoPri) {
@@ -886,8 +903,8 @@ Task* TaskScheduler::GetTask() {
 }
 
 bool TaskScheduler::TryRunStolenFastJob() {
-	// Steal ONE fastJob and run it to completion right here with the full completion bookkeeping
-	// Worker()'s fast path does. GetTask vets fastJob-ness AT THE DEQUE (steal_if) -- a non-fastJob
+	// Steal ONE noFiber and run it to completion right here with the full completion bookkeeping
+	// Worker()'s fast path does. GetTask vets the noFiber flag AT THE DEQUE (steal_if) -- a fiber-backed task
 	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue
 	// relocation path (claim CAS + re-push + notify = contention/thrash) no longer exists.
 	Task* task = GetTask();
@@ -917,11 +934,11 @@ void TaskScheduler::WaitAll() {
 		std::this_thread::yield();
 }
 
-Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t fastJob, CorePref corePref) {
+Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t noFiber, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;
 	Task* t = ::new (mem) Task(fn, data, hipri, size);
-	t->fastJob = fastJob;
+	t->noFiber = noFiber;
 	t->corePref = corePref;
 	return t;
 }
@@ -989,7 +1006,7 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	if (immediateCoresInUse[idx]->load(std::memory_order_acquire)) return false;
 
 	// Marks this core busy-with-a-fork until Thread::Worker() clears it on completion (see
-	// the is_handling_fork cleanup in both the fastJob and fiber-DEAD paths). If the forked
+	// the is_handling_fork cleanup in both the noFiber and fiber-DEAD paths). If the forked
 	// task never returns (a long-running subsystem pinned here for the program's lifetime),
 	// this correctly STAYS true forever -- which is what makes PickNextWorker()'s existing
 	// skip-if-busy check actually mean something: without setting this, a never-returning fork

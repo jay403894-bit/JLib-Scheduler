@@ -57,6 +57,8 @@ The trade: **modern 64-bit hardware assumed** — x86-64 or AArch64, Windows/MSV
 
 **Requirements:** x86-64 or AArch64, and one of **Windows 10+ with MSVC** (x86-64 only; C++17+, MASM `ml64` ships with VS), **Linux/Android with GCC/Clang**, or **macOS with AppleClang** (C++17+, GAS for the context switch). CMake 3.21+ optional everywhere. The benchmark is C++17 too — there is no longer a C++20 caveat attached to that claim.
 
+**What "1.0" covers.** The supported API is **`TaskScheduler.h`, `Task.h` and `TaskDAG.h`** — those follow semver, and nothing in them breaks without a 2.0. The install ships the whole `include/` directory because the supported headers need those types to compile, but everything else (`TaskDeque.h`, `LockFreeList.h`, `ThreadLocalCache.h`, `Epochs.h`, `TaskAllocator.h`, `Fiber.h`, `Thread.h`, `Context.h`, `Topology.h`, `platform.h`, and the vendored moodycamel queues) is **implementation detail and may change in any release**. If you find yourself including one of those directly, that is a missing feature in the supported API — please open an issue rather than depending on it.
+
 **Deliberate limitations — read before adopting:**
 
 - **Four verified targets, and the ABI is the reason there are only four.** The context switch is hand-written assembly per ABI — MASM for Win64, GAS for System V and for AAPCS64 — so a new *architecture* needs a new `ContextSwitch` and a matching `Fiber::Init`, not a compiler flag. Verified in CI on every push — **Windows x64 (MSVC)**, **Linux x86-64 (GCC)**, **Linux AArch64 (GCC)** and **macOS arm64 / Apple Silicon (AppleClang)** — plus **AArch64 on Android/Termux (Clang)** by hand. The full benchmark suite passes on all of them, fibers suspending and resuming through the hand-written switch under the real scheduler; the AAPCS64 switch additionally has a standalone ABI harness (`tests/fibertest_aarch64.cpp`) run at `-O0` and `-O2` on both ARM64 platforms. That the ARM64 results agree across **three toolchains, three libcs and two object formats** — GCC/glibc/ELF, Clang/bionic/ELF and AppleClang/libc++/Mach-O — is what makes the ABI claim worth anything. Raspberry Pi is the same configuration as the CI ARM64 runner (Debian-family aarch64, glibc) and needs nothing extra. 32-bit targets are not supported and are not planned. Everything platform-specific lives in `src/win32/`, `src/posix/` (Linux, Android) and `src/darwin/` (macOS), with the ABI layer under `src/posix/<arch>/` shared by every POSIX target — the calling convention belongs to the instruction set, not the kernel. `include/platform.h` is the single place that tests OS *and* architecture.
@@ -99,14 +101,14 @@ int main() {
     JLib::TaskScheduler::Init();               // auto pool size (hw-1); Init(hw-2) if you ship a foreign thread with real busy time
     auto& sched = JLib::TaskScheduler::Instance();
 
-    // Fire-and-forget fastJob (default): pure compute, runs inline on a worker
+    // Fire-and-forget noFiber task (default): pure compute, runs inline on a worker
     sched.Push([] { HeavyMath(); });
 
     // Fork-join: create tasks against a WaitGroup, then wait (fiber-suspends if
-    // called from a task; spin-helps by stealing fastJobs if called from main)
+    // called from a task; spin-helps by stealing noFiber tasks if called from main)
     JLib::WaitGroup wg;
     for (int i = 0; i < 8; ++i) {
-        auto* t = sched.CreateTask([i] { Chunk(i); });   // hiPri=false, fastJob=true defaults
+        auto* t = sched.CreateTask([i] { Chunk(i); });   // hiPri=false, noFiber=true defaults
         t->waitGroup = &wg;
         wg.n.fetch_add(1, std::memory_order_release);
         sched.Push(t);
@@ -152,7 +154,7 @@ enum class CorePref : uint8_t {
     Any = Wide // alias: "genuinely don't care" -- same mechanism, honest name
 };
 
-sched.CreateTask(fn, data, /*hiPri*/ false, FiberSize::Standard, /*fastJob*/ true, CorePref::E);
+sched.CreateTask(fn, data, /*hiPri*/ false, FiberSize::Standard, /*noFiber*/ true, CorePref::E);
 ```
 
 **The rules (deliberate, and worth copying):**
@@ -184,12 +186,12 @@ When a high-priority task contends a lock held by a low-priority task, the holde
 
 The scheduler operates two distinct execution pathways. **Selecting the wrong pathway will result in immediate deadlocks or queue corruption.**
 
-| Execution Mode | fastJob | Allocation | Thread Model | Use Case |
+| Execution Mode | noFiber | Allocation | Thread Model | Use Case |
 |---|---|---|---|---|
 | **Standard Task** | `true` (Default) | Raw worker stack | Non-cooperative, run-to-completion | Bulk math, raycasts, data sweeps, physics jobs |
 | **Fiber Task** | `false` | Custom ASM/C++ fiber stack | Cooperative (may `WaitOnEvent`/suspend) | Fork-join patterns, waitable work |
 
-fastJobs skip fiber allocation and context switching entirely — this is why per-job overhead stays microscopic for pure-compute workloads (e.g., an entire physics engine's job graph).
+noFiber tasks skip fiber allocation and context switching entirely — this is why per-job overhead stays microscopic for pure-compute workloads (e.g., an entire physics engine's job graph).
 
 ---
 
@@ -199,15 +201,15 @@ fastJobs skip fiber allocation and context switching entirely — this is why pe
 
 When employing fork-join parallelism, tasks must cooperatively yield their execution contexts during wait cycles rather than blocking the physical thread.
 
-**The Rule:** You **MUST** pass `fastJob = false` inside `CreateTask` when pushing to `PushFork`.
+**The Rule:** You **MUST** pass `noFiber = false` inside `CreateTask` when pushing to `PushFork`.
 
-**The Trap:** If a task enters `PushFork` with `fastJob = true`, the scheduler runs it as a standard thread-bound job. When that job calls `WaitFor()`, it will attempt fiber suspension mechanics on a naked thread — immediate hard deadlock.
+**The Trap:** If a task enters `PushFork` with `noFiber = true`, the scheduler runs it as a standard thread-bound job. When that job calls `WaitFor()`, it will attempt fiber suspension mechanics on a naked thread — immediate hard deadlock.
 
 ### Contract 2: Long-Running Services vs. Immediate Mode
 
 `PushImmediate(cpu_affinity, task)` strips a worker from the general pool, offloads its queue to neighbors, and locks it to a dedicated loop.
 
-**The Rule:** Service tasks (audio processing loops, network listeners) launched via `PushImmediate` must be `fastJob = true`.
+**The Rule:** Service tasks (audio processing loops, network listeners) launched via `PushImmediate` must be `noFiber = true`.
 
 **The Trap:** Immediate-mode tasks are structurally isolated from the fiber pool. If one triggers a fiber suspend/resume, the worker-queue boundary tracking corrupts.
 
@@ -224,24 +226,24 @@ A fiber task that calls `WaitOnEvent`/`WaitForFenceValue`-style primitives suspe
 ```cpp
 JLib::WaitGroup wg;
 
-// fastJob MUST be false: this task suspends while waiting on children
-Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, /*fastJob*/ false);
+// noFiber MUST be false: this task suspends while waiting on children
+Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, /*noFiber*/ false);
 parent->waitGroup = &wg;
 wg.n.fetch_add(1, std::memory_order_release);   // count BEFORE push -- workers decrement on completion
 sched.PushFork(parent);
 
-sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing fastJobs
+sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing noFibers
 ```
 
 ### The Immediate Mode Pattern (Pinned Services)
 
 ```cpp
-// Service tasks run raw on the pinned thread (fastJob MUST be true)
+// Service tasks run raw on the pinned thread (noFiber MUST be true)
 Task* audioService = sched.CreateTask([](void*) {
     while (engineRunning) {
         UpdateAudioBuffers();   // uses OS waits or atomics -- NEVER fiber yields
     }
-}, nullptr, /*hiPri*/ 1, FiberSize::Standard, /*fastJob*/ true);
+}, nullptr, /*hiPri*/ 1, FiberSize::Standard, /*noFiber*/ true);
 
 sched.PushImmediate(/*coreID*/ 2, audioService);   // evicts core 2's queue, locks the loop to it
 ```
@@ -264,7 +266,7 @@ Use `SchedulerMutex` instead of `std::mutex` when a lock might be held by a low-
 - ❌ Scheduler-internal locks (already fast, no fiber wait)
 - ❌ Locks only used within one priority level (no inversion possible)
 
-While spinning on a contended `SchedulerMutex` or `SchedulerConditionVariable`, the spinner **helps drain the pool** by stealing fastJobs (class-vetted against the core it's actually standing on) instead of burning cycles.
+While spinning on a contended `SchedulerMutex` or `SchedulerConditionVariable`, the spinner **helps drain the pool** by stealing noFibers (class-vetted against the core it's actually standing on) instead of burning cycles.
 
 ### Memory Lifecycle Ownership
 

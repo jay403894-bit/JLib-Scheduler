@@ -320,13 +320,13 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
     }
 
     int mid = start + (end - start) / 2;
-    // fastJob=false is the load-bearing argument: these tasks call WaitFor below, which SUSPENDS,
+    // noFiber=false is the load-bearing argument: these tasks call WaitFor below, which SUSPENDS,
     // and only a fiber-backed task can suspend. It also makes this the only section of the bench
     // that exercises a fiber at all -- every other one uses the fn-pointer overload, which
-    // defaults to fastJob=true.
+    // defaults to noFiber=true.
     JLib::Task* left = sched.CreateTask([&sched, start, mid, BASE_CASE] {
         RecursiveForkJoinImpl(sched, start, mid, BASE_CASE);
-    }, false, JLib::FiberSize::Standard, false);  // hipri=false, size=Standard, fastJob=false
+    }, false, JLib::FiberSize::Standard, false);  // hipri=false, size=Standard, noFiber=false
     JLib::Task* right = sched.CreateTask([&sched, mid, end, BASE_CASE] {
         RecursiveForkJoinImpl(sched, mid, end, BASE_CASE);
     }, false, JLib::FiberSize::Standard, false);
@@ -374,7 +374,7 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
         JLib::WaitGroup wg;
         JLib::Task* task = sched.CreateTask([&sched, kN, kBaseCase] {
             RecursiveForkJoinImpl(sched, 0, kN, kBaseCase);
-        }, false, JLib::FiberSize::Standard, false);  // non-fastJob, fiber-based
+        }, false, JLib::FiberSize::Standard, false);  // noFiber=false: this task suspends, so it needs a fiber
 
         // RecursiveForkJoinImpl checks its two CreateTask results; this one never did, so an
         // exhausted allocator surfaced as a write through nullptr instead of a message.

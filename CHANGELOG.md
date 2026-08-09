@@ -3,7 +3,41 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
-## 2026-08-09
+## 1.0.0 — 2026-08-09
+
+First tagged release. The version number is a statement about API stability, not about the code
+suddenly becoming ready: the scheduler has been running a real engine for months. What changed is
+that it now builds and passes its suite on four verified platforms with CI enforcing that on every
+push, which is the point at which promising not to break the API costs something and therefore
+means something. Breaking changes from here need a 2.0.
+
+Everything below this heading shipped in 1.0.0.
+
+**BREAKING (the last break before the promise): `fastJob` is now `noFiber`.** Same meaning, same
+polarity, same `true` default — only the name changed. `CreateTask`'s parameter rename is invisible
+to callers (C++ has no named arguments), so this only affects code touching `Task::noFiber`
+directly, which realistically means nobody. Renamed now because it was the last free moment: the
+old name advertised a benefit while the flag's real content is a *constraint* — a task with no
+fiber underneath cannot suspend, and getting that wrong fail-fasts with no message. `noFiber` names
+something checkable and puts the constraint at the call site.
+
+**`ParallelForFJ` is not experimental** and the header no longer says it is. `ParallelFor`
+dispatches to it automatically past ~2 tasks per worker; below that the flat path is ~14% faster,
+above it flat is ~8x slower at ~15k tasks. The doc comment had been contradicting the code beside it.
+
+**Named events: the contract is now written down.** `GetEvent`/`WaitOnEvent` keep one entry per
+distinct name and never evict — correct and cheap for a bounded, static set of rendezvous points,
+which is what they are for. Minting a name per operation (`"fence_" + counter`) instead grows the
+map without bound and eventually convoys on `registryMtx` during a rehash, which presents in a
+debugger as a deadlock after about an hour of uptime. `WaitOnEventDirectArmed` is the API for
+per-operation waits: pooled, no name, no map, no global lock. No eviction policy is needed here
+because the unbounded case has its own API — that was always the design, it just was not documented.
+A debug/development build now warns once at 4096 named events, naming the last key inserted.
+
+**The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`.** Every header is installed
+because the supported ones need them to compile, but the rest are implementation detail and are not
+covered by the version promise. Stated explicitly so that fixing internals later is not a breaking
+change by accident.
 
 ### macOS / Apple Silicon support
 Builds and runs on macOS arm64, verified in CI on `macos-14` (AppleClang). The AAPCS64 context

@@ -102,10 +102,17 @@ namespace JLib {
 		static double GetParallelForThresholdUs();
 
 		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
-		// Fork-join (recursive-split) variant of ParallelFor -- experimental, benchmarked against the
-		// flat one. Splits the range in half, spawns the right half as a task, recurses on the left
-		// inline; `grain` is the base-case size. Parallelizes task CREATION (the tree is built by many
-		// workers) instead of the caller spawning every chunk serially.
+		// Fork-join (recursive-split) variant of ParallelFor. Splits the range in half, spawns the
+		// right half as a task and recurses on the left inline; `grain` is the base-case size. It
+		// parallelizes task CREATION -- the tree is built by the whole pool -- instead of the caller
+		// spawning every chunk serially.
+		//
+		// NOT experimental, and usually not the one to call: ParallelFor DISPATCHES HERE AUTOMATICALLY
+		// once a range needs more than ~2 tasks per worker, which is where the measurements put the
+		// crossover. Below that the flat path is ~14% faster (no tree to build); above it, flat's
+		// O(#tasks) serial CreateTask+Push+NotifyWorker on one thread collapses -- ~8x slower at
+		// ~15k tasks. Call this directly only to bypass ParallelFor's serial-vs-parallel probe, which
+		// is what the crossover benchmark does deliberately.
 		void ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func);
 		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 		bool Push(Task* task);
@@ -119,6 +126,21 @@ namespace JLib {
 			return instance != nullptr;
 		}
 		GlobalFiberPool& GetGlobalPool();
+		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
+		// "level_loaded", the handful of names your app knows at compile time. The registry is
+		// find-or-insert and never evicts, which is correct for that use: it reaches N entries and
+		// stays there.
+		//
+		// DO NOT MINT A NAME PER OPERATION. A key like "fence_" + counter grows the map without
+		// bound, and since every GetEvent holds registryMtx across the lookup (and occasionally a
+		// rehash of a huge map), the result is a lock convoy that PRESENTS EXACTLY LIKE A DEADLOCK
+		// in a debugger -- several workers piled on one mutex with no visible owner. It takes an
+		// hour or so of uptime to show up, so it will not appear in any short test.
+		//
+		// For a per-operation wait -- a GPU fence value, an IO completion, anything with a fresh
+		// identity each time -- use WaitOnEventDirectArmed below instead. It takes a pooled
+		// DirectEvent, touches no map and no global lock, and is the reason no eviction policy is
+		// needed here: the unbounded case has its own API.
 		Event& GetEvent(const std::string& name);
 		void WaitOnEvent(const std::string& eventName);
 		// Like WaitOnEvent, but runs 'arm' AFTER this fiber is registered as a waiter and
@@ -143,7 +165,7 @@ namespace JLib {
 
 		// Lets a non-worker caller (e.g. main, while spinning on a WaitGroup/counter) safely
 		// help drain the pool instead of pure-spinning. Steals ONE FASTJOB via GetTask(), which
-		// vets fastJob-ness AT THE DEQUE (TaskDeque::steal_if) -- a non-fastJob is never claimed
+		// vets the noFiber flag AT THE DEQUE (TaskDeque::steal_if) -- a fiber-backed task is never claimed
 		// by this fiberless caller at all (it could suspend, and there's no fiber to switch away
 		// to), so it stays queued for a real worker. This replaced the old steal-then-Requeue
 		// relocation, which was pure contention churn (claim CAS + re-push + notify, task moved
@@ -168,10 +190,10 @@ namespace JLib {
 			return (p == CorePref::P) ? thiefIsP : !thiefIsP;
 		}
 
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true, CorePref corePref = CorePref::Default);
+		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t noFiber = true, CorePref corePref = CorePref::Default);
 
 		template<typename F>
-		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t fastJob = true, CorePref corePref = CorePref::Default) {
+		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t noFiber = true, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			static_assert(sizeof(L) <= TaskAllocator::SLOT, "lambda too big for a slot");
 			static_assert(alignof(L) <= 16, "lambda over-aligned for the slot");
@@ -180,7 +202,7 @@ namespace JLib {
 			L* t = ::new (mem) L(std::forward<F>(f));
  			t->hiPri = hipri;
 			t->requiredSize = size;
-			t->fastJob = fastJob;
+			t->noFiber = noFiber;
 			t->corePref = corePref;
 			return t;
 		}
@@ -305,7 +327,7 @@ namespace JLib {
 		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenFastJob's
 		// callers include NON-worker, possibly UNPINNED threads (main, or any app thread hitting a
 		// SchedulerMutex/SchedulerConditionVariable spin): their class can't be assumed -- it's looked
-		// up via GetCurrentProcessorNumber() at steal time ("the fastJob would run HERE, right now").
+		// up via GetCurrentProcessorNumber() at steal time ("this noFiber task would run HERE, right now").
 		// Workers keep the cheaper static isPCore[qIndex] lookup (hard-pinned, class never changes).
 		std::vector<char> isPCpu;
 		// -----------------------------------------------
