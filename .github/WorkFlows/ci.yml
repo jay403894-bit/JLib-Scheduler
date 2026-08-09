@@ -1,0 +1,102 @@
+# Build and smoke-test JLib::Scheduler on every supported target.
+#
+# The point is not the benchmark numbers -- CI runners are shared VMs and their timings are noise.
+# The point is that the thing BUILDS and RUNS on each ABI from a CLEAN CHECKOUT. That last part
+# matters more than it sounds: the worst bug of the AArch64 port was a stale file that a local
+# incremental build happily kept using and a fresh clone could never have produced.
+#
+# Free on GitHub-hosted runners for public repositories, including the ARM64 Linux ones.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:      # adds a "Run workflow" button on the Actions tab
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false    # one target failing should not hide the others' results
+      matrix:
+        include:
+          - name: Windows x64 (MSVC)
+            os: windows-latest
+            bench: build/bin/Release/SchedulerBench.exe
+          - name: Linux x86-64 (GCC)
+            os: ubuntu-latest
+            bench: build/bin/SchedulerBench
+          - name: Linux AArch64 (GCC)
+            os: ubuntu-24.04-arm
+            bench: build/bin/SchedulerBench
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the target
+        run: cmake --version
+        shell: bash
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      # --config matters on Windows (the VS generator is multi-config and ignores
+      # CMAKE_BUILD_TYPE); it is harmlessly ignored by single-config generators.
+      - name: Build
+        run: cmake --build build --config Release -j 2
+        shell: bash
+
+      # AffinityPolicy::None, not the default Hard: CI containers run under a restricted cpuset, so
+      # pinning to a CPU index the cgroup does not own just fails. The scheduler ignores that
+      # failure by design, but None keeps the run honest about what is being tested -- correctness,
+      # not placement.
+      - name: Run benchmark (smoke test)
+        run: ./${{ matrix.bench }} none
+        shell: bash
+
+  # The ABI harness: links against ONE object (the context switch) with no scheduler attached, so a
+  # failure here is unambiguously the assembly's fault. Run at BOTH -O0 and -O2 -- register
+  # allocation around the pinned callee-saved sentinels differs enough between them that a broken
+  # switch can pass at one level and fail at the other.
+  context-switch-abi:
+    name: AArch64 context switch (ABI harness)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify we are actually on AArch64
+        run: test "$(uname -m)" = "aarch64" && echo "arch OK: $(uname -m)"
+      - name: Build and run at -O0 and -O2
+        run: |
+          for O in 0 2; do
+            echo "===== -O$O ====="
+            g++ -std=c++17 -O$O -g -o ft$O \
+              tests/fibertest_aarch64.cpp src/posix/aarch64/ContextSwitch.S
+            ./ft$O
+          done
+
+# ---------------------------------------------------------------------------------------------
+# NOT YET ENABLED: macOS / Apple Silicon.
+#
+# The runner is free and is real M-series hardware (macos-14 and later are arm64; macos-13 is
+# Intel), and the CONTEXT SWITCH is already macOS-ready -- ContextSwitch.S carries its Apple
+# directives behind #if defined(__APPLE__), and those are genuinely preprocessed now that the file
+# is .S rather than .s.
+#
+# What is missing is an OS layer, not an ABI:
+#   - include/platform.h tests __linux__ and #errors on anything else; macOS defines __APPLE__.
+#   - src/posix/Topology.cpp parses sysfs. macOS has no /sys -- it needs sysctlbyname, which does
+#     at least expose P/E cores properly (hw.perflevel0.logicalcpu / hw.perflevel1.logicalcpu).
+#   - No sched_getcpu, and no thread-affinity API at all on Apple arm64: placement becomes a
+#     documented no-op there, the way it effectively already is on Android.
+#   - MAP_NORESERVE does not exist.
+#
+# Uncomment and add to the matrix above once those land:
+#   - name: macOS arm64 (Apple Silicon)
+#     os: macos-14
+#     bench: build/bin/SchedulerBench
