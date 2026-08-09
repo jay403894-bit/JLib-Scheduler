@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Windows topology acquisition. Moved verbatim (behaviour-wise) out of TaskScheduler.cpp so the
 // Linux equivalent could exist beside it rather than inside an #ifdef.
 //

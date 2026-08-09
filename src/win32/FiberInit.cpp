@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Fiber::Init -- Windows x64 frame layout.
 //
 // This lives beside ContextSwitch.asm ON PURPOSE. The two are one contract: Init writes a frame

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Linux topology acquisition, from sysfs. The Windows equivalent calls one API; here the same
 // information is text under /sys/devices/system/cpu/, so the two share nothing and live in
 // separate files rather than behind an #ifdef.

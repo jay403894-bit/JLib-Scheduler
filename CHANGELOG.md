@@ -3,6 +3,43 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2026-08-09
+
+### AArch64 support — the scheduler now builds and runs on ARM64
+Full benchmark suite passes on Android/Termux (clang, AArch64), including recursive fork-join —
+fibers suspending and resuming through a new hand-written AAPCS64 context switch under the real
+scheduler. Windows x64 and Linux x86-64 rebuilt and re-run, unchanged.
+
+New `src/posix/aarch64/{ContextSwitch.S,FiberInit.cpp}`: a 176-byte frame (x19–x30, d8–d15, FPCR).
+Three things differ from the x86 ports and are worth knowing if you port further — the return
+address lives in x30 rather than on the stack, so the trampoline address is seeded into a *register*
+slot; there is no `call` to misalign the stack, so the trampoline needs no alignment compensation;
+and SP must be 16-byte aligned at all times, not merely at call boundaries, because misalignment
+faults rather than merely violating convention.
+
+**Source layout change (affects hand-rolled builds).** `src/posix/` is now split by architecture:
+`src/posix/x86_64/` and `src/posix/aarch64/`, each holding `ContextSwitch.S` and `FiberInit.cpp`.
+The OS layer (`Topology.cpp`) stays shared, since Linux/x86-64 and Linux/AArch64 differ only in the
+switch. If you add sources by hand rather than via CMake, add **one** architecture directory.
+
+**[CRITICAL] for hand-rolled and out-of-tree builds.** Two definitions of `Fiber::Init` in one
+static library is *not* a link error — the linker takes whichever archive member it reaches first
+and silently drops the other. A stale `src/posix/FiberInit.cpp` left beside the new arch directories
+therefore produces an AArch64 build that seeds a 64-byte System V frame for a 176-byte AAPCS64
+restore, which faults one instruction past the top of the fiber stack. CMake now refuses to
+configure if such a file exists, and each `FiberInit.cpp` `#error`s when built for the wrong
+architecture. If you sync this tree by copying files, delete removed ones.
+
+Also in this release: `include/platform.h` gained an architecture axis alongside its OS axis and a
+`platform::CpuRelax()` spin hint (`pause` on x86-64, `yield` on AArch64) replacing 17 direct
+`_mm_pause()` calls; the stray `<immintrin.h>` in `TaskScheduler.h` is gone; and on bionic, worker
+affinity goes through `sched_setaffinity(pthread_gettid_np(...))`, since `pthread_setaffinity_np`
+did not reach Android until API 36 and the binding is applied by the parent thread.
+
+**No AArch64 performance numbers are published, deliberately.** Android cgroups own thread
+placement, so affinity requests from an unprivileged app are routinely ignored, and thermal
+throttling moves results mid-run. The ARM claim here is correctness only.
+
 ## 2026-08-07
 
 ### Linux support — the scheduler now builds and runs on Linux x86-64

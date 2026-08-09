@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 /*  ContextSwitch / FiberTrampoline -- System V AMD64 (Linux).
  *  Port of ContextSwitch.asm (Win64/MASM). Intel syntax to stay readable next to the original.
  *

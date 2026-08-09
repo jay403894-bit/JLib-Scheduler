@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // TSAN probe -- NOT a benchmark. Exercises each lock-free structure enough times for TSAN to
 // observe conflicting accesses, then exits. Deliberately small: a race is reported the FIRST time
 // two conflicting accesses occur without intervening synchronisation, so volume buys nothing and

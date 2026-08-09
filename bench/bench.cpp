@@ -1,4 +1,7 @@
-﻿// Scheduler microbenchmark -- console app built by the umbrella solution (Bench.vcxproj takes a
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+// Scheduler microbenchmark -- console app built by the umbrella solution (Bench.vcxproj takes a
 // ProjectReference on Scheduler), so it measures exactly the library every game links, not a
 // special build. Build JLib.slnx, run build\x64\<Config>\SchedulerBench.exe.
 //
@@ -279,11 +282,7 @@ int main(int argc, char** argv) {
     BenchThroughput(sched);
     BenchLatency(sched);
     BenchParallelFor(sched);
-    printf("about to call BenchRecursiveForkJoin\n");
-    fflush(stdout);
     BenchRecursiveForkJoin(sched);
-    printf("returned from BenchRecursiveForkJoin\n");
-    fflush(stdout);
     BenchFrameDag(sched);
     BenchParallelForCrossover(sched);
 
@@ -307,12 +306,14 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
     }
 
     int mid = start + (end - start) / 2;
+    // fastJob=false is the load-bearing argument: these tasks call WaitFor below, which SUSPENDS,
+    // and only a fiber-backed task can suspend. It also makes this the only section of the bench
+    // that exercises a fiber at all -- every other one uses the fn-pointer overload, which
+    // defaults to fastJob=true.
     JLib::Task* left = sched.CreateTask([&sched, start, mid, BASE_CASE] {
-        printf("    [lambda left executing]\n"); fflush(stdout);
         RecursiveForkJoinImpl(sched, start, mid, BASE_CASE);
     }, false, JLib::FiberSize::Standard, false);  // hipri=false, size=Standard, fastJob=false
     JLib::Task* right = sched.CreateTask([&sched, mid, end, BASE_CASE] {
-        printf("    [lambda right executing]\n"); fflush(stdout);
         RecursiveForkJoinImpl(sched, mid, end, BASE_CASE);
     }, false, JLib::FiberSize::Standard, false);
 
@@ -340,11 +341,7 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
         fj_pushed.fetch_add(1);
     }
 
-    printf("  waiting for wg (n=%d)...\n", wg.n.load());
-    fflush(stdout);
     sched.WaitFor(wg);
-    printf("  wg done (n=%d)\n", wg.n.load());
-    fflush(stdout);
 }
 
 static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
@@ -357,9 +354,6 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
         fj_pushed.store(0);
         fj_failed.store(0);
         fj_executed.store(0);
-        printf("fork-join    : starting run %d...\n", run);
-        fflush(stdout);
-
         auto t0 = Clock::now();
 
         // Wrap recursion in a task so it never blocks a main/worker thread
@@ -367,6 +361,16 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
         JLib::Task* task = sched.CreateTask([&sched, kN, kBaseCase] {
             RecursiveForkJoinImpl(sched, 0, kN, kBaseCase);
         }, false, JLib::FiberSize::Standard, false);  // non-fastJob, fiber-based
+
+        // RecursiveForkJoinImpl checks its two CreateTask results; this one never did, so an
+        // exhausted allocator surfaced as a write through nullptr instead of a message.
+        if (!task) {
+            printf("ERROR: CreateTask(outer) returned null -- allocator exhausted "
+                   "(live=%lld / capacity=%zu)\n",
+                   sched.GetAllocator()->LiveCount(), sched.GetAllocator()->Capacity());
+            fflush(stdout);
+            return;
+        }
 
         task->waitGroup = &wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);

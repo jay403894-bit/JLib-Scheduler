@@ -1,4 +1,7 @@
-﻿#pragma once
+﻿// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
+#pragma once
 #define NOMINMAX
 #include "Task.h"
 #include "TaskMPSCQueue.h"
@@ -14,7 +17,9 @@
 #include <string>
 #include <unordered_map>
 #include <thread>
-#include <immintrin.h>
+// <immintrin.h> was here and is x86-only. Removed rather than guarded, for the same reason
+// LockFreeList.h lost its <intrin.h>: nothing in this header uses an intrinsic. The spin hint the
+// .cpp needs is platform::CpuRelax() in platform.h, which is arch-correct by construction.
 #include <queue>
 #include "GlobalFiberPool.h"
 #include "DirectEvent.h"

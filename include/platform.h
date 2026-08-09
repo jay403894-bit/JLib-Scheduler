@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 #pragma once
 // ============================ THE ONE PLACE THAT DECIDES THE PLATFORM ============================
 //
@@ -20,16 +23,27 @@
 #include <cstddef>   // std::size_t, used by the primitives below on BOTH platforms
 #include <cstdint>
 
+// TWO AXES, decided independently. The OS picks the syscalls; the ARCH picks the context switch and
+// the spin hint. They are genuinely orthogonal -- Linux/x86-64 and Linux/AArch64 share every syscall
+// in this file and differ only in one instruction -- so collapsing them into a single "platform"
+// enum would force a fresh copy of the POSIX layer for each new chip. CMake makes the same split:
+// src/posix/ is the OS layer, src/posix/<arch>/ is the ABI layer.
 #if defined(_WIN32)
     #define JLIB_PLATFORM_WINDOWS 1
-#elif defined(__linux__)
+#elif defined(__linux__)      // also true on Android: bionic differs in details, not in kind
     #define JLIB_PLATFORM_POSIX 1
 #else
-    #error "JLib::Scheduler supports Windows x64 and Linux x86-64. See platform.h."
+    #error "JLib::Scheduler supports Windows, Linux and Android. See platform.h."
 #endif
 
-#if !defined(__x86_64__) && !defined(_M_X64)
-    #error "JLib::Scheduler is x86-64 only: the fiber context switch is hand-written assembly."
+#if defined(__x86_64__) || defined(_M_X64)
+    #define JLIB_ARCH_X86_64 1
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #define JLIB_ARCH_AARCH64 1
+#else
+    // Not a compiler flag away: adding an arch means writing src/posix/<arch>/ContextSwitch.S and a
+    // matching Fiber::Init, then teaching CpuRelax() below the local spin hint.
+    #error "JLib::Scheduler supports x86-64 and AArch64: the fiber context switch is hand-written assembly."
 #endif
 
 // ------------------------------------------------------------------------------------------------
@@ -57,7 +71,9 @@ using native_handle_t = HANDLE;
 #include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if JLIB_ARCH_X86_64
 #include <xmmintrin.h>   // _mm_pause -- on Windows this arrives via windows.h/intrin.h
+#endif
 
 // cpu_set_t is the direct analogue of Windows' affinity mask, and pthread_t of a HANDLE. Naming
 // them the same way keeps Thread.h and the scheduler's members platform-free.
@@ -103,6 +119,28 @@ inline void ReleaseReservation(void* addr, std::size_t bytes) {
     ::VirtualFree(addr, 0, MEM_RELEASE);
 #else
     ::munmap(addr, bytes);             // munmap, unlike VirtualFree, DOES want the length
+#endif
+}
+
+// ==================================== SPIN-WAIT HINT ===========================================
+// Tell the core "I am in a spin loop, this is not useful work". Every one of the scheduler's
+// test_and_set loops goes through here. It is not a yield to the OS and never blocks -- it is a
+// hint to the pipeline, so the cost of getting it wrong is throughput, not correctness.
+//
+// This is the ONLY thing in the POSIX layer that is genuinely per-arch rather than per-OS, which is
+// why it is a wrapped primitive and not seventeen #ifdefs at the call sites.
+//   x86-64: PAUSE -- de-pipelines the loop, avoids the memory-order-violation flush on exit, and on
+//           SMT hardware hands the physical core's issue slots to the sibling thread.
+//   AArch64: YIELD -- the architectural equivalent hint. On many implementations it retires as a
+//           NOP, but on SMT-capable ARM cores it does the same sibling handoff, and it is the
+//           instruction the architecture designates for this. (Some spin implementations prefer
+//           'isb' for a longer stall; that is a tuning choice to MEASURE on real hardware, not to
+//           assume -- and it is a heavier hammer than PAUSE, so it is not the like-for-like port.)
+inline void CpuRelax() {
+#if JLIB_ARCH_X86_64
+    _mm_pause();
+#else
+    __asm__ __volatile__("yield" ::: "memory");
 #endif
 }
 

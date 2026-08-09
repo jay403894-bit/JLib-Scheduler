@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 #include "../include/Thread.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
@@ -1103,12 +1106,12 @@ void SchedulerMutex::Lock() {
 		// Fiber context: suspend on contention instead of blocking thread
 		Task* callerTask = (TaskScheduler::IsInitialized()) ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
 		{
-			while (spinLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 			if (!locked) {
 				locked = true;
 				spinLock.clear(std::memory_order_release);
 				{
-					while (holderLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+					while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 					lockHolder = callerTask;
 					holderLock.clear(std::memory_order_release);
 				}
@@ -1120,7 +1123,7 @@ void SchedulerMutex::Lock() {
 		Thread::Suspend(current);
 		// Resumed: we have the lock
 		{
-			while (holderLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 			lockHolder = callerTask;
 			holderLock.clear(std::memory_order_release);
 		}
@@ -1130,11 +1133,11 @@ void SchedulerMutex::Lock() {
 		while (!Try_Lock()) {
 			if (TaskScheduler::IsInitialized()) {
 				if (!TaskScheduler::Instance().TryRunStolenFastJob()) {
-					_mm_pause();
+					platform::CpuRelax();
 				}
 			}
 			else {
-				_mm_pause();
+				platform::CpuRelax();
 			}
 		}
 	}
@@ -1145,14 +1148,14 @@ void SchedulerMutex::Unlock()
 	Task* wasHolder;
 	Fiber* nextFiber = nullptr;
 	{
-		while (holderLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+		while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 		wasHolder = lockHolder;
 		lockHolder = nullptr;
 		holderLock.clear(std::memory_order_release);
 	}
 
 	{
-		while (spinLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+		while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 		if (!waitingFibers.empty()) {
 			nextFiber = waitingFibers.front();
 			waitingFibers.pop();
@@ -1175,12 +1178,12 @@ void SchedulerMutex::Unlock()
 
 bool SchedulerMutex::Try_Lock()
 {
-	while (spinLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 	if (!locked) {
 		locked = true;
 		spinLock.clear(std::memory_order_release);
 		{
-			while (holderLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 			Task* callerTask = TaskScheduler::IsInitialized() ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
 			lockHolder = callerTask;
 			holderLock.clear(std::memory_order_release);
@@ -1197,7 +1200,7 @@ void SchedulerSemaphore::Wait() {
 	if (current != nullptr) {
 		{
 			// Tight spin-lock to protect inner state variables in user-space
-			while (spinLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 
 			if (permits > 0) {
 				--permits;
@@ -1214,17 +1217,17 @@ void SchedulerSemaphore::Wait() {
 		while (!Try_Wait()) {
 			if (TaskScheduler::IsInitialized()) {
 				if (!TaskScheduler::Instance().TryRunStolenFastJob()) {
-					_mm_pause();
+					platform::CpuRelax();
 				}
 			}
 			else
-				_mm_pause();
+				platform::CpuRelax();
 		}
 	}
 }
 
 bool SchedulerSemaphore::Try_Wait() {
-	while (spinLock.test_and_set(std::memory_order_acquire)) { _mm_pause(); }
+	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 	if (permits > 0) {
 		--permits;
 		spinLock.clear(std::memory_order_release);
@@ -1238,7 +1241,7 @@ void SchedulerSemaphore::Signal()
 {
 	// 1. Acquire the user-space spinlock
 	while (spinLock.test_and_set(std::memory_order_acquire)) {
-		_mm_pause();
+		platform::CpuRelax();
 	}
 
 	// 2. Safely manipulate the queue and permits
@@ -1262,7 +1265,7 @@ void SchedulerSemaphore::Signal()
 
 void SchedulerConditionVariable::LockQueue() {
 	while (spinLock.test_and_set(std::memory_order_acquire)) {
-		_mm_pause();
+		platform::CpuRelax();
 	}
 }
 
@@ -1298,10 +1301,10 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex) {
 		mutex.Unlock();
 		if (TaskScheduler::IsInitialized()) {
 			if (!TaskScheduler::Instance().TryRunStolenFastJob())
-				_mm_pause();
+				platform::CpuRelax();
 		}
 		else {
-			_mm_pause();
+			platform::CpuRelax();
 		}
 		mutex.Lock();
 	}

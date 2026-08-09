@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // Fiber::Init -- System V AMD64 (Linux) frame layout.
 //
 // Beside ContextSwitch.s for the same reason the Windows pair sit together: this function writes
@@ -13,9 +16,15 @@
 // Layout at ctx.rsp, low to high -- must match ContextSwitch.s exactly:
 //   +0  MXCSR (4) + x87 CW (2) + 2 pad     +8  r15   +16 r14   +24 r13
 //   +32 r12                                +40 rbx   +48 rbp   +56 return address
-#include "../../include/Fiber.h"
-#include "../../include/Thread.h"
-#include "../../include/TaskScheduler.h"
+#include "../../../include/Fiber.h"
+#include "../../../include/Thread.h"
+#include "../../../include/TaskScheduler.h"
+
+// See the matching guard in aarch64/FiberInit.cpp. A stale copy of THIS file, globbed into an
+// AArch64 build, is what silently seeded a 64-byte SysV frame for a 176-byte AAPCS64 restore.
+#if !defined(__x86_64__) && !defined(_M_X64)
+#error "x86_64/FiberInit.cpp built for a non-x86-64 target: the build picked the wrong arch directory."
+#endif
 
 using namespace JLib;
 

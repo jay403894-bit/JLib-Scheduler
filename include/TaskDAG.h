@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+
 // TaskDAG.h  -- requires Task and TaskScheduler forward declarations
 #pragma once
 #include <vector>
