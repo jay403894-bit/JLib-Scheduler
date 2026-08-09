@@ -347,6 +347,6 @@ Negative results with receipts — the section most libraries won't write.
 
 ## 📄 License
 
-BSD. Use it, fork it, ship it. A community Linux fork exists — upstreaming is welcome.
+BSD. Use it, fork it, ship it. 
 
 **Built for real-time engines. Proven under concurrent load — and under profilers.**
