@@ -112,12 +112,20 @@ jobs:
                    hw.l1dcachesize hw.l2cachesize hw.pagesize; do
             printf '%-32s ' "$k"; sysctl -n "$k" 2>/dev/null || echo "(absent)"
           done
-      # Expected to fail at platform.h's #error until the macOS OS layer exists. The log names the
-      # next thing to fix, every push, for free.
-      - name: Configure and build (expected to fail until macOS is ported)
+      - name: Configure and build
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j 3
+      - name: Run benchmark (smoke test)
+        run: ./build/bin/SchedulerBench none
+      - name: ABI harness at -O0 and -O2
+        run: |
+          for O in 0 2; do
+            echo "===== -O$O ====="
+            clang++ -std=c++17 -O$O -g -o ft$O \
+              tests/fibertest_aarch64.cpp src/posix/aarch64/ContextSwitch.S
+            ./ft$O
+          done
 
 # ---------------------------------------------------------------------------------------------
 # NOTES ON THE macOS PORT (the exploratory job above is the feedback loop).

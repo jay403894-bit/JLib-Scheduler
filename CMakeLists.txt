@@ -64,10 +64,11 @@ endif()
 # thread layer) and an ARCH (which decides the context switch). Android is accepted alongside Linux
 # because bionic differs from glibc only in details the POSIX layer already handles -- Termux's
 # CMake reports one or the other depending on version, and both are the same target here.
-if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android|Darwin)$")
     message(FATAL_ERROR
-        "JLib::Scheduler supports Windows, Linux and Android. The context switch is hand-written "
-        "assembly per ABI, so a new platform needs a new ContextSwitch, not a compiler flag.")
+        "JLib::Scheduler supports Windows, Linux, Android and macOS. The context switch is "
+        "hand-written assembly per ABI, so a new platform needs a new ContextSwitch, not a "
+        "compiler flag.")
 endif()
 
 # Normalise the many spellings a toolchain may use for the same instruction set.
@@ -112,8 +113,21 @@ if(WIN32)
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/*.cpp")
     set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/ContextSwitch.asm")
 else()
+    # OS layer: src/posix/ (Linux, Android) or src/darwin/ (macOS). They diverge wholesale --
+    # sysfs text versus sysctl, and macOS has no thread-affinity API at all -- so they are separate
+    # directories, not #ifdefs.
+    #
+    # The ARCH layer under src/posix/<arch>/ is shared by BOTH, because the ABI is a property of the
+    # instruction set and not of the kernel: Apple arm64 is AAPCS64, the same switch Linux/AArch64
+    # uses, and ContextSwitch.S carries the handful of Mach-O directive differences behind
+    # #if defined(__APPLE__). (That guard only works because the file is .S -- see below.)
+    if(APPLE)
+        set(JLIBSCHED_OSDIR "darwin")
+    else()
+        set(JLIBSCHED_OSDIR "posix")
+    endif()
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/${JLIBSCHED_OSDIR}/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/${JLIBSCHED_ARCH}/*.cpp")
     # .S, not .s: the capital is what runs the file through the C preprocessor. The AArch64 switch
     # selects its Apple directives with #if defined(__APPLE__), and with a lowercase .s the
@@ -122,7 +136,11 @@ else()
     set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/${JLIBSCHED_ARCH}/ContextSwitch.S")
 endif()
 
-message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH}")
+if(WIN32)
+    message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH} (os layer: win32)")
+else()
+    message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH} (os layer: ${JLIBSCHED_OSDIR})")
+endif()
 
 add_library(Scheduler STATIC ${JLIBSCHED_SRC} ${JLIBSCHED_PLAT} ${JLIBSCHED_ASM})
 add_library(JLib::Scheduler ALIAS Scheduler)

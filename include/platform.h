@@ -28,12 +28,19 @@
 // in this file and differ only in one instruction -- so collapsing them into a single "platform"
 // enum would force a fresh copy of the POSIX layer for each new chip. CMake makes the same split:
 // src/posix/ is the OS layer, src/posix/<arch>/ is the ABI layer.
+// JLIB_PLATFORM_POSIX means "mmap and pthreads exist". It is NOT fine-grained enough on its own:
+// Linux and macOS diverge on topology (sysfs vs sysctl) and on thread affinity (macOS has none at
+// all on arm64), so those two get a second define and CMake picks a different OS directory for each.
 #if defined(_WIN32)
     #define JLIB_PLATFORM_WINDOWS 1
+#elif defined(__APPLE__)
+    #define JLIB_PLATFORM_POSIX  1
+    #define JLIB_PLATFORM_DARWIN 1
 #elif defined(__linux__)      // also true on Android: bionic differs in details, not in kind
     #define JLIB_PLATFORM_POSIX 1
+    #define JLIB_PLATFORM_LINUX 1
 #else
-    #error "JLib::Scheduler supports Windows, Linux and Android. See platform.h."
+    #error "JLib::Scheduler supports Windows, Linux/Android and macOS. See platform.h."
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -77,8 +84,20 @@ using native_handle_t = HANDLE;
 
 // cpu_set_t is the direct analogue of Windows' affinity mask, and pthread_t of a HANDLE. Naming
 // them the same way keeps Thread.h and the scheduler's members platform-free.
+// macOS has no cpu_set_t because it has no thread-affinity API to use one with, so it gets a plain
+// bitmask -- the type is only a name here; nothing in the scheduler reads it.
+#if JLIB_PLATFORM_DARWIN
+using affinity_mask_t = std::uint64_t;
+#else
 using affinity_mask_t = cpu_set_t;
+#endif
 using native_handle_t = pthread_t;
+
+// MAP_NORESERVE is a Linux overcommit-accounting flag. macOS has no equivalent and no equivalent
+// problem (a PROT_NONE mapping is never charged), so define it away rather than #ifdef the call.
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 
 #endif
 
@@ -151,6 +170,12 @@ inline void CpuRelax() {
 inline unsigned CurrentCpu() {
 #if JLIB_PLATFORM_WINDOWS
     return ::GetCurrentProcessorNumber();
+#elif JLIB_PLATFORM_DARWIN
+    // macOS deliberately does not expose the current CPU: the kernel owns placement and will not
+    // let a thread pin itself, so an answer would be advisory to the point of uselessness. Callers
+    // already treat this as a hint (it only indexes the P/E table), and 0 degrades to "no
+    // preference", which is the same outcome macOS gives us for placement generally.
+    return 0u;
 #else
     const int c = ::sched_getcpu();      // -1 only if the syscall is unavailable
     return (c < 0) ? 0u : (unsigned)c;

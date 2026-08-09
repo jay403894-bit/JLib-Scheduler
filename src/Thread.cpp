@@ -27,12 +27,26 @@ thread_local Thread* Thread::instance = nullptr;
 // correctness one. On Android that is not an edge case -- the platform's cgroups own thread
 // placement, so these calls routinely fail (or succeed and are then overridden) for an
 // unprivileged app. Treat Android placement as UNENFORCEABLE and never quote a number from it.
-static inline void BindThreadToSet(pthread_t handle, const cpu_set_t& set)
+// Takes a plain 64-bit mask rather than a cpu_set_t so the CALL SITES stay portable: macOS has no
+// cpu_set_t at all, and mentioning it in the policy switch would need the whole block #ifdef'd.
+static inline void BindThreadToMask(pthread_t handle, std::uint64_t mask)
 {
-#if defined(__BIONIC__)
-	(void)sched_setaffinity(pthread_gettid_np(handle), sizeof(cpu_set_t), &set);
+#if JLIB_PLATFORM_DARWIN
+	// macOS has NO thread-affinity API on arm64. THREAD_AFFINITY_POLICY still compiles but has been
+	// a no-op since Apple Silicon -- the kernel owns placement and expresses intent through QoS
+	// classes instead. So this is an honest no-op, not a stub awaiting an implementation: the
+	// policy is unenforceable, which is why the docs say placement is Windows/Linux only.
+	(void)handle; (void)mask;
 #else
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (int c = 0; c < 64; ++c)
+		if (mask & (std::uint64_t(1) << c)) CPU_SET(c, &set);
+  #if defined(__BIONIC__)
+	(void)sched_setaffinity(pthread_gettid_np(handle), sizeof(cpu_set_t), &set);
+  #else
 	(void)pthread_setaffinity_np(handle, sizeof(cpu_set_t), &set);
+  #endif
 #endif
 }
 #endif
@@ -123,23 +137,14 @@ void Thread::StartWorker(size_t cpu_affinity)
 	switch (scheduler->GetAffinityPolicy()) {
 	case TaskScheduler::AffinityPolicy::PhysicalOnly:
 	case TaskScheduler::AffinityPolicy::Hard: {
-		cpu_set_t set;
-		CPU_ZERO(&set);
-		CPU_SET((int)cpu_affinity, &set);
-		BindThreadToSet(nativeHandle, set);
+		BindThreadToMask(nativeHandle, std::uint64_t(1) << cpu_affinity);
 		break;
 	}
 	case TaskScheduler::AffinityPolicy::Ideal: {
 		const size_t qi = (size_t)qIndex;   // set by SetQueueIndex before StartWorker
 		const uint64_t llc = (qi < scheduler->llcMaskOfWorker.size())
 		                   ? scheduler->llcMaskOfWorker[qi] : 0;
-		if (llc) {
-			cpu_set_t set;
-			CPU_ZERO(&set);
-			for (int c = 0; c < 64; ++c)
-				if (llc & (uint64_t(1) << c)) CPU_SET(c, &set);
-			BindThreadToSet(nativeHandle, set);
-		}
+		if (llc) BindThreadToMask(nativeHandle, llc);
 		break;
 	}
 	case TaskScheduler::AffinityPolicy::None:
