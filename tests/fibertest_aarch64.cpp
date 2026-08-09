@@ -166,8 +166,10 @@ int main() {
     }
 
     g_fib = MakeFiber(region, kStack, FiberEntry);
-    printf("frame %zu bytes, x19 slot +%d, x30 slot +%d\n",
-           kFrameBytes, kSlotX19 * 8, kSlotX30 * 8);
+    // Page size is worth printing: Apple Silicon uses 16K pages where Linux/ARM typically uses 4K,
+    // so the guard costs 16K of a 64K fiber stack there rather than 4K.
+    printf("frame %zu bytes, x19 slot +%d, x30 slot +%d, page %zu\n",
+           kFrameBytes, kSlotX19 * 8, kSlotX30 * 8, kPage);
 
     const uint64_t mainFpcr = GetFpcr();
 
@@ -194,14 +196,23 @@ int main() {
     if (!fpcrOk && ((nowFpcr ^ mainFpcr) & kFpcrFZ))
         printf("  -> FZ leaked out of the fiber: the FPCR slot is not being restored\n");
 
-    // 6. Guard page must still fault. Forked so the SIGSEGV kills a child, not the test.
+    // 6. Guard page must still fault. Forked so the fault kills a child, not the test.
+    //
+    // ACCEPT SIGSEGV *OR* SIGBUS. Linux raises SIGSEGV for a protection violation; macOS/Mach
+    // raises SIGBUS when the page is MAPPED but protected, and reserves SIGSEGV for addresses that
+    // are not mapped at all. Checking only SIGSEGV made this report "*** WRITABLE ***" on Apple
+    // Silicon for a guard page that was working perfectly -- a false alarm about the one safety
+    // property the arena exists to provide, which is the worst kind of test bug to leave in.
     printf("guard page         : ");
     fflush(stdout);
     pid_t pid = fork();
-    if (pid == 0) { *(volatile char*)region = 1; _exit(0); }   // should die on SIGSEGV
+    if (pid == 0) { *(volatile char*)region = 1; _exit(0); }   // must not survive this
     int st = 0; waitpid(pid, &st, 0);
-    bool faulted = WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV;
-    printf("%s\n", faulted ? "faults as expected" : "*** WRITABLE ***");
+    const int sig = WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+    const bool faulted = (sig == SIGSEGV || sig == SIGBUS);
+    printf("%s\n", faulted
+           ? (sig == SIGBUS ? "faults as expected (SIGBUS)" : "faults as expected (SIGSEGV)")
+           : "*** WRITABLE ***");
 
     bool pass = g_hits >= 2 && gprOk && fpOk && fpcrOk && faulted;
     printf("\n%s\n", pass ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
