@@ -159,6 +159,20 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched);
 // the results are summed into a global that gets printed.
 static std::atomic<double> g_sink{ 0.0 };
 
+// std::atomic<floating-point>::fetch_add is C++20 (P0020R6), and AppleClang 15's libc++ does not
+// ship it -- which is what broke the macOS build while the LIBRARY itself compiled fine. A
+// compare-exchange loop is the portable equivalent, works in C++17, and costs nothing here: no
+// mainstream CPU has a native atomic FP add, so fetch_add lowers to this loop anyway. Removing it
+// leaves the bench with no C++20 dependency at all.
+static void SinkAdd(double v) {
+    double cur = g_sink.load(std::memory_order_relaxed);
+    while (!g_sink.compare_exchange_weak(cur, cur + v,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+        // cur was refreshed with the current value by the failed exchange; retry.
+    }
+}
+
 template <int kFlops>
 static double BodyCost(int i) {
     double x = (double)i * 0.5 + 1.0;
@@ -187,7 +201,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             double acc = 0.0;
             for (int i = 0; i < n; ++i) acc += BodyCost<kFlops>(i);
             bestSerial = std::min(bestSerial, MsBetween(t0, Clock::now()));
-            g_sink.fetch_add(acc, std::memory_order_relaxed);
+            SinkAdd(acc);
 
             // --- parallel ---
             std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
@@ -204,7 +218,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
                 while (!pacc.compare_exchange_weak(cur, cur + local, std::memory_order_relaxed)) {}
                 });
             bestPar = std::min(bestPar, MsBetween(t1, Clock::now()));
-            g_sink.fetch_add(pacc.load(), std::memory_order_relaxed);
+            SinkAdd(pacc.load());
         }
 
         const double speedup = bestSerial / std::max(bestPar, 1e-9);

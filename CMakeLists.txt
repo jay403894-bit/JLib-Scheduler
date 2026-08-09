@@ -162,12 +162,14 @@ else()
 endif()
 
 # ---- bench -----------------------------------------------------------------------------------
-# C++20 even though the library is C++17: the crossover sweep accumulates into a
-# std::atomic<double>, and atomic<floating-point>::fetch_add is C++20. That is a property of the
-# harness, not of the library's compatibility claim.
+# C++17, same as the library. This used to be C++20 solely because the crossover sweep accumulated
+# into a std::atomic<double> via fetch_add, which is C++20 (P0020R6). AppleClang's libc++ does not
+# ship that overload, so the macOS port replaced it with a compare-exchange loop -- which is what
+# fetch_add lowers to anyway -- and the whole C++20 requirement went with it. There is now no
+# caveat to attach to the project's C++17 claim.
 add_executable(SchedulerBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench.cpp")
 target_link_libraries(SchedulerBench PRIVATE Scheduler)
-target_compile_features(SchedulerBench PRIVATE cxx_std_20)
+target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 
 # ---- install (standalone only) ---------------------------------------------------------------
 # Inside the umbrella, JLib's own top-level file owns the export set and installs Scheduler as part
