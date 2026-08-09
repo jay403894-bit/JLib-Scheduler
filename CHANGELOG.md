@@ -5,6 +5,31 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## 2026-08-09
 
+### macOS / Apple Silicon support
+Builds and runs on macOS arm64, verified in CI on `macos-14` (AppleClang). The AAPCS64 context
+switch is unchanged — the calling convention belongs to the instruction set, not the kernel, so
+Apple arm64 uses the same `src/posix/aarch64/ContextSwitch.S` as Linux; only the Mach-O directives
+behind `#if defined(__APPLE__)` differ, and those now genuinely take effect (see the `.s`→`.S` note
+below). The ABI harness passes at `-O0` and `-O2` on both ARM64 platforms.
+
+New `src/darwin/` OS layer, selected by CMake alongside `src/win32/` and `src/posix/`, while the
+ABI layer under `src/posix/<arch>/` is shared by every POSIX target. `Topology.cpp` there reads
+`sysctl` rather than sysfs. `Thread.cpp`'s affinity helper now takes a plain 64-bit mask instead of
+a `cpu_set_t`, which keeps the policy switch free of a type macOS does not have.
+
+**Placement is a documented no-op on macOS.** There is no thread-affinity API on Apple arm64 —
+`THREAD_AFFINITY_POLICY` still links but has done nothing since Apple Silicon; the kernel owns
+placement and takes intent through QoS classes. Topology reports SMT honestly (Apple Silicon has
+none) but leaves the P/E class table empty: macOS publishes per-performance-level CPU *counts*, not
+a logical-CPU-index → level mapping, and a class table built on a guessed ordering could not be
+acted on even if it were right.
+
+### The benchmark no longer requires C++20
+`std::atomic<double>::fetch_add` (C++20, P0020R6) is absent from AppleClang's libc++, and it was the
+harness's only C++20 dependency. Replaced with a compare-exchange loop — which is what `fetch_add`
+lowers to anyway on hardware with no native atomic FP add — so the bench is C++17 like the library.
+Verified equivalent: the crossover sweep's sink prints the same value on x86-64 and AArch64.
+
 ### AArch64 support — the scheduler now builds and runs on ARM64
 Full benchmark suite passes on Android/Termux (clang, AArch64), including recursive fork-join —
 fibers suspending and resuming through a new hand-written AAPCS64 context switch under the real

@@ -33,6 +33,9 @@ jobs:
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
+          - name: macOS arm64 (AppleClang)
+            os: macos-14
+            bench: build/bin/SchedulerBench
 
     steps:
       - uses: actions/checkout@v4
@@ -63,87 +66,40 @@ jobs:
   # failure here is unambiguously the assembly's fault. Run at BOTH -O0 and -O2 -- register
   # allocation around the pinned callee-saved sentinels differs enough between them that a broken
   # switch can pass at one level and fail at the other.
+  # Runs on BOTH AArch64 OSes, because the ABI is shared but the toolchain and object format are
+  # not: Linux is GCC/ELF, macOS is AppleClang/Mach-O and takes the #if defined(__APPLE__) half of
+  # the file -- the half that can only ever be exercised on a Mac. `c++` resolves correctly on each.
+  # Note `uname -m` disagrees between them: Linux says aarch64, Darwin says arm64. Same ISA.
   context-switch-abi:
-    name: AArch64 context switch (ABI harness)
-    runs-on: ubuntu-24.04-arm
+    name: ABI harness -- ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AArch64 (GCC/ELF)
+            os: ubuntu-24.04-arm
+          - name: macOS arm64 (AppleClang/Mach-O)
+            os: macos-14
     steps:
       - uses: actions/checkout@v4
       # Block scalar, not an inline one: an unquoted YAML value containing ": " parses as a nested
       # mapping and breaks the whole file.
       - name: Verify we are actually on AArch64
         run: |
-          test "$(uname -m)" = "aarch64"
+          uname -m | grep -Eq '^(aarch64|arm64)$'
           echo "arch is $(uname -m)"
       - name: Build and run at -O0 and -O2
         run: |
           for O in 0 2; do
             echo "===== -O$O ====="
-            g++ -std=c++17 -O$O -g -o ft$O \
+            c++ -std=c++17 -O$O -g -o ft$O \
               tests/fibertest_aarch64.cpp src/posix/aarch64/ContextSwitch.S
             ./ft$O
           done
 
-  # Apple Silicon, EXPLORATORY. macos-14+ runners are real M-series hardware and are free for public
-  # repositories -- which is the whole point of this job: it is the only Apple Silicon access this
-  # project has, so CI is the development loop for the macOS port rather than a gate on it.
-  #
-  # continue-on-error means a failure here does NOT fail the workflow or redden the badge. Read its
-  # log to see exactly what macOS rejects; when it finally goes green, delete the flag and promote
-  # it into the matrix above.
-  macos-exploratory:
-    name: macOS arm64 (exploratory, allowed to fail)
-    runs-on: macos-14
-    continue-on-error: true
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - name: Confirm the runner is Apple Silicon
-        run: |
-          uname -m
-          sysctl -n machdep.cpu.brand_string
-      # Useful even before the port compiles: this is the data a macOS Topology.cpp would read, and
-      # unlike Linux, Apple exposes P/E cores directly -- perflevel0 is P, perflevel1 is E.
-      - name: Dump the topology macOS actually exposes
-        run: |
-          for k in hw.ncpu hw.logicalcpu hw.physicalcpu hw.nperflevels \
-                   hw.perflevel0.logicalcpu hw.perflevel0.physicalcpu \
-                   hw.perflevel1.logicalcpu hw.perflevel1.physicalcpu \
-                   hw.l1dcachesize hw.l2cachesize hw.pagesize; do
-            printf '%-32s ' "$k"; sysctl -n "$k" 2>/dev/null || echo "(absent)"
-          done
-      - name: Configure and build
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j 3
-      - name: Run benchmark (smoke test)
-        run: ./build/bin/SchedulerBench none
-      - name: ABI harness at -O0 and -O2
-        run: |
-          for O in 0 2; do
-            echo "===== -O$O ====="
-            clang++ -std=c++17 -O$O -g -o ft$O \
-              tests/fibertest_aarch64.cpp src/posix/aarch64/ContextSwitch.S
-            ./ft$O
-          done
-
-# ---------------------------------------------------------------------------------------------
-# NOTES ON THE macOS PORT (the exploratory job above is the feedback loop).
-#
-# The runner is free and is real M-series hardware (macos-14 and later are arm64; macos-13 is
-# Intel), and the CONTEXT SWITCH is already macOS-ready -- ContextSwitch.S carries its Apple
-# directives behind #if defined(__APPLE__), and those are genuinely preprocessed now that the file
-# is .S rather than .s.
-#
-# What is missing is an OS layer, not an ABI:
-#   - include/platform.h tests __linux__ and #errors on anything else; macOS defines __APPLE__.
-#   - src/posix/Topology.cpp parses sysfs. macOS has no /sys -- it needs sysctlbyname, which does
-#     at least expose P/E cores properly (hw.perflevel0.logicalcpu / hw.perflevel1.logicalcpu).
-#   - No sched_getcpu, and no thread-affinity API at all on Apple arm64: placement becomes a
-#     documented no-op there, the way it effectively already is on Android.
-#   - MAP_NORESERVE does not exist.
-#
-# Uncomment and add to the matrix above once those land:
-#   - name: macOS arm64 (Apple Silicon)
-#     os: macos-14
-#     bench: build/bin/SchedulerBench
+# macOS note: macos-14 and later are Apple Silicon; macos-13 is Intel. If an Intel macOS target is
+# ever wanted, it needs no new code -- src/darwin/ is the OS layer and src/posix/x86_64/ already has
+# the System V switch -- but hw.logicalcpu != hw.physicalcpu there (hyper-threading), and
+# src/darwin/Topology.cpp deliberately reports no SMT pairing in that case rather than guess it.
