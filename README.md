@@ -4,7 +4,7 @@ A fiber-based, work-stealing task scheduler for real-time engines. Hand-written 
 
 **Windows x64 (MSVC) · Linux x86-64 (GCC/Clang) · C++17 · BSD licensed**
 
-*looking for an alternative to marl or fibertaskinglib?*
+looking for an alternative to marl or fibertaskinglib? Try out JLibScheduler!
 ---
 
 ## 📈 Measured (i9-13900K, Release)
