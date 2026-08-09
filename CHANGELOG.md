@@ -36,6 +36,12 @@ Also in this release: `include/platform.h` gained an architecture axis alongside
 affinity goes through `sched_setaffinity(pthread_gettid_np(...))`, since `pthread_setaffinity_np`
 did not reach Android until API 36 and the binding is applied by the parent thread.
 
+**CI now builds and runs the suite on every push** across Windows x64 (MSVC), Linux x86-64 (GCC)
+and Linux AArch64 (GCC), plus the standalone AAPCS64 ABI harness at `-O0` and `-O2`. The ARM64
+results therefore hold across two toolchains and two libcs — GCC/glibc in CI and Clang/bionic on
+Android — which is what makes the ABI claim more than one machine's anecdote. Raspberry Pi needs
+nothing extra: it is the same Debian-family aarch64/glibc configuration as the CI runner.
+
 **No AArch64 performance numbers are published, deliberately.** Android cgroups own thread
 placement, so affinity requests from an unprivileged app are routinely ignored, and thermal
 throttling moves results mid-run. The ARM claim here is correctness only.

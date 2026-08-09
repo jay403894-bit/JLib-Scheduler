@@ -84,8 +84,43 @@ jobs:
             ./ft$O
           done
 
+  # Apple Silicon, EXPLORATORY. macos-14+ runners are real M-series hardware and are free for public
+  # repositories -- which is the whole point of this job: it is the only Apple Silicon access this
+  # project has, so CI is the development loop for the macOS port rather than a gate on it.
+  #
+  # continue-on-error means a failure here does NOT fail the workflow or redden the badge. Read its
+  # log to see exactly what macOS rejects; when it finally goes green, delete the flag and promote
+  # it into the matrix above.
+  macos-exploratory:
+    name: macOS arm64 (exploratory, allowed to fail)
+    runs-on: macos-14
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm the runner is Apple Silicon
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+      # Useful even before the port compiles: this is the data a macOS Topology.cpp would read, and
+      # unlike Linux, Apple exposes P/E cores directly -- perflevel0 is P, perflevel1 is E.
+      - name: Dump the topology macOS actually exposes
+        run: |
+          for k in hw.ncpu hw.logicalcpu hw.physicalcpu hw.nperflevels \
+                   hw.perflevel0.logicalcpu hw.perflevel0.physicalcpu \
+                   hw.perflevel1.logicalcpu hw.perflevel1.physicalcpu \
+                   hw.l1dcachesize hw.l2cachesize hw.pagesize; do
+            printf '%-32s ' "$k"; sysctl -n "$k" 2>/dev/null || echo "(absent)"
+          done
+      # Expected to fail at platform.h's #error until the macOS OS layer exists. The log names the
+      # next thing to fix, every push, for free.
+      - name: Configure and build (expected to fail until macOS is ported)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 3
+
 # ---------------------------------------------------------------------------------------------
-# NOT YET ENABLED: macOS / Apple Silicon.
+# NOTES ON THE macOS PORT (the exploratory job above is the feedback loop).
 #
 # The runner is free and is real M-series hardware (macos-14 and later are arm64; macos-13 is
 # Intel), and the CONTEXT SWITCH is already macOS-ready -- ContextSwitch.S carries its Apple
