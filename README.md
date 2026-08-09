@@ -335,6 +335,16 @@ if (!graph.Submit()) { /* cycle detected -- graph refused safely */ }
 
 Negative results with receipts — the section most libraries won't write.
 
+**Fibers rather than C++20 coroutines.** Coroutines colour the call chain. A function can only suspend if it was written as a coroutine, and so must **every frame between it and the scheduler** — `co_await` propagates one frame at a time, and any ordinary function in the middle stops it dead. A fiber suspends the *stack*, so the wait can sit at the bottom of a call chain whose middle frames are plain functions, including ones you don't own and can't change.
+
+Be precise about what that does and does not buy, because it is easy to overstate: **the suspend call is still yours.** A third-party function that blocks internally on a mutex or a syscall blocks the worker thread, and no fiber rescues you — the library has to hand you a callback, a visitor, or a polling hook first. What fibers remove is the requirement that everything *between* your suspension point and the scheduler be a coroutine. Given a physics library that takes a visitor callback, your callback can wait on a `WaitGroup` with the library's frames sitting untouched in the middle of the stack. Coroutines cannot express that without rewriting the library.
+
+The same applies to code you *do* own: colouring is transitive, so making one leaf function suspend means converting every caller above it. Recursive algorithms are the sharpest case — this scheduler's own fork-join benchmark calls `WaitFor` at every level of a recursive split, which is trivial on a fiber and a whole-program refactor with coroutines.
+
+Two more practical differences. A suspended fiber has a **real stack**, so debuggers walk it and profilers attribute samples to it; a suspended coroutine is a heap object whose call history is gone. And fiber stacks are pooled at a fixed cost from a guard-paged arena, rather than a per-invocation frame allocation the compiler may or may not elide.
+
+The honest trade: where coroutines *do* fit, they are cheaper — no stack, no context switch, a frame sized exactly to its locals — and they are standard C++, whereas fibers cost a hand-written context switch per ABI (four of them here, which is why the platform list is short and deliberate). That is precisely why this scheduler is a **hybrid**: `noFiber` tasks, the default, never touch a fiber at all and pay none of it. You spend a fiber only on tasks that actually suspend. Coroutines are the better answer for a pure async-I/O pipeline; fibers are the better answer when arbitrary existing code has to be able to block inside a task.
+
 **No batch steal.** A lock-free batch steal claims `[t, t+n)` under one `top` CAS, but the owner's `pop_bottom` takes from the *other* end without touching `top` for non-last items — a batch can double-claim a task the owner also popped. That was a real use-after-free heisenbug, not a thought experiment. Single-item stealing is standard, fast, and *correct*; there is no `steal_batch`.
 
 **Age-based promotion removed.** See §5 — promotion was vestigial once stealing went single-item. Features earn their place with profiles here.
