@@ -255,30 +255,36 @@ static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
 }
 
 int main(int argc, char** argv) {
-    // Worker binding policy, chosen on the command line. It has to be set BEFORE Init() (binding
+    // Worker binding policy, chosen on the command line. It must be set BEFORE Init() (binding
     // happens at thread creation), and the scheduler is a process-wide singleton -- so one process
-    // can only measure ONE policy. Compare by running the exe three times:
-    //     bench.exe hard    (default -- SetThreadAffinityMask)
-    //     bench.exe ideal   (SetThreadIdealProcessor: a hint Windows may override)
-    //     bench.exe none    (placement entirely up to Windows)
-    // What to look for: 'hard' should win on a quiet machine (cache locality, no migration). 'ideal'
-    // should be close, and should degrade far more gracefully when something ELSE is loading the
-    // machine -- which is the case hard affinity handles worst. Run each under load as well as idle;
-    // measuring only on an idle box is what makes hard affinity look strictly better than it is.
-    const char* policyName = "hard";
-    auto policy = JLib::TaskScheduler::AffinityPolicy::Hard;
+    // measures ONE policy. Compare by running the exe once per policy.
+    //
+    // DEFAULTS TO 'ideal' BECAUSE THE LIBRARY DOES. A benchmark whose default differs from the
+    // library's default reports numbers nobody actually gets, and this one used to: it defaulted to
+    // 'hard' on the old assumption that pinning wins on a quiet machine. Measured 2026-08-05, that
+    // was wrong -- hard cost ~45% on wake latency and ~2x on the frame DAG, because a wake has to
+    // wait for one specific, possibly parked core instead of landing on any awake core in the
+    // domain. The library's default changed to Ideal then; this had not caught up.
+    //
+    // So do NOT expect 'hard' to win. It is kept because it is the only mode where you DECIDE where
+    // oversubscription lands rather than discovering it, which is worth measuring on a machine that
+    // genuinely owns itself -- and because a policy nobody can reproduce is a claim, not a result.
+    const char* policyName = "ideal";
+    auto policy = JLib::TaskScheduler::AffinityPolicy::Ideal;
     if (argc > 1) {
-        if (JLIB_STRICMP(argv[1], "hard") == 0) { /* the default, but accept it explicitly */ }
-        else if (JLIB_STRICMP(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
+        if (JLIB_STRICMP(argv[1], "ideal") == 0) { /* the default, but accept it explicitly */ }
+        else if (JLIB_STRICMP(argv[1], "hard") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Hard; policyName = "hard"; }
         else if (JLIB_STRICMP(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
         else if (JLIB_STRICMP(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
         else {
             // Anything else, --help included, prints usage and exits. It used to fall through to
             // the default and silently run the whole suite, so asking for help started a multi-
             // minute benchmark under a policy you did not choose.
-            printf("usage: SchedulerBench [hard|ideal|none|physical]\n"
-                   "  hard      (default) bind each worker to one logical CPU\n"
-                   "  ideal     Windows: SetThreadIdealProcessor. Linux: bind to the LLC domain\n"
+            printf("usage: SchedulerBench [ideal|hard|none|physical]\n"
+                   "  ideal     (default, and the library's default) Windows: SetThreadIdealProcessor.\n"
+                   "            Linux: bind to the whole LLC domain\n"
+                   "  hard      bind each worker to one logical CPU. Measured ~45%% worse on wake\n"
+                   "            latency and ~2x worse on the frame DAG -- do not assume it wins\n"
                    "  none      leave placement to the OS\n"
                    "  physical  one worker per physical core, SMT siblings left empty\n"
                    "\n"
