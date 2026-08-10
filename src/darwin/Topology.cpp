@@ -15,12 +15,50 @@
 // indices are simply ordered P-then-E; that is an observation about particular kernels, not a
 // documented contract, and Info::efficiencyClass feeds task PLACEMENT.
 //
-// And placement is the part macOS does not offer at all: there is no thread-affinity API on Apple
-// arm64 (THREAD_AFFINITY_POLICY still links but has been a no-op since Apple Silicon -- the kernel
-// owns placement and takes intent through QoS classes instead). So a class table built on a guessed
-// ordering could not be ACTED on even if it were right; it would only skew queue selection on the
-// strength of an assumption. Reporting "all cores equal" is both honest and operationally
-// identical, and it is the documented fallback Info was designed around.
+// And a class table built on a guessed ordering could not be ACTED on by the mechanism this struct
+// was designed for: there is no thread-affinity API on Apple arm64 (THREAD_AFFINITY_POLICY still
+// links but has been a no-op since Apple Silicon). Reporting "all cores equal" is therefore both
+// honest and operationally identical today, and it is the documented fallback Info was built around.
+//
+// WHAT macOS OFFERS INSTEAD, AND WHY THIS LIBRARY DOES NOT REACH FOR IT. Apple's substitute for
+// affinity is QoS: pthread_set_qos_class_self_np with QOS_CLASS_USER_INITIATED biases a thread to
+// P-cores, QOS_CLASS_UTILITY to the efficiency cluster, and unlike affinity it needs no
+// index->level mapping -- the counts above would be enough to tier the pool.
+//
+// The scheduler deliberately sets NO QoS AT ALL. Workers inherit it from the thread that calls
+// Init(), and that inheritance IS the configuration mechanism: an application that wants a
+// particular class sets its own QoS before initialising and the whole pool follows. Zero API
+// surface, and the decision stays where it belongs.
+//
+// That last part is the real reason. QoS is a power and thermal decision as much as a scheduling
+// one. A host that deliberately runs at UTILITY because it is a background exporter has made a
+// choice about battery and fan noise, and a job system that silently promoted its workers would be
+// overriding it -- the identical argument that justifies AffinityPolicy::None on the other
+// platforms. A library embedded in someone else's process does not get to make that call.
+//
+// Tiering is also a poorer fit for THIS scheduler than it first looks, for reasons that have
+// nothing to do with macOS and are worth understanding before anyone tries:
+//
+//   1. STEALING ERASES THE PREFERENCE, AND DOES SO EXACTLY WHEN IT WOULD MATTER. Stealing is
+//      deliberately preference-blind (work-conserving), and steals happen when workers run dry.
+//      The canonical E-tier use is background work that should not wake performance cores -- but
+//      that is precisely the state where P-workers are idle and will pull the backlogged E-work
+//      onto themselves. The hint is therefore weakest in the one scenario it exists for. Making it
+//      stick would mean preference-RESPECTING stealing, i.e. surrendering work-conservation, which
+//      is worth far more than the hint.
+//
+//   2. TIERING SHRINKS THE USABLE POOL. A class-preferred task can only be placed on its subset,
+//      so the scheduler no longer has the whole CPU for it. The design survives that today because
+//      preference is a HINT and PickNextWorker SPILLS to the other class when the preferred one is
+//      busy -- a slower core is a fine fallback. Under QoS the spill target is a deprioritised,
+//      throttleable scheduling class instead, so the graceful degradation that makes CorePref safe
+//      on Windows and Linux turns into a cliff.
+//
+//   3. And CorePref routing is opt-in and dormant today (nothing sets it), so a startup-time split
+//      would only make some workers slower at general work in exchange for nothing.
+//
+// If it is ever added anyway it must be opt-in, gated more tightly than the affinity path, and
+// UTILITY-vs-BACKGROUND settled by measurement on real hardware rather than by guess.
 //
 // The counts are still worth reading for the SMT answer below, which is real information.
 #include "../../include/Topology.h"
