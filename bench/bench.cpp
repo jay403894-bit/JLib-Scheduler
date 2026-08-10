@@ -268,9 +268,26 @@ int main(int argc, char** argv) {
     const char* policyName = "hard";
     auto policy = JLib::TaskScheduler::AffinityPolicy::Hard;
     if (argc > 1) {
-        if (JLIB_STRICMP(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
+        if (JLIB_STRICMP(argv[1], "hard") == 0) { /* the default, but accept it explicitly */ }
+        else if (JLIB_STRICMP(argv[1], "ideal") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Ideal; policyName = "ideal"; }
         else if (JLIB_STRICMP(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
         else if (JLIB_STRICMP(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
+        else {
+            // Anything else, --help included, prints usage and exits. It used to fall through to
+            // the default and silently run the whole suite, so asking for help started a multi-
+            // minute benchmark under a policy you did not choose.
+            printf("usage: SchedulerBench [hard|ideal|none|physical]\n"
+                   "  hard      (default) bind each worker to one logical CPU\n"
+                   "  ideal     Windows: SetThreadIdealProcessor. Linux: bind to the LLC domain\n"
+                   "  none      leave placement to the OS\n"
+                   "  physical  one worker per physical core, SMT siblings left empty\n"
+                   "\n"
+                   "The scheduler is a process-wide singleton and the policy is fixed at Init(),\n"
+                   "so one run measures ONE policy -- run the exe once per policy to compare.\n"
+                   "On macOS and Android every policy is a no-op (no usable affinity API there);\n"
+                   "prefer 'none' on those so the label matches what actually happens.\n");
+            return (JLIB_STRICMP(argv[1], "--help") == 0 || JLIB_STRICMP(argv[1], "-h") == 0) ? 0 : 2;
+        }
     }
     JLib::TaskScheduler::SetAffinityPolicy(policy);
 
