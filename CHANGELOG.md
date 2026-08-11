@@ -21,6 +21,59 @@ old name advertised a benefit while the flag's real content is a *constraint* �
 fiber underneath cannot suspend, and getting that wrong fail-fasts with no message. `noFiber` names
 something checkable and puts the constraint at the call site.
 
+**BREAKING, same pass: `TaskScheduler::TryRunStolenFastJob()` is now `TryRunStolenNoFiberTask()`.**
+A public method, but with no callers in this tree or in any consuming project — the earlier rename
+was case-sensitive and left every capital-F identifier behind. Renamed at the same last-free moment
+and for the same reason: the name should say the task runs without a fiber, which is what makes it
+safe for a fiberless spin-waiter to call.
+
+**[CRITICAL] for consumers: `Task`'s layout changed, though its size did not.** It gained a
+`Task* nextWaiter` link in what was already tail padding, so `sizeof(Task) == 64` still holds and is
+still asserted. But the layout moved, which means a consuming project must be CLEAN-rebuilt rather
+than incrementally rebuilt. A stale object file compiled against the old layout links without
+complaint and reads the wrong offsets at runtime.
+
+**`Event` is now lock-free and allocation-free.** It was a `std::mutex` around an `unordered_set`,
+so every suspend allocated a hash node and every signal took a lock that an external thread — a GPU
+fence callback, say — could contend. It is now an intrusive push-only stack threaded through
+`Task::nextWaiter`: `AddWaiter` is one CAS, `SignalAll` is one `exchange`.
+
+It needs no epoch reclamation, hazard pointers or tagged pointers, and the reason is load-bearing
+rather than incidental. ABA bites on *pop* — read head, read `head->next`, CAS, and in that window
+the node can be freed and a recycled address put back. Nothing here pops: `SignalAll` takes the
+entire list in one exchange, so the window does not exist. That holds **only** while there is no
+remove-one-waiter operation, which is why `Signal(Task*)` and `RemoveWaiter` were deleted rather
+than kept — both had zero callers, and either one reintroduces remove-from-middle and the whole
+hazard-pointer problem with it. The header says so, because they are exactly what someone would
+helpfully restore.
+
+Covered by `tests/event_smoke.cpp`, which signals while registrations are still in flight rather
+than waiting for them to settle — the interleaving that could actually lose a waiter. It runs on all
+four CI platforms, two of them weakly-ordered ARM64, which is the only reason coverage of new atomic
+code is worth much: x86 is TSO and hides a missing barrier.
+
+**`WaitGroup` moved to its own header, and `src/Task.cpp` became `src/WaitGroup.cpp`.** That file
+contained exactly one function — `WaitGroup::WakeAll()` — and nothing about `Task` at all, so anyone
+opening it looking for task internals found a synchronisation primitive. `WaitGroup` is a sibling of
+`Event` and `DirectEvent` and now has a header like they do.
+
+No caller changes: `TaskScheduler.h` includes `WaitGroup.h`, exactly as it already included
+`DirectEvent.h`. `Task.h` forward-declares it, since a `Task` only holds a `WaitGroup*` — which also
+keeps `<mutex>` and `<unordered_set>` out of the seven headers that include `Task.h` without ever
+naming a `WaitGroup`. CMake needed no change (it globs `src/*.cpp`); `Scheduler.vcxproj` lists
+sources explicitly and was updated.
+
+**`GetEvent()` is usable without a second include now.** `TaskScheduler.h` returns `Event&` but only
+forward-declared `Event`, so callers had to include `Event.h` themselves or get an incomplete-type
+error. The cause was a cycle — `Event.h` included `TaskScheduler.h` — and it was unnecessary: all
+`Event.h` ever needed was `Task` and `Fiber`, so it now includes `Fiber.h` and `TaskScheduler.h`
+includes `Event.h`. One header is enough for all three primitives.
+
+**`SchedulerMutex::Lock`'s documentation was wrong.** It said the caller must be a fiber. It has
+always had a non-fiber branch that spins while running stolen `noFiber` work. Corrected — along with
+the consequence, which is that it is the wrong lock for a short critical section reachable from a
+foreign thread, since a driver callback contending on it would start executing tasks from the graph.
+
 **`ParallelForFJ` is not experimental** and the header no longer says it is. `ParallelFor`
 dispatches to it automatically past ~2 tasks per worker; below that the flat path is ~14% faster,
 above it flat is ~8x slower at ~15k tasks. The doc comment had been contradicting the code beside it.
@@ -57,6 +110,32 @@ placement and takes intent through QoS classes. Topology reports SMT honestly (A
 none) but leaves the P/E class table empty: macOS publishes per-performance-level CPU *counts*, not
 a logical-CPU-index → level mapping, and a class table built on a guessed ordering could not be
 acted on even if it were right.
+
+### Benchmark
+`--help` used to fall through to the default and start a multi-minute run under a policy you had not
+chosen; it now prints usage and exits, and an unknown argument exits non-zero.
+
+**It defaulted to the wrong affinity policy.** `hard`, while the library defaults to `Ideal` — so
+every casual run, including the first third-party numbers that came back, measured a policy the
+library does not use and which measured ~45% worse on wake latency. Now defaults to `ideal`, and the
+help text carries the measurement so the old assumption does not get re-derived.
+
+New `[poolSize]` and `nosweep` arguments. Pool size is for sweeping worker count against latency and
+the frame DAG, which is a DIAGNOSTIC — do not ship a small pool, it starves everything that is not a
+tiny graph.
+
+**`ParallelFor` is now reported as two cases instead of one misleading number.** The old single line
+measured a 64 MB, ~2-flop-per-element kernel, which is capped by the memory system rather than the
+scheduler: it reads below 1.00x on machines with a small last-level cache (0.75x on a Ryzen laptop
+APU, 1.09x on an M1 Air) and above it on a large one (~3.4x on a 36 MB L3). A reader saw that near
+the top of the output and concluded the feature does not work, while the crossover sweep at the
+bottom of the same run showed up to 16x. It now prints a labelled memory-bound line and a
+cache-resident compute-bound line, so the difference reads as the workload rather than the library.
+
+**The crossover sweep was reporting invented numbers.** It took the first cell above `1.00x` as the
+crossover, and run-to-run noise supplies that immediately — an M1 Air run claimed `trivial` won at
+one microsecond of total work. A crossover now has to clear 1.15x *and* be confirmed by the next
+size up, and the header states the rule.
 
 ### The benchmark no longer requires C++20
 `std::atomic<double>::fetch_add` (C++20, P0020R6) is absent from AppleClang's libc++, and it was the

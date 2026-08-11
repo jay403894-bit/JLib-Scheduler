@@ -22,10 +22,15 @@
 // .cpp needs is platform::CpuRelax() in platform.h, which is arch-correct by construction.
 #include <queue>
 #include "GlobalFiberPool.h"
+// The three synchronisation primitives, all pulled in here so a caller needs only this header --
+// WaitFor takes a WaitGroup&, GetEvent returns an Event&, and WaitOnEventDirectArmed hands out a
+// DirectEvent*. Event.h used to be excluded because it depended on this header; it now depends on
+// Fiber.h instead, which is all it ever needed.
 #include "DirectEvent.h"
+#include "WaitGroup.h"
+#include "Event.h"
 namespace JLib {
 	class Thread;
-	class Event;	
 
 	class TaskScheduler {
 		friend class Thread;
@@ -164,7 +169,7 @@ namespace JLib {
 		void WaitAll();
 
 		// Lets a non-worker caller (e.g. main, while spinning on a WaitGroup/counter) safely
-		// help drain the pool instead of pure-spinning. Steals ONE FASTJOB via GetTask(), which
+		// help drain the pool instead of pure-spinning. Steals ONE noFiber task via GetTask(), which
 		// vets the noFiber flag AT THE DEQUE (TaskDeque::steal_if) -- a fiber-backed task is never claimed
 		// by this fiberless caller at all (it could suspend, and there's no fiber to switch away
 		// to), so it stays queued for a real worker. This replaced the old steal-then-Requeue
@@ -175,7 +180,7 @@ namespace JLib {
 		// one of these either leaks a slab slot or hangs a WaitAll().
 		// Returns true if it ran a task, false if nothing stealable -- callers should yield()
 		// on false to avoid a hot spin.
-		bool TryRunStolenFastJob();
+		bool TryRunStolenNoFiberTask();
 
 		// Steal-time class compatibility (used with TaskDeque::steal_if -- vet BEFORE claiming, never
 		// steal-then-Requeue, which is pure deque contention + worker thrash). Placement policy at steal
@@ -324,7 +329,7 @@ namespace JLib {
 		// HARD-PINNED (Thread::StartWorker SetThreadAffinityMask), so the OS can't place work P/E for us.
 		std::vector<char> isPCore;
 		// isPCpu[logical CPU] -- P/E class of every logical processor (group 0), same EfficiencyClass
-		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenFastJob's
+		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenNoFiberTask's
 		// callers include NON-worker, possibly UNPINNED threads (main, or any app thread hitting a
 		// SchedulerMutex/SchedulerConditionVariable spin): their class can't be assumed -- it's looked
 		// up via GetCurrentProcessorNumber() at steal time ("this noFiber task would run HERE, right now").
@@ -364,8 +369,19 @@ namespace JLib {
 		SchedulerMutex() = default;
 		~SchedulerMutex() = default;
 
-		// Acquires the lock. If the caller blocks on contention, boosts the lock holder's
-		// priority to prevent priority inversion. Must be called from a fiber (task context).
+		// Acquires the lock, boosting the holder's priority on contention to prevent inversion.
+		//
+		// Callable from EITHER context, and the two behave differently on contention:
+		//   on a fiber      -- the fiber is queued and SUSPENDED, freeing the worker for other work.
+		//   on a bare thread -- there is no fiber to suspend, so it spins, running one stolen
+		//                       noFiber task per iteration (TryRunStolenNoFiberTask) instead of
+		//                       burning the cycles.
+		//
+		// That second path is why this is NOT the right lock everywhere. A caller that must return
+		// promptly, or that is not one of ours at all -- a driver thread-pool callback, say -- would
+		// start executing arbitrary tasks from the graph while it waits. For a short critical
+		// section reached from foreign threads, a plain std::mutex is both cheaper and safer; see
+		// the note in Event.h.
 		void Lock();
 
 		void Unlock();
@@ -409,7 +425,7 @@ namespace JLib {
 		SchedulerConditionVariable() = default;
 		~SchedulerConditionVariable() = default;
 
-		// Fibers suspend here; FastJobs spin/steal work
+		// Fibers suspend here; noFiber tasks spin and steal work
 		void Wait(SchedulerMutex& mutex);
 
 		// Unblocks one waiting fiber context

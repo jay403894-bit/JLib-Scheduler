@@ -30,6 +30,10 @@
 #include <vector>
 #include <thread>
 #include <algorithm>
+#include <string>      // std::to_string, for the pool-size label
+#include <cstdlib>     // strtoul, for the pool-size argument
+#include <cmath>       // std::sqrt, the compute-bound ParallelFor body
+#include <utility>     // std::pair, returned by the measure helper
 
 using Clock = std::chrono::steady_clock;
 static double MsBetween(Clock::time_point a, Clock::time_point b) {
@@ -75,30 +79,74 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
 }
 
 // ---------------------------------------------------------------- 3. ParallelFor
+//
+// TWO cases, reported separately, because one number here is actively misleading.
+//
+// The memory-bound case used to be the only one printed, and it reports BELOW 1.00x on every
+// machine measured so far (0.75x on a Ryzen laptop APU, 0.82x on a phone, 1.09x on an M1 Air, whose
+// unified memory has the best bandwidth-per-core of the three). A reader sees that near the top of
+// the output and concludes ParallelFor does not work. What it actually shows is that a DRAM-bound
+// loop does not parallelise -- 64 MB at roughly two flops per element read and written, so every
+// worker queues on the same memory controller. No scheduler fixes that, and this one already takes
+// its better dispatch path here: 256 chunks is well past the fork-join crossover on any pool size.
+//
+// So the pair is the honest report. Same call, same scheduler, two workloads: one the memory system
+// caps, one it does not.
 static void BenchParallelFor(JLib::TaskScheduler& sched) {
-    constexpr int kN = 1 << 24;            // 16M floats = 64 MB, well past every cache
-    constexpr int kChunk = 1 << 16;        // 64K elements per task = 256 tasks
     constexpr int kRuns = 5;
-    std::vector<float> data(kN, 1.0f);
+    const int workers = (int)std::max(1u, std::thread::hardware_concurrency() - 1u);
 
-    auto kernel = [&](int s, int e) {
-        for (int i = s; i < e; ++i)
-            data[i] = data[i] * 1.000001f + 0.5f; // enough math to not be pure bandwidth
+    // Best-of-kRuns for each of a serial and a parallel pass over the same data.
+    auto measure = [&](int n, int chunk, auto&& body) {
+        double serialBest = 1e300, parallelBest = 1e300;
+        for (int r = 0; r < kRuns; ++r) {
+            auto t0 = Clock::now();
+            body(0, n);
+            serialBest = std::min(serialBest, MsBetween(t0, Clock::now()));
+        }
+        for (int r = 0; r < kRuns; ++r) {
+            auto t0 = Clock::now();
+            sched.ParallelFor(0, n, chunk, body);
+            parallelBest = std::min(parallelBest, MsBetween(t0, Clock::now()));
+        }
+        return std::pair<double, double>{ serialBest, parallelBest };
     };
 
-    double serialBest = 1e300, parallelBest = 1e300;
-    for (int run = 0; run < kRuns; ++run) {
-        auto t0 = Clock::now();
-        kernel(0, kN);
-        serialBest = std::min(serialBest, MsBetween(t0, Clock::now()));
+    // --- memory-bound: 64 MB, ~2 flops per element. Bandwidth decides this, not the scheduler. ---
+    {
+        constexpr int kN = 1 << 24;          // 16M floats = 64 MB, past every cache
+        constexpr int kChunk = 1 << 16;      // 256 chunks
+        std::vector<float> data(kN, 1.0f);
+        auto body = [&](int s, int e) {
+            for (int i = s; i < e; ++i) data[i] = data[i] * 1.000001f + 0.5f;
+        };
+        auto [ser, par] = measure(kN, kChunk, body);
+        printf("ParallelFor  : memory-bound  16M floats, ~2 flop/elem  serial %6.2f ms | parallel %6.2f ms  ->  %5.2fx\n",
+            ser, par, ser / par);
+        printf("               (this one is capped by the memory system, not the scheduler: it scales on a\n"
+               "                large L3 that holds much of the 64 MB, and lands BELOW 1.00x where it does\n"
+               "                not -- 0.75x measured on a Ryzen laptop APU, 1.09x on an M1 Air)\n");
     }
-    for (int run = 0; run < kRuns; ++run) {
-        auto t0 = Clock::now();
-        sched.ParallelFor(0, kN, kChunk, kernel);
-        parallelBest = std::min(parallelBest, MsBetween(t0, Clock::now()));
+
+    // --- compute-bound: cache-resident, ~200 cycles per element. Now the cores decide. ---
+    // 1 MB rather than 256 KB: at 64K elements the whole parallel pass was ~150 us, which is about
+    // what dispatching 124 tasks costs on a large pool -- so it measured push throughput, not
+    // speedup. Four times the work moves the ratio back to where the cores dominate.
+    {
+        constexpr int kN = 1 << 18;          // 256K floats = 1 MB, cache-resident
+        const int chunk = std::max(1, kN / (workers * 4));
+        std::vector<float> data(kN, 1.0f);
+        auto body = [&](int s, int e) {
+            for (int i = s; i < e; ++i) {
+                float v = data[i];
+                for (int k = 0; k < 10; ++k) v = v * 1.000001f + std::sqrt(v + 1.0f);
+                data[i] = v;
+            }
+        };
+        auto [ser, par] = measure(kN, chunk, body);
+        printf("ParallelFor  : compute-bound 256K floats, ~200 cyc/elem serial %6.2f ms | parallel %6.2f ms  ->  %5.2fx\n",
+            ser, par, ser / par);
     }
-    printf("ParallelFor  : 16M floats  serial %.2f ms | parallel %.2f ms (%d-elem chunks)  ->  %.2fx speedup\n",
-        serialBest, parallelBest, kChunk, serialBest / parallelBest);
 }
 
 // ---------------------------------------------------------------- 4. frame-shaped DAG
@@ -180,11 +228,24 @@ static double BodyCost(int i) {
     return x;
 }
 
+// How far above 1.00x a cell has to be before it counts as a win.
+//
+// Not 1.00x. Run-to-run noise on a quiet machine reaches ~1.09x even for a body doing a microsecond
+// of total work, and the old rule -- first cell above 1.00x -- happily reported that as the
+// crossover. An M1 Air run produced "trivial: wins from N=1000 (serial work there: 1.0 us)", which
+// is nonsense: parallel does not beat serial on one microsecond of work, the row was just
+// 1.00/1.00/1.09/1.07/1.06 and the first sample over the line got picked.
+//
+// A real crossover also STAYS won as N grows, so a lone spike is required to be confirmed by the
+// next size up. Between the margin and the persistence check, the reported number means something.
+static constexpr double kWinMargin = 1.15;
+
 template <int kFlops>
 static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::vector<int>& sizes) {
     printf("  %-10s |", label);
-    int crossover = -1;
-    double crossoverSerialUs = 0.0;
+    std::vector<double> speedups, serialUs;
+    speedups.reserve(sizes.size());
+    serialUs.reserve(sizes.size());
 
     for (int n : sizes) {
         constexpr int kRuns = 7;
@@ -222,8 +283,21 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
         }
 
         const double speedup = bestSerial / std::max(bestPar, 1e-9);
-        if (crossover < 0 && speedup > 1.0) { crossover = n; crossoverSerialUs = bestSerial * 1000.0; }
+        speedups.push_back(speedup);
+        serialUs.push_back(bestSerial * 1000.0);
         printf(" %5.2fx", speedup);
+    }
+
+    // First size that clears the margin AND is confirmed by the next size up (the last column has
+    // nothing after it, so it stands alone).
+    int    crossover = -1;
+    double crossoverSerialUs = 0.0;
+    for (size_t i = 0; i < speedups.size(); ++i) {
+        if (speedups[i] < kWinMargin) continue;
+        if (i + 1 < speedups.size() && speedups[i + 1] < kWinMargin) continue;   // lone spike, not a crossover
+        crossover = sizes[i];
+        crossoverSerialUs = serialUs[i];
+        break;
     }
 
     // The number that actually generalizes: how much SERIAL WORK (in microseconds) the loop has to
@@ -231,7 +305,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
     // it is the threshold the scheduler should be using instead of an element count.
     if (crossover > 0) printf("   | wins from N=%-7d (serial work there: %7.1f us)\n",
                               crossover, crossoverSerialUs);
-    else               printf("   | serial wins throughout\n");
+    else               printf("   | never clears %.2fx\n", kWinMargin);
 }
 
 static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
@@ -240,6 +314,8 @@ static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
     const std::vector<int> sizes = { 256, 512, 1000, 2000, 4000, 10000, 40000, 200000 };
 
     printf("\nParallelFor crossover sweep (speedup = serial/parallel; >1.00 means parallel wins)\n");
+    printf("  a crossover is only reported at >=%.2fx confirmed by the next size -- below that is noise\n",
+           kWinMargin);
     printf("  gate: probe a prefix, extrapolate, parallelize when est. work >= 75us (was: N > 10000)\n");
     printf("  %-10s |", "body");
     for (int n : sizes) printf(" %5d", n);
@@ -280,7 +356,7 @@ int main(int argc, char** argv) {
             // Anything else, --help included, prints usage and exits. It used to fall through to
             // the default and silently run the whole suite, so asking for help started a multi-
             // minute benchmark under a policy you did not choose.
-            printf("usage: SchedulerBench [ideal|hard|none|physical]\n"
+            printf("usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
                    "  ideal     (default, and the library's default) Windows: SetThreadIdealProcessor.\n"
                    "            Linux: bind to the whole LLC domain\n"
                    "  hard      bind each worker to one logical CPU. Measured ~45%% worse on wake\n"
@@ -288,20 +364,36 @@ int main(int argc, char** argv) {
                    "  none      leave placement to the OS\n"
                    "  physical  one worker per physical core, SMT siblings left empty\n"
                    "\n"
-                   "The scheduler is a process-wide singleton and the policy is fixed at Init(),\n"
-                   "so one run measures ONE policy -- run the exe once per policy to compare.\n"
-                   "On macOS and Android every policy is a no-op (no usable affinity API there);\n"
-                   "prefer 'none' on those so the label matches what actually happens.\n");
+                   "  poolSize  worker count passed to Init(). 0 or omitted = auto (hw-1).\n"
+                   "            For sweeping pool size against latency and the frame DAG, which is\n"
+                   "            a DIAGNOSTIC -- do not ship a small pool, it starves everything that\n"
+                   "            is not a tiny graph.\n"
+                   "  nosweep   skip the ParallelFor crossover sweep (much the slowest section),\n"
+                   "            so a pool-size sweep is a few seconds per point instead of minutes.\n"
+                   "\n"
+                   "The scheduler is a process-wide singleton and both policy and pool size are\n"
+                   "fixed at Init(), so one run measures ONE configuration -- run the exe once per\n"
+                   "point to compare. On macOS and Android every policy is a no-op (no usable\n"
+                   "affinity API there); prefer 'none' on those so the label matches reality.\n");
             return (JLIB_STRICMP(argv[1], "--help") == 0 || JLIB_STRICMP(argv[1], "-h") == 0) ? 0 : 2;
         }
     }
+
+    size_t poolSize = 0;                 // 0 = auto (hw-1)
+    bool   runSweep = true;
+    for (int a = 2; a < argc; ++a) {
+        if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
+        poolSize = (size_t)strtoul(argv[a], nullptr, 10);
+    }
+
     JLib::TaskScheduler::SetAffinityPolicy(policy);
 
-    printf("JLib::Scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s)\n",
-        sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName);
+    printf("JLib::Scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, pool=%s)\n",
+        sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName,
+        poolSize ? std::to_string(poolSize).c_str() : "auto");
     printf("----------------------------------------------------------------\n");
 
-    JLib::TaskScheduler::Init();
+    JLib::TaskScheduler::Init(poolSize);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
     // Warmup: get every worker spun up and fibers touched before measuring anything.
@@ -321,7 +413,7 @@ int main(int argc, char** argv) {
     BenchParallelFor(sched);
     BenchRecursiveForkJoin(sched);
     BenchFrameDag(sched);
-    BenchParallelForCrossover(sched);
+    if (runSweep) BenchParallelForCrossover(sched);
 
     printf("----------------------------------------------------------------\n");
     printf("done.\n");

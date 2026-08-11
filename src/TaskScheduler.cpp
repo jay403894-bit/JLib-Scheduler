@@ -241,7 +241,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// Capturing `&func` (a by-value parameter) is safe ONLY because WaitFor(wg) below
 		// blocks until every task tied to `wg` has completed -- the tasks never outlive this
 		// frame. The completion decrement is done exclusively by the worker's waitGroup path
-		// (Thread::Worker / TryRunStolenFastJob); the task body must NOT also decrement, or
+		// (Thread::Worker / TryRunStolenNoFiberTask); the task body must NOT also decrement, or
 		// each task counts down twice and the wait wakes early on half-finished work.
 		WaitGroup wg;
 		for (int i = 1; i < numTasks; ++i) {
@@ -262,7 +262,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 			// is set (a worker PINNED by a persistent PushImmediate/PushFork task -- e.g. the
 			// audio subsystem's forever-running mixer). A pinned worker never returns to its
 			// loop to drain its inbox, and inboxes are owner-drain-only (never stealable, so
-			// TryRunStolenFastJob can't rescue them) -- so a chunk shoved into a pinned worker's
+			// TryRunStolenNoFiberTask can't rescue them) -- so a chunk shoved into a pinned worker's
 			// inbox is stranded forever and WaitFor(wg) spins until the heat death of the app.
 			// This was the particle-demo deadlock: it only bit once the sound thread was pinned.
 			// Push() also handles pendingTasks++/MarkQueuedWork/NotifyWorker.
@@ -273,7 +273,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		func(mainChunkStart, mainChunkEnd);
 
 		// Block until every dispatched chunk is done (fiber callers park; non-fiber callers
-		// spin-and-help via TryRunStolenFastJob inside WaitFor).
+		// spin-and-help via TryRunStolenNoFiberTask inside WaitFor).
 		WaitFor(wg);
 	}
 	else
@@ -294,7 +294,7 @@ void TaskScheduler::ParallelForFJ(int start, int end, int grain, std::function<v
 	// WORKERS (each spawned task runs it on its own sub-range). Discipline: spawn the RIGHT half as
 	// a task and continue on the LEFT inline. Each spawned task increments wg once (before Push) and
 	// is decremented once when it completes -- by the worker's waitGroup path (Thread::Worker /
-	// TryRunStolenFastJob), NOT here. The caller's own inline work is not a task and never touches wg.
+	// TryRunStolenNoFiberTask), NOT here. The caller's own inline work is not a task and never touches wg.
 	// wg can't hit 0 prematurely: a task increments for all its children (inside rec) BEFORE it
 	// returns (and gets decremented), so pending descendants are always counted.
 	std::function<void(int, int)> rec = [&](int a, int b) {
@@ -661,7 +661,7 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 	}
 	else {
 		while (wg.n.load(std::memory_order_acquire) > 0) {
-			if (!TryRunStolenFastJob())
+			if (!TryRunStolenNoFiberTask())
 				std::this_thread::yield();
 		}
 	}
@@ -855,7 +855,7 @@ void TaskScheduler::Stop(Task* worker_task) {
 Task* TaskScheduler::GetTask() {
 	bool forceLoPri = (consecutiveHiPriSteals >= kStealFairnessWindow);
 
-	// FASTJOB- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenFastJob,
+	// NOFIBER- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenNoFiberTask,
 	// whose fiberless caller can't run anything that might suspend. Previously this stole blind and
 	// Requeued fiber-backed tasks -- a claim-CAS + full re-push + notify to move a task nowhere (deque
 	// contention + thrash). Now a fiber-backed task is never claimed at all: it stays put for a real worker,
@@ -902,7 +902,7 @@ Task* TaskScheduler::GetTask() {
 	return nullptr;
 }
 
-bool TaskScheduler::TryRunStolenFastJob() {
+bool TaskScheduler::TryRunStolenNoFiberTask() {
 	// Steal ONE noFiber and run it to completion right here with the full completion bookkeeping
 	// Worker()'s fast path does. GetTask vets the noFiber flag AT THE DEQUE (steal_if) -- a fiber-backed task
 	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue
@@ -1149,7 +1149,7 @@ void SchedulerMutex::Lock() {
 		// Fast job: try to run stolen work while spinning on lock
 		while (!Try_Lock()) {
 			if (TaskScheduler::IsInitialized()) {
-				if (!TaskScheduler::Instance().TryRunStolenFastJob()) {
+				if (!TaskScheduler::Instance().TryRunStolenNoFiberTask()) {
 					platform::CpuRelax();
 				}
 			}
@@ -1233,7 +1233,7 @@ void SchedulerSemaphore::Wait() {
 		// Fast job: continuous loop until permit is successfully acquired
 		while (!Try_Wait()) {
 			if (TaskScheduler::IsInitialized()) {
-				if (!TaskScheduler::Instance().TryRunStolenFastJob()) {
+				if (!TaskScheduler::Instance().TryRunStolenNoFiberTask()) {
 					platform::CpuRelax();
 				}
 			}
@@ -1317,7 +1317,7 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex) {
 		// Fast Job fallback
 		mutex.Unlock();
 		if (TaskScheduler::IsInitialized()) {
-			if (!TaskScheduler::Instance().TryRunStolenFastJob())
+			if (!TaskScheduler::Instance().TryRunStolenNoFiberTask())
 				platform::CpuRelax();
 		}
 		else {

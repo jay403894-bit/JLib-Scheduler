@@ -103,7 +103,7 @@
     <ClCompile Include="src\Epochs.cpp" />
     <ClCompile Include="src\Fiber.cpp" />
     <ClCompile Include="src\GlobalFiberPool.cpp" />
-    <ClCompile Include="src\Task.cpp" />
+    <ClCompile Include="src\WaitGroup.cpp" />
     <ClCompile Include="src\TaskDAG.cpp" />
     <ClCompile Include="src\TaskScheduler.cpp" />
     <ClCompile Include="src\Thread.cpp" />

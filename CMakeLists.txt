@@ -186,6 +186,19 @@ add_executable(SchedulerBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench.cpp")
 target_link_libraries(SchedulerBench PRIVATE Scheduler)
 target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 
+# ---- tests ------------------------------------------------------------------------------------
+# A CMake target rather than a hand-compiled file, specifically so CI can run it everywhere without
+# per-platform compile commands. That matters more than convenience here: this covers the named
+# EVENT path (lock-free waiter stack), which the benchmark never touches, and the thing most worth
+# knowing about new atomic code is whether it holds on a WEAKLY ORDERED machine. x86 is TSO and
+# hides ordering mistakes; the ARM64 runners do not.
+#
+# The AArch64 ABI harness (tests/fibertest_aarch64.cpp) stays hand-built -- it is arch-specific and
+# links the context switch directly rather than the library.
+add_executable(SchedulerEventSmoke "${CMAKE_CURRENT_SOURCE_DIR}/tests/event_smoke.cpp")
+target_link_libraries(SchedulerEventSmoke PRIVATE Scheduler)
+target_compile_features(SchedulerEventSmoke PRIVATE cxx_std_17)
+
 # ---- install (standalone only) ---------------------------------------------------------------
 # Inside the umbrella, JLib's own top-level file owns the export set and installs Scheduler as part
 # of it; duplicating that here would produce two packages describing the same target.

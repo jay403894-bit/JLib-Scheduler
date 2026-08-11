@@ -27,15 +27,19 @@ jobs:
           - name: Windows x64 (MSVC)
             os: windows-latest
             bench: build/bin/Release/SchedulerBench.exe
+            smoke: build/bin/Release/SchedulerEventSmoke.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
+            smoke: build/bin/SchedulerEventSmoke
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
+            smoke: build/bin/SchedulerEventSmoke
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
+            smoke: build/bin/SchedulerEventSmoke
 
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +64,15 @@ jobs:
       # not placement.
       - name: Run benchmark (smoke test)
         run: ./${{ matrix.bench }} none
+        shell: bash
+
+      # The named-event path: a lock-free waiter stack the benchmark never touches. Worth running on
+      # every target rather than just one, because the thing at risk in new atomic code is memory
+      # ORDERING, and x86 is TSO -- it hands you acquire/release semantics on ordinary loads and
+      # stores whether you asked for them or not. A missing barrier is invisible there. Two of these
+      # four runners are weakly ordered ARM64, which is the only reason this test is worth much.
+      - name: Run event test (lock-free waiter stack)
+        run: ./${{ matrix.smoke }}
         shell: bash
 
   # The ABI harness: links against ONE object (the context switch) with no scheduler attached, so a
