@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them —
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.0.0 — 2026-08-09
+## 1.0.0 — 2026-08-11
 
 First tagged release. The version number is a statement about API stability, not about the code
 suddenly becoming ready: the scheduler has been running a real engine for months. What changed is
