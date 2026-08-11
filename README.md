@@ -29,24 +29,7 @@ Run them yourself with `SchedulerBench` — it takes an affinity policy argument
 same one the library does.
 
 <<<<<<< HEAD
-## Build
-=======
-Public C++ job systems make you choose: task graphs **without** fibers ([Taskflow], enkiTS), fibers **without** maintenance (marl — archived), or GDC-talk fiber schedulers that never ship outside their studios. This is the missing combination, maintained and BSD-licensed:
-
-|  | enkiTS | Taskflow | marl | **JLib::TaskScheduler** |
-|---|---|---|---|---|
-| Work-stealing | ✅ | ✅ | ✅ | ✅ |
-| Fibers (suspend/resume *inside* tasks) | ❌ | ❌ | ✅ | ✅ |
-| Dependency DAG w/ AND/OR gates | partial | ✅ | ❌ | ✅ |
-| Cache/SMT topology-aware stealing | ❌ | ❌ | ❌ | ✅ |
-| Hybrid P/E-core placement | ❌ | ❌ | ❌ | ✅ |
-| Maintained | ✅ | ✅ | ❌ archived | ✅ |
-
-The trade: **modern 64-bit hardware assumed** — x86-64 or AArch64, Windows/MSVC or Linux/GCC-Clang, nothing else. Constraining the problem is what makes one-person excellence possible — see *Requirements*.
-
----
-
-## 📋 Table of Contents
+##  Table of Contents
 
 1. [Requirements & Honest Limitations](#1-requirements--honest-limitations)
 2. [Quick Start](#2-quick-start)
@@ -62,7 +45,7 @@ The trade: **modern 64-bit hardware assumed** — x86-64 or AArch64, Windows/MSV
 
 ---
 
-## ⚙️ 1. Requirements & Honest Limitations
+##  1. Requirements & Honest Limitations
 
 **Requirements:** x86-64 or AArch64, and one of **Windows 10+ with MSVC** (x86-64 only; C++17+, MASM `ml64` ships with VS), **Linux/Android with GCC/Clang**, or **macOS with AppleClang** (C++17+, GAS for the context switch). CMake 3.21+ optional everywhere. The benchmark is C++17 too — there is no longer a C++20 caveat attached to that claim.
 
@@ -82,7 +65,7 @@ The trade: **modern 64-bit hardware assumed** — x86-64 or AArch64, Windows/MSV
 
 ---
 
-## 🚀 2. Quick Start
+##  2. Quick Start
 
 **CMake, either platform:**
 -> 8e682e7f4c08ab7c52b2ae1a1e03e83ec883295a
