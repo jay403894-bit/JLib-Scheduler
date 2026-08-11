@@ -28,7 +28,6 @@ this was tested on my machine, third party tests have come back and some are fas
 Run them yourself with `SchedulerBench` — it takes an affinity policy argument and defaults to the
 same one the library does.
 
-<<<<<<< HEAD
 ##  Table of Contents
 
 1. [Requirements & Honest Limitations](#1-requirements--honest-limitations)
