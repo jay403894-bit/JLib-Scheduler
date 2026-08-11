@@ -8,31 +8,14 @@ Windows x64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silic
 
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
-<!-- ============================================================================================
-     GAP 1 -- WRITE THIS ONE YOURSELF, IN FIRST PERSON. It is the most important paragraph in the
-     file and the one that should not sound like anybody else.
-
-     Three or four sentences, plain: what you were building, what you needed the job system to do,
-     what you looked at first and why it did not fit, and what you decided to do instead. Concrete
-     beats impressive -- name the actual problem you hit.
-
-     Something in this shape (do not use these words, they are mine):
-       "I was writing a 2D/3D engine and needed tasks that could wait on a GPU fence without
-        parking a worker thread. enkiTS and Taskflow do not suspend inside a task; marl does but
-        was archived in April. So I wrote this, and it has been running my engine since <month>."
-
-     Delete this whole comment block when you are done.
-============================================================================================ -->
-
-**TODO: replace this paragraph with GAP 1 above.**
+I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
+I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, mamrl can but was archived in April.
 
 ---
 
 ## Measured
 
-<!-- GAP 2 (small): one sentence saying which machine and build, and that these are your numbers
-     rather than a spec. Third-party runs have already come in higher on some metrics, so this is
-     worth being plain about. Delete this comment when done. -->
+this was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 
 | | i9-13900K, Release |
 |---|---|
