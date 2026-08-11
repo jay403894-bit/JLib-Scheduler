@@ -102,7 +102,7 @@ The trade: **modern 64-bit hardware assumed** — x86-64 or AArch64, Windows/MSV
 ## 🚀 2. Quick Start
 
 **CMake, either platform:**
->>>>>>> 8e682e7f4c08ab7c52b2ae1a1e03e83ec883295a
+-> 8e682e7f4c08ab7c52b2ae1a1e03e83ec883295a
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Development
