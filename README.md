@@ -9,7 +9,7 @@ Windows x64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silic
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
 I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
-I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, mamrl can but was archived in April.
+I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, marl can but was archived in April.
 
 ---
 
