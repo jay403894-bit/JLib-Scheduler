@@ -15,7 +15,8 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 
 ## Measured
 
-this was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
+This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
+Needs and welcomes more testing for research!
 
 | | i9-13900K, Release |
 |---|---|
