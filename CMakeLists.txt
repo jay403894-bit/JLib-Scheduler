@@ -64,11 +64,48 @@ endif()
 # thread layer) and an ARCH (which decides the context switch). Android is accepted alongside Linux
 # because bionic differs from glibc only in details the POSIX layer already handles -- Termux's
 # CMake reports one or the other depending on version, and both are the same target here.
-if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android|Darwin)$")
-    message(FATAL_ERROR
-        "JLib::Scheduler supports Windows, Linux, Android and macOS. The context switch is "
-        "hand-written assembly per ABI, so a new platform needs a new ContextSwitch, not a "
-        "compiler flag.")
+# Opt-in escape hatch for a platform that SHOULD work but has never been run.
+#
+# Only two categories exist here, and the difference matters. A platform is refused outright when a
+# build would produce something BROKEN -- Windows on ARM64 would hand the x64 MASM switch to an ARM
+# target, and no flag should let that through. A platform is merely UNVERIFIED when every piece it
+# needs already exists and is tested elsewhere, and the only thing missing is that nobody has run
+# it. iOS is the motivating case: same AAPCS64 context switch as macOS arm64, same src/darwin/ OS
+# layer, same sysctl topology, same 16K pages -- all of it verified on macos-14 in CI. What is
+# absent is a device run, and the maintainer has no Mac to produce one.
+#
+# So this flag exists to let someone who CAN test it do so, without the project claiming support it
+# cannot stand behind. It is off by default, it warns loudly when on, and the README does not list
+# these platforms. If you turn it on and it works, please say so in an issue; if it does not, a PR
+# is very welcome -- you will have hardware nobody here does.
+option(JLIBSCHED_ALLOW_UNVERIFIED_PLATFORM
+       "Attempt a build on a platform that is expected to work but has never been run (e.g. iOS)" OFF)
+
+set(JLIBSCHED_VERIFIED_OS "^(Linux|Android|Darwin)$")
+# Expected to work, never run. Apple's non-macOS platforms are all arm64/Darwin/Mach-O, which is
+# exactly the configuration macos-14 already verifies.
+set(JLIBSCHED_UNVERIFIED_OS "^(iOS|tvOS|watchOS|visionOS)$")
+
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "${JLIBSCHED_VERIFIED_OS}")
+    if(CMAKE_SYSTEM_NAME MATCHES "${JLIBSCHED_UNVERIFIED_OS}" AND JLIBSCHED_ALLOW_UNVERIFIED_PLATFORM)
+        message(WARNING
+            "Building for ${CMAKE_SYSTEM_NAME}, which is UNVERIFIED. Every component it needs is "
+            "tested on macOS arm64 in CI -- the same AAPCS64 context switch and the same src/darwin/ "
+            "OS layer -- but nobody has ever run the result on this platform. Do not treat a "
+            "successful build as support. Note also that placement is a no-op on Apple platforms, "
+            "and that an iOS executable must be wrapped in an app bundle before it will run at all.")
+    elseif(CMAKE_SYSTEM_NAME MATCHES "${JLIBSCHED_UNVERIFIED_OS}")
+        message(FATAL_ERROR
+            "${CMAKE_SYSTEM_NAME} is not a supported target, but it is expected to work: it shares "
+            "the AAPCS64 context switch and the src/darwin/ OS layer with macOS arm64, which IS "
+            "verified in CI. Nobody has run it, so it is not claimed. Configure with "
+            "-DJLIBSCHED_ALLOW_UNVERIFIED_PLATFORM=ON to try it, and please report what happens.")
+    else()
+        message(FATAL_ERROR
+            "JLib::Scheduler supports Windows, Linux, Android and macOS. The context switch is "
+            "hand-written assembly per ABI, so a new platform needs a new ContextSwitch, not a "
+            "compiler flag.")
+    endif()
 endif()
 
 # Normalise the many spellings a toolchain may use for the same instruction set.
@@ -89,6 +126,21 @@ if(WIN32)
             "flag. Linux and macOS on AArch64 ARE supported -- see src/posix/aarch64/.")
     endif()
     set(JLIBSCHED_ARCH "x86_64")   # the MASM switch is x64-only; the MSVC guard above is the gate
+elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    # Apple cross-builds (iOS, or an explicit -DCMAKE_OSX_ARCHITECTURES on macOS) leave
+    # CMAKE_SYSTEM_PROCESSOR as the HOST's or empty, so the target arch has to come from here
+    # instead. Checked before the generic cases below, which would otherwise read the wrong value.
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        set(JLIBSCHED_ARCH "aarch64")
+    elseif(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+        set(JLIBSCHED_ARCH "x86_64")
+    else()
+        message(FATAL_ERROR
+            "CMAKE_OSX_ARCHITECTURES='${CMAKE_OSX_ARCHITECTURES}' names no architecture this "
+            "project has a context switch for. Use arm64 or x86_64, one at a time -- a universal "
+            "binary would need both switches in one build, which the one-directory-per-target "
+            "source layout deliberately does not allow.")
+    endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     set(JLIBSCHED_ARCH "x86_64")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")

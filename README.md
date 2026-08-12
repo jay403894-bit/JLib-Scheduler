@@ -47,6 +47,31 @@ macOS) plus exactly one architecture subdirectory, `src/posix/x86_64/` or `src/p
 Never two of the same kind — they define the same symbols, and a static library will not diagnose
 that. It silently links whichever one it reaches first.
 
+### iOS and other Apple platforms
+
+Not supported, but probably working. iOS, tvOS, watchOS and visionOS are arm64 Darwin, so they use
+the same AAPCS64 context switch and the same `src/darwin/` OS layer that macOS arm64 uses, and that
+configuration is verified in CI on every push. What is missing is that nobody has ever run the
+result. I have no Apple hardware, so I cannot produce that run and will not claim the platform.
+
+If you can, the build is opt-in:
+
+```
+cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+      -DJLIBSCHED_ALLOW_UNVERIFIED_PLATFORM=ON
+```
+
+Without that flag it refuses and tells you the flag exists. With it, it warns and proceeds. Two
+things to expect: placement is a no-op on Apple platforms (see below), and an iOS executable has to
+be wrapped in an app bundle before it will run at all, since there is no console.
+
+Please open an issue either way — a report that it works is as useful as one that it doesn't, and a
+PR from someone with the hardware is very welcome.
+
+Windows on ARM64 is a different case and is refused outright with no flag. It would need a third
+hand-written context switch in `armasm64` syntax plus the TEB stack-bounds fixup, so a build there
+would produce something broken rather than something untested.
+
 ## Using it
 
 ```cpp
