@@ -37,14 +37,14 @@ cmake --build build -j
 ```
 
 Or open `Scheduler.sln` in Visual Studio. Three build types: `Debug`, `Release`, and `Development`
-(optimized, with symbols and assertions live --it deliberately does not define `NDEBUG`).
+(optimized, with symbols and assertions live -- it deliberately does not define `NDEBUG`).
 
 To consume an installed copy, `find_package(JLibScheduler)` and link `JLib::Scheduler`.
 
 Adding the sources to your own build directly: take `src/*.cpp` plus exactly one platform directory.
 That is either `src/win32/` with its `ContextSwitch.asm`, or `src/posix/` (or `src/darwin/` on
 macOS) plus exactly one architecture subdirectory, `src/posix/x86_64/` or `src/posix/aarch64/`.
-Never two of the same kind --they define the same symbols, and a static library will not diagnose
+Never two of the same kind -- they define the same symbols, and a static library will not diagnose
 that. It silently links whichever one it reaches first.
 
 ### iOS and other Apple platforms
@@ -68,13 +68,13 @@ be wrapped in an app bundle before it will run at all, since there is no console
 the one that might make this a poor fit regardless of whether it compiles: **a pool of persistent
 worker threads does not map cleanly onto the iOS app lifecycle.** This scheduler is built on the
 assumption that the application largely owns the machine, which is true of a game in the foreground
-and false the instant it is backgrounded --threads are frozen mid-execution, and anything waiting on
+and false the instant it is backgrounded -- threads are frozen mid-execution, and anything waiting on
 a fence or a lock stalls until the app resumes. `TaskScheduler::Pause()` and `Resume()` exist as the
 hook for that, but nothing here wires them to `applicationDidEnterBackground`, and a `hardware_concurrency - 1`
 pool is an awkward shape on a phone where the OS is actively managing power. Treat iOS as
 foreground-only unless you do that work yourself.
 
-Please open an issue either way --a report that it works is as useful as one that it doesn't, and a
+Please open an issue either way -- a report that it works is as useful as one that it doesn't, and a
 PR from someone with the hardware is very welcome.
 
 Windows on ARM64 is a different case and is refused outright with no flag. It would need a third
@@ -113,15 +113,15 @@ int main() {
 ```
 
 Three things to know while writing against it. A task that will call `WaitFor` must be created with
-`noFiber = false` --`noFiber` defaults to true, and a task with no fiber under it cannot suspend, so
+`noFiber = false` -- `noFiber` defaults to true, and a task with no fiber under it cannot suspend, so
 it fail-fasts with no message. Tasks live in 256-byte slab slots, so a lambda capturing more than
 about 192 bytes fails a `static_assert`: capture pointers, not payloads.
 
 And `CorePref::P` / `CorePref::E` are Windows-only. Elsewhere the scheduler has no way to tell the
-core classes apart, so those requests are silently ignored rather than rejected --leave tasks at
+core classes apart, so those requests are silently ignored rather than rejected -- leave tasks at
 `Default` or `Any` on other platforms, and don't build a design that assumes the placement held.
 
-[DESIGN.md](DESIGN.md) has the rest --the execution model, the integration contracts, and the
+[DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.
 
 ## How it compares
@@ -135,7 +135,7 @@ decisions that were tried and removed.
 | Maintained | yes | yes | archived Apr 2026 | yes |
 
 marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so middleware written
-for an ordinary thread pool works unchanged --Jolt Physics runs through a `JPH::JobSystem` adapter
+for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
 and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
 
 ## Versioning
@@ -143,7 +143,7 @@ and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-corr
 1.0.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
 not break without a 2.0. Every header is installed because the supported ones need them to compile,
 but the rest are implementation detail and may change in any release. If you need something only
-reachable through one of those, that is a missing feature --open an issue rather than depend on it.
+reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
 
 [CHANGELOG.md](CHANGELOG.md) has the release history and the negative results.
 
