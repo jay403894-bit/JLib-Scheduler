@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.1.0 - unreleased
+## 1.1.0 - 2026-08-12
 
 Started as 1.0.1 and became a minor rather than a patch partway through, once the 64-CPU work turned
 from refusing an unsupported machine into actually supporting it. Adding a capability is a minor
