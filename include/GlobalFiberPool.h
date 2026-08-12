@@ -28,7 +28,7 @@ namespace JLib {
         std::vector<Fiber> standardFibers;
         std::vector<Fiber> heavyFibers;
 
-        // Private constructor — use Create() factory
+        // Private constructor - use Create() factory
         GlobalFiberPool(size_t standardCount, size_t heavyCount);
             
 

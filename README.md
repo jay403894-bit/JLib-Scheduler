@@ -26,8 +26,9 @@ Needs and welcomes more testing for research!
 | Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
 | Steal protocol | single-item Chase-Lev CAS |
 
-Run them yourself with `SchedulerBench` --it takes an affinity policy argument and defaults to the
+Run them yourself with `SchedulerBench`. It takes an affinity policy argument and defaults to the
 same one the library does.
+
 ## Build
 
 
