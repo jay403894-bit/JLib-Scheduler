@@ -15,7 +15,9 @@
 // dependency in the project, for about a hundred lines of text parsing -- off-brand for a library
 // whose pitch is owning its own stack.
 //
-// Group 0 / first 64 logical CPUs only, matching the Windows implementation's limitation.
+// No processor groups exist on Linux, so the kernel's CPU numbering IS the flat CpuId and the only
+// bound is CpuMask::kMaxCpus. cpu_set_t is 1024 bits, so this platform never had the 64-CPU limit
+// Windows imposes -- the old ceiling here was purely the uint64_t the masks used to be.
 #include "../../include/Topology.h"
 #include <cstdio>
 #include <cstring>
@@ -39,9 +41,11 @@ static bool ReadFileText(const char* path, std::string& out) {
     return true;
 }
 
-// "0-3,8,12-15" -> bitmask. CPUs at or above 64 are ignored, matching the group-0 limitation.
-static uint64_t ParseCpuList(const std::string& s) {
-    uint64_t mask = 0;
+// "0-3,8,12-15" -> CpuMask. Linux has no processor groups, so the kernel's own CPU numbering is
+// already the flat CpuId and no widening is needed. CPUs at or above CpuMask::kMaxCpus are ignored.
+namespace detail {
+CpuMask ParseCpuList(const std::string& s) {
+    CpuMask mask;
     const char* p = s.c_str();
     while (*p) {
         while (*p == ',' || *p == ' ' || *p == '\n') ++p;
@@ -57,20 +61,26 @@ static uint64_t ParseCpuList(const std::string& s) {
             if (end == p) break;
             p = end;
         }
-        for (long c = lo; c <= hi && c < 64; ++c)
-            if (c >= 0) mask |= (uint64_t(1) << c);
+        for (long c = lo; c <= hi && c < (long)CpuMask::kMaxCpus; ++c)
+            if (c >= 0) mask.Set((CpuId)c);
     }
     return mask;
 }
+}   // namespace detail
+using detail::ParseCpuList;
 
 static int OnlineCpuCount() {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n < 1) n = 1;
-    return (int)std::min<long>(n, 64);
+    return (int)std::min<long>(n, (long)CpuMask::kMaxCpus);
 }
 
 void Query(Info& out) {
     const int nCpu = OnlineCpuCount();
+    // Linux has no processor groups, so there is exactly one and the flat CpuId is the kernel's own
+    // CPU number. Reported anyway so Info reads the same on every platform for the diagnostic dump.
+    out.logicalCount = (unsigned)nCpu;
+    out.groupCount   = 1;
     char path[256];
     std::string text;
 
@@ -81,8 +91,8 @@ void Query(Info& out) {
         std::snprintf(path, sizeof(path),
                       "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
         if (!ReadFileText(path, text)) continue;
-        const uint64_t m = ParseCpuList(text);
-        if (m && std::find(out.coreMasks.begin(), out.coreMasks.end(), m) == out.coreMasks.end())
+        const CpuMask m = ParseCpuList(text);
+        if (m.Any() && std::find(out.coreMasks.begin(), out.coreMasks.end(), m) == out.coreMasks.end())
             out.coreMasks.push_back(m);
     }
     out.haveCores = !out.coreMasks.empty();
@@ -96,8 +106,8 @@ void Query(Info& out) {
             std::snprintf(path, sizeof(path),
                           "/sys/devices/system/cpu/cpu%d/cache/index%d/shared_cpu_list", cpu, idx);
             if (!ReadFileText(path, text)) continue;
-            const uint64_t m = ParseCpuList(text);
-            if (m && std::find(out.cacheMasks.begin(), out.cacheMasks.end(), m) == out.cacheMasks.end())
+            const CpuMask m = ParseCpuList(text);
+            if (m.Any() && std::find(out.cacheMasks.begin(), out.cacheMasks.end(), m) == out.cacheMasks.end())
                 out.cacheMasks.push_back(m);
         }
     }

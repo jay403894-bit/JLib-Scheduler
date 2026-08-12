@@ -8,6 +8,7 @@
 #include "Epochs.h"
 #include "TaskDeque.h"
 #include "TaskAllocator.h"
+#include "Topology.h"   // topology::CpuMask -- llcMaskOfWorker is one per worker
 #include <atomic>
 #include <array>
 #include <vector>
@@ -320,7 +321,7 @@ namespace JLib {
 		// correct rather than missing, since there is no domain to protect and binding would only
 		// add the rigidity that measured ~45% worse. UNMEASURED on real Linux hardware -- WSL
 		// virtualises topology and has no real core parking.
-		std::vector<uint64_t> llcMaskOfWorker;
+		std::vector<topology::CpuMask> llcMaskOfWorker;
 		// isPCore[qIndex] -- 1 if this worker is pinned to a PERFORMANCE core, 0 for an EFFICIENCY core
 		// (Intel hybrid, e.g. i9-13900K = 8 P + 16 E). Derived in BuildTopology from each core's
 		// PROCESSOR_RELATIONSHIP.EfficiencyClass (highest class present = P). Non-hybrid CPU -> all 1
@@ -328,7 +329,7 @@ namespace JLib {
 		// (hiPri->P, loPri/bulk->E) + a P/E-aware core reserve -- needed manually because the pool is
 		// HARD-PINNED (Thread::StartWorker SetThreadAffinityMask), so the OS can't place work P/E for us.
 		std::vector<char> isPCore;
-		// isPCpu[logical CPU] -- P/E class of every logical processor (group 0), same EfficiencyClass
+		// isPCpu[logical CPU] -- P/E class of every logical processor, same EfficiencyClass
 		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenNoFiberTask's
 		// callers include NON-worker, possibly UNPINNED threads (main, or any app thread hitting a
 		// SchedulerMutex/SchedulerConditionVariable spin): their class can't be assumed -- it's looked

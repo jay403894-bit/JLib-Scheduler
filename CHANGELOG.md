@@ -3,43 +3,75 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.0.1 - unreleased
+## 1.1.0 - unreleased
 
-The version was bumped here rather than at release, because a tree that has changed while still
-reporting the last tag is the exact problem the stamp below was added to solve. `1.0.1` and not
-`1.1.0`: nothing was added, and the one removal is from a header the versioning policy already
-declares unsupported.
+Started as 1.0.1 and became a minor rather than a patch partway through, once the 64-CPU work turned
+from refusing an unsupported machine into actually supporting it. Adding a capability is a minor
+bump. The version is raised in the same commit as the change rather than at release, because a tree
+that has changed while still reporting the last tag is precisely the problem the benchmark version
+stamp below exists to solve.
 
-**[CRITICAL] above 64 logical CPUs: worker placement was silently wrong, and is now refused instead
-of guessed.** `StartWorker` bound each worker with `1ULL << cpu_affinity`. Past 63 that shift is
-undefined, and on x86 the count is masked to six bits, so CPU 64 evaluated to `1ULL << 0` and pinned
-that worker to CPU 0. On a 128-thread machine an entire processor group would have stacked onto one
-core, presenting as general slowness rather than as a bug. Both platforms were affected: the Linux
-path builds the same 64-bit mask and `llcMaskOfWorker` is one word too.
+**Machines wider than 64 logical CPUs are now addressed properly, across all processor groups.**
+Previously the scheduler could not name a CPU outside the first group, and did not know it: worker
+binding used `1ULL << cpu_affinity`, which is undefined past 63 and, because x86 masks the shift
+count to six bits, quietly evaluated to `1ULL << 0` and pinned that worker to CPU 0. A 128-thread
+machine would have stacked an entire processor group onto a single core, presenting as unexplained
+slowness rather than as a bug. Both platforms built the same 64-bit mask, so this was never
+Windows-only, though Windows is where it bit hardest.
 
-To be clear about what this does and does not limit, because the two are easy to conflate. **The
-number of workers was never capped and still is not.** Workers above CPU 63 are created, steal and
-run tasks exactly as before. What was capped is *placement*: which CPU a worker pins to, and the
-topology map behind locality-aware stealing. Those workers now fall back to `AffinityPolicy::None`
-with one warning, so the cost is placement rather than capacity, and their locality is approximate.
-Anything with 64 threads or fewer is unaffected, which is every machine this has been tested on.
+The fix is in three parts. Masks are now a `CpuMask`, a 256-CPU fixed bitset, in place of a
+`uint64_t` throughout `Topology`, `llcMaskOfWorker` and the binding calls. CPUs are named by a flat
+`CpuId` defined as `group * 64 + bit`, so the group and the processor number fall back out by
+shifting and nothing above the platform layer has to know groups exist. And binding goes through
+`SetThreadGroupAffinity` and `SetThreadIdealProcessorEx` rather than `SetThreadAffinityMask` and
+`SetThreadIdealProcessor`, which is the part that actually matters: the old calls take the processor
+group *ambiently* from the calling thread, so no mask value whatsoever could have referred to a CPU
+in another group. The new ones take it as data.
 
-The 64 is Windows' own granularity rather than a shortcut. `KAFFINITY` is a 64-bit word and Windows
-models wider machines as multiple processor GROUPS of up to 64, with `SetThreadAffinityMask` and
-`SetThreadIdealProcessor` both scoped to a single group; reaching CPU 100 needs
-`SetThreadGroupAffinity` and a `GROUP_AFFINITY {mask, group}` pair. Linux has no such limit at all,
-`cpu_set_t` is 1024 bits, so there the ceiling really was just this code's `uint64_t`.
+`src/win32/Topology.cpp` also stopped filtering its records on `Group == 0`. That filter meant a
+machine with a second group received a topology map describing only the first 64 CPUs: no SMT
+siblings, no cache clusters and no P/E labels for any of the rest. Not a degraded map, an absent
+one, and it would have silently disabled locality-aware stealing for half the machine.
 
-It also runs deeper than the binding call. `src/win32/Topology.cpp` filters every record on
-`GroupMask.Group == 0`, so on a multi-group machine the topology map describes only the first group
-and the cores, caches and LLC clusters of the rest are invisible to the stealer. Real support means
-the `Ex` APIs, dropping those filters, and carrying `(group, mask)` pairs through `Info`,
-`llcMaskOfWorker` and `BindThreadToMask`. That is a topology-representation change rather than a
-wider integer, and it wants a machine to verify against, so it is deliberately not attempted here.
+Pool sizing no longer trusts `std::thread::hardware_concurrency()` on Windows either, since it has
+historically reported only the calling thread's group. `Info` now carries `logicalCount` and
+`groupCount` from `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`, which the platform layer already
+had to walk every group to fill in anyway.
 
-Found while costing out whether a rented multi-die machine was worth it. The LLC-cluster stealing
-that multi-die actually needs turned out to be already present, and the real gap was a ceiling that
-could be made honest for free.
+Nothing changes on a machine with 64 CPUs or fewer, which is every machine this has been tested on:
+verified unchanged on a 32-thread i9 under all three policies, and building and passing on Linux.
+**The multi-group path itself is written but not yet exercised on real hardware** -- that needs a
+machine nobody here owns, and it is the next thing to validate. A `CpuId` past `CpuMask::kMaxCpus`
+still degrades to unbound with one warning, because a mask that silently sets no bit reads as
+unexplained slowness too. Raising the cap is `CpuMask::kWords` and nothing else.
+
+**The worker-to-CPU assignment is enumerated from the topology rather than assumed to be `0..N-1`.**
+This was a bug in the first cut of the above, caught before it shipped and worth recording because
+the failure was silent. Workers were assigned `cpu i+1`, a DENSE walk, while the new flat `CpuId` is
+SPARSE: Windows aligns processor groups to NUMA boundaries instead of packing them to 64, so a
+96-CPU machine presented as two groups of 48 has live ids 0..47 and 64..111 with a hole between.
+Dense assignment would have requested ids 48..63, which name no processor at all. The binds fail,
+sixteen workers run unbound, and their sibling and cluster entries point at CPUs that do not exist.
+Nothing crashes. `StartPool` now unions the reported core masks, lists the live ids ascending and
+hands worker `i` the `(i+1)`'th, which is identical to `i+1` on any dense single-group machine.
+
+**New `SchedulerTopologyTest`, and it is the reason the above was found.** The wide path cannot be
+exercised on any machine here, so the parts of it that are pure logic are tested directly instead:
+mask operations across all four words and past the cap, the `CpuId` to (group, bit) round trip, the
+sysfs list parser including `"0-63,128-191"` which the old `uint64_t` silently truncated, and a
+hand-built two-groups-of-48 topology asserting every worker lands on a CPU that exists, that none
+collide, and that no worker asks for a processor number its group lacks.
+
+That last case carries a negative control: it also asserts the OLD dense scheme would have missed
+exactly sixteen CPUs. Without it the test would pass on a correct-looking enumeration purely because
+the machine running it is dense, which would make it decoration. `detail::ParseCpuList` is declared
+in `Topology.h` solely so the suite can reach it.
+
+Found while costing out whether renting a multi-die machine was worthwhile. The answer was no: the
+LLC-cluster stealing multi-die actually needs was already present, and the mapping bug that would
+have justified the rental was found by reading the code and then pinned down by a test that runs on
+a laptop. What hardware would still add is confirmation that Windows accepts these calls and lays
+threads out as expected, which is worth having but is not what was broken.
 
 **The published benchmark numbers were 25% pessimistic and the DAG row said the wrong node count.**
 Latency is 4.7 µs rather than 6.3, the frame DAG is 23.2 µs/graph rather than 31.9, and that graph

@@ -86,15 +86,22 @@ void JLib::topology::Query(Info& out)
     const long long physical = SysctlInt("hw.physicalcpu");
     if (logical <= 0) return;                 // nothing usable; both have* flags stay false
 
-    const int n = (int)(logical > 64 ? 64 : logical);   // group-0 / first-64 rule, as on Windows
+    // No processor groups on Darwin, so the flat CpuId is the kernel's own numbering. The cap is
+    // the CpuMask width and is theoretical here: no Apple machine comes close to it.
+    const int n = (int)(logical > (long long)CpuMask::kMaxCpus ? (long long)CpuMask::kMaxCpus : logical);
+    out.logicalCount = (unsigned)n;
+    out.groupCount   = 1;
 
     // SMT: the one thing sysctl answers unambiguously. Apple Silicon has no SMT, so logical ==
     // physical and every core is its own sibling group -- which is real information, not an
     // absence of it: it lets the caller correctly conclude there are no SMT pairs to reason about.
     if (physical > 0 && physical == logical) {
         out.coreMasks.reserve((size_t)n);
-        for (int c = 0; c < n; ++c)
-            out.coreMasks.push_back(std::uint64_t(1) << c);
+        for (int c = 0; c < n; ++c) {
+            CpuMask m;
+            m.Set((CpuId)c);
+            out.coreMasks.push_back(m);
+        }
         out.haveCores = true;
     }
     // Hyper-threaded Intel Mac: we know pairs EXIST (logical == 2 * physical) but not which CPU

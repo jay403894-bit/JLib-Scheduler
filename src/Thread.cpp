@@ -29,7 +29,7 @@ thread_local Thread* Thread::instance = nullptr;
 // unprivileged app. Treat Android placement as UNENFORCEABLE and never quote a number from it.
 // Takes a plain 64-bit mask rather than a cpu_set_t so the CALL SITES stay portable: macOS has no
 // cpu_set_t at all, and mentioning it in the policy switch would need the whole block #ifdef'd.
-static inline void BindThreadToMask(pthread_t handle, std::uint64_t mask)
+static inline void BindThreadToMask(pthread_t handle, const topology::CpuMask& mask)
 {
 #if JLIB_PLATFORM_DARWIN
 	// macOS has NO thread-affinity API on arm64. THREAD_AFFINITY_POLICY still compiles but has been
@@ -38,10 +38,12 @@ static inline void BindThreadToMask(pthread_t handle, std::uint64_t mask)
 	// policy is unenforceable, which is why the docs say placement is Windows/Linux only.
 	(void)handle; (void)mask;
 #else
+	// cpu_set_t is 1024 bits by default, so Linux never had the 64-CPU problem Windows has -- the
+	// old ceiling here was purely the uint64_t this function used to take.
 	cpu_set_t set;
 	CPU_ZERO(&set);
-	for (int c = 0; c < 64; ++c)
-		if (mask & (std::uint64_t(1) << c)) CPU_SET(c, &set);
+	for (unsigned c = 0; c < topology::CpuMask::kMaxCpus; ++c)
+		if (mask.Test(c) && c < CPU_SETSIZE) CPU_SET(c, &set);
   #if defined(__BIONIC__)
 	(void)sched_setaffinity(pthread_gettid_np(handle), sizeof(cpu_set_t), &set);
   #else
@@ -71,32 +73,29 @@ void Thread::StartWorker(size_t cpu_affinity)
 		});
 	nativeHandle = thread.native_handle();
 
-	// ---- THE 64-CPU CEILING, enforced once for both platforms ----
-	// Every affinity mask in this file is a single 64-bit word: `1ULL << cpu_affinity` on both
-	// branches below, and `llcMaskOfWorker` for the Linux Ideal path. Windows compounds it, because
-	// SetThreadAffinityMask and SetThreadIdealProcessor are scoped to the caller's PROCESSOR GROUP,
-	// so even a correct wider mask could not reach past 64 without the *Ex variants taking a
-	// GROUP_AFFINITY.
+	// ---- THE REMAINING CEILING: CpuMask::kMaxCpus, not 64 ----
+	// The 64-CPU limit this guard originally enforced is gone. Windows binding now goes through
+	// SetThreadGroupAffinity / SetThreadIdealProcessorEx, which take the processor group as DATA
+	// rather than inheriting it from the calling thread, and every mask in the scheduler is a
+	// CpuMask rather than a uint64_t. What is left is the CpuMask width itself.
 	//
-	// Past 63 that shift is not merely useless, it is UNDEFINED -- and on x86 the shift count is
-	// masked to 6 bits, so CPU 64 evaluates to `1ULL << 0` and that worker silently pins to CPU 0.
-	// On a 128-thread box the entire second processor group would stack onto one core. Failing to
-	// bind gives you a slower machine; binding WRONG gives you a broken one, so this refuses rather
-	// than guesses.
+	// This is still worth guarding rather than trusting, because the failure it prevents is silent.
+	// A CpuId past the mask width would index off the end of efficiencyClass and set no bit at all,
+	// so the worker would appear bound while being bound to nothing, which reads as unexplained
+	// slowness. Refusing and saying so costs one branch per worker at startup.
 	//
-	// Degrading to None is the honest outcome and not a capacity loss: the worker is still created,
-	// still stealing, still running tasks. Only its PLACEMENT is dropped, which is precisely what
-	// AffinityPolicy::None means. Machines this wide (dual-socket EPYC, 128-thread Threadripper) are
-	// untested here. Lifting the ceiling means GROUP_AFFINITY on Windows plus a wider mask type
-	// carried through Topology, llcMaskOfWorker and BindThreadToMask -- not a bigger integer here.
+	// Degrading to None is not a capacity loss: the worker is still created, still stealing, still
+	// running tasks. Only its PLACEMENT is dropped, which is exactly AffinityPolicy::None, and its
+	// locality becomes approximate. Raising the cap is CpuMask::kWords in Topology.h.
 	auto affinityPolicy = scheduler->GetAffinityPolicy();
-	if (cpu_affinity >= 64 && affinityPolicy != TaskScheduler::AffinityPolicy::None) {
+	if (cpu_affinity >= topology::CpuMask::kMaxCpus &&
+	    affinityPolicy != TaskScheduler::AffinityPolicy::None) {
 		affinityPolicy = TaskScheduler::AffinityPolicy::None;
 		static std::atomic<bool> warned{ false };
 		if (!warned.exchange(true, std::memory_order_relaxed)) {
 			std::cerr << "[JLib::Scheduler] logical CPU " << cpu_affinity
-			          << " is past the 64-CPU affinity ceiling -- workers above 63 run unbound. "
-			             "Topology-aware stealing is degraded for them; see README.\n";
+			          << " is past CpuMask::kMaxCpus (" << topology::CpuMask::kMaxCpus
+			          << ") -- that worker runs unbound. Raise CpuMask::kWords in Topology.h.\n";
 		}
 	}
 
@@ -118,14 +117,35 @@ void Thread::StartWorker(size_t cpu_affinity)
 	// NOTE the topology-aware steal ordering (SMT sibling first, then cache cluster) is only
 	// meaningful under Hard or Ideal: if threads migrate freely, "my sibling" no longer describes
 	// where any data actually is. Pinning and locality-aware stealing are ONE decision, not two.
+	// Both calls are the GROUP-AWARE variants, and that is the whole reason this scheduler can
+	// address a machine wider than 64 logical CPUs. SetThreadAffinityMask takes a bare 64-bit mask
+	// interpreted in the CALLING thread's group, so it cannot name a CPU in another group at all --
+	// the group is not a parameter, it is ambient. SetThreadGroupAffinity takes the group as data.
+	// Same story for SetThreadIdealProcessor versus its Ex form, which swaps a bare DWORD for a
+	// PROCESSOR_NUMBER carrying {Group, Number}.
+	//
+	// On a machine with one group these are exactly equivalent to what they replaced, so nothing
+	// changes for the overwhelming majority of hardware. The flat CpuId splits into its two halves
+	// by construction (see Topology.h): group is the high bits, processor number is the low six.
+	const WORD  cpuGroup  = (WORD)topology::CpuMask::GroupOf((topology::CpuId)cpu_affinity);
+	const BYTE  cpuNumber = (BYTE)topology::CpuMask::BitOf((topology::CpuId)cpu_affinity);
+
 	switch (affinityPolicy) {
 	case TaskScheduler::AffinityPolicy::PhysicalOnly:   // one worker per physical core -- still a hard bind
-	case TaskScheduler::AffinityPolicy::Hard:
-		SetThreadAffinityMask(nativeHandle, 1ULL << cpu_affinity);
+	case TaskScheduler::AffinityPolicy::Hard: {
+		GROUP_AFFINITY ga{};
+		ga.Mask  = (KAFFINITY)(1ULL << cpuNumber);
+		ga.Group = cpuGroup;
+		SetThreadGroupAffinity(nativeHandle, &ga, nullptr);
 		break;
-	case TaskScheduler::AffinityPolicy::Ideal:
-		SetThreadIdealProcessor(nativeHandle, (DWORD)cpu_affinity);
+	}
+	case TaskScheduler::AffinityPolicy::Ideal: {
+		PROCESSOR_NUMBER pn{};
+		pn.Group  = cpuGroup;
+		pn.Number = cpuNumber;
+		SetThreadIdealProcessorEx(nativeHandle, &pn, nullptr);
 		break;
+	}
 	case TaskScheduler::AffinityPolicy::None:
 		break;
 	}
@@ -167,14 +187,17 @@ void Thread::StartWorker(size_t cpu_affinity)
 	switch (affinityPolicy) {
 	case TaskScheduler::AffinityPolicy::PhysicalOnly:
 	case TaskScheduler::AffinityPolicy::Hard: {
-		BindThreadToMask(nativeHandle, std::uint64_t(1) << cpu_affinity);
+		topology::CpuMask one;
+		one.Set((topology::CpuId)cpu_affinity);
+		BindThreadToMask(nativeHandle, one);
 		break;
 	}
 	case TaskScheduler::AffinityPolicy::Ideal: {
 		const size_t qi = (size_t)qIndex;   // set by SetQueueIndex before StartWorker
-		const uint64_t llc = (qi < scheduler->llcMaskOfWorker.size())
-		                   ? scheduler->llcMaskOfWorker[qi] : 0;
-		if (llc) BindThreadToMask(nativeHandle, llc);
+		if (qi < scheduler->llcMaskOfWorker.size()) {
+			const topology::CpuMask& llc = scheduler->llcMaskOfWorker[qi];
+			if (llc.Any()) BindThreadToMask(nativeHandle, llc);
+		}
 		break;
 	}
 	case TaskScheduler::AffinityPolicy::None:

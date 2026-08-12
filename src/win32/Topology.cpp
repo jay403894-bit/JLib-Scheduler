@@ -9,9 +9,10 @@
 // the hardware looks like: adjacent logical CPU numbers being SMT or cache neighbours is a common
 // convention and never a guarantee.
 //
-// Limitation, unchanged from the original: processor GROUP 0 only. Fine for the vast majority of
-// desktop and workstation hardware (<=64 logical CPUs); a true multi-group machine would need
-// GROUP_AFFINITY.Group handled here and wider masks in Info.
+// ALL processor groups, not just group 0. Every GROUP_AFFINITY record is widened into the flat
+// CpuId space (group * 64 + bit) defined in Topology.h, so nothing downstream has to know groups
+// exist. This used to filter on `Group == 0`, which meant a machine wide enough to have a second
+// group got a topology map describing only its first 64 CPUs.
 #include "../../include/Topology.h"
 #include <vector>
 #include <cstddef>
@@ -34,7 +35,7 @@ namespace JLib { namespace topology {
 // Found by porting: the Linux implementation reported 17 cache instances on the same box where
 // this reported 0. Two implementations of the same query disagreeing is what made it visible.
 static bool GetGroupMasksForRelation(LOGICAL_PROCESSOR_RELATIONSHIP relation,
-                                     std::vector<uint64_t>& outMasks) {
+                                     std::vector<CpuMask>& outMasks) {
     DWORD len = 0;
     GetLogicalProcessorInformationEx(relation, nullptr, &len);
     if (len == 0) return false;
@@ -47,19 +48,31 @@ static bool GetGroupMasksForRelation(LOGICAL_PROCESSOR_RELATIONSHIP relation,
     while (offset < len) {
         auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
         if (info->Relationship == relation) {
+            // GROUP_AFFINITY is inherently single-group: it carries one Group and one 64-bit Mask,
+            // so a cache instance or a physical core can never span groups and each record maps to
+            // exactly one CpuMask. Widen the record's bits into the flat id space (group * 64 + bit)
+            // and every consumer downstream stays group-agnostic.
+            //
+            // These used to be filtered to `Group == 0`, which on a machine wide enough to HAVE a
+            // second group meant the topology map silently described only the first 64 CPUs: no
+            // SMT siblings, no cache clusters and no P/E labels for anything above that. Not a
+            // degraded map, an absent one.
+            auto widen = [&](const GROUP_AFFINITY& ga) {
+                CpuMask m;
+                for (unsigned bit = 0; bit < 64; ++bit)
+                    if ((uint64_t)ga.Mask & (uint64_t(1) << bit))
+                        m.Set(CpuMask::Make(ga.Group, bit));
+                if (m.Any()) outMasks.push_back(m);
+            };
+
             if (relation == RelationCache) {
                 // One GROUP_AFFINITY per cache instance. Every level (L1/L2/L3) arrives through
                 // this same query; the caller identifies the last-level one by preferring the
                 // widest group, so no filtering on Cache.Level is needed here.
-                const CACHE_RELATIONSHIP& cache = info->Cache;
-                if (cache.GroupMask.Group == 0)
-                    outMasks.push_back((uint64_t)cache.GroupMask.Mask);
+                widen(info->Cache.GroupMask);
             } else {
                 const PROCESSOR_RELATIONSHIP& proc = info->Processor;
-                for (WORD g = 0; g < proc.GroupCount; ++g) {
-                    if (proc.GroupMask[g].Group == 0)
-                        outMasks.push_back((uint64_t)proc.GroupMask[g].Mask);
-                }
+                for (WORD g = 0; g < proc.GroupCount; ++g) widen(proc.GroupMask[g]);
             }
         }
         offset += info->Size;
@@ -70,6 +83,13 @@ static bool GetGroupMasksForRelation(LOGICAL_PROCESSOR_RELATIONSHIP relation,
 void Query(Info& out) {
     out.haveCores = GetGroupMasksForRelation(RelationProcessorCore, out.coreMasks);
     out.haveCache = GetGroupMasksForRelation(RelationCache,         out.cacheMasks);
+
+    // Ask the OS directly rather than trusting std::thread::hardware_concurrency(), which on a
+    // multi-group machine has historically reported only the CALLING thread's group. Passing
+    // ALL_PROCESSOR_GROUPS is the whole point: it is the difference between seeing 128 CPUs and
+    // seeing 64 of them twice as hard.
+    out.groupCount   = (unsigned)GetActiveProcessorGroupCount();
+    out.logicalCount = (unsigned)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
 
     // P/E-core labels (Intel hybrid). Each physical core's PROCESSOR_RELATIONSHIP carries an
     // EfficiencyClass; the HIGHEST class present is a Performance core and anything lower is an
@@ -91,10 +111,10 @@ void Query(Info& out) {
             const int eff = (int)proc.EfficiencyClass;
             if (eff > out.maxClass) out.maxClass = eff;
             for (WORD g = 0; g < proc.GroupCount; ++g) {
-                if (proc.GroupMask[g].Group != 0) continue;   // group 0 only, see the note above
-                const uint64_t mask = (uint64_t)proc.GroupMask[g].Mask;
-                for (int cpu = 0; cpu < 64; ++cpu)
-                    if (mask & (uint64_t(1) << cpu)) out.efficiencyClass[cpu] = eff;
+                const GROUP_AFFINITY& ga = proc.GroupMask[g];
+                for (unsigned bit = 0; bit < 64; ++bit)
+                    if ((uint64_t)ga.Mask & (uint64_t(1) << bit))
+                        out.efficiencyClass[CpuMask::Make(ga.Group, bit)] = eff;
             }
         }
         off += info->Size;

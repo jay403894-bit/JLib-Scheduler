@@ -28,18 +28,22 @@ jobs:
             os: windows-latest
             bench: build/bin/Release/SchedulerBench.exe
             smoke: build/bin/Release/SchedulerEventSmoke.exe
+            topo: build/bin/Release/SchedulerTopologyTest.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
+            topo: build/bin/SchedulerTopologyTest
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
+            topo: build/bin/SchedulerTopologyTest
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
+            topo: build/bin/SchedulerTopologyTest
 
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +77,15 @@ jobs:
       # four runners are weakly ordered ARM64, which is the only reason this test is worth much.
       - name: Run event test (lock-free waiter stack)
         run: ./${{ matrix.smoke }}
+        shell: bash
+
+      # The >64-CPU path, which none of these runners is wide enough to exercise for real. These are
+      # the parts of it that are pure logic: mask math, the flat CpuId split, the sysfs list parser,
+      # and a hand-built uneven-processor-group topology checking that every worker gets a CPU that
+      # actually exists. It carries a negative control asserting the old dense scheme WOULD have
+      # failed that case, so a pass means something rather than just "this runner is dense".
+      - name: Run topology test (wide-CPU logic)
+        run: ./${{ matrix.topo }}
         shell: bash
 
   # The ABI harness: links against ONE object (the context switch) with no scheduler attached, so a

@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "1.0.1")
+set(JLIBSCHED_VERSION "1.1.0")
 
 set(JLIBSCHED_STANDALONE OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -267,6 +267,13 @@ target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED
 add_executable(SchedulerEventSmoke "${CMAKE_CURRENT_SOURCE_DIR}/tests/event_smoke.cpp")
 target_link_libraries(SchedulerEventSmoke PRIVATE Scheduler)
 target_compile_features(SchedulerEventSmoke PRIVATE cxx_std_17)
+
+# Pure-logic tests for the >64-CPU path: mask math, the flat-id split, and the worker-to-CPU
+# assignment on unevenly sized processor groups. Runs anywhere, which is the point -- it is the only
+# check on the wide path that does not require hardware nobody here has.
+add_executable(SchedulerTopologyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/topology_test.cpp")
+target_link_libraries(SchedulerTopologyTest PRIVATE Scheduler)
+target_compile_features(SchedulerTopologyTest PRIVATE cxx_std_17)
 
 # ---- install (standalone only) ---------------------------------------------------------------
 # Inside the umbrella, JLib's own top-level file owns the export set and installs Scheduler as part

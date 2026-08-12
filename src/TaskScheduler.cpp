@@ -358,7 +358,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	// lower class is an Efficiency core. Default everyone to P (1): correct for a non-hybrid CPU, and a safe
 	// fallback if the query fails -- only demote workers we positively identify as lower-class. ---
 	isPCore.assign(num_workers, 1);
-	isPCpu.assign(64, 1);   // per-LOGICAL-CPU class (group 0); default all-P (non-hybrid / query-fail safe)
+	isPCpu.assign(topology::CpuMask::kMaxCpus, 1);   // per-LOGICAL-CPU class; default all-P (non-hybrid / query-fail safe)
 
 	topology::Info topo;
 	topology::Query(topo);
@@ -368,7 +368,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 		// -- the CPU table serves unpinned/non-worker threads, see isPCpu in the header). Linux
 		// reports all-unknown today, so every core stays P there, which is what dormant class
 		// routing wants.
-		for (int cpu = 0; cpu < 64; ++cpu) {
+		for (int cpu = 0; cpu < (int)topology::CpuMask::kMaxCpus; ++cpu) {
 			const int eff = topo.efficiencyClass[cpu];
 			if (eff >= 0 && eff < topo.maxClass) {
 				isPCpu[cpu] = 0;
@@ -378,17 +378,17 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 		}
 	}
 
-	const std::vector<uint64_t>& coreMasks  = topo.coreMasks;    // one per physical core -- SMT groups
-	const std::vector<uint64_t>& cacheMasks = topo.cacheMasks;   // one per cache instance -- clusters
+	const std::vector<topology::CpuMask>& coreMasks  = topo.coreMasks;    // one per physical core -- SMT groups
+	const std::vector<topology::CpuMask>& cacheMasks = topo.cacheMasks;   // one per cache instance -- clusters
 	const bool haveCores = topo.haveCores;
 	const bool haveCache = topo.haveCache;
 
 	if (haveCores) {
-		for (uint64_t mask : coreMasks) {
+		for (const topology::CpuMask& mask : coreMasks) {
 			std::vector<int> qsInGroup;
-			for (int cpu = 0; cpu < 64; ++cpu) {
-				if (mask & (uint64_t(1) << cpu)) {
-					int q = qIndexOf(cpu);
+			for (unsigned cpu = 0; cpu < topology::CpuMask::kMaxCpus; ++cpu) {
+				if (mask.Test(cpu)) {
+					int q = qIndexOf((int)cpu);
 					if (q >= 0) qsInGroup.push_back(q);
 				}
 			}
@@ -403,7 +403,7 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	}
 
 	if (haveCache) {
-		for (uint64_t mask : cacheMasks) {
+		for (const topology::CpuMask& mask : cacheMasks) {
 			// RelationCache returns one record PER cache instance PER level (L1/L2/L3 all
 			// come back through this same query) -- we only want the last-level one(s), which
 			// in practice are the masks covering the MOST logical CPUs. Filtering by "biggest
@@ -411,9 +411,9 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 			// field through GetGroupMasksForRelation, so just collect qIndex groups for every
 			// mask here and pick the highest-CPU-count group per worker afterward.
 			std::vector<int> qsInGroup;
-			for (int cpu = 0; cpu < 64; ++cpu) {
-				if (mask & (uint64_t(1) << cpu)) {
-					int q = qIndexOf(cpu);
+			for (unsigned cpu = 0; cpu < topology::CpuMask::kMaxCpus; ++cpu) {
+				if (mask.Test(cpu)) {
+					int q = qIndexOf((int)cpu);
 					if (q >= 0) qsInGroup.push_back(q);
 				}
 			}
@@ -444,17 +444,15 @@ void TaskScheduler::BuildTopology(unsigned int num_workers) {
 	// (see llcMaskOfWorker in the header). The widest cache group containing this worker's logical
 	// CPU is its last-level cache -- the same "widest wins" rule the cluster derivation above uses,
 	// so a worker's mask and its clusterMates always describe the same domain.
-	llcMaskOfWorker.assign(num_workers, 0);
+	llcMaskOfWorker.assign(num_workers, topology::CpuMask{});
 	if (haveCache) {
 		for (unsigned int q = 0; q < num_workers; ++q) {
-			const int cpu = (int)q + 1;              // the sequential pinning scheme: main on 0
-			if (cpu >= 64) continue;
-			const uint64_t bit = uint64_t(1) << cpu;
-			int best = 0;
-			for (uint64_t mask : cacheMasks) {
-				if (!(mask & bit)) continue;
-				int n = 0;
-				for (int c = 0; c < 64; ++c) if (mask & (uint64_t(1) << c)) ++n;
+			const unsigned cpu = q + 1;              // the sequential pinning scheme: main on 0
+			if (cpu >= topology::CpuMask::kMaxCpus) continue;
+			unsigned best = 0;
+			for (const topology::CpuMask& mask : cacheMasks) {
+				if (!mask.Test(cpu)) continue;
+				const unsigned n = mask.Count();
 				if (n > best) { best = n; llcMaskOfWorker[q] = mask; }
 			}
 		}
@@ -502,21 +500,46 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// without doubling up. Sizing a pool to physical rather than logical cores is a legitimate
 	// configuration in its own right, which is why it is worth measuring rather than avoiding.
 	std::vector<int> physicalCpus;   // empty unless PhysicalOnly; entry 0 is reserved for main
-	if (GetAffinityPolicy() == AffinityPolicy::PhysicalOnly) {
+	std::vector<int> logicalCpus;    // every logical CPU that EXISTS, ascending; entry 0 -> main
+	{
 		topology::Info topo;
 		topology::Query(topo);
+
+		// WHY THIS IS NOT 0..N-1. The flat CpuId is `group * 64 + bit` (see Topology.h), and Windows
+		// aligns processor groups to NUMA/socket boundaries rather than packing them to 64. A 96-CPU
+		// machine presented as two groups of 48 therefore has LIVE ids 0..47 and 64..111, with a hole
+		// between -- the id space is sparse, while a naive `worker i -> cpu i+1` is dense.
+		//
+		// Handing out i+1 there would request ids 48..63, which name no processor at all: the bind
+		// call fails, sixteen workers silently run unbound, and their siblingQIndex/clusterMates
+		// entries describe CPUs that do not exist. Nothing crashes, which is what makes it nasty.
+		//
+		// Enumerating the CPUs the topology actually reported makes the assignment correct on any
+		// grouping, and collapses to exactly i+1 on a dense single-group machine, which is every
+		// machine anyone currently runs this on.
 		if (topo.haveCores) {
-			// One representative logical CPU per physical core: the lowest-numbered member of each
-			// SMT group. Deliberately the SAME masks BuildTopology consumes, so "physical core"
-			// means one thing across the whole scheduler.
-			for (uint64_t m : topo.coreMasks)
-				for (int cpu = 0; cpu < 64; ++cpu)
-					if (m & (uint64_t(1) << cpu)) { physicalCpus.push_back(cpu); break; }
+			topology::CpuMask all;
+			for (const topology::CpuMask& m : topo.coreMasks)
+				for (unsigned cpu = 0; cpu < topology::CpuMask::kMaxCpus; ++cpu)
+					if (m.Test(cpu)) all.Set(cpu);
+			for (unsigned cpu = 0; cpu < topology::CpuMask::kMaxCpus; ++cpu)
+				if (all.Test(cpu)) logicalCpus.push_back((int)cpu);
 		}
-		if (physicalCpus.size() >= 2)
-			poolSize = physicalCpus.size() - 1;   // one physical core left to main
-		else
-			physicalCpus.clear();                 // topology unavailable -> fall back to the normal scheme
+
+		if (GetAffinityPolicy() == AffinityPolicy::PhysicalOnly) {
+			if (topo.haveCores) {
+				// One representative logical CPU per physical core: the lowest-numbered member of each
+				// SMT group. Deliberately the SAME masks BuildTopology consumes, so "physical core"
+				// means one thing across the whole scheduler.
+				for (const topology::CpuMask& m : topo.coreMasks)
+					for (unsigned cpu = 0; cpu < topology::CpuMask::kMaxCpus; ++cpu)
+						if (m.Test(cpu)) { physicalCpus.push_back((int)cpu); break; }
+			}
+			if (physicalCpus.size() >= 2)
+				poolSize = physicalCpus.size() - 1;   // one physical core left to main
+			else
+				physicalCpus.clear();                 // topology unavailable -> fall back to the normal scheme
+		}
 	}
 
 	unsigned int num_workers = static_cast<unsigned int>(poolSize);
@@ -593,9 +616,17 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		workers.push_back(worker);
 	}
 	for (unsigned int i = 0; i < num_workers; ++i) {
-		// Default scheme: worker i -> logical CPU i+1 (main keeps 0). PhysicalOnly instead walks the
-		// list of distinct physical cores, so no two workers share a core's execution units.
-		workers[i]->StartWorker(physicalCpus.empty() ? (i + 1) : (size_t)physicalCpus[i + 1]);
+		// Default scheme: worker i takes the (i+1)'th logical CPU that EXISTS, main keeps the first.
+		// On the dense single-group machines everyone runs, that is literally i+1; on a machine with
+		// unevenly sized processor groups it skips the holes in the flat id space (see above).
+		// PhysicalOnly instead walks the list of distinct physical cores, so no two workers share a
+		// core's execution units. The bare i+1 is the last resort for when topology is unavailable,
+		// which is also the only case where no holes can be detected.
+		size_t cpu;
+		if (!physicalCpus.empty())                cpu = (size_t)physicalCpus[i + 1];
+		else if (logicalCpus.size() > (size_t)i + 1) cpu = (size_t)logicalCpus[i + 1];
+		else                                      cpu = i + 1;
+		workers[i]->StartWorker(cpu);
 	}
 	for (auto& w : workers) {
 		while (!w->Ready())

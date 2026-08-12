@@ -154,12 +154,15 @@ And `CorePref::P` / `CorePref::E` are Windows-only. Elsewhere the scheduler has 
 core classes apart, so those requests are silently ignored rather than rejected -- leave tasks at
 `Default` or `Any` on other platforms, and don't build a design that assumes the placement held.
 
-Placement also stops at 64 logical CPUs. Every affinity mask here is a single 64-bit word, and on
-Windows the relevant calls are scoped to one processor group besides, so workers on CPU 64 and above
-run unbound and print one warning saying so. They are still created and still take work; only their
-placement is dropped, and topology-aware stealing is correspondingly approximate for them. This
-affects dual-socket and 128-thread parts, which are untested here. Open an issue if you have one,
-because lifting it properly wants a machine to verify against.
+Machines wider than 64 logical CPUs are handled across all processor groups, up to 256 CPUs. This is
+worth stating because it is the thing most job systems get wrong on Windows: `SetThreadAffinityMask`
+takes its processor group from the calling thread rather than from its argument, so on a 128-thread
+box no mask value can name a CPU in the second group. Binding here goes through
+`SetThreadGroupAffinity` and `SetThreadIdealProcessorEx`, which take the group as data.
+
+That path is written and reasoned through but **has not yet run on a machine wide enough to exercise
+it**, because I do not own one. If you do, that is the single most useful thing you could report.
+Everything at 64 CPUs or below is unaffected and is what the tested numbers come from.
 
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.
