@@ -29,6 +29,27 @@ Needs and welcomes more testing for research!
 Run them yourself with `SchedulerBench`. It takes an affinity policy argument and defaults to the
 same one the library does.
 
+## Model checked
+
+The two lock-free structures are model checked with [GenMC](https://plv.mpi-sws.org/genmc/), not
+only tested. A test runs whichever interleaving the CPU happens to produce; a model checker
+enumerates every execution the C11 memory model permits, so for a bounded harness the result is
+exhaustive rather than lucky. Models live in `tests/verify/`.
+
+- **Chase-Lev deque** (`deque_model.c`) - one owner, two thieves, 174 executions, no errors. It also
+  settled a real question: the published verified Chase-Lev uses `seq_cst` for the steal CAS and this
+  uses `acq_rel`. Both check clean, so the weaker ordering is sufficient here and the `seq_cst`
+  fences are what carry the ordering.
+- **Event waiter stack** (`event_model.c`) - two pushers, one drainer, 24 executions, no errors. No
+  waiter lost, none woken twice, no race on the plain `nextWaiter` field.
+
+Each model ships a negative control, which is the part that makes a clean run mean anything. Build
+the deque model with `-DNO_POP_FENCE` and it produces a double-claim in under a second: two threads
+taking the same task, the use-after-free class. That fence had been called redundant more than once.
+
+This is not a proof of the whole scheduler. It covers two data structures at small bounds, which is
+where memory-ordering bugs live.
+
 ## Build
 
 
