@@ -18,7 +18,7 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-| | i9-13900K, reduced power limits, Release, 1.1.1 |
+| | i9-13900K at Intel spec power limits, Release, 1.1.1 |
 |---|---|
 | Task enqueue → dequeue latency | 6.4 µs |
 | 6-node frame DAG (build, validate, execute) | 28.4 µs |
@@ -31,11 +31,15 @@ Needs and welcomes more testing for research!
 Medians of six runs on the default affinity policy. Run-to-run spread was about 19% on latency, 5%
 on the DAG and 30% on fork-join, so treat the last digit as noise.
 
-**This machine runs reduced power limits** and settles near its base clock under sustained load
-rather than boosting, which is a deliberate setting and not something being worked around. Expect a
-stock part to beat every figure above. Numbers that are conservative for the reader are the right
-kind to be wrong, and it is the reason the third-party results matter more than mine: some have come
-back faster, and the spread across machines is more informative than any single row.
+**This machine runs Intel's specified power limits with unlimited turbo disabled**, so it boosts
+briefly and then settles near base clock under sustained load. That is the part behaving as Intel
+specifies it, not a handicap, but it is worth stating because most enthusiast boards ship with PL1
+and PL2 effectively unlimited and most published numbers are measured that way. A machine running
+board defaults will beat every figure above.
+
+Numbers that are conservative for the reader are the right kind to be wrong, and this is also why
+the third-party results matter more than mine: some have come back faster, and the spread across
+machines says more than any single row.
 
 `SchedulerBench` prints the version it was built from. That exists because results get pasted into
 issues while the suite changes underneath them, and a number nobody can attribute to a build is not
