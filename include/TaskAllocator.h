@@ -10,6 +10,14 @@
 #include <Windows.h> // OutputDebugStringA/__debugbreak for the free-list canary check below
 #endif
 namespace JLib {
+    namespace detail {
+        // One live-slot counter, padded to its own cache line. Lives OUT here rather than nested in
+        // TaskAllocator because a default member initializer cannot be used by a static data member
+        // of the same enclosing class: the initializer is not complete until the class is, which
+        // GCC diagnoses and MSVC quietly accepts. See TaskAllocator's counter block for the why.
+        struct alignas(64) LiveCounter { std::atomic<long long> v{ 0 }; };
+    }
+
     class TaskAllocator {
     public:
         static constexpr size_t SLOT = 256;   // bytes per slot (>= your biggest task)
@@ -24,7 +32,39 @@ namespace JLib {
         std::vector<Block> mem;
         void* sharedHead = nullptr;
         std::mutex mtx;
-        std::atomic<long long> liveCount{ 0 }; // see LiveCount() below
+
+        // ---- live-slot accounting, SHARDED PER THREAD (see LiveCount() below) ----
+        // This was one `std::atomic<long long>` incremented on every Alloc and decremented on every
+        // Free. That is a single cache line hit twice per task by every worker in the pool, and
+        // `memory_order_relaxed` does NOT make it cheap: relaxed governs ORDERING, which is the free
+        // part, while the read-modify-write still has to take the line exclusively. So every
+        // allocation anywhere yanked that line away from whichever core held it last.
+        //
+        // The cost of that scales the wrong way. At eight workers a few cores trade the line; at
+        // thirty-one it spends most of its life in transit and throughput goes DOWN as you add
+        // hardware. It is a prime suspect for the measured 3.3 M/s at 8 workers versus 0.76 M/s at
+        // 31, which is a collapse rather than a plateau and therefore looks like contention rather
+        // than saturation.
+        //
+        // Paying that on the hottest path in the scheduler would be one thing if the number were
+        // load-bearing. It is not: LiveCount() has exactly two callers, an error message in
+        // TaskNode.h and a diagnostic print in the benchmark.
+        //
+        // Now each thread increments its own counter and LiveCount() sums them when asked. alignas
+        // keeps one counter per cache line, without which this would just relocate the false
+        // sharing into an array instead of removing it. The slots are static, so a thread that
+        // exits leaves its final value behind rather than a dangling pointer -- which is also the
+        // right answer, since slots stranded in a dead thread's cache genuinely are out of
+        // circulation. Above kLiveSlots threads the modulo makes two threads share a counter; it
+        // stays correct because the update is still atomic, just mildly contended again.
+        using LiveCounter = detail::LiveCounter;
+        static constexpr size_t kLiveSlots = 128;
+        inline static LiveCounter    s_live[kLiveSlots];
+        inline static std::atomic<size_t> s_liveNext{ 0 };
+        static LiveCounter& liveSlot() {
+            static thread_local size_t s = s_liveNext.fetch_add(1, std::memory_order_relaxed) % kLiveSlots;
+            return s_live[s];
+        }
 
         // ---- per-thread cache (the lock-Free hot path) ----
         struct Cache { void* head = nullptr; size_t count = 0; };
@@ -82,7 +122,9 @@ namespace JLib {
 #endif
             c.head = next(slot);
             c.count--;
-            liveCount.fetch_add(1, std::memory_order_relaxed);
+            // Uncontended: this thread owns the line, so the RMW costs its latency and no coherence
+            // traffic. That is the entire difference from the shared counter this replaced.
+            liveSlot().v.fetch_add(1, std::memory_order_relaxed);
             return slot;
         }
 
@@ -94,7 +136,7 @@ namespace JLib {
 #endif
             c.head = slot;
             c.count++;
-            liveCount.fetch_sub(1, std::memory_order_relaxed);
+            liveSlot().v.fetch_sub(1, std::memory_order_relaxed);
             if (c.count > 2 * BATCH) flush(c);
         }
 
@@ -103,7 +145,21 @@ namespace JLib {
         // Alloc/Free beyond the atomic itself -- a momentary snapshot, good enough to watch
         // whether usage climbs monotonically (a real leak) or oscillates near a steady state
         // (normal churn) while chasing an exhaustion bug.
-        long long LiveCount() const { return liveCount.load(std::memory_order_relaxed); }
+        long long LiveCount() const {
+            // Summed on demand rather than maintained. Individual shards go NEGATIVE and that is
+            // correct, not a bug to clamp: a task allocated on the submitting thread and freed on a
+            // worker leaves +1 on one shard and -1 on another. Only the total means anything.
+            //
+            // Deliberately not a synchronized snapshot, exactly as before: shards are read one at a
+            // time while other threads keep working, so the result is a smear across a short window
+            // rather than the state at an instant. That was already true of the single atomic, and
+            // it is fine for the job -- watching whether usage climbs monotonically (a real leak) or
+            // oscillates around a steady state (normal churn).
+            long long n = 0;
+            for (size_t i = 0; i < kLiveSlots; ++i)
+                n += s_live[i].v.load(std::memory_order_relaxed);
+            return n;
+        }
         size_t Capacity() const { return mem.size(); }
 
     private:

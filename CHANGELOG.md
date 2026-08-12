@@ -3,6 +3,46 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.1.1 - unreleased
+
+**The throughput benchmark was measuring something narrower than its name, and the difference looked
+like a scheduler defect.** Sweeping pool size on it showed 3.4 M tasks/sec at 8 workers falling to
+0.8 M/s at 14 and staying flat, a 4.3x collapse that reads as a failure to scale. It is not. On the
+same machine and the same sweep, fork-join runs 0.16 to 0.20 ms and the frame DAG 24.2 to 23.6 us,
+both essentially unchanged. Only the one benchmark with a single submitting thread fell over.
+
+The old bench is now `throughput/1p` and has a sibling, `throughput/mp`, which submits the same
+200,000 tasks from four producer TASKS running on the pool instead of from one thread. Measured
+across the same sweep, on 4 through 31 workers: 1p goes 3.24, 3.44, 2.37, 1.01, 0.78, 0.79, 0.80,
+while mp goes 6.34, 5.14, 4.64, 4.51, 4.39, 4.03, 3.34. The cliff is entirely absent from the second
+column. What remains there is a gentle decline across an eightfold increase in workers, which is
+ordinary contention in a benchmark composed of nothing but scheduling overhead.
+
+The mechanism is a threshold rather than accumulating contention, which is why it is a cliff and not
+a slope. One thread creates and pushes about 3.4 M tasks/sec. Below roughly twelve workers the pool
+cannot drain faster than that and everyone stays busy; past it the surplus workers find empty deques
+and spend their time steal-probing, and that traffic slows the producer further. Note this is
+inferred from the shape and from its absence in the multi-producer case rather than measured
+directly; confirming it means counting steal attempts across the crossover.
+
+1p is kept rather than replaced, because a main thread submitting a frame's work is a real pattern
+and its submission rate is worth knowing. It is now labelled as a producer measurement so nobody
+reads it as capacity, the same reason ParallelFor was split into memory-bound and compute-bound.
+Producers in 1b are tasks rather than extra OS threads, so a pool that already owns every core is
+not measured against oversubscription, and the count is fixed at four so a pool-size sweep compares
+one variable at a time.
+
+**`TaskAllocator`'s live-slot counter is sharded per thread.** It was one `std::atomic<long long>`
+incremented on every `Alloc` and decremented on every `Free`: a single cache line taken exclusively
+twice per task by every worker. `memory_order_relaxed` does not help, since relaxed governs ordering
+and the read-modify-write still needs the line. It is now one padded counter per thread, summed on
+demand by `LiveCount()`, whose only two callers are an error string and a diagnostic print.
+
+Honesty about why: this was done as a fix for the collapse above and **it was not the cause** -- the
+measured difference was 0.76 to 0.81 M/s at 31 workers, which is noise. Kept because removing a
+globally contended atomic from the hottest path in the scheduler is correct on its own terms, but it
+earns no performance claim.
+
 ## 1.1.0 - 2026-08-12
 
 Started as 1.0.1 and became a minor rather than a patch partway through, once the 64-CPU work turned

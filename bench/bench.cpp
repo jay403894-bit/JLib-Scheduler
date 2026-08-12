@@ -5,12 +5,25 @@
 // ProjectReference on Scheduler), so it measures exactly the library every game links, not a
 // special build. Build JLib.slnx, run build\x64\<Config>\SchedulerBench.exe.
 //
-// Four benches, chosen to mirror how the games actually use the scheduler:
-//   1. throughput   -- how many no-op tasks/sec the pool can drain (create+push+steal+run+free)
-//   2. latency      -- round-trip for ONE task: push -> worker runs it -> WaitFor returns
-//   3. ParallelFor  -- real math over a big array, serial vs parallel, reported as speedup
-//   4. frame DAG    -- a Game01-shaped graph (start -> {update,sprites,text,particles} -> present)
-//                      built+submitted+drained per iteration, reported as graphs/sec and us/frame
+// Five benches, chosen to mirror how the games actually use the scheduler:
+//   1a. throughput/1p -- no-op tasks/sec with ONE thread submitting (create+push+steal+run+free)
+//   1b. throughput/mp -- the same total work, submitted from several tasks already on the pool
+//   2.  latency       -- round-trip for ONE task: push -> worker runs it -> WaitFor returns
+//   3.  ParallelFor   -- real math over a big array, serial vs parallel, reported as speedup
+//   4.  frame DAG     -- a Game01-shaped graph (start -> {update,sprites,text,particles} -> present)
+//                        built+submitted+drained per iteration, reported as graphs/sec and us/frame
+//
+// 1a and 1b exist as a PAIR because measuring only the first one is actively misleading, and this
+// was learned the hard way. Sweeping pool size on 1a shows throughput collapsing from 3.4 M/s at 8
+// workers to 0.8 M/s at 14 and staying there, which reads as the scheduler failing to scale. It is
+// not: 1b, fork-join and the frame DAG are all flat across the same sweep on the same machine.
+//
+// What 1a actually measures past that point is a single producer being outrun. One thread creates
+// and pushes roughly 3.4 M tasks/sec; once the pool can drain faster than that, the surplus workers
+// find empty deques and spend their time steal-probing, and that traffic slows the producer down.
+// Hence a CLIFF at the crossover rather than a gradual slope. That is a real and useful number --
+// a main thread submitting a frame's work is a genuine pattern -- but it is a submission-rate
+// measurement, not a capacity one, and the label now says so.
 #define NOMINMAX
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
@@ -40,16 +53,17 @@ static double MsBetween(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
-// ---------------------------------------------------------------- 1. throughput
-static void BenchThroughput(JLib::TaskScheduler& sched) {
-    constexpr int kTasks = 200'000;
-    constexpr int kRuns = 5;
+// ------------------------------------------------- 1a. throughput, ONE producer (the main thread)
+static constexpr int kThroughputTasks = 200'000;
+static constexpr int kThroughputRuns  = 5;
+
+static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
     double best = 1e300;
-    for (int run = 0; run < kRuns; ++run) {
+    for (int run = 0; run < kThroughputRuns; ++run) {
         JLib::WaitGroup wg;
-        wg.n.store(kTasks, std::memory_order_relaxed);
+        wg.n.store(kThroughputTasks, std::memory_order_relaxed);
         auto t0 = Clock::now();
-        for (int i = 0; i < kTasks; ++i) {
+        for (int i = 0; i < kThroughputTasks; ++i) {
             JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
             t->waitGroup = &wg;
             sched.Push(t);
@@ -57,8 +71,67 @@ static void BenchThroughput(JLib::TaskScheduler& sched) {
         sched.WaitFor(wg);
         best = std::min(best, MsBetween(t0, Clock::now()));
     }
-    printf("throughput   : %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec\n",
-        kTasks, best, kRuns, kTasks / best / 1000.0);
+    printf("throughput/1p: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (1 producer)\n",
+        kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0);
+}
+
+// ------------------------------------------------- 1b. throughput, SEVERAL producers on the pool
+// Producers are TASKS rather than extra std::threads, deliberately. Spawning four more OS threads
+// on a machine whose pool already owns every core would measure oversubscription as much as
+// submission, and it would change what is being compared as the pool grows. Producing from inside
+// the pool is also how a job system is actually driven once work is nested: fork-join already does
+// exactly this, which is why it stays flat where 1a falls over.
+//
+// Four rather than one-per-worker so the count stays FIXED across a pool-size sweep. The whole
+// point is comparing 8 workers against 31, and that comparison is meaningless if the producer count
+// moves at the same time.
+static constexpr int kProducers = 4;
+
+namespace {
+struct ProducerArg {
+    JLib::TaskScheduler* sched;
+    JLib::WaitGroup*     wg;
+    int                  count;
+    int                  failed;   // CreateTask returning nullptr means the slab ran dry
+};
+ProducerArg g_producerArgs[kProducers];
+}
+
+static void ProducerBody(void* p) {
+    auto* a = static_cast<ProducerArg*>(p);
+    for (int i = 0; i < a->count; ++i) {
+        JLib::Task* t = a->sched->CreateTask(+[](void*) {}, nullptr);
+        if (!t) { ++a->failed; a->wg->n.fetch_sub(1, std::memory_order_release); continue; }
+        t->waitGroup = a->wg;
+        a->sched->Push(t);
+    }
+}
+
+static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
+    double best = 1e300;
+    int    totalFailed = 0;
+    for (int run = 0; run < kThroughputRuns; ++run) {
+        JLib::WaitGroup wg;
+        wg.n.store(kThroughputTasks, std::memory_order_relaxed);
+
+        // Split as evenly as possible; the first producer absorbs the remainder.
+        const int per = kThroughputTasks / kProducers;
+        auto t0 = Clock::now();
+        for (int p = 0; p < kProducers; ++p) {
+            g_producerArgs[p] = { &sched, &wg,
+                                  (p == 0) ? (kThroughputTasks - per * (kProducers - 1)) : per, 0 };
+            JLib::Task* t = sched.CreateTask(ProducerBody, &g_producerArgs[p]);
+            if (!t) { printf("throughput/mp: ERROR -- CreateTask returned null for a producer\n"); return; }
+            sched.Push(t);
+        }
+        sched.WaitFor(wg);
+        best = std::min(best, MsBetween(t0, Clock::now()));
+        for (int p = 0; p < kProducers; ++p) totalFailed += g_producerArgs[p].failed;
+    }
+    if (totalFailed)
+        printf("throughput/mp: ERROR -- %d task allocations failed\n", totalFailed);
+    printf("throughput/mp: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (%d producers)\n",
+        kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0, kProducers);
 }
 
 // ---------------------------------------------------------------- 2. latency
@@ -417,7 +490,8 @@ int main(int argc, char** argv) {
         sched.WaitFor(wg);
     }
 
-    BenchThroughput(sched);
+    BenchThroughputSingleProducer(sched);
+    BenchThroughputMultiProducer(sched);
     BenchLatency(sched);
     BenchParallelFor(sched);
     BenchRecursiveForkJoin(sched);

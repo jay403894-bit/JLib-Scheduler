@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "1.1.0")
+set(JLIBSCHED_VERSION "1.1.1")
 
 set(JLIBSCHED_STANDALONE OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
