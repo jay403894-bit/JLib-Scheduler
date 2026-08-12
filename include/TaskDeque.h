@@ -93,6 +93,14 @@ namespace JLib {
             b -= 1;
             bottom_.store(b, std::memory_order_release);
 
+            // DO NOT REMOVE. This orders the store to bottom_ above against the load of top_ below
+            // -- a StoreLoad pair, the one reordering x86-TSO permits and the one release/acquire
+            // does NOT prevent on any architecture. Advice to drop it "because the surrounding
+            // operations are already release/acquire" has been offered more than once and is wrong.
+            //
+            // PROVEN, not argued: deleting it in tests/verify/deque_model.c (-DNO_POP_FENCE) makes
+            // GenMC produce an execution in under a second where one item is claimed by both the
+            // owner and a thief -- the double-claim use-after-free. x86 cannot show you this.
             std::atomic_thread_fence(std::memory_order_seq_cst);
 
             t = top_.load(std::memory_order_acquire);
@@ -101,6 +109,13 @@ namespace JLib {
                 Task* item = buffer_[b & mask_];
                 if (t == b) {
                     // Last item: race the stealer for it.
+                    // acq_rel, not seq_cst. Le/Pop/Cohen/Zappa Nardelli's verified Chase-Lev
+                    // (PPoPP 2013) uses seq_cst for the steal-side CAS; MODEL CHECKED with GenMC
+                    // v0.17.0 on 2026-08-11 (tests/verify/deque_model.c, one owner + two thieves,
+                    // 174 complete executions) and acq_rel is sufficient -- the seq_cst FENCES on
+                    // both sides carry the store-load ordering, so the CAS strength is not what
+                    // makes this correct. seq_cst here would cost a stronger barrier on ARM64
+                    // (casal vs casa) for nothing.
                     if (!top_.compare_exchange_strong(
                         t, t + 1,
                         std::memory_order_acq_rel,

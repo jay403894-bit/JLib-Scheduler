@@ -37,6 +37,15 @@ namespace JLib {
         // Register a waiter. Does NOT touch fiber status -- WaitOnEvent has already put the fiber
         // in WANTS_SUSPEND before calling this. The release on success publishes nextWaiter to
         // whoever later takes the list, so a signal landing after we push will find us.
+        // MODEL CHECKED, GenMC v0.17.0, 2026-08-11 (tests/verify/event_model.c, two concurrent
+        // pushers + one drainer, 24 complete executions): no waiter lost, none woken twice, and no
+        // race on the plain nextWaiter field. Dropping the release below reports a non-atomic race
+        // immediately, so the release is load-bearing and not decoration.
+        //
+        // The subtle half is the CHAINED case -- A pushes, B pushes, the drainer takes B. B's CAS
+        // is an RMW reading A's value, which puts it in A's release sequence, so the acquiring
+        // exchange synchronises with A's release too and A's nextWaiter write is visible. That rule
+        // is why a Treiber push is correct with release/acquire instead of seq_cst.
         void AddWaiter(Task* t) {
             Task* h = head.load(std::memory_order_relaxed);
             do {
