@@ -3,6 +3,105 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.0.1 - unreleased
+
+The version was bumped here rather than at release, because a tree that has changed while still
+reporting the last tag is the exact problem the stamp below was added to solve. `1.0.1` and not
+`1.1.0`: nothing was added, and the one removal is from a header the versioning policy already
+declares unsupported.
+
+**[CRITICAL] above 64 logical CPUs: worker placement was silently wrong, and is now refused instead
+of guessed.** `StartWorker` bound each worker with `1ULL << cpu_affinity`. Past 63 that shift is
+undefined, and on x86 the count is masked to six bits, so CPU 64 evaluated to `1ULL << 0` and pinned
+that worker to CPU 0. On a 128-thread machine an entire processor group would have stacked onto one
+core, presenting as general slowness rather than as a bug. Both platforms were affected: the Linux
+path builds the same 64-bit mask and `llcMaskOfWorker` is one word too.
+
+To be clear about what this does and does not limit, because the two are easy to conflate. **The
+number of workers was never capped and still is not.** Workers above CPU 63 are created, steal and
+run tasks exactly as before. What was capped is *placement*: which CPU a worker pins to, and the
+topology map behind locality-aware stealing. Those workers now fall back to `AffinityPolicy::None`
+with one warning, so the cost is placement rather than capacity, and their locality is approximate.
+Anything with 64 threads or fewer is unaffected, which is every machine this has been tested on.
+
+The 64 is Windows' own granularity rather than a shortcut. `KAFFINITY` is a 64-bit word and Windows
+models wider machines as multiple processor GROUPS of up to 64, with `SetThreadAffinityMask` and
+`SetThreadIdealProcessor` both scoped to a single group; reaching CPU 100 needs
+`SetThreadGroupAffinity` and a `GROUP_AFFINITY {mask, group}` pair. Linux has no such limit at all,
+`cpu_set_t` is 1024 bits, so there the ceiling really was just this code's `uint64_t`.
+
+It also runs deeper than the binding call. `src/win32/Topology.cpp` filters every record on
+`GroupMask.Group == 0`, so on a multi-group machine the topology map describes only the first group
+and the cores, caches and LLC clusters of the rest are invisible to the stealer. Real support means
+the `Ex` APIs, dropping those filters, and carrying `(group, mask)` pairs through `Info`,
+`llcMaskOfWorker` and `BindThreadToMask`. That is a topology-representation change rather than a
+wider integer, and it wants a machine to verify against, so it is deliberately not attempted here.
+
+Found while costing out whether a rented multi-die machine was worth it. The LLC-cluster stealing
+that multi-die actually needs turned out to be already present, and the real gap was a ceiling that
+could be made honest for free.
+
+**The published benchmark numbers were 25% pessimistic and the DAG row said the wrong node count.**
+Latency is 4.7 µs rather than 6.3, the frame DAG is 23.2 µs/graph rather than 31.9, and that graph
+has always had six nodes (start, update, sprites, text, parts, present) despite the table calling it
+five. The old figures came from an older build and no policy reproduces them: `ideal` and `none` both
+land at 4.7, and `hard` is far worse than 6.3, not better. Which change earned the improvement is not
+recoverable without bisecting, and it was not worth it. Table now records medians of five runs, the
+spread (3% on latency, 7% on the DAG) and the version measured.
+
+**`fork-join` is best-of-3 rather than best-of-1.** It was the one unreportable number in the suite:
+five runs spanned 0.34 to 0.49 ms, a 37% swing, while every other section held under 7%. A single run
+of a sub-millisecond section mostly measures scheduler warm-up, which the halved result confirms, the
+figure dropped to 0.19 ms once the first run stopped counting. It is still the noisiest section at
+roughly 25% (0.18 to 0.23 ms over nine runs), so the README quotes it with that spread attached
+rather than pretending the last digit means anything.
+
+**The benchmark prints its version.** `JLIBSCHED_VERSION` in CMakeLists.txt is now the single source
+of truth, feeding `project()`, the installed package config and a new define that `SchedulerBench`
+puts in its header line. This exists because the first two third-party runs had to be discarded: the
+ParallelFor test had been split into memory-bound and compute-bound, the default affinity policy had
+moved from `hard` to `ideal`, and the crossover reporting had changed, but nothing in the pasted
+output said which build produced the numbers. A result that cannot be attributed to a build is not
+data, and asking people to re-run costs goodwill that is in short supply.
+
+**Removed `JLib::current_task`.** It was an `inline thread_local Task*` in `Thread.h`, written on
+four paths in the worker dispatch loop and read nowhere: not in the library, not in the bench, not
+in the tests. `Thread.h` is an implementation-detail header rather than part of the supported API
+(`TaskScheduler.h`, `Task.h`, `TaskDAG.h`), so removing it is within the versioning policy, but it
+is still a removal and belongs here.
+
+It went because it was a trap rather than merely dead weight. A header-inlined thread-local called
+`current_task` is exactly what someone extending this would reach for, and the obvious way to use it
+(read it, wait on something, use it afterwards) is precisely the stale-thread-local bug described
+below. It also cost a thread-local store per dispatch to hold a value nothing consumed.
+
+**DESIGN.md states the rule that makes the above matter: nothing thread-derived may be held across a
+suspend point.** A suspended fiber resumes on whatever worker collects it, so a `Thread*`, a thread
+index or the address of a `thread_local` is stale as soon as a suspend returns. The section is there
+because the failure is asymmetric across architectures and therefore easy to ship: x86-64 reaches
+thread-locals through `%fs:`-relative addressing that is re-evaluated at every access, while AArch64
+must materialise the thread pointer from `TPIDR_EL0` into a general register that the compiler may
+hoist into a callee-saved one, where a correct context switch then faithfully preserves it across
+the migration. Invisible on the machine most people develop on, live on the one they ship to.
+
+The two thread-local sites that remain are safe structurally rather than by discipline, and the
+section documents which pattern each uses, since those are what an extension should copy. Epoch
+slots travel with the fiber (`Epochs::ThreadSlot(tid)` is only the fallback for callers not on a
+fiber, which therefore cannot migrate). `TaskAllocator`'s per-thread free-list cache is safe for the
+other available reason: `Alloc` and `Free` contain no suspend point, so the window never opens.
+
+**`CpuRelax()` compiles under MSVC on ARM64.** It used GNU inline assembly on the non-x86 path, and
+MSVC has no inline assembly on ARM64 at all, so that branch now uses the `__yield()` intrinsic.
+Unreachable today because CMake refuses Windows on ARM64, and no supported platform changes
+behaviour, but it removes a landmine for anyone attempting that port by hand.
+
+Also corrected the README's stated reason for refusing Windows on ARM64. It claimed the port needed
+a TEB stack-bounds fixup, which is false: no such fixup exists anywhere in this codebase, including
+the Windows x64 build that ships and works. It gets away without one because the arena pre-commits
+its stacks and installs its own guard page, and because x64 SEH unwinds from `.pdata` tables rather
+than reading TEB bounds. Both reasons carry to ARM64. The honest position is that the port is
+roughly a day of mechanical work that nobody has asked for, not that it is blocked.
+
 ## 1.0.0 - 2026-08-11
 
 First tagged release. The version number is a statement about API stability, not about the code

@@ -140,6 +140,27 @@ A fiber task that waits on an event suspends the *fiber*; the worker immediately
 work. That is the property that lets GPU-fence waits, physics barriers, and IO share one pool with
 compute without stalling cores, and it is the reason fibers exist here at all.
 
+### Nothing thread-derived may be held across a suspend point
+
+The direct consequence of the above: a suspended fiber resumes on whatever worker picks it up, which
+is usually not the one it left. So any value that identifies or belongs to a thread, a `Thread*`, a
+thread index, the address of a `thread_local`, is stale the moment a suspend returns. Re-fetch it,
+never carry it across.
+
+This is not a style rule, and it bites harder on AArch64 than on x86-64. Reaching a `thread_local`
+on x86-64 goes through `%fs:`-relative addressing that is re-evaluated at every access, so a stale
+one is hard to construct. AArch64 has to materialize the thread pointer from `TPIDR_EL0` into a
+general register, which the compiler may hoist into a callee-saved one, and a correct context switch
+then faithfully preserves it across the migration. Same for Windows on ARM64 via `x18`. The bug is
+invisible on the platform most people develop on and live on the one they ship to.
+
+The scheduler's own thread-local state is structured so this cannot arise rather than trusting the
+rule. Epoch slots are the example worth copying: `Epochs::ThreadSlot(tid)` exists only as the
+fallback for callers that are *not* on a fiber and therefore cannot migrate, while a fiber's epoch
+slot is registered per-fiber in `GlobalFiberPool` and travels with it. `TaskAllocator`'s per-thread
+free-list cache is safe for the other available reason, `Alloc` and `Free` contain no suspend point,
+so the window does not exist.
+
 ---
 
 ## API patterns

@@ -18,13 +18,19 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-| | i9-13900K, Release |
+| | i9-13900K, Release, 1.0.1 |
 |---|---|
-| Task enqueue → dequeue latency | 6.3 µs |
-| 5-node frame DAG (build, validate, execute) | 31.9 µs |
+| Task enqueue → dequeue latency | 4.7 µs |
+| 6-node frame DAG (build, validate, execute) | 23.2 µs |
+| 1M-element recursive fork-join (10k leaves) | 0.19 ms |
 | `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
 | Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
 | Steal protocol | single-item Chase-Lev CAS |
+
+Medians on the default affinity policy. Run-to-run spread was 3% on latency, 7% on the DAG and about
+25% on fork-join, so treat the last digit as noise and the fork-join figure as a rough one.
+`SchedulerBench` prints the version it was built from, and these numbers move between versions:
+quoting one without the other is how the previous table ended up 25% pessimistic.
 
 Run them yourself with `SchedulerBench`. It takes an affinity policy argument and defaults to the
 same one the library does.
@@ -99,9 +105,14 @@ foreground-only unless you do that work yourself.
 Please open an issue either way -- a report that it works is as useful as one that it doesn't, and a
 PR from someone with the hardware is very welcome.
 
-Windows on ARM64 is a different case and is refused outright with no flag. It would need a third
-hand-written context switch in `armasm64` syntax plus the TEB stack-bounds fixup, so a build there
-would produce something broken rather than something untested.
+Windows on ARM64 is refused outright with no flag, but not because anything about it is hard. The
+Windows ARM64 calling convention matches AAPCS64 on everything a context switch touches, so the
+existing register save/restore carries over; what is actually missing is an `armasm64` translation
+of it, an ARM64 configuration in the MSBuild project, and somebody with a Snapdragon machine who
+wants this. It is roughly a day of mechanical work that nobody has asked for yet.
+
+If you are that somebody, open an issue. That is the signal that would move it, and it is the
+difference between a fifth supported platform and a fifth platform I cannot run.
 
 ## Using it
 
@@ -142,6 +153,13 @@ about 192 bytes fails a `static_assert`: capture pointers, not payloads.
 And `CorePref::P` / `CorePref::E` are Windows-only. Elsewhere the scheduler has no way to tell the
 core classes apart, so those requests are silently ignored rather than rejected -- leave tasks at
 `Default` or `Any` on other platforms, and don't build a design that assumes the placement held.
+
+Placement also stops at 64 logical CPUs. Every affinity mask here is a single 64-bit word, and on
+Windows the relevant calls are scoped to one processor group besides, so workers on CPU 64 and above
+run unbound and print one warning saying so. They are still created and still take work; only their
+placement is dropped, and topology-aware stealing is correspondingly approximate for them. This
+affects dual-socket and 128-thread parts, which are untested here. Open an issue if you have one,
+because lifting it properly wants a machine to verify against.
 
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.

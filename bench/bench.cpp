@@ -388,7 +388,16 @@ int main(int argc, char** argv) {
 
     JLib::TaskScheduler::SetAffinityPolicy(policy);
 
-    printf("JLib::Scheduler bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, pool=%s)\n",
+    // The version is stamped here on purpose. Results get pasted into issues and threads, and the
+    // suite changes: the ParallelFor case was split in two, the default affinity policy moved from
+    // hard to ideal, and the crossover sweep stopped reporting noise as a win. Third-party numbers
+    // from before those changes had to be thrown away because nothing in the output identified the
+    // build. Anything pasted from here says which scheduler produced it.
+#ifndef JLIBSCHED_VERSION
+#define JLIBSCHED_VERSION "unknown"   // hand-built outside CMake
+#endif
+    printf("JLib::Scheduler %s bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, pool=%s)\n",
+        JLIBSCHED_VERSION,
         sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName,
         poolSize ? std::to_string(poolSize).c_str() : "auto");
     printf("----------------------------------------------------------------\n");
@@ -476,7 +485,11 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
 static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
     constexpr int kN = 1 << 20;            // 1M elements
     constexpr int kBaseCase = 10'000;      // 10k-elem leaf
-    constexpr int kRuns = 1;
+    // Was 1, which made this the only unreportable number in the suite: measured across five runs
+    // it swung 0.34-0.49 ms (37%) while latency held to 3% and the frame DAG to 7%. A single run of
+    // a sub-millisecond section is mostly scheduler warm-up and whatever else the OS was doing.
+    // Matches the other sections at 3 now.
+    constexpr int kRuns = 3;
     double best = 1e300;
 
     for (int run = 0; run < kRuns; ++run) {

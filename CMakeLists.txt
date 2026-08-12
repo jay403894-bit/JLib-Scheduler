@@ -18,6 +18,18 @@
 
 cmake_minimum_required(VERSION 3.21)
 
+# ONE place the version lives. Used by project(), by the installed package config, and stamped into
+# the benchmark's output -- that last one because third-party results are only useful if you can
+# tell which build produced them. Runs came back on an older bench once and had to be discarded:
+# the ParallelFor case, the default affinity policy and the crossover reporting had all changed
+# underneath them, and nothing in the pasted output said so.
+#
+# BUMP THIS IN THE SAME COMMIT that changes anything the bench measures or the API exposes, rather
+# than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
+# while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
+# there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
+set(JLIBSCHED_VERSION "1.0.1")
+
 set(JLIBSCHED_STANDALONE OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(JLIBSCHED_STANDALONE ON)
@@ -28,9 +40,9 @@ if(JLIBSCHED_STANDALONE)
     # The language has to be enabled at project() time, which is why this is not simply a
     # per-target property.
     if(WIN32)
-        project(JLibScheduler LANGUAGES CXX ASM_MASM)
+        project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM_MASM)
     else()
-        project(JLibScheduler LANGUAGES CXX ASM)
+        project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM)
     endif()
 
     get_property(_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -240,6 +252,8 @@ endif()
 add_executable(SchedulerBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench.cpp")
 target_link_libraries(SchedulerBench PRIVATE Scheduler)
 target_compile_features(SchedulerBench PRIVATE cxx_std_17)
+# Stamped into the header line so a pasted result identifies the build that produced it.
+target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED_VERSION}")
 
 # ---- tests ------------------------------------------------------------------------------------
 # A CMake target rather than a hand-compiled file, specifically so CI can run it everywhere without
@@ -275,7 +289,7 @@ if(JLIBSCHED_STANDALONE)
         # SameMajorVersion: a consumer writing find_package(JLibScheduler 1.0) accepts any 1.x,
         # which is the semver promise this version number is making -- no breaking API change
         # without a 2.0.
-        VERSION 1.0.0 COMPATIBILITY SameMajorVersion)
+        VERSION ${JLIBSCHED_VERSION} COMPATIBILITY SameMajorVersion)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake.in"
 "@PACKAGE_INIT@\ninclude(CMakeFindDependencyMacro)\nif(NOT WIN32)\n  find_dependency(Threads)\nendif()\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/JLibSchedulerTargets.cmake\")\ncheck_required_components(JLibScheduler)\n")
     configure_package_config_file(

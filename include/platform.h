@@ -158,6 +158,12 @@ inline void ReleaseReservation(void* addr, std::size_t bytes) {
 inline void CpuRelax() {
 #if JLIB_ARCH_X86_64
     _mm_pause();
+#elif defined(_MSC_VER)
+    // MSVC has NO inline assembly on ARM64 -- not different syntax, none at all -- so the GNU form
+    // below will not compile there. __yield() is its intrinsic for the same instruction. Currently
+    // unreachable, since CMake refuses Windows on ARM64 (that needs a third context switch), but
+    // this file should not be the thing that breaks if anyone ever does the port by hand.
+    __yield();
 #else
     __asm__ __volatile__("yield" ::: "memory");
 #endif

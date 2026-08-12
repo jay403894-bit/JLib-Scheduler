@@ -70,6 +70,36 @@ void Thread::StartWorker(size_t cpu_affinity)
 		this->Worker();
 		});
 	nativeHandle = thread.native_handle();
+
+	// ---- THE 64-CPU CEILING, enforced once for both platforms ----
+	// Every affinity mask in this file is a single 64-bit word: `1ULL << cpu_affinity` on both
+	// branches below, and `llcMaskOfWorker` for the Linux Ideal path. Windows compounds it, because
+	// SetThreadAffinityMask and SetThreadIdealProcessor are scoped to the caller's PROCESSOR GROUP,
+	// so even a correct wider mask could not reach past 64 without the *Ex variants taking a
+	// GROUP_AFFINITY.
+	//
+	// Past 63 that shift is not merely useless, it is UNDEFINED -- and on x86 the shift count is
+	// masked to 6 bits, so CPU 64 evaluates to `1ULL << 0` and that worker silently pins to CPU 0.
+	// On a 128-thread box the entire second processor group would stack onto one core. Failing to
+	// bind gives you a slower machine; binding WRONG gives you a broken one, so this refuses rather
+	// than guesses.
+	//
+	// Degrading to None is the honest outcome and not a capacity loss: the worker is still created,
+	// still stealing, still running tasks. Only its PLACEMENT is dropped, which is precisely what
+	// AffinityPolicy::None means. Machines this wide (dual-socket EPYC, 128-thread Threadripper) are
+	// untested here. Lifting the ceiling means GROUP_AFFINITY on Windows plus a wider mask type
+	// carried through Topology, llcMaskOfWorker and BindThreadToMask -- not a bigger integer here.
+	auto affinityPolicy = scheduler->GetAffinityPolicy();
+	if (cpu_affinity >= 64 && affinityPolicy != TaskScheduler::AffinityPolicy::None) {
+		affinityPolicy = TaskScheduler::AffinityPolicy::None;
+		static std::atomic<bool> warned{ false };
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			std::cerr << "[JLib::Scheduler] logical CPU " << cpu_affinity
+			          << " is past the 64-CPU affinity ceiling -- workers above 63 run unbound. "
+			             "Topology-aware stealing is degraded for them; see README.\n";
+		}
+	}
+
 #if JLIB_PLATFORM_WINDOWS
 	// HOW this worker is bound to its core, per TaskScheduler::SetAffinityPolicy.
 	//
@@ -88,7 +118,7 @@ void Thread::StartWorker(size_t cpu_affinity)
 	// NOTE the topology-aware steal ordering (SMT sibling first, then cache cluster) is only
 	// meaningful under Hard or Ideal: if threads migrate freely, "my sibling" no longer describes
 	// where any data actually is. Pinning and locality-aware stealing are ONE decision, not two.
-	switch (scheduler->GetAffinityPolicy()) {
+	switch (affinityPolicy) {
 	case TaskScheduler::AffinityPolicy::PhysicalOnly:   // one worker per physical core -- still a hard bind
 	case TaskScheduler::AffinityPolicy::Hard:
 		SetThreadAffinityMask(nativeHandle, 1ULL << cpu_affinity);
@@ -134,7 +164,7 @@ void Thread::StartWorker(size_t cpu_affinity)
 	//          binding if topology was unavailable (mask 0), which is the old behaviour.
 	//
 	// None -> nothing, same as Windows.
-	switch (scheduler->GetAffinityPolicy()) {
+	switch (affinityPolicy) {
 	case TaskScheduler::AffinityPolicy::PhysicalOnly:
 	case TaskScheduler::AffinityPolicy::Hard: {
 		BindThreadToMask(nativeHandle, std::uint64_t(1) << cpu_affinity);
@@ -466,7 +496,6 @@ void Thread::Worker() {
 				}
 
 				task_to_run = immediateTask;
-				current_task = immediateTask;
 				immediateTask = nullptr;
 				immediate.store(false, std::memory_order_release);
 				is_handling_fork = true;
@@ -484,7 +513,6 @@ void Thread::Worker() {
 					}
 					else {
 						task_to_run = task;
-						current_task = task;
 						continue;
 					}
 				}
@@ -498,7 +526,6 @@ void Thread::Worker() {
 					}
 					else {
 						task_to_run = task;
-						current_task = task;
 						continue;
 					}
 				}
@@ -598,7 +625,6 @@ void Thread::Worker() {
 
 				if (task_to_run) {
 					consecutiveMisses = 0;
-					current_task = task_to_run;
 					continue;
 				}
 				else {
