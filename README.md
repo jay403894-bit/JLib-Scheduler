@@ -152,12 +152,16 @@ Tasks that spawn tasks are the path this is built around, and the gap is larger 
 with 31**, going backwards as workers are added. Submitting the same work from four tasks already on
 the pool holds 4 to 6 M/s across the whole range.
 
-Two reasons, and they compound. A single submitting thread is a fixed serial cost, so once the pool
-can drain faster than one thread can push, the surplus workers find empty deques and their steal
-traffic slows the producer down further. And the deques are Chase-Lev: their owner pushes and pops
-locally with no atomic in the common case, and only thieves pay for the CAS. That asymmetry assumes
-the producer is a worker. A task spawning a task gets that fast path; something pushing from outside
-the pool goes through the shared inbox instead.
+The cost is entirely in submission, not in getting the work done. Timing the two halves separately,
+the pool has already finished by the time the loop stops pushing: drain-after-submit is 0.00 ms at
+every pool size from 8 to 31. So this is not the pool struggling to keep up, it is one thread's
+`Push` getting more expensive as the pool grows, and external submission round-robins across every
+worker's inbox, so the producer's working set and its coherence traffic grow with the worker count.
+
+The deques are also Chase-Lev, which is the structural half: their owner pushes and pops locally
+with no atomic in the common case, and only thieves pay for the CAS. That asymmetry assumes the
+producer is a worker. A task spawning a task gets that fast path; something pushing from outside the
+pool goes through the shared inbox instead.
 
 None of which means one submitter is wrong. A main thread submitting a frame's work is a normal
 shape and 3.4 M/s is plenty for it. It means that if you are feeding the pool from a loop and

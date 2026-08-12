@@ -599,9 +599,11 @@ void Thread::Worker() {
 					return false;
 				};
 				auto tryStealFrom = [&](int target) -> bool {
+					JLIBSCHED_STEAL_STAT(qIndex, probes);
 					auto s = scheduler->hiPri[target]->steal_if(classOK);
 					if (!s) s = scheduler->loPri[target]->steal_if(classOK);
 					if (!s) return false;
+					JLIBSCHED_STEAL_STAT(qIndex, hits);
 					task_to_run = *s;
 					return true;
 				};

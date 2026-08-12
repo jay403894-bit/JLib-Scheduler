@@ -11,6 +11,8 @@ bench/*.ilk
 # committing: the generated tree is machine- and generator-specific, so a clone that inherited one
 # would fail to configure rather than save anyone a step.
 build/
+# -DJLIBSCHED_STEAL_STATS=ON gets its own tree so the normal build stays clean
+build-stats/
 cmake-build*/
 out/
 CMakeCache.txt

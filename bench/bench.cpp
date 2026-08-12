@@ -27,6 +27,7 @@
 #define NOMINMAX
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
+#include <Thread.h>    // StealStatsRead/Reset -- no-ops unless built with JLIBSCHED_STEAL_STATS
 #include <chrono>
 #include <cstdio>
 
@@ -34,10 +35,12 @@
 // differently and neither name is standard C++: MSVC has _stricmp, POSIX has strcasecmp.
 #if defined(_WIN32)
   #include <cstring>
-  #define JLIB_STRICMP _stricmp
+  #define JLIB_STRICMP  _stricmp
+  #define JLIB_STRNICMP _strnicmp
 #else
   #include <strings.h>
-  #define JLIB_STRICMP strcasecmp
+  #define JLIB_STRICMP  strcasecmp
+  #define JLIB_STRNICMP strncasecmp
 #endif
 #include <cstdint>
 #include <vector>
@@ -57,8 +60,26 @@ static double MsBetween(Clock::time_point a, Clock::time_point b) {
 static constexpr int kThroughputTasks = 200'000;
 static constexpr int kThroughputRuns  = 5;
 
+// Prints nothing unless the library was built with -DJLIBSCHED_STEAL_STATS=ON. Probes per task is
+// the number to watch: it says how many victim deques a worker had to touch, on average, to move
+// one task through the system. Cheap work-stealing is a fraction of a probe per task. A large
+// number means workers are spending their time asking empty deques for work.
+static void ReportStealStats(const char* label) {
+    if (!JLib::kStealStatsEnabled) return;
+    long long probes = 0, hits = 0;
+    JLib::StealStatsRead(probes, hits);
+    printf("  steal/%s   : %lld probes, %lld hits (%.1f%% hit rate, %.2f probes per task)\n",
+        label, probes, hits,
+        probes ? 100.0 * (double)hits / (double)probes : 0.0,
+        (double)probes / (double)(kThroughputTasks * kThroughputRuns));
+    JLib::StealStatsReset();
+}
+
 static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
-    double best = 1e300;
+    double best = 1e300, bestPush = 0.0, bestDrain = 0.0;
+    // Reset HERE, not at construction: workers steal-probe continuously while idle, so anything
+    // accumulated before the measured region is dead time rather than work being done.
+    JLib::StealStatsReset();
     for (int run = 0; run < kThroughputRuns; ++run) {
         JLib::WaitGroup wg;
         wg.n.store(kThroughputTasks, std::memory_order_relaxed);
@@ -68,11 +89,20 @@ static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
             t->waitGroup = &wg;
             sched.Push(t);
         }
+        // Split the measurement: everything up to here is SUBMISSION by one thread, everything
+        // after is the pool finishing whatever is left. Without the split, "throughput" conflates a
+        // serial producer with a parallel consumer and a change in either looks the same.
+        auto t1 = Clock::now();
         sched.WaitFor(wg);
-        best = std::min(best, MsBetween(t0, Clock::now()));
+        auto t2 = Clock::now();
+        const double total = MsBetween(t0, t2);
+        if (total < best) { best = total; bestPush = MsBetween(t0, t1); bestDrain = MsBetween(t1, t2); }
     }
     printf("throughput/1p: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (1 producer)\n",
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0);
+    printf("               submit %.2f ms (%.2f M/s), drain-after-submit %.2f ms\n",
+        bestPush, kThroughputTasks / bestPush / 1000.0, bestDrain);
+    ReportStealStats("1p");
 }
 
 // ------------------------------------------------- 1b. throughput, SEVERAL producers on the pool
@@ -107,9 +137,104 @@ static void ProducerBody(void* p) {
     }
 }
 
+// ------------------------------------------------- 1c. throughput via PushBatch
+// PushBatch links a run of tasks locally and hands the whole chain to ONE inbox with a single
+// notify, instead of paying a worker selection, an inbox push and a condition-variable signal per
+// task. Given that the per-push wake turned out to dominate single-producer submission, this is the
+// API-level answer to the same problem the fan-out cap addresses by policy, and it has been in the
+// scheduler the whole time. It was never benchmarked, which is part of why the cost stayed hidden.
+static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
+    constexpr int kChunk = 64;               // 200,000 divides evenly by this
+    double best = 1e300, bestPush = 0.0, bestDrain = 0.0;
+    JLib::Task* chunk[kChunk];
+    JLib::StealStatsReset();
+    for (int run = 0; run < kThroughputRuns; ++run) {
+        JLib::WaitGroup wg;
+        wg.n.store(kThroughputTasks, std::memory_order_relaxed);
+        auto t0 = Clock::now();
+        int made = 0;
+        for (int i = 0; i < kThroughputTasks; ++i) {
+            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+            if (!t) { printf("throughput/batch: ERROR -- CreateTask returned null\n"); return; }
+            t->waitGroup = &wg;
+            chunk[made++] = t;
+            if (made == kChunk) { sched.PushBatch(chunk, (size_t)made, 0); made = 0; }
+        }
+        if (made) sched.PushBatch(chunk, (size_t)made, 0);
+        auto t1 = Clock::now();
+        sched.WaitFor(wg);
+        auto t2 = Clock::now();
+        const double total = MsBetween(t0, t2);
+        if (total < best) { best = total; bestPush = MsBetween(t0, t1); bestDrain = MsBetween(t1, t2); }
+    }
+    printf("throughput/bt: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (1 producer, PushBatch x%d)\n",
+        kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0, kChunk);
+    printf("               submit %.2f ms (%.2f M/s), drain-after-submit %.2f ms\n",
+        bestPush, kThroughputTasks / bestPush / 1000.0, bestDrain);
+    ReportStealStats("bt");
+}
+
+// ------------------------------------------------- 1d. HEAVY burst from an idle pool
+// The case none of the other benches covers, and the one that decides whether narrowing external
+// fan-out is safe as a default. A frame loop is idle, then submits a handful of EXPENSIVE tasks.
+//
+// The worry is specific: a push notifies only its target worker. With wide fan-out each of the N
+// tasks wakes its own worker and they all start at once. With a narrow cap they all land on one
+// inbox, and the rest of the pool has to be recruited by STEALING -- which requires those workers to
+// be awake to steal. If they slept through it, parallelism collapses to roughly one worker and the
+// speedup below drops toward 1.0. Reported as speedup against a measured single-task time so it is
+// self-calibrating rather than depending on a hand-tuned duration.
+static std::atomic<unsigned long long> g_burstSink{ 0 };
+static void BurstBody(void*) {
+    // An xorshift CHAIN, not a summation. The obvious `acc += i * k` loop has a closed form and GCC
+    // finds it: the same body measured 0.66 ms under MSVC and 0.02 ms under GCC, which silently
+    // turned this into a task-overhead benchmark on one platform and a parallelism benchmark on the
+    // other. Every iteration here depends on the previous one, so there is nothing to fold.
+    unsigned long long x = 88172645463325252ull;
+    for (int i = 0; i < 3'000'000; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
+    g_burstSink.fetch_add(x, std::memory_order_relaxed);
+}
+
+static void BenchIdleBurst(JLib::TaskScheduler& sched) {
+    constexpr int kBurst = 16;
+    constexpr int kRuns  = 5;
+
+    // Reference: one task, alone, on an otherwise idle pool.
+    double solo = 1e300;
+    for (int r = 0; r < kRuns; ++r) {
+        JLib::WaitGroup wg; wg.n.store(1, std::memory_order_relaxed);
+        auto t0 = Clock::now();
+        JLib::Task* t = sched.CreateTask(BurstBody, nullptr);
+        if (!t) { printf("burst        : ERROR -- CreateTask returned null\n"); return; }
+        t->waitGroup = &wg; sched.Push(t);
+        sched.WaitFor(wg);
+        solo = std::min(solo, MsBetween(t0, Clock::now()));
+    }
+
+    double burst = 1e300;
+    for (int r = 0; r < kRuns; ++r) {
+        // Let the pool actually PARK before the burst; measuring a pool that is still spinning would
+        // quietly answer a different question.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        JLib::WaitGroup wg; wg.n.store(kBurst, std::memory_order_relaxed);
+        auto t0 = Clock::now();
+        for (int i = 0; i < kBurst; ++i) {
+            JLib::Task* t = sched.CreateTask(BurstBody, nullptr);
+            if (!t) { printf("burst        : ERROR -- CreateTask returned null\n"); return; }
+            t->waitGroup = &wg; sched.Push(t);
+        }
+        sched.WaitFor(wg);
+        burst = std::min(burst, MsBetween(t0, Clock::now()));
+    }
+
+    printf("burst        : %d heavy tasks from an idle pool -> %.2f ms (1 task = %.2f ms, speedup %.1fx of %d)\n",
+        kBurst, burst, solo, (solo * kBurst) / burst, kBurst);
+}
+
 static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
     double best = 1e300;
     int    totalFailed = 0;
+    JLib::StealStatsReset();
     for (int run = 0; run < kThroughputRuns; ++run) {
         JLib::WaitGroup wg;
         wg.n.store(kThroughputTasks, std::memory_order_relaxed);
@@ -132,6 +257,7 @@ static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
         printf("throughput/mp: ERROR -- %d task allocations failed\n", totalFailed);
     printf("throughput/mp: %d no-op tasks in %.2f ms best-of-%d  ->  %.2f M tasks/sec  (%d producers)\n",
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0, kProducers);
+    ReportStealStats("mp");
 }
 
 // ---------------------------------------------------------------- 2. latency
@@ -491,11 +617,18 @@ int main(int argc, char** argv) {
     }
 
     BenchThroughputSingleProducer(sched);
+    BenchThroughputBatched(sched);
     BenchThroughputMultiProducer(sched);
     BenchLatency(sched);
     BenchParallelFor(sched);
     BenchRecursiveForkJoin(sched);
     BenchFrameDag(sched);
+    // LAST, and deliberately. This one sleeps 50 ms before each of its five runs so the pool is
+    // genuinely parked, which is the whole point of it. Run earlier, it leaves every worker cold and
+    // the next section pays the wake-up: with it sitting before the frame DAG, that section read
+    // 30.88 us/graph against 22.7 to 24.7 measured on its own. Anything that deliberately idles the
+    // pool has to go after everything it would otherwise contaminate.
+    BenchIdleBurst(sched);
     if (runSweep) BenchParallelForCrossover(sched);
 
     printf("----------------------------------------------------------------\n");

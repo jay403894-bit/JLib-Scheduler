@@ -18,12 +18,101 @@ while mp goes 6.34, 5.14, 4.64, 4.51, 4.39, 4.03, 3.34. The cliff is entirely ab
 column. What remains there is a gentle decline across an eightfold increase in workers, which is
 ordinary contention in a benchmark composed of nothing but scheduling overhead.
 
-The mechanism is a threshold rather than accumulating contention, which is why it is a cliff and not
-a slope. One thread creates and pushes about 3.4 M tasks/sec. Below roughly twelve workers the pool
-cannot drain faster than that and everyone stays busy; past it the surplus workers find empty deques
-and spend their time steal-probing, and that traffic slows the producer further. Note this is
-inferred from the shape and from its absence in the multi-producer case rather than measured
-directly; confirming it means counting steal attempts across the crossover.
+**The mechanism is submission cost, and it is not what was first assumed.** 1p now times the push
+loop separately from the wait, and `drain-after-submit` is **0.00 ms at every pool size from 8 to
+31**. The pool is never behind; it has finished before the producer stops pushing. The entire number
+is one thread's submission rate, which falls from 3.36 M/s at 8 workers to 0.91 at 13 and then sits
+flat near 0.80 through 31.
+
+The first explanation offered for this, recorded because it was wrong and the disproof is the useful
+part, was a steal storm: surplus workers finding empty deques and interfering with the producer. A
+new opt-in build option, `JLIBSCHED_STEAL_STATS`, counts steal probes and hits per worker and shows
+the opposite. At 31 workers 1p performs 8.79 M probes for **81 hits**, while mp performs 15.19 M
+probes for 110,738 hits. Per unit of time mp probes roughly seven times harder than 1p and runs four
+times faster, so probe volume cannot be what makes 1p slow.
+
+**The cause turned out to be thread wakes, and it is fixable.** Every push ends in
+`Thread::NotifyWorker()`, which unconditionally takes the target worker's mutex and signals its
+condition variable. While the pool is saturated that signal is nearly free, because nobody is
+waiting on it. Once the pool can drain faster than one thread can submit, workers genuinely park,
+and each push starts paying a real thread wake. That is a threshold rather than a gradient, which is
+why the measurement is a cliff followed by a plateau, and it explains why mp is immune: its
+producers are workers, so nothing idles.
+
+**An external-submitter fan-out cap was tried and REMOVED.** It is recorded here rather than shipped
+because the experiment identified the mechanism above, and because the reasons it failed are worth
+not rediscovering. The idea was to cap how many distinct workers an external submitter rotates
+across. Worker-to-worker pushes are never capped, since narrowing those would concentrate a
+fork-join's children onto a few deques; `Thread::GetCurrent()` is null exactly when the caller is
+not one of ours. Measured at pool 31, sweeping the cap:
+
+```
+fanout   1p throughput   latency    frame DAG
+all(31)  0.81 M/s        4.84 us    24.69 us     <- current default
+1        8.96 M/s        0.79 us    22.02 us
+2        4.55 M/s        0.71 us    22.40 us
+4        3.27 M/s        4.69 us    23.48 us
+8        3.20 M/s        4.82 us    23.53 us
+```
+
+Single-producer throughput improves 11x and drain stays near zero (0.17 ms), so stealing distributes
+the concentrated work perfectly well -- which it should, that being what the deques are for, and it
+was previously doing almost nothing here. **Latency improves 6x**, and that is the more interesting
+number: the latency bench pushes one task and waits, 20,000 times, so with wide fan-out every
+round-trip lands on a different PARKED worker and pays a full wake. 4.8 us is roughly what a thread
+wake costs. The frame DAG gains 11%. `throughput/mp` and fork-join are unchanged, confirming the
+blast radius.
+
+**Two things killed it.** A new `burst` bench submits 16 EXPENSIVE tasks from a deliberately idled
+pool and reports parallel speedup against a measured single-task time. That is the case every other
+bench misses, and it is the one a frame loop actually contains:
+
+```
+fanout   burst speedup, MSVC   burst speedup, GCC
+all(31)  7.8x                  11.6x
+1        1.8x                   2.0x
+2        2.5x                    -
+```
+
+Two compilers on two platforms, which matters here because the first version of this bench was
+wrong. Its body was `acc += i * k`, which has a closed form that GCC finds and MSVC does not: the
+identical task measured 0.66 ms under one and 0.02 ms under the other, quietly making it a
+parallelism benchmark on Windows and a task-overhead benchmark on Linux. It is an xorshift chain
+now, where each iteration depends on the last and there is nothing to fold. Worth remembering for
+any future bench body: if a compiler can solve your busy-work, one platform will report a number
+that means something different from the other's.
+
+Narrowing the fan-out collapses it. All sixteen tasks land in one inbox, only that worker is
+notified, and the other thirty stay parked with no one to wake them, so the pool never assembles.
+Trading 7.8x down to 1.8x on burst parallelism to buy submission rate is a bad deal for an engine,
+and no fixed cap can tell the two workloads apart.
+
+Worse, it could HANG. `PushLocal` spins on `while (immediateCoresInUse[chosen]) chosen =
+PickNextWorker();` with no yield and no widening. That is safe with thirty-one candidates, because
+they are never all claimed at once, and is not safe with four: `PickNextWorker` keeps handing back
+claimed workers and the loop never exits. A benchmark run sat livelocked on one core for hours
+before anyone noticed. An attempted fix that widened to the full pool on exhaustion did not hold
+either, so the whole thing came out rather than being patched twice.
+
+The experiment still earned its place, because it identified the mechanism. What it points at is
+preferring workers that are already AWAKE and waking one only when none are: that keeps choosing the
+hot worker in the latency case while an idle pool still recruits everybody for a burst. No tuning
+constant, and no workload where it is the wrong answer. Not attempted here, because it modifies the
+notify path that produced the ParallelFor lost-wakeup deadlock and deserves its own change rather
+than a footnote to this one.
+
+**`PushBatch` is benchmarked for the first time, as `throughput/bt`, and it is the actual answer for
+bulk submission: 12.0 M tasks/sec against 0.78 for the per-task path.** It has been in the scheduler
+all along, linking a run of tasks locally and handing the chain to one inbox with a single notify
+instead of paying worker selection, an inbox push and a condition-variable signal per task. Nothing
+measured it, which is a large part of why the per-push wake cost stayed invisible. It concentrates
+work on one worker exactly as a fan-out cap does, but as an explicit call at a site where the caller
+knows what they are submitting, rather than as a global policy applied to work it knows nothing
+about. That difference is why one is a default and the other is not.
+
+The instrumentation defaults OFF and the library is built without it, because counters in the steal
+loop would tax exactly the path under investigation. Numbers from a `JLIBSCHED_STEAL_STATS` build
+should not be compared against a normal one.
 
 1p is kept rather than replaced, because a main thread submitting a frame's work is a real pattern
 and its submission rate is worth knowing. It is now labelled as a producer measurement so nobody

@@ -30,6 +30,12 @@ cmake_minimum_required(VERSION 3.21)
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
 set(JLIBSCHED_VERSION "1.1.1")
 
+# Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
+# where contention is being investigated, so leaving them in a shipping build would tax the thing
+# they exist to measure. Turn on only for an experiment, and do not compare its numbers against a
+# normal build's.
+option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
+
 set(JLIBSCHED_STANDALONE OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(JLIBSCHED_STANDALONE ON)
@@ -229,6 +235,14 @@ add_library(JLib::Scheduler ALIAS Scheduler)
 
 # BUILD_INTERFACE / INSTALL_INTERFACE rather than a bare path: a bare absolute source path gets
 # baked into the exported package, pointing every consumer back at the tree it was built from.
+# PUBLIC, not PRIVATE: the counters are inline in Thread.h, so the library and anything reading them
+# (the bench) must agree on whether they exist. Compiling half the program with them and half without
+# would give two different Thread.h and a silently wrong answer.
+if(JLIBSCHED_STEAL_STATS)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STEAL_STATS=1)
+    message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+
 target_include_directories(Scheduler PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)

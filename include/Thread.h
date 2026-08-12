@@ -14,6 +14,51 @@
 #include "GlobalFiberPool.h"
 namespace JLib {
 	class TaskScheduler;
+
+    // ================================ STEAL INSTRUMENTATION (opt-in) ============================
+    // Counts steal PROBES (one call against one victim, hiPri then loPri) and HITS (probes that
+    // claimed a task). Built to answer one question: past the point where the pool can drain faster
+    // than a single producer can submit, do the surplus workers actually burn themselves on empty
+    // deques? A probe/hit ratio that explodes across that crossover says yes.
+    //
+    // OFF unless JLIBSCHED_STEAL_STATS is defined, because this sits in the steal loop and the whole
+    // point is measuring contention there. Instrumentation that perturbs the thing it measures is
+    // worse than none: a shared counter here would manufacture exactly the cache-line traffic the
+    // experiment is trying to detect. Hence one counter per worker, each on its own line, summed
+    // only when someone asks.
+    //
+    // Enable with -DJLIBSCHED_STEAL_STATS=ON at configure time.
+#ifdef JLIBSCHED_STEAL_STATS
+    struct alignas(64) StealCounters { std::atomic<long long> probes{ 0 }; std::atomic<long long> hits{ 0 }; };
+    inline constexpr size_t kStealStatSlots = 256;
+    inline StealCounters g_stealStats[kStealStatSlots];
+    #define JLIBSCHED_STEAL_STAT(q, field)                                                   \
+        do { const size_t _qi = (size_t)(q);                                                 \
+             if (_qi < ::JLib::kStealStatSlots)                                              \
+                 ::JLib::g_stealStats[_qi].field.fetch_add(1, std::memory_order_relaxed);    \
+        } while (0)
+
+    inline void StealStatsReset() {
+        for (size_t i = 0; i < kStealStatSlots; ++i) {
+            g_stealStats[i].probes.store(0, std::memory_order_relaxed);
+            g_stealStats[i].hits.store(0, std::memory_order_relaxed);
+        }
+    }
+    inline void StealStatsRead(long long& probes, long long& hits) {
+        probes = 0; hits = 0;
+        for (size_t i = 0; i < kStealStatSlots; ++i) {
+            probes += g_stealStats[i].probes.load(std::memory_order_relaxed);
+            hits   += g_stealStats[i].hits.load(std::memory_order_relaxed);
+        }
+    }
+    inline constexpr bool kStealStatsEnabled = true;
+#else
+    #define JLIBSCHED_STEAL_STAT(q, field) ((void)0)
+    inline void StealStatsReset() {}
+    inline void StealStatsRead(long long& probes, long long& hits) { probes = 0; hits = 0; }
+    inline constexpr bool kStealStatsEnabled = false;
+#endif
+
     struct WaitHandle {
         Fiber* fiber;
         std::atomic<bool> signaled{ false };

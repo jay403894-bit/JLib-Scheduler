@@ -88,6 +88,19 @@ jobs:
         run: ./${{ matrix.topo }}
         shell: bash
 
+      # The steal counters compile out entirely in a normal build, which is the point but also the
+      # hazard: code that is never compiled rots silently, and the first person to need it would
+      # discover that months later while chasing something else. This is the one place it gets built,
+      # so a typo in it cannot reach a release unnoticed. One target is enough, since the code is
+      # platform-independent, and it goes on the cheapest runner.
+      - name: Build with steal instrumentation (one target)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cmake -S . -B build-stats -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_STEAL_STATS=ON
+          cmake --build build-stats -j 2
+          ./build-stats/bin/SchedulerBench none 4 nosweep
+        shell: bash
+
   # The ABI harness: links against ONE object (the context switch) with no scheduler attached, so a
   # failure here is unambiguously the assembly's fault. Run at BOTH -O0 and -O2 -- register
   # allocation around the pinned callee-saved sentinels differs enough between them that a broken

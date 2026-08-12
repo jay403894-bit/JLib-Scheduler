@@ -277,6 +277,13 @@ namespace JLib {
 		// Preference is a hint -- never a constraint.
 		int PickNextWorker(CorePref pref = CorePref::Default);
 
+		// NOTE: an external-submitter fan-out cap was tried here and REMOVED. See CHANGELOG 1.1.1.
+		// It made single-producer submission much faster and burst parallelism much worse, and it
+		// could livelock: PushLocal spins on `while (immediateCoresInUse[chosen])` with no yield and
+		// no widening, which is safe with thirty-one candidates and is not with four. If you are
+		// tempted to reintroduce it, the useful version is preferring workers that are already
+		// AWAKE, not capping how many exist.
+
 		// ---------- topology-aware steal biasing ----------
 		// Queried ONCE at StartPool() time via GetLogicalProcessorInformationEx -- real
 		// hardware topology, not an assumption from the sequential affinity scheme (worker
