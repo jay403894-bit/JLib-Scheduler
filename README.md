@@ -18,19 +18,28 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-| | i9-13900K, Release, 1.0.1 |
+| | i9-13900K, reduced power limits, Release, 1.1.1 |
 |---|---|
-| Task enqueue → dequeue latency | 4.7 µs |
-| 6-node frame DAG (build, validate, execute) | 23.2 µs |
-| 1M-element recursive fork-join (10k leaves) | 0.19 ms |
+| Task enqueue → dequeue latency | 6.4 µs |
+| 6-node frame DAG (build, validate, execute) | 28.4 µs |
+| 1M-element recursive fork-join (10k leaves) | 0.27 ms |
+| Bulk submission via `PushBatch` | 11.9 M tasks/sec |
 | `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
 | Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
 | Steal protocol | single-item Chase-Lev CAS |
 
-Medians on the default affinity policy. Run-to-run spread was 3% on latency, 7% on the DAG and about
-25% on fork-join, so treat the last digit as noise and the fork-join figure as a rough one.
-`SchedulerBench` prints the version it was built from, and these numbers move between versions:
-quoting one without the other is how the previous table ended up 25% pessimistic.
+Medians of six runs on the default affinity policy. Run-to-run spread was about 19% on latency, 5%
+on the DAG and 30% on fork-join, so treat the last digit as noise.
+
+**This machine runs reduced power limits** and settles near its base clock under sustained load
+rather than boosting, which is a deliberate setting and not something being worked around. Expect a
+stock part to beat every figure above. Numbers that are conservative for the reader are the right
+kind to be wrong, and it is the reason the third-party results matter more than mine: some have come
+back faster, and the spread across machines is more informative than any single row.
+
+`SchedulerBench` prints the version it was built from. That exists because results get pasted into
+issues while the suite changes underneath them, and a number nobody can attribute to a build is not
+data. If a pasted run has no version line at all, it predates 1.0.1 and should be re-run.
 
 Run them yourself with `SchedulerBench`. It takes an affinity policy argument and defaults to the
 same one the library does.
@@ -150,7 +159,12 @@ int main() {
 Tasks that spawn tasks are the path this is built around, and the gap is larger than it sounds. On a
 32-thread i9, pushing 200,000 tasks from one thread runs at 3.4 M/s with 8 workers and **0.8 M/s
 with 31**, going backwards as workers are added. Submitting the same work from four tasks already on
-the pool holds 4 to 6 M/s across the whole range.
+the pool holds 3.5 to 5 M/s across the whole range.
+
+If you must submit in bulk from one thread, `PushBatch` is the answer and it is not a small
+difference: **around 12 M/s, and flat whether the pool has 8 workers or 31.** It links a run of
+tasks locally and hands the chain to one worker with a single wake, instead of paying a worker
+selection, a queue push and a condition-variable signal per task.
 
 The cost is entirely in submission, not in getting the work done. Timing the two halves separately,
 the pool has already finished by the time the loop stops pushing: drain-after-submit is 0.00 ms at
