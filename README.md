@@ -61,9 +61,18 @@ cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=ar
       -DJLIBSCHED_ALLOW_UNVERIFIED_PLATFORM=ON
 ```
 
-Without that flag it refuses and tells you the flag exists. With it, it warns and proceeds. Two
-things to expect: placement is a no-op on Apple platforms (see below), and an iOS executable has to
-be wrapped in an app bundle before it will run at all, since there is no console.
+Without that flag it refuses and tells you the flag exists. With it, it warns and proceeds.
+
+Expect three things. Placement is a no-op on Apple platforms (see below). An iOS executable has to
+be wrapped in an app bundle before it will run at all, since there is no console. And the third is
+the one that might make this a poor fit regardless of whether it compiles: **a pool of persistent
+worker threads does not map cleanly onto the iOS app lifecycle.** This scheduler is built on the
+assumption that the application largely owns the machine, which is true of a game in the foreground
+and false the instant it is backgrounded — threads are frozen mid-execution, and anything waiting on
+a fence or a lock stalls until the app resumes. `TaskScheduler::Pause()` and `Resume()` exist as the
+hook for that, but nothing here wires them to `applicationDidEnterBackground`, and a `hardware_concurrency - 1`
+pool is an awkward shape on a phone where the OS is actively managing power. Treat iOS as
+foreground-only unless you do that work yourself.
 
 Please open an issue either way — a report that it works is as useful as one that it doesn't, and a
 PR from someone with the hardware is very welcome.

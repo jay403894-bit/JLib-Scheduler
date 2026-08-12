@@ -93,7 +93,10 @@ if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME MATCHES "${JLIBSCHED_VERIFIED_OS}")
             "tested on macOS arm64 in CI -- the same AAPCS64 context switch and the same src/darwin/ "
             "OS layer -- but nobody has ever run the result on this platform. Do not treat a "
             "successful build as support. Note also that placement is a no-op on Apple platforms, "
-            "and that an iOS executable must be wrapped in an app bundle before it will run at all.")
+            "that an iOS executable must be wrapped in an app bundle before it will run at all, and "
+            "that a pool of persistent worker threads fits the iOS app lifecycle poorly -- "
+            "backgrounding freezes them mid-execution. Pause()/Resume() are the hook; wiring them "
+            "to the lifecycle is the caller's job. Foreground-only unless you do that work.")
     elseif(CMAKE_SYSTEM_NAME MATCHES "${JLIBSCHED_UNVERIFIED_OS}")
         message(FATAL_ERROR
             "${CMAKE_SYSTEM_NAME} is not a supported target, but it is expected to work: it shares "
