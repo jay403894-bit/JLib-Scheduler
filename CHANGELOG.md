@@ -67,6 +67,11 @@ for keeping a runner for a platform nobody owns.
 
 ## 1.2.0 - 2026-08-13
 
+> **DO NOT USE THE `v1.2.0` TAG.** It contains the notify optimisation described below in its broken
+> form, which can lose a wakeup and park a worker forever. It hung macOS arm64 about one run in
+> three. It was tagged but never published as a release, so nothing points at it by default; the tag
+> is left in place only because rewriting a published one is worse. Use 1.2.2 or later.
+
 `v1.1.1` is an intermediate tag inside this release rather than a release of its own. It was cut
 partway through the work below, while this section still read "unreleased", and three commits landed
 after it. Everything it contains is described here; it is left in place rather than deleted because
