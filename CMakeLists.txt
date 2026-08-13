@@ -289,6 +289,13 @@ add_executable(SchedulerTopologyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/topology
 target_link_libraries(SchedulerTopologyTest PRIVATE Scheduler)
 target_compile_features(SchedulerTopologyTest PRIVATE cxx_std_17)
 
+# The fiber-aware locks. Least-tested code in the library and the most recently changed, including a
+# regression test for the 1.2.3 self-deadlock. Every blocking case runs under a watchdog, so a
+# regression fails in seconds instead of hanging CI for the whole job timeout.
+add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primitives_test.cpp")
+target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)
+target_compile_features(SchedulerPrimitivesTest PRIVATE cxx_std_17)
+
 # ---- install (standalone only) ---------------------------------------------------------------
 # Inside the umbrella, JLib's own top-level file owns the export set and installs Scheduler as part
 # of it; duplicating that here would produce two packages describing the same target.

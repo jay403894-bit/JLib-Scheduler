@@ -45,6 +45,29 @@ whole share so an idle worker's hoard is not the reason a busy one has to go to 
 Verified at pool 31 and pool 4 on Windows and Linux; no measurable change at the default, which is
 expected given 36 versus 32.
 
+**New `SchedulerPrimitivesTest`, covering the least-tested code in the library.** The fiber-aware
+locks had no tests at all, which is uncomfortable given 1.2.3 added three behavioural guards to them
+and 1.2.4 touched them again, both verified by little more than "the benchmark still completes" --
+and the benchmark barely takes a lock. 18 checks: mutex basics, two-thread contention asserting a
+second holder is never admitted, semaphore counting, a producer/consumer permit released by a
+different thread than took it (the case that makes permits unownable, so worth proving still works),
+and `ScopedPermit` scope, balance over 1000 cycles, and correct no-op from a fiber.
+
+**The one that earns its place is a regression test for the 1.2.3 self-deadlock**, and it is
+verified against the bug rather than merely passing: with `t_heldMutexes` removed from
+`ContendedSpinStep`, it hangs and the watchdog exits nonzero in 30 seconds. Restore the guard and it
+passes. A test that has never been shown to fail proves nothing, which is the same rule the GenMC
+models follow.
+
+Passing is deterministic there; failing is probabilistic, since the broken version only hangs if the
+helper happens to steal one of the queued tasks that wants the held lock. Hence 256 of them and a
+300 ms hold on the second mutex.
+
+**Every blocking case runs under a watchdog** that `_Exit(1)`s after 30 seconds. A regression in this
+code does not produce a wrong answer, it produces a hang, and a hang in CI burns the whole job
+timeout before reporting anything -- which is precisely what the 1.2.0 macOS bug did for thirty
+minutes a run. Wired into all four CI targets.
+
 ## 1.2.3 - 2026-08-13
 
 **[CRITICAL] `SchedulerMutex` could deadlock a thread against itself.** Acquiring one from a bare

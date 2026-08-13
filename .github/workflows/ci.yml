@@ -29,21 +29,25 @@ jobs:
             bench: build/bin/Release/SchedulerBench.exe
             smoke: build/bin/Release/SchedulerEventSmoke.exe
             topo: build/bin/Release/SchedulerTopologyTest.exe
+            prims: build/bin/Release/SchedulerPrimitivesTest.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
             topo: build/bin/SchedulerTopologyTest
+            prims: build/bin/SchedulerPrimitivesTest
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
             topo: build/bin/SchedulerTopologyTest
+            prims: build/bin/SchedulerPrimitivesTest
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
             topo: build/bin/SchedulerTopologyTest
+            prims: build/bin/SchedulerPrimitivesTest
 
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +90,15 @@ jobs:
       # failed that case, so a pass means something rather than just "this runner is dense".
       - name: Run topology test (wide-CPU logic)
         run: ./${{ matrix.topo }}
+        shell: bash
+
+      # The fiber-aware locks: mutex, semaphore, condition variable, ScopedPermit. Carries the
+      # regression test for the 1.2.3 self-deadlock, which is verified to FAIL with the guard removed
+      # rather than merely passing with it present. Every blocking case runs under a watchdog, so a
+      # regression exits nonzero in 30 seconds instead of hanging this job for its full timeout --
+      # which is exactly what the 1.2.0 macOS bug did, for thirty minutes a run.
+      - name: Run primitives test (locks, and the deadlock regression)
+        run: ./${{ matrix.prims }}
         shell: bash
 
       # The steal counters compile out entirely in a normal build, which is the point but also the
