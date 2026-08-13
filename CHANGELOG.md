@@ -3,6 +3,51 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.2.2 - 2026-08-13
+
+**[CRITICAL] fixes an intermittent hang introduced in 1.2.0.** The notify optimisation could lose a
+wakeup and park a worker forever on work only it can drain. It stalled CI on macOS arm64 roughly one
+run in three, on identical code, after passing twice. Anyone on 1.2.0 should take this.
+
+**The protocol was sound and the model was correct. The proof was too narrow, and it was applied
+wider than it reached.** The original `tests/verify/sleepwake_model.c` contained ONE flag,
+`hasQueuedWork`, seq_cst on both sides, and showed that a single total order leaves at most one
+party stale. Worker()'s sleep predicate has THREE inputs. `immediate` and `paused` were left as
+release stores read with acquire, and for those pairs no total order exists: the setter stores its
+flag, loads `workerState`, sees AWAKE and skips the signal, while the worker stores GOING_TO_SLEEP,
+loads the flag, sees the stale value and parks. Exactly the interleaving the model's own negative
+control reproduces, on variables the model never contained.
+
+The fix is that every input to the sleep decision now joins the same total order: `immediate` and
+`paused` are seq_cst on both store and load, alongside `hasQueuedWork`. `running` is the exception
+and does not need it, because `Join()` passes `force=true` and never takes the skip.
+
+**The model now contains all of them, and its negative control reproduces the shipped bug.** Adding
+that control exposed a second trap worth naming: with the correctly-ordered pusher present,
+`-DWEAK_IMMEDIATE` PASSES. Any single notify wakes the worker whoever sent it, so while a seq_cst
+pusher is racing, the worker can only reach SLEEPING in executions where that pusher already
+signalled. **A correctly handled flag masks a broken one.** The real system has no such guarantee,
+since a worker can park with only an immediate-setter racing it, so `-DIMMEDIATE_ONLY` removes the
+pusher and makes the weak flag stand alone. It fails immediately there.
+
+```
+every flag seq_cst                  no errors, 32 executions
+-DIMMEDIATE_ONLY (strong)           no errors, 5 executions
+-DIMMEDIATE_ONLY -DWEAK_IMMEDIATE   Safety violation     <- the 1.2.0 bug
+-DACQ_REL_ONLY                      Safety violation
+```
+
+Why macOS caught it and nothing else did. It is weakly ordered, which x86 is not, so the reordering
+is real rather than hidden by TSO. And `macos-14` is a **3-core** runner, so `pool = hw-1` is two
+workers: the most park-prone configuration in the matrix, hitting the window far more often than
+Linux AArch64's four. A full run on a six-worker Android phone missed it too.
+
+The measured gains are unchanged from 1.2.0: latency 4.7 us, frame DAG 22.0 us, burst 11.5x.
+
+The rule this leaves behind, now written into the model: a fourth input to the sleep predicate must
+be seq_cst on both sides AND must appear in that model with its own negative control. A proof covers
+what it modelled and nothing else.
+
 ## 1.2.1 - 2026-08-13
 
 **[CRITICAL] for macOS: the default build was broken, and had been since 1.1.1.** `SchedulerTopologyTest`

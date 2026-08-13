@@ -213,7 +213,7 @@ bool Thread::SetImmediateTask(Task* new_task) {
 	if (!new_task) return false;
 	{
 		immediateTask = new_task;
-		immediate.store(true, std::memory_order_release);
+		immediate.store(true, std::memory_order_seq_cst);
 	}
 	cv.notify_one();
 	return true;
@@ -284,9 +284,21 @@ void Thread::NotifyWorker(bool force){
 	// push buys a real wake -- which is why single-producer submission used to collapse from 3.4 M/s
 	// at 8 workers to 0.8 at 14+, a threshold rather than a gradient.
 	//
-	// The load is seq_cst and pairs with MarkQueuedWork's seq_cst store; see that function and
-	// tests/verify/sleepwake_model.c for why nothing weaker is sound. GOING_TO_SLEEP counts as
-	// "needs a signal": the worker has published intent but may not be inside cv.wait yet.
+	// The load is seq_cst and pairs with the seq_cst STORES of every flag the sleep decision reads:
+	// hasQueuedWork (MarkQueuedWork), immediate (SetImmediateTask and the fork path) and paused
+	// (Pause/Resume). All four operations of each pair have to be in one total order or the skip is
+	// unsound -- see tests/verify/sleepwake_model.c.
+	//
+	// THIS SHIPPED BROKEN ONCE, in 1.2.0, and the reason is worth keeping. The first model had ONE
+	// flag and proved the handshake for it. The predicate has three. `immediate` and `paused` were
+	// left as release stores read with acquire, so for those the total-order argument did not exist:
+	// the setter stores its flag, loads workerState, sees AWAKE, skips -- while the worker stores
+	// GOING_TO_SLEEP, loads the flag, sees the stale value, and parks forever. It hung macOS arm64
+	// in CI about one run in three and never once reproduced on x86, because TSO hides it.
+	//
+	// The model now carries `-DIMMEDIATE_ONLY -DWEAK_IMMEDIATE` as a permanent negative control that
+	// reproduces exactly that. If a FOURTH input is ever added to the sleep predicate, it must be
+	// seq_cst on both sides and it must go into that model. A proof covers what it modelled.
 	if (!force && workerState.load(std::memory_order_seq_cst) == WS_AWAKE) return;
 
 	// The empty lock is load-bearing: cv.notify_one() without synchronizing on workerMutex
@@ -414,7 +426,7 @@ void Thread::Worker() {
 					//  - A regular task goes back on the local deque to be retried or stolen.
 					if (is_handling_fork) {
 						immediateTask = task_to_run;
-						immediate.store(true, std::memory_order_release);
+						immediate.store(true, std::memory_order_seq_cst);
 					}
 					else {
 						scheduler->loPri[qIndex]->push_bottom(task_to_run);
@@ -536,7 +548,7 @@ void Thread::Worker() {
 
 				task_to_run = immediateTask;
 				immediateTask = nullptr;
-				immediate.store(false, std::memory_order_release);
+				immediate.store(false, std::memory_order_seq_cst);
 				is_handling_fork = true;
 				continue;
 			}
@@ -740,9 +752,14 @@ void Thread::Worker() {
 			// disagree about what counts as work. The hasQueuedWork load is seq_cst deliberately:
 			// it and MarkQueuedWork's store are the StoreLoad pair the whole protocol turns on, and
 			// acquire here is precisely the bug the model's negative control reproduces.
+			// ALL of these are seq_cst, not just hasQueuedWork. Each one pairs with a seq_cst store
+			// on the setter's side, and each pair needs its own place in the single total order --
+			// promoting one flag and leaving the others at acquire is precisely the bug that hung
+			// macOS arm64 in 1.2.0. `running` is the exception and does not need it, because Join()
+			// passes force=true and never takes the skip.
 			if (!running.load(std::memory_order_acquire)
-				|| immediate.load(std::memory_order_acquire)
-				|| (!scheduler->paused.load(std::memory_order_acquire)
+				|| immediate.load(std::memory_order_seq_cst)
+				|| (!scheduler->paused.load(std::memory_order_seq_cst)
 					&& hasQueuedWork.load(std::memory_order_seq_cst))) {
 				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
 				if (!running.load(std::memory_order_acquire)) break;

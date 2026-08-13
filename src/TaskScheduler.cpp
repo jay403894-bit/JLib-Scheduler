@@ -863,10 +863,10 @@ Event& TaskScheduler::GetEvent(const std::string& name) {
 	return event;
 }
 void TaskScheduler::Pause() {
-	paused.store(true, std::memory_order_release);
+	paused.store(true, std::memory_order_seq_cst);
 }
 void TaskScheduler::Resume() {
-	paused.store(false, std::memory_order_release);
+	paused.store(false, std::memory_order_seq_cst);
 	NotifyAll();
 }
 void TaskScheduler::Stop(Task* worker_task) {

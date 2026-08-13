@@ -38,8 +38,10 @@
 //   though it still would be for anything about eventual progress.
 //
 //   Build variants:
-//     genmc -- sleepwake_model.c                     # as proposed (seq_cst)
-//     genmc -- -DACQ_REL_ONLY sleepwake_model.c      # negative control, MUST fail
+//     genmc -- sleepwake_model.c                                        # as shipped
+//     genmc -- -DIMMEDIATE_ONLY sleepwake_model.c                       # one setter, strong
+//     genmc -- -DIMMEDIATE_ONLY -DWEAK_IMMEDIATE sleepwake_model.c      # the 1.2.0 bug, MUST fail
+//     genmc -- -DACQ_REL_ONLY sleepwake_model.c                         # MUST fail
 //
 //   RESULTS: recorded at the bottom of this file.
 
@@ -53,15 +55,17 @@
 #define ST_GOING     1     /* intent published: about to sleep, not yet in cv.wait */
 #define ST_SLEEPING  2
 
-static _Atomic int g_state;      /* one worker's state */
-static _Atomic int g_work;       /* items in that worker's inbox */
-static _Atomic int g_notified;   /* did the pusher take the mutex and signal? */
+static _Atomic int g_state;      /* Thread::workerState */
+static _Atomic int g_work;       /* Thread::hasQueuedWork */
+static _Atomic int g_immediate;  /* Thread::immediate -- the SECOND predicate input */
+static _Atomic int g_notified;   /* did a setter take the mutex and signal? */
 
 #ifdef ACQ_REL_ONLY
-  /* Negative control. This is the version that looks correct and IS correct on x86, because
-     `lock cmpxchg` is incidentally a full barrier that drains the store buffer. On AArch64,
-     ldaxr/stlxr give exactly acquire-release and nothing more, so the hole reopens. The scheduler
-     ships on Apple Silicon and Android, so "works on my desktop" is not an argument here. */
+  /* Negative control 1: the whole handshake weakened. This is the version that looks correct and IS
+     correct on x86, because `lock cmpxchg` is incidentally a full barrier that drains the store
+     buffer. On AArch64, ldaxr/stlxr give exactly acquire-release and nothing more, so the hole
+     reopens. The scheduler ships on Apple Silicon and Android, so "works on my desktop" is not an
+     argument here. */
   #define PUBLISH      memory_order_release
   #define OBSERVE      memory_order_acquire
   #define TRANSITION   memory_order_acq_rel
@@ -69,6 +73,21 @@ static _Atomic int g_notified;   /* did the pusher take the mutex and signal? */
   #define PUBLISH      memory_order_seq_cst
   #define OBSERVE      memory_order_seq_cst
   #define TRANSITION   memory_order_seq_cst
+#endif
+
+/* Negative control 2, and the one that matters: THE BUG ACTUALLY SHIPPED IN 1.2.0.
+   The first version of this model had a single flag. The real sleep predicate has three inputs, and
+   `immediate` and `paused` were left as plain release stores read with acquire while only
+   `hasQueuedWork` was promoted to seq_cst. The total-order argument covers the flags that are IN
+   the total order and no others, so the second flag reopened the identical hole -- and hung macOS
+   arm64 in CI roughly one run in three.
+   -DWEAK_IMMEDIATE reproduces exactly that: flag one strong, flag two weak. It MUST fail. */
+#ifdef WEAK_IMMEDIATE
+  #define IMM_PUBLISH  memory_order_release
+  #define IMM_OBSERVE  memory_order_acquire
+#else
+  #define IMM_PUBLISH  PUBLISH
+  #define IMM_OBSERVE  OBSERVE
 #endif
 
 // ---- the worker, deciding whether to park ----------------------------------------------------
@@ -81,7 +100,13 @@ static void *worker(void *arg) {
     atomic_compare_exchange_strong_explicit(&g_state, &expected, ST_GOING,
                                             TRANSITION, memory_order_relaxed);
 
-    if (atomic_load_explicit(&g_work, OBSERVE) == 0) {
+    /* EVERY input to the real sleep predicate must be here, not just the interesting one. Modelling
+       a subset is what shipped the 1.2.0 hang: the proof covered `hasQueuedWork` and the code
+       applied it to a decision that also reads `immediate` and `paused`. */
+    const int work = atomic_load_explicit(&g_work,      OBSERVE);
+    const int imm  = atomic_load_explicit(&g_immediate, IMM_OBSERVE);
+
+    if (work == 0 && imm == 0) {
         int e2 = ST_GOING;
         if (atomic_compare_exchange_strong_explicit(&g_state, &e2, ST_SLEEPING,
                                                     TRANSITION, memory_order_relaxed)) {
@@ -114,63 +139,93 @@ static void *pusher(void *arg) {
     return NULL;
 }
 
+// ---- the OTHER setter --------------------------------------------------------------------------
+// Mirrors SetImmediateTask (and, identically in shape, Resume clearing `paused`). Same handshake,
+// different flag. This thread is the whole reason the model was rewritten: it did not exist in the
+// version that "proved" the protocol, so nothing checked whether a second predicate input was also
+// in the total order. It was not, and macOS arm64 found out.
+static void *immediate_setter(void *arg) {
+    (void)arg;
+
+    atomic_store_explicit(&g_immediate, 1, IMM_PUBLISH);
+
+    int s = atomic_load_explicit(&g_state, OBSERVE);
+    if (s == ST_GOING || s == ST_SLEEPING) {
+        atomic_fetch_add_explicit(&g_notified, 1, memory_order_relaxed);
+    }
+    return NULL;
+}
+
 int main(void) {
     atomic_init(&g_state, ST_AWAKE);
     atomic_init(&g_work, 0);
+    atomic_init(&g_immediate, 0);
     atomic_init(&g_notified, 0);
 
-    /* TWO pushers, not one. The Dekker race needs only one, but two is the realistic shape -- the
-       main thread and a worker can both target the same inbox -- and it also covers the case where
-       one pusher observes AWAKE and skips while the other observes GOING and signals. */
-    pthread_t w, p0, p1;
-    pthread_create(&w,  NULL, worker, NULL);
-    pthread_create(&p0, NULL, pusher, NULL);
-    pthread_create(&p1, NULL, pusher, NULL);
+    /* One worker, one pusher, one immediate-setter. Two DIFFERENT setters rather than two of the
+       same, because the failure that shipped needed a second FLAG, not a second thread -- the
+       earlier two-pusher version explored more interleavings of the same variable and proved
+       nothing about the other inputs. */
+    pthread_t w, im;
+    pthread_create(&w,  NULL, worker,           NULL);
+    pthread_create(&im, NULL, immediate_setter, NULL);
+
+    /* A CORRECTLY ordered flag MASKS a broken one, which is why this can be turned off.
+       Any single notify wakes the worker, whichever setter sent it. So while the seq_cst pusher is
+       running, the worker can only reach SLEEPING in executions where that pusher already
+       signalled -- if the pusher skipped, the total-order argument forces the worker to observe the
+       work and stay awake. The lost wakeup on the WEAK flag is therefore unreachable here, and the
+       first version of this model reported -DWEAK_IMMEDIATE as clean.
+       That is not the real system: a worker can park with only an immediate-setter racing it.
+       -DIMMEDIATE_ONLY removes the pusher so the weak flag has to stand on its own. */
+#ifndef IMMEDIATE_ONLY
+    pthread_t p;
+    pthread_create(&p, NULL, pusher, NULL);
+#endif
+
     pthread_join(w,  NULL);
-    pthread_join(p0, NULL);
-    pthread_join(p1, NULL);
+    pthread_join(im, NULL);
+#ifndef IMMEDIATE_ONLY
+    pthread_join(p, NULL);
+#endif
 
-    const int work     = atomic_load(&g_work);
-    const int state    = atomic_load(&g_state);
-    const int notified = atomic_load(&g_notified);
+    const int work      = atomic_load(&g_work);
+    const int immediate = atomic_load(&g_immediate);
+    const int state     = atomic_load(&g_state);
+    const int notified  = atomic_load(&g_notified);
 
-    /* THE PROPERTY: no lost wakeup. A worker that reached SLEEPING with work queued must have been
-       signalled. Anything else is a thread parked forever on a task only it can drain.
+    /* THE PROPERTY: no lost wakeup, from ANY input the sleep decision reads. A worker that reached
+       SLEEPING while any of them says it has something to do must have been signalled. Anything
+       else is a thread parked forever on work only it can drain.
 
        Note what is NOT asserted: signalling a worker that then decided to stay awake is FINE. That
        is a notify landing on a condvar with no waiter, which is a no-op -- a wasted syscall, not a
        correctness problem. Asserting against it would reject a correct protocol. */
-    assert(!(work > 0 && state == ST_SLEEPING && notified == 0));
+    assert(!((work > 0 || immediate > 0) && state == ST_SLEEPING && notified == 0));
 
     return 0;
 }
 
-// RESULTS -- GenMC v0.17.0, 2026-08-12, one worker + two pushers:
+// RESULTS -- GenMC v0.17.0, 2026-08-13, one worker plus one or two setters:
 //
-//   as proposed (seq_cst)   no errors, 25 complete executions
-//   -DACQ_REL_ONLY          Error: Safety violation!  (the assert below)
+//   as shipped now, every flag seq_cst        no errors, 32 complete executions
+//   -DIMMEDIATE_ONLY (strong, one setter)     no errors, 5 complete executions
+//   -DIMMEDIATE_ONLY -DWEAK_IMMEDIATE         Error: Safety violation!   <- the 1.2.0 bug
+//   -DACQ_REL_ONLY                            Error: Safety violation!
 //
-// So the three-state handshake is free of lost wakeups at this bound, AND the seq_cst is load
-// bearing rather than defensive. The negative control is what makes the first statement worth
-// anything, and it fails in exactly the predicted way. From its trace, with one pusher:
+// The third line is the important one, and it is why this file was rewritten. The FIRST version of
+// this model had a single flag. It passed, the protocol was implemented from it, and 1.2.0 shipped
+// a lost wakeup that hung macOS arm64 in CI roughly one run in three. The model was not wrong about
+// what it modelled; it was applied to a decision with two more inputs than it contained.
 //
-//   worker: (1,3): Racq (g_work,  0) [(0,2)]   <- reads the INITIAL value, misses the push
-//   pusher: (2,3): Racq (g_state, 0) [(0,1)]   <- reads the INITIAL value, misses GOING_TO_SLEEP
+// Note also why -DIMMEDIATE_ONLY has to exist at all, because it is a trap worth naming: with the
+// correctly-ordered pusher present, -DWEAK_IMMEDIATE PASSES. Any single notify wakes the worker
+// whoever sent it, so while a seq_cst pusher is racing, the worker can only reach SLEEPING in
+// executions where that pusher already signalled -- if it skipped, the total-order argument forces
+// the worker to see the work and stay awake. A correctly handled flag MASKS a broken one. The real
+// system has no such guarantee, since a worker can park with only an immediate-setter racing it, so
+// the weak flag has to be checked standing on its own.
 //
-// Both loads stale simultaneously: the pusher concludes "awake, no signal needed" while the worker
-// concludes "no work, safe to sleep". Neither thread is reordered against itself. Acquire/release
-// simply never promised that at least one of them would observe the other, because StoreLoad is the
-// one pair it leaves free. seq_cst gives a single total order in which one store necessarily
-// precedes the other's load, so at most one side can be stale.
-//
-// WHY THIS MATTERS BEYOND THE MODEL: the failing version is correct on x86 anyway, because
-// `lock cmpxchg` is incidentally a full barrier and drains the store buffer. It is AArch64 where
-// ldaxr/stlxr give exactly acquire-release and the hole is real. This scheduler ships on Apple
-// Silicon and Android. Testing the acq_rel version on a desktop would have produced a clean run and
-// a shipped deadlock.
-//
-// One modelling note worth keeping: g_notified is incremented with an RMW rather than stored,
-// because two pushers storing the same value to one location is an unordered write-write pair that
-// GenMC's in-place revisiting rejects outright. That was a harness artifact, not a protocol defect.
-//
-// Keep -DACQ_REL_ONLY as a permanent negative control and re-run it whenever this model changes.
+// RULE FOR ANYONE ADDING A FOURTH INPUT to Worker()'s sleep predicate: it must be seq_cst on both
+// the store and the load, and it must appear in this model with its own negative control. A proof
+// covers what it modelled and nothing else. That sentence cost a release.
