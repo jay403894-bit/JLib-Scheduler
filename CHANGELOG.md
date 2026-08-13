@@ -3,6 +3,46 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.2.3 - unreleased
+
+**[CRITICAL] `SchedulerMutex` could deadlock a thread against itself.** Acquiring one from a bare
+thread runs stolen noFiber tasks while it waits, which is work-conserving and is also the most
+dangerous property in the file: it makes locking REENTRANT. User code executes inside the
+acquisition loop and can take locks of its own, and the interleaving is chosen by the scheduler, so
+no lock-ordering discipline in the caller's code can prevent what follows.
+
+Three separate failures came out of that, now guarded separately in `ContendedSpinStep`:
+
+**Self-deadlock by inversion, the one that actually hangs.** A thread holding mutex A waits on B,
+helps, and the helped task asks for A. A is owned by that same thread, stuck inside the task, so
+nothing can ever release it. No fiber involved. `t_heldMutexes` closes it: a bare thread that owns a
+`SchedulerMutex` stops executing other people's tasks entirely. Counted in `Try_Lock`, which is the
+one place a bare thread acquires, including when a caller uses `Try_Lock` directly.
+
+**Unbounded nesting.** A helped task contending the same primitive helps again, and each level is a
+real stack frame. `t_spinHelpDepth` permits exactly one level; inside a helped task it spins instead.
+
+**Pointless CPU burn when the holder is a suspended fiber.** Helping cannot resume it, because only
+noFiber tasks are stolen here, so if the resumer is a fiber task the waiting thread structurally
+cannot make that progress. After 1000 unproductive passes it yields, giving the OS a chance to run a
+worker that can. The count measures UNPRODUCTIVE passes rather than iterations: each pass may run a
+whole task, so counting all of them would yield out a thread doing real work, and a run task resets
+it.
+
+`SchedulerSemaphore::Wait` and `SchedulerConditionVariable::Wait` use the same helper. Two
+deliberate asymmetries. The semaphore RESPECTS `t_heldMutexes` but never adds to it, because a
+permit has no owner -- the thread that takes one is frequently not the one that returns it, so
+counting a `Wait` as an acquisition would make a consumer's count climb forever and permanently
+disable helping on that thread. And the ownership count is maintained for bare threads only: a fiber
+can acquire on one worker and resume on another, so a per-thread count would be corrupted by
+migration, which is the same rule DESIGN.md already states about thread-derived state.
+
+Holding a semaphore permit across a contended wait therefore remains unguarded, and is now
+documented as such in `TaskScheduler.h` rather than left to be discovered.
+
+No measurable cost: latency 4.69 us, frame DAG 22.7 us, fork-join 0.21 ms, burst 11.4x, all
+unchanged. Found by reading, not by a failure.
+
 ## 1.2.2 - 2026-08-13
 
 **[CRITICAL] fixes an intermittent hang introduced in 1.2.0.** The notify optimisation could lose a

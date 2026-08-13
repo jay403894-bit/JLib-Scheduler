@@ -1146,6 +1146,70 @@ void TaskScheduler::CleanupTaskMetadata(Task* task) {
 	UnboostTaskPriority(task);
 }
 
+// ================= CONTENDED-WAIT HELPER, shared by SchedulerMutex and SchedulerSemaphore =======
+// A bare thread that blocks on one of these cannot suspend, so instead of burning the core it runs
+// a stolen noFiber task per iteration. That is work-conserving and it is also the single most
+// dangerous thing in this file, because it makes acquiring a lock REENTRANT: user code runs inside
+// the acquisition loop, and it can do anything, including taking locks.
+//
+// Three distinct failures come out of that, and they need three different guards.
+//
+//  1. UNBOUNDED NESTING. The helped task contends the same primitive, spin-helps again, runs another
+//     task, and so on. Each level is a real stack frame. `t_spinHelpDepth` allows exactly one level:
+//     inside a helped task we spin rather than help.
+//
+//  2. SELF-DEADLOCK BY INVERSION, and this one is a genuine hang rather than a slowdown. A thread
+//     holding mutex A waits on B, helps, and the helped task asks for A. A is owned by this very
+//     thread, which is stuck inside the task, so nothing can ever release it. No fiber involved and
+//     no lock-ordering discipline in the caller's own code can prevent it, because the interleaving
+//     is chosen by the scheduler. `t_heldMutexes` closes it: a thread that owns a SchedulerMutex
+//     stops executing other people's tasks entirely.
+//
+//  3. POINTLESS CPU BURN when the holder is a SUSPENDED FIBER. Helping cannot resume it -- only
+//     noFiber tasks are stolen here, so if the resumer is a fiber task this thread structurally
+//     cannot make that progress. Yielding gives the OS a chance to run a worker that can.
+//
+// The idle count deliberately measures UNPRODUCTIVE passes, not iterations. Each pass may run a
+// whole task, so counting all of them would yield out a thread that is doing real work; a run task
+// resets it.
+namespace {
+	thread_local uint32_t t_spinHelpDepth = 0;   // >0 -> we are executing inside a helped task
+	thread_local uint32_t t_heldMutexes   = 0;   // >0 -> this BARE THREAD owns a SchedulerMutex
+
+	constexpr uint32_t kIdleSpinsBeforeYield = 1000;
+
+	// Thread-local rather than a parameter so it survives across calls. The condition variable calls
+	// this once per predicate check and loops outside, so a local would reset to zero every time and
+	// the yield would never fire.
+	thread_local uint32_t t_idleSpins = 0;
+
+	// One iteration of a bare-thread contended wait. The caller owns the predicate and the loop.
+	inline void ContendedSpinStep() {
+		if (t_spinHelpDepth == 0 && t_heldMutexes == 0 && TaskScheduler::IsInitialized()) {
+			++t_spinHelpDepth;
+			const bool ranSomething = TaskScheduler::Instance().TryRunStolenNoFiberTask();
+			--t_spinHelpDepth;
+			if (ranSomething) { t_idleSpins = 0; return; }   // progress: not an idle pass
+		}
+		if (++t_idleSpins >= kIdleSpinsBeforeYield) {
+			t_idleSpins = 0;
+			std::this_thread::yield();
+		}
+		else {
+			platform::CpuRelax();
+		}
+	}
+
+	// Ownership is tracked for BARE THREADS ONLY. A fiber can acquire on one worker and resume on
+	// another, so a per-thread count would be corrupted by migration -- see DESIGN.md's rule that
+	// nothing thread-derived survives a suspend. The count only ever decides whether to help, and
+	// erring toward "do not help" is safe, so a fiber simply never sets it.
+	inline bool OnBareThread() {
+		Thread* t = Thread::GetCurrent();
+		return t == nullptr || t->currentFiber == nullptr;
+	}
+}
+
 void SchedulerMutex::Lock() {
 	auto thread = Thread::GetCurrent();
 	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
@@ -1177,22 +1241,21 @@ void SchedulerMutex::Lock() {
 		}
 	}
 	else {
-		// Fast job: try to run stolen work while spinning on lock
-		while (!Try_Lock()) {
-			if (TaskScheduler::IsInitialized()) {
-				if (!TaskScheduler::Instance().TryRunStolenNoFiberTask()) {
-					platform::CpuRelax();
-				}
-			}
-			else {
-				platform::CpuRelax();
-			}
-		}
+		// Bare thread: cannot suspend, so help with stolen noFiber work while waiting. See the
+		// block comment above ContendedSpinStep for what that costs and what guards it.
+		while (!Try_Lock()) ContendedSpinStep();
+		// Ownership is counted inside Try_Lock, which is the single place a bare thread takes this
+		// lock -- including when a caller uses Try_Lock directly.
 	}
 }
 
 void SchedulerMutex::Unlock()
 {
+	// Guarded rather than unconditional: a fiber never incremented (it can migrate mid-hold, so a
+	// per-thread count would be wrong), and an unbalanced Unlock must not wrap the counter to
+	// SIZE_MAX and silently disable helping on this thread forever.
+	if (OnBareThread() && t_heldMutexes > 0) --t_heldMutexes;
+
 	Task* wasHolder;
 	Fiber* nextFiber = nullptr;
 	{
@@ -1236,6 +1299,9 @@ bool SchedulerMutex::Try_Lock()
 			lockHolder = callerTask;
 			holderLock.clear(std::memory_order_release);
 		}
+		// Every bare-thread acquisition passes through here, whether via Lock()'s spin loop or a
+		// direct Try_Lock() by the caller, which is why the count lives here and not in Lock().
+		if (OnBareThread()) ++t_heldMutexes;
 		return true;
 	}
 	spinLock.clear(std::memory_order_release);
@@ -1261,16 +1327,15 @@ void SchedulerSemaphore::Wait() {
 		Thread::Suspend(current);
 	}
 	else {
-		// Fast job: continuous loop until permit is successfully acquired
-		while (!Try_Wait()) {
-			if (TaskScheduler::IsInitialized()) {
-				if (!TaskScheduler::Instance().TryRunStolenNoFiberTask()) {
-					platform::CpuRelax();
-				}
-			}
-			else
-				platform::CpuRelax();
-		}
+		// Same contended-wait discipline as SchedulerMutex; see ContendedSpinStep.
+		//
+		// This RESPECTS t_heldMutexes but does not add to it, and the asymmetry is deliberate. A
+		// semaphore permit has no owner: the thread that takes one is frequently not the thread that
+		// returns it, which is the entire point of a producer/consumer semaphore. Counting a Wait as
+		// an acquisition would make a consumer's count climb forever and permanently disable helping
+		// on that thread. So the inversion guard covers mutexes, which have real ownership, and a
+		// thread holding only a permit is a documented gap rather than a tracked one.
+		while (!Try_Wait()) ContendedSpinStep();
 	}
 }
 
@@ -1345,15 +1410,12 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex) {
 		mutex.Lock();
 	}
 	else {
-		// Fast Job fallback
+		// Bare-thread fallback. The unlock happens FIRST, which is what makes helping legitimate
+		// here: by the time ContendedSpinStep runs, this thread owns nothing, so the inversion the
+		// t_heldMutexes guard exists to prevent cannot arise. It still needs the recursion guard and
+		// the yield, hence the shared helper rather than an inline copy.
 		mutex.Unlock();
-		if (TaskScheduler::IsInitialized()) {
-			if (!TaskScheduler::Instance().TryRunStolenNoFiberTask())
-				platform::CpuRelax();
-		}
-		else {
-			platform::CpuRelax();
-		}
+		ContendedSpinStep();
 		mutex.Lock();
 	}
 }

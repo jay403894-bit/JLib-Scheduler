@@ -385,11 +385,20 @@ namespace JLib {
 		//                       noFiber task per iteration (TryRunStolenNoFiberTask) instead of
 		//                       burning the cycles.
 		//
-		// That second path is why this is NOT the right lock everywhere. A caller that must return
-		// promptly, or that is not one of ours at all -- a driver thread-pool callback, say -- would
-		// start executing arbitrary tasks from the graph while it waits. For a short critical
-		// section reached from foreign threads, a plain std::mutex is both cheaper and safer; see
-		// the note in Event.h.
+		// That second path is why this is NOT the right lock everywhere, and the reason is stronger
+		// than latency. Running stolen tasks inside the acquisition loop makes locking REENTRANT:
+		// user code executes while you are blocked, and it can take locks of its own. Three guards
+		// bound that (see ContendedSpinStep in TaskScheduler.cpp), the important one being that a
+		// bare thread ALREADY HOLDING a SchedulerMutex stops helping entirely -- otherwise a helped
+		// task asking for the lock you hold deadlocks you against yourself, with no fiber involved.
+		//
+		// What is still true: a caller that must return promptly, or that is not one of ours at all
+		// (a driver thread-pool callback, say), will run tasks from the graph while it waits. For a
+		// short critical section reached from foreign threads, a plain std::mutex is both cheaper
+		// and safer; see the note in Event.h.
+		//
+		// Also unguarded by design: holding a SEMAPHORE permit. Permits have no owner -- the thread
+		// that takes one is often not the one that returns it -- so there is nothing sound to count.
 		void Lock();
 
 		void Unlock();
