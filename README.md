@@ -18,18 +18,18 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-| | i9-13900K at Intel spec power limits, Release, 1.1.1 |
+| | i9-13900K at Intel spec power limits, Release, 1.2.0 |
 |---|---|
-| Task enqueue → dequeue latency | 6.4 µs |
-| 6-node frame DAG (build, validate, execute) | 28.4 µs |
-| 1M-element recursive fork-join (10k leaves) | 0.27 ms |
+| Task enqueue → dequeue latency | 4.7 µs |
+| 6-node frame DAG (build, validate, execute) | 22.1 µs |
+| 1M-element recursive fork-join (10k leaves) | 0.23 ms |
 | Bulk submission via `PushBatch` | 11.9 M tasks/sec |
 | `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
 | Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
 | Steal protocol | single-item Chase-Lev CAS |
 
-Medians of six runs on the default affinity policy. Run-to-run spread was about 19% on latency, 5%
-on the DAG and 30% on fork-join, so treat the last digit as noise.
+Medians of five runs on the default affinity policy. Run-to-run spread was 2.4% on latency, 9% on
+the DAG and 19% on fork-join, so treat the last digit as noise.
 
 **This machine runs Intel's specified power limits with unlimited turbo disabled**, so it boosts
 briefly and then settles near base clock under sustained load. That is the part behaving as Intel
@@ -195,6 +195,15 @@ about 192 bytes fails a `static_assert`: capture pointers, not payloads.
 And `CorePref::P` / `CorePref::E` are Windows-only. Elsewhere the scheduler has no way to tell the
 core classes apart, so those requests are silently ignored rather than rejected -- leave tasks at
 `Default` or `Any` on other platforms, and don't build a design that assumes the placement held.
+
+On **Android, placement does not work at all**, and that is the platform's decision rather than a
+gap here. Its cgroups own thread placement, so the affinity calls either fail for an unprivileged
+app or succeed and are immediately overridden. `Hard` and `Ideal` are effectively `None` there, and
+the topology-aware steal ordering they enable is correspondingly approximate. Android is supported
+for correctness, not for placement, and it is the one target where you should read nothing into
+timings: thermal throttling is unconstrained and the cores are heterogeneous, so a benchmark run
+on a phone describes the phone. It is also verified by hand on Termux rather than in CI, which
+covers Linux AArch64 on glibc but not bionic.
 
 Machines wider than 64 logical CPUs are handled across all processor groups, up to 256 CPUs. This is
 worth stating because it is the thing most job systems get wrong on Windows: `SetThreadAffinityMask`

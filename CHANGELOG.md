@@ -3,7 +3,58 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.1.1 - unreleased
+## 1.2.0 - unreleased
+
+**A push no longer wakes a worker that is already running.** `NotifyWorker()` used to take the
+target worker's mutex and signal its condition variable on every single push, whether or not anyone
+was listening. It now checks the worker's state first and returns immediately if that worker is
+awake, because an awake worker clears `hasQueuedWork` and re-searches on every loop pass and will
+find the task by itself.
+
+Measured on a 32-thread i9 at Intel spec, medians of five runs against five before:
+
+```
+                 before    after
+latency          6.4 us    4.7 us     -26%
+frame DAG       28.4 us   22.1 us     -22%
+fork-join       0.27 ms   0.23 ms     -15%
+burst           11.6x     11.4x       unchanged
+throughput/1p   0.81 M/s  0.83 M/s    unchanged
+```
+
+The variance result is worth as much as the speed: latency run-to-run spread fell from **19% to
+2.4%**. Removing a kernel thread wake from the hot path removes the largest single source of jitter,
+which for a frame scheduler matters at least as much as the mean. And `burst` is untouched, which is
+the whole point -- the fan-out cap described below bought similar submission gains and destroyed
+burst parallelism to do it, while this leaves an idle pool free to recruit everybody.
+
+1p and PushBatch are unchanged, as expected. In those the pool genuinely outruns the producer, so
+the workers really are parked and really do need waking; there is no wake to skip.
+
+**The protocol is three states, not a flag, and it was model checked before it was written.**
+`AWAKE` / `GOING_TO_SLEEP` / `SLEEPING`, where the middle state publishes the worker's INTENT before
+it commits, so a pusher arriving between "decided to park" and "actually inside cv.wait" still
+signals. `tests/verify/sleepwake_model.c` runs it through GenMC: 25 executions, no errors.
+
+Every transition, and the load in `NotifyWorker`, is `seq_cst`, and that is load bearing rather than
+defensive. The model's `-DACQ_REL_ONLY` negative control reports a safety violation, with this trace:
+
+```
+worker: Racq (g_work,  0)   <- reads the initial value, misses the push
+pusher: Racq (g_state, 0)   <- reads the initial value, misses GOING_TO_SLEEP
+```
+
+Both loads stale at once. The pusher concludes "awake, no signal needed" while the worker concludes
+"no work, safe to sleep", and the task is stranded on an inbox only that worker can drain. Neither
+thread is reordered against itself; acquire/release simply never promised one would observe the
+other, because StoreLoad is the pair it leaves free. **The weaker version is correct on x86 anyway**,
+since `lock cmpxchg` incidentally drains the store buffer, so testing it on a desktop would have
+produced a clean run and shipped a deadlock to AArch64.
+
+`Join()` deliberately does NOT get the optimisation and passes `force=true`. Shutdown flips
+`running` rather than `hasQueuedWork`, so skipping there would be the same Dekker race on a
+different pair of variables, and one the model never covered. A proof does not extend to the
+operation it did not model.
 
 **The throughput benchmark was measuring something narrower than its name, and the difference looked
 like a scheduler defect.** Sweeping pool size on it showed 3.4 M tasks/sec at 8 workers falling to
@@ -94,12 +145,11 @@ claimed workers and the loop never exits. A benchmark run sat livelocked on one 
 before anyone noticed. An attempted fix that widened to the full pool on exhaustion did not hold
 either, so the whole thing came out rather than being patched twice.
 
-The experiment still earned its place, because it identified the mechanism. What it points at is
-preferring workers that are already AWAKE and waking one only when none are: that keeps choosing the
-hot worker in the latency case while an idle pool still recruits everybody for a burst. No tuning
-constant, and no workload where it is the wrong answer. Not attempted here, because it modifies the
-notify path that produced the ParallelFor lost-wakeup deadlock and deserves its own change rather
-than a footnote to this one.
+The experiment still earned its place, because it identified the mechanism, and the fix it pointed
+at is the awake-preference change at the top of this release. That one keeps choosing the hot worker
+in the latency case while an idle pool still recruits everybody for a burst: no tuning constant, and
+no workload where it is the wrong answer. It touches the notify path that produced the ParallelFor
+lost-wakeup deadlock, which is why it got a model before it got code.
 
 **`PushBatch` is benchmarked for the first time, as `throughput/bt`, and it is the actual answer for
 bulk submission: 12.0 M tasks/sec against 0.78 for the per-task path.** It has been in the scheduler

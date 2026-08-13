@@ -99,12 +99,25 @@ namespace JLib {
         static void CoYield();
         static void Suspend();
         static void Resume();
-        void NotifyWorker();
+        // force=true skips the awake-check below and always signals. Used by Join(): shutdown flips
+        // `running` rather than pushing work, and the awake-check is only PROVEN correct for the
+        // hasQueuedWork handshake. Extending it to a second variable would be the same Dekker race
+        // on a pair the model never covered, so shutdown does not get the optimisation.
+        void NotifyWorker(bool force = false);
+
         // Called by TaskScheduler (PushLocal/PushBatch/ParallelFor/Requeue) whenever a task is
         // pushed specifically to THIS worker's inbox, right alongside the matching
         // NotifyWorker() call -- lets Worker()'s sleep predicate depend only on "did MY OWN
         // queue change," not a pool-wide counter (see hasQueuedWork's comment).
-        void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_release); }
+        //
+        // seq_cst, NOT release, and it is load bearing. This store and NotifyWorker's load of
+        // workerState are a StoreLoad pair on DIFFERENT objects, which is exactly the ordering
+        // release/acquire does not provide. With release here the pusher can observe a stale AWAKE
+        // while the worker observes a stale empty queue, and the worker parks on a task only it can
+        // drain. tests/verify/sleepwake_model.c reports that as a safety violation; it passes with
+        // seq_cst. Note it would still run correctly on x86 either way, because `lock cmpxchg`
+        // incidentally drains the store buffer -- AArch64 is where the weaker version breaks.
+        void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
         bool Ready();
     private:
         uint64_t GenerateID();
@@ -132,6 +145,18 @@ namespace JLib {
         // OTHER workers' deques is already found for free by the unconditional steal-attempt
         // phase every awake worker runs each loop pass, with no predicate involved at all.
         std::atomic<bool> hasQueuedWork{ false };
+
+        // Worker sleep state, so a push can skip the wake entirely when this worker is already
+        // running. Three states rather than a bool because the interesting window is between
+        // "decided to park" and "actually inside cv.wait": GOING_TO_SLEEP publishes the INTENT, so
+        // a pusher arriving mid-decision still signals instead of assuming it will be seen.
+        //
+        // Protocol and its proof: tests/verify/sleepwake_model.c. Every transition here and the
+        // load in NotifyWorker are seq_cst, and that is not defensive -- the model's -DACQ_REL_ONLY
+        // negative control fails with a lost wakeup.
+        enum WorkerState : int { WS_AWAKE = 0, WS_GOING_TO_SLEEP = 1, WS_SLEEPING = 2 };
+        std::atomic<int> workerState{ WS_AWAKE };
+
         std::atomic<bool> running{ false };
         std::atomic<bool> ready{ false };
         std::atomic<bool> joining{ false };

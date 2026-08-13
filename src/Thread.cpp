@@ -227,7 +227,7 @@ void Thread::Join() {
 	if (!joining.compare_exchange_strong(expected, true)) return;
 
 	running.store(false, std::memory_order_release);
-	NotifyWorker();
+	NotifyWorker(/*force*/ true);   // shutdown flips `running`, not hasQueuedWork -- see NotifyWorker
 
 	std::unique_lock<std::mutex> lock(joinMutex);
 	cvWorkerDone.wait(lock, [this] {
@@ -272,7 +272,23 @@ void Thread::Suspend(Fiber* targetFiber){
  uint64_t Thread::GenerateID() {
 	 return scheduler->nextId.fetch_add(1, std::memory_order_relaxed);
  }
-void Thread::NotifyWorker(){
+void Thread::NotifyWorker(bool force){
+	// THE OPTIMISATION: if this worker is running, say nothing. It clears hasQueuedWork and
+	// re-searches every loop pass, so it will find the task on its own, and MarkQueuedWork has
+	// already been stored by every caller that reaches here. Skipping saves a mutex acquire/release
+	// plus a condition-variable signal, and when the worker is actually parked the signal is a
+	// kernel thread wake costing microseconds.
+	//
+	// That cost is not theoretical. While the pool is saturated nobody is waiting on the condvar and
+	// the signal is nearly free, but once the pool drains faster than one thread can submit, every
+	// push buys a real wake -- which is why single-producer submission used to collapse from 3.4 M/s
+	// at 8 workers to 0.8 at 14+, a threshold rather than a gradient.
+	//
+	// The load is seq_cst and pairs with MarkQueuedWork's seq_cst store; see that function and
+	// tests/verify/sleepwake_model.c for why nothing weaker is sound. GOING_TO_SLEEP counts as
+	// "needs a signal": the worker has published intent but may not be inside cv.wait yet.
+	if (!force && workerState.load(std::memory_order_seq_cst) == WS_AWAKE) return;
+
 	// The empty lock is load-bearing: cv.notify_one() without synchronizing on workerMutex
 	// can land in the window AFTER Worker()'s sleep predicate evaluated false but BEFORE it
 	// actually blocks -- the notify is dropped, the flag store is never re-checked, and the
@@ -713,12 +729,39 @@ void Thread::Worker() {
 			// to steal has no reason to keep spinning just because some unrelated queue has a
 			// backlog it structurally can't help with anyway (e.g. another worker's own inbox,
 			// which nobody but that worker can ever drain).
+			// Publish the INTENT to park before the final check. From here until this worker is
+			// awake again, a pusher observing the state will signal rather than assume this worker
+			// will notice on its own. Model checked: tests/verify/sleepwake_model.c.
+			int expected = WS_AWAKE;
+			workerState.compare_exchange_strong(expected, WS_GOING_TO_SLEEP,
+				std::memory_order_seq_cst, std::memory_order_relaxed);
+
+			// RECHECK after advertising, and mirror the wait predicate exactly so the two cannot
+			// disagree about what counts as work. The hasQueuedWork load is seq_cst deliberately:
+			// it and MarkQueuedWork's store are the StoreLoad pair the whole protocol turns on, and
+			// acquire here is precisely the bug the model's negative control reproduces.
+			if (!running.load(std::memory_order_acquire)
+				|| immediate.load(std::memory_order_acquire)
+				|| (!scheduler->paused.load(std::memory_order_acquire)
+					&& hasQueuedWork.load(std::memory_order_seq_cst))) {
+				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+				if (!running.load(std::memory_order_acquire)) break;
+				continue;   // work landed while deciding: go search for it instead of parking
+			}
+
 			std::unique_lock<std::mutex> lock(workerMutex);
+			int expectedGoing = WS_GOING_TO_SLEEP;
+			workerState.compare_exchange_strong(expectedGoing, WS_SLEEPING,
+				std::memory_order_seq_cst, std::memory_order_relaxed);
+
 			cv.wait(lock, [this]() {
 				return !running.load(std::memory_order_acquire)
 					|| immediate.load(std::memory_order_acquire)
 					|| (!scheduler->paused.load(std::memory_order_acquire) && hasQueuedWork.load(std::memory_order_acquire));
 				});
+
+			// Back to AWAKE before releasing the mutex, so the very next push skips the signal.
+			workerState.store(WS_AWAKE, std::memory_order_seq_cst);
 
 			if (!running.load(std::memory_order_acquire)) break;
 		}
