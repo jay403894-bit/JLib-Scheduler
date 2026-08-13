@@ -3,6 +3,29 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.2.4 - unreleased
+
+**False-sharing padding was half the size it needed to be on Apple Silicon.** Seven places used
+`alignas(64)`; M-series cores have **128-byte** cache lines, so on that platform two supposedly
+separated objects shared a line and the padding bought nothing.
+
+`TaskDeque` is the case that matters. Its `top_` and `bottom_` are padded apart specifically to keep
+the owner's end off the thieves' end, which is the whole reason a Chase-Lev deque is cheap for its
+owner. On a Mac that separation silently did not exist. The sharded `LiveCounter` and
+`StealCounters` arrays had the same problem, at two counters per line instead of one.
+
+All seven now use `platform::kCacheLine`, one constant set to 128. Over-aligning on 64-byte-line
+machines costs a little memory and measured nothing: latency 4.67 to 4.73 us, frame DAG 21.5 to
+21.8, fork-join and multi-producer throughput unchanged across three runs. It is arguably correct
+there too, since Intel's adjacent-line prefetcher pulls lines in pairs, making 128 the effective
+sharing granularity on much x86 hardware regardless of the architectural line size.
+
+Deliberately not `std::hardware_destructive_interference_size`: it is the standard spelling, but
+libc++ was late to implement it and AppleClang is precisely the platform this exists for.
+
+Found because a question about mobile cache sizes prompted checking line sizes, which are a
+different thing. The phone was fine -- 64-byte lines, `Task` still one line. The Mac was not.
+
 ## 1.2.3 - 2026-08-13
 
 **[CRITICAL] `SchedulerMutex` could deadlock a thread against itself.** Acquiring one from a bare

@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include "Task.h"
+#include "platform.h"   // platform::kCacheLine
 
 namespace JLib {
 
@@ -23,7 +24,7 @@ namespace JLib {
     // correct needs either a lock (hot-path cost) or a block-based deque (complex + unverifiable
     // without race testing). Not worth it -- single-item stealing is standard and fast, so there is
     // no steal_batch: callers steal one task at a time via steal().
-    class alignas(64) TaskDeque {
+    class alignas(platform::kCacheLine) TaskDeque {
     public:
         explicit TaskDeque(size_t capacity = 32768)
             : capacity_(capacity),
@@ -213,8 +214,8 @@ namespace JLib {
         const size_t capacity_;
         const size_t mask_;
 
-        alignas(64) std::atomic<size_t> top_;
-        alignas(64) std::atomic<size_t> bottom_;
+        alignas(platform::kCacheLine) std::atomic<size_t> top_;
+        alignas(platform::kCacheLine) std::atomic<size_t> bottom_;
     };
 
 }

@@ -5,11 +5,12 @@
 #include <atomic>
 #include <type_traits>
 #include "Task.h"
+#include "platform.h"   // platform::kCacheLine
 #include "TaskAllocator.h"
 
 namespace JLib {
 	//vyokov-style intrusive MPSCqueue for Task pointers
-    class alignas(64)TaskMPSCQueue {
+    class alignas(platform::kCacheLine)TaskMPSCQueue {
         static_assert(std::is_pointer<Task*>::value, "MPSCQueue<T> expects a pointer type");
 
         std::atomic<Task*> head_;   

@@ -14,7 +14,7 @@ namespace JLib {
     //  still live in the cache -> the same fiber got acquired by two workers -> two
     //  workers ran one stack -> corruption. It also dropped the fiber being pushed.)
     template<size_t MaxCapacity = 256>
-    struct alignas(64) ThreadLocalCache {
+    struct alignas(platform::kCacheLine) ThreadLocalCache {
         Fiber* localFibers[MaxCapacity];
         size_t activeCapacity = 0;
         size_t count = 0;

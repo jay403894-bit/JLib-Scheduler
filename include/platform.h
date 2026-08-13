@@ -108,6 +108,25 @@ using native_handle_t = pthread_t;
 // silently corrupting the next fiber's stack.
 namespace JLib { namespace platform {
 
+// ================================ FALSE-SHARING PADDING ========================================
+// The granularity to pad hot, independently-written fields apart by. Used with alignas wherever two
+// threads write neighbouring data -- TaskDeque's top_/bottom_, the sharded counters, the per-thread
+// caches.
+//
+// 128, NOT 64, and the difference is not theoretical. Apple Silicon uses 128-byte cache lines, so
+// alignas(64) there puts two supposedly-separated objects in the SAME line and the padding buys
+// nothing at all. TaskDeque is the case that matters: its whole point is keeping the owner's
+// bottom_ off the thieves' top_, and on a Mac that separation silently did not exist.
+//
+// Over-aligning on 64-byte-line machines costs a little memory and nothing else. It is arguably
+// right there too: Intel's adjacent-line prefetcher pulls cache lines in pairs, so 128 is the
+// effective sharing granularity on much x86 hardware regardless of the architectural line size.
+//
+// Deliberately NOT std::hardware_destructive_interference_size. It is the standard spelling, but
+// libc++ was late to implement it and this library has to build on AppleClang -- which is precisely
+// the platform this constant exists for.
+inline constexpr std::size_t kCacheLine = 128;
+
 // Reserve address space without backing it. Returns nullptr on failure.
 inline void* ReserveNoAccess(std::size_t bytes) {
 #if JLIB_PLATFORM_WINDOWS

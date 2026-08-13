@@ -29,7 +29,7 @@ namespace JLib {
     //
     // Enable with -DJLIBSCHED_STEAL_STATS=ON at configure time.
 #ifdef JLIBSCHED_STEAL_STATS
-    struct alignas(64) StealCounters { std::atomic<long long> probes{ 0 }; std::atomic<long long> hits{ 0 }; };
+    struct alignas(platform::kCacheLine) StealCounters { std::atomic<long long> probes{ 0 }; std::atomic<long long> hits{ 0 }; };
     inline constexpr size_t kStealStatSlots = 256;
     inline StealCounters g_stealStats[kStealStatSlots];
     #define JLIBSCHED_STEAL_STAT(q, field)                                                   \

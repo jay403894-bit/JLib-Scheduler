@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #pragma once
+#include "platform.h"   // platform::kCacheLine
 #include <vector>
 #include <cstddef>
 #include <mutex>
@@ -15,7 +16,7 @@ namespace JLib {
         // TaskAllocator because a default member initializer cannot be used by a static data member
         // of the same enclosing class: the initializer is not complete until the class is, which
         // GCC diagnoses and MSVC quietly accepts. See TaskAllocator's counter block for the why.
-        struct alignas(64) LiveCounter { std::atomic<long long> v{ 0 }; };
+        struct alignas(platform::kCacheLine) LiveCounter { std::atomic<long long> v{ 0 }; };
     }
 
     class TaskAllocator {
