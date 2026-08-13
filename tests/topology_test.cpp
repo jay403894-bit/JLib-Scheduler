@@ -155,7 +155,7 @@ static void TestUnevenGroups() {
 }
 
 // ------------------------------------------------------------------ 4. sysfs list parsing (POSIX)
-#if !JLIB_PLATFORM_WINDOWS
+#if JLIB_PLATFORM_LINUX
 static void TestParseCpuList() {
     std::printf("sysfs CPU-list parsing\n");
 
@@ -187,7 +187,7 @@ int main() {
     TestCpuMaskBasics();
     TestFlatIdSplit();
     TestUnevenGroups();
-#if !JLIB_PLATFORM_WINDOWS
+#if JLIB_PLATFORM_LINUX
     TestParseCpuList();
 #endif
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");

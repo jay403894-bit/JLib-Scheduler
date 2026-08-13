@@ -3,6 +3,23 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.2.1 - 2026-08-13
+
+**[CRITICAL] for macOS: the default build was broken, and had been since 1.1.1.** `SchedulerTopologyTest`
+failed to link with an undefined `JLib::topology::detail::ParseCpuList`. The library itself compiled
+fine, but `cmake --build build` builds every target, so a plain build on macOS failed outright.
+
+The declaration in `Topology.h` was guarded on `!JLIB_PLATFORM_WINDOWS`, which is not the same set
+as "platforms that have this function". `ParseCpuList` parses Linux sysfs text and lives in
+`src/posix/Topology.cpp`; macOS does not build that file at all, it gets `src/darwin/Topology.cpp`
+and sysctl. So Apple targets got the declaration without a definition and the test linked against a
+symbol nobody emits. Both guards are now `JLIB_PLATFORM_LINUX`.
+
+Worth naming how it slipped through: a Windows and a Linux build both pass, because on Windows the
+guard excludes it and on Linux the definition exists. The only configuration that fails is the one
+neither developer machine here can produce. CI on `macos-14` caught it, which is the entire argument
+for keeping a runner for a platform nobody owns.
+
 ## 1.2.0 - 2026-08-13
 
 `v1.1.1` is an intermediate tag inside this release rather than a release of its own. It was cut

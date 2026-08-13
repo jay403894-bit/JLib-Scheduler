@@ -5,7 +5,7 @@
 #include "platform.h"
 #include <vector>
 #include <cstdint>
-#if !JLIB_PLATFORM_WINDOWS
+#if JLIB_PLATFORM_LINUX
 #include <string>   // detail::ParseCpuList, declared at the bottom for the test suite
 #endif
 
@@ -127,7 +127,12 @@ struct Info {
 // reported through the haveCores/haveCache flags rather than a single boolean.
 void Query(Info& out);
 
-#if !JLIB_PLATFORM_WINDOWS
+// LINUX ONLY, not merely non-Windows. This parses Linux sysfs text and is defined in
+// src/posix/Topology.cpp, which macOS does not build -- it gets src/darwin/Topology.cpp and sysctl
+// instead. Guarding this on !JLIB_PLATFORM_WINDOWS declared it on Apple platforms too, where the
+// definition does not exist, and the test suite linked against a symbol that was never emitted.
+// Caught by CI on macos-14; a Windows and Linux build cannot reproduce it.
+#if JLIB_PLATFORM_LINUX
 namespace detail {
 // Parses a Linux sysfs CPU list ("0-3,8,12-15") into a mask. Declared here ONLY so the test suite
 // can reach it: it is the one piece of the POSIX topology path that is pure logic, and therefore
