@@ -425,6 +425,39 @@ namespace JLib {
 		bool Try_Wait();
 
 		void Signal();
+
+		// RAII permit, and the ONLY way to hold one safely across a blocking call on a bare thread.
+		//
+		// Why this exists rather than tracking it in Wait(). A bare thread that blocks on a
+		// scheduler primitive runs stolen tasks while it waits, so anything it holds can be demanded
+		// by the code it runs. SchedulerMutex closes that by counting ownership and refusing to help
+		// while it owns something. A raw permit cannot be counted the same way: the thread that
+		// takes one is frequently not the thread that returns it, which is the entire point of a
+		// producer/consumer semaphore, so counting a Wait() as an acquisition would make a
+		// consumer's tally climb forever and silently stop it ever helping again.
+		//
+		// This resolves that by making the USAGE PATTERN declare itself. Take a permit lock-like --
+		// acquire, work, release on the same thread -- and you get the same guard the mutex has.
+		// Keep using Wait()/Signal() directly for producer/consumer and you pay nothing, correctly,
+		// because there the permit genuinely has no owner.
+		//
+		// A fiber deliberately gets no counting: it can acquire on one worker and resume on another,
+		// so a per-thread count would be corrupted by migration. It also does not need it, since a
+		// fiber SUSPENDS on contention and never enters the helping path at all.
+		//
+		// What this does NOT do: make deadlock impossible. A helped task can still block on
+		// something the scheduler cannot see -- a std::mutex, a file read, a GPU fence -- and no
+		// ownership tracking reaches those. The rule in DESIGN.md is the real protection; this makes
+		// the safe spelling the convenient one.
+		class ScopedPermit {
+		public:
+			explicit ScopedPermit(SchedulerSemaphore& s);
+			~ScopedPermit();
+			ScopedPermit(const ScopedPermit&) = delete;
+			ScopedPermit& operator=(const ScopedPermit&) = delete;
+		private:
+			SchedulerSemaphore& sem;
+		};
 	};
 
 	class SchedulerConditionVariable {

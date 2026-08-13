@@ -140,6 +140,31 @@ A fiber task that waits on an event suspends the *fiber*; the worker immediately
 work. That is the property that lets GPU-fence waits, physics barriers, and IO share one pool with
 compute without stalling cores, and it is the reason fibers exist here at all.
 
+### From a bare thread, hold nothing across a blocking call into the scheduler
+
+A bare thread cannot suspend, so when it blocks on a `SchedulerMutex`, a `SchedulerSemaphore`, a
+condition variable or `WaitFor`, it runs stolen noFiber tasks instead of burning the core. That is
+work-conserving and it has a consequence worth stating plainly: **acquiring a lock executes user
+code**. Whatever the caller holds can be demanded by the task it runs, and the interleaving is
+chosen by the scheduler, so lock-ordering discipline in the caller's own code cannot prevent it.
+
+The concrete failure is self-deadlock. A thread holding mutex A waits on B, helps, and the helped
+task asks for A. A is owned by that same thread, which is stuck inside the task, so nothing can ever
+release it. No fiber is involved.
+
+Three guards bound this (see `ContendedSpinStep`): a thread owning a `SchedulerMutex` stops helping
+entirely, helping never nests more than one level deep, and a thread that has made no progress for a
+long time yields rather than spinning. `SchedulerSemaphore::ScopedPermit` opts a lock-like permit
+into the first of those, which raw `Wait`/`Signal` cannot do because a permit has no owner.
+
+**None of that makes deadlock impossible, which is why the rule above is the actual protection.** A
+helped task can block on something the scheduler cannot see: a plain `std::mutex`, a file read, a
+GPU fence, a user's own condition variable. Ownership tracking reaches none of those. Hold nothing,
+and the question does not arise.
+
+Fibers are exempt from all of it. A fiber suspends on contention and never enters the helping path,
+which is the main reason to prefer running work as tasks rather than blocking a bare thread.
+
 ### Nothing thread-derived may be held across a suspend point
 
 The direct consequence of the above: a suspended fiber resumes on whatever worker picks it up, which

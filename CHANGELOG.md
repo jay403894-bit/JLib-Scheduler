@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.2.3 - unreleased
+## 1.2.3 - 2026-08-13
 
 **[CRITICAL] `SchedulerMutex` could deadlock a thread against itself.** Acquiring one from a bare
 thread runs stolen noFiber tasks while it waits, which is work-conserving and is also the most
@@ -37,8 +37,36 @@ disable helping on that thread. And the ownership count is maintained for bare t
 can acquire on one worker and resume on another, so a per-thread count would be corrupted by
 migration, which is the same rule DESIGN.md already states about thread-derived state.
 
-Holding a semaphore permit across a contended wait therefore remains unguarded, and is now
-documented as such in `TaskScheduler.h` rather than left to be discovered.
+**New `SchedulerSemaphore::ScopedPermit`, which closes that gap for the case where it can be
+closed.** RAII: acquire on construction, release on destruction, and while held it opts into the
+same ownership guard the mutex uses. That works because the TYPE declares the usage pattern. Take a
+permit lock-like, on one thread, and you get the protection; keep calling `Wait`/`Signal` directly
+for producer/consumer and you pay nothing, correctly, because there the permit has no owner to
+track. A fiber gets no counting and does not need it, since it suspends on contention and never
+enters the helping path.
+
+Verified rather than assumed, given how the last two changes went: permit held for exactly its
+scope, released on destruction, balanced across 1000 acquire/release cycles, correct no-op when used
+from inside a task, and the pool still drains afterwards (which is what a guard stuck above zero
+would break).
+
+What it does NOT do, and the changelog should say so rather than implying a stronger claim: make
+deadlock impossible. A helped task can block on something the scheduler cannot see -- a plain
+`std::mutex`, a file read, a GPU fence -- and no ownership tracking reaches those. DESIGN.md now
+states the rule that actually covers it: **from a bare thread, hold nothing across a blocking call
+into the scheduler.** The guards bound the damage; the rule is the protection.
+
+**`WaitFor` gets the two guards but keeps its own yield policy.** It has the identical reentrancy
+hazard -- a caller holding a `SchedulerMutex` across it runs tasks that can ask for that same mutex
+-- and it was also helping without marking the depth, so a helped task's own `Lock()` could help
+again and nest through it. It does NOT adopt the 1000-pass counter: that loop already yields on the
+first unproductive pass, which is the right behaviour when there is genuinely nothing to steal, and
+the counter would only make it spin longer for no gain.
+
+Fork-join is unaffected, which was the thing worth checking rather than assuming. Normal callers
+hold no `SchedulerMutex` at that point, so `t_heldMutexes` is zero and the loop behaves exactly as
+before; the guard only bites on a pattern that already self-deadlocked. Measured across five runs:
+fork-join 0.20 to 0.24 ms against a 0.21 to 0.25 ms baseline.
 
 No measurable cost: latency 4.69 us, frame DAG 22.7 us, fork-join 0.21 ms, burst 11.4x, all
 unchanged. Found by reading, not by a failure.
