@@ -3,7 +3,12 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.2.0 - unreleased
+## 1.2.0 - 2026-08-13
+
+`v1.1.1` is an intermediate tag inside this release rather than a release of its own. It was cut
+partway through the work below, while this section still read "unreleased", and three commits landed
+after it. Everything it contains is described here; it is left in place rather than deleted because
+it is already pushed and rewriting a published tag is worse than an untidy one.
 
 **A push no longer wakes a worker that is already running.** `NotifyWorker()` used to take the
 target worker's mutex and signal its condition variable on every single push, whether or not anyone
