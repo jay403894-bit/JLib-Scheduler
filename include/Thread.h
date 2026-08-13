@@ -85,7 +85,11 @@ namespace JLib {
         Thread(const Thread& other) = delete;
         Thread& operator=(const Thread& other) = delete;
         ~Thread();
-        void StartWorker(size_t cpu_affinity);
+        // fiberCacheCapacity: how many fibers this worker may hold in its local cache. Passed in
+        // rather than derived here, because the only place that knows both the global fiber budget
+        // and the worker count is StartPool. The old inline formula tried to compute it from
+        // workers.size() alone and could not, which is how it ended up as a constant by accident.
+        void StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity);
         std::thread::id GetID();
         bool SetImmediateTask(Task* task_);
 

@@ -26,6 +26,25 @@ libc++ was late to implement it and AppleClang is precisely the platform this ex
 Found because a question about mobile cache sizes prompted checking line sizes, which are a
 different thing. The phone was fine -- 64-byte lines, `Task` still one line. The Mac was not.
 
+**The per-worker fiber cache size is now actually computed.** `StartWorker` derived it from
+`((workerThreads * 72) / workerThreads) * 0.5`, in which the worker count cancels out: it was the
+constant 36 at every pool size, and the `< 16` floor beneath it could never fire.
+
+Mostly harmless, because 36 sits near the 32 the intended formula gives at the default pool size.
+But it diverged badly for an explicitly small pool. Fibers are allocated from HARDWARE thread count,
+not pool size, so `Init(4)` on a 32-thread machine still creates 1984 standard fibers; those four
+workers should cache roughly 248 each and instead cached 36, sending them to the global pool
+constantly. A performance cost only, never a fault, which is why nothing ever surfaced it.
+
+It is now computed in `StartPool` as half of each worker's fair share of the standard pool and
+passed to `StartWorker`. That is the only scope that knows both the fiber budget and the worker
+count, which is precisely why the old inline version could not express it. Half rather than the
+whole share so an idle worker's hoard is not the reason a busy one has to go to the global pool.
+`ThreadLocalCache::Initialize` still clamps above and floors below, so this only has to be sane.
+
+Verified at pool 31 and pool 4 on Windows and Linux; no measurable change at the default, which is
+expected given 36 versus 32.
+
 ## 1.2.3 - 2026-08-13
 
 **[CRITICAL] `SchedulerMutex` could deadlock a thread against itself.** Acquiring one from a bare

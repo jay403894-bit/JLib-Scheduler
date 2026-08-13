@@ -679,6 +679,22 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		worker->SetQueueIndex(i);
 		workers.push_back(worker);
 	}
+	// HALF of each worker's fair share of the standard fiber pool.
+	//
+	// Computed here because this is the only scope that knows both numbers. The old version lived
+	// inside StartWorker and read `((workerThreads * 72) / workerThreads) * 0.5`, in which the
+	// worker count cancels out -- it was the constant 36 on every pool size, and the `< 16` floor
+	// under it could never fire. Harmless in practice, since 36 happens to sit near the 32 the
+	// intended formula gives at the default pool size, but it diverged badly for an explicitly small
+	// pool: Init(4) still allocates fibers from HARDWARE thread count, so four workers should cache
+	// roughly 248 each and instead cached 36, sending them to the global pool constantly.
+	//
+	// Half rather than the whole share so an idle worker's hoard is not the reason a busy one has to
+	// go to the global pool. ThreadLocalCache::Initialize clamps to its own MaxCapacity above and
+	// floors at 2 below, so this only has to be sane, not exact.
+	const size_t fairShare = standardFiberCount / (num_workers ? num_workers : 1);
+	const size_t fiberCacheCapacity = (fairShare / 2 < 16) ? 16 : fairShare / 2;
+
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		// Default scheme: worker i takes the (i+1)'th logical CPU that EXISTS, main keeps the first.
 		// On the dense single-group machines everyone runs, that is literally i+1; on a machine with
@@ -690,7 +706,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		if (!physicalCpus.empty())                cpu = (size_t)physicalCpus[i + 1];
 		else if (logicalCpus.size() > (size_t)i + 1) cpu = (size_t)logicalCpus[i + 1];
 		else                                      cpu = i + 1;
-		workers[i]->StartWorker(cpu);
+		workers[i]->StartWorker(cpu, fiberCacheCapacity);
 	}
 	for (auto& w : workers) {
 		while (!w->Ready())

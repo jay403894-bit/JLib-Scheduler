@@ -58,17 +58,15 @@ Thread::Thread(TaskScheduler& scheduler) : scheduler(&scheduler) {
 }
 Thread::~Thread() {
 }
-void Thread::StartWorker(size_t cpu_affinity)
+void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 {
 	auto ready = std::make_shared<std::atomic<bool>>(false);
-	thread = std::thread([this, ready]() {
+	thread = std::thread([this, ready, fiberCacheCapacity]() {
 		while (!ready->load(std::memory_order_acquire)) std::this_thread::yield();
 		instance = this;
 		thread_id = thread_counter.fetch_add(1);
-		unsigned int workerThreads = (scheduler->workers.size() > 1) ? scheduler->workers.size() : 1;
-		size_t idealCapacity = ((workerThreads * 72) / workerThreads) * 0.5;
-		if (idealCapacity < 16) idealCapacity = 16;
-		localCache.Initialize(&scheduler->GetGlobalPool(),idealCapacity);
+		// ThreadLocalCache::Initialize clamps this to its MaxCapacity and floors it at 2.
+		localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity);
 		this->Worker();
 		});
 	nativeHandle = thread.native_handle();
