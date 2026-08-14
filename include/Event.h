@@ -60,14 +60,42 @@ namespace JLib {
         // caller privately owns every node afterwards and no other thread can touch them. Read
         // nextWaiter BEFORE resuming -- Resume() can put the task straight back on a worker, which
         // may finish it and recycle its slab slot before the loop advances.
+        // Wakes every registered waiter. The list is taken in ONE exchange, so a signal never
+        // partially drains it.
+        //
+        // Resumable fibers are COLLECTED and re-queued in a batch rather than one at a time. Each
+        // individual re-queue is a placement + inbox push + seq_cst flag + condition-variable
+        // signal, and a broadcast that wakes 64 fibers paid all of that 64 times, serially, on
+        // whichever thread called SignalAll. Measured elsewhere: single Push ~1 M/s, PushBatch
+        // ~12 M/s.
+        //
+        // Split by priority because PushBatch takes ONE priority for the whole run -- merging them
+        // would silently demote a hiPri fiber. Buffers are fixed and flushed when full, so this
+        // allocates nothing on a path that may run from any thread, including a signaller that is
+        // not a worker.
         void SignalAll() {
             Task* t = head.exchange(nullptr, std::memory_order_acq_rel);
+            constexpr size_t kBuf = 64;
+            Task* lo[kBuf]; size_t nlo = 0;
+            Task* hi[kBuf]; size_t nhi = 0;
             while (t) {
                 Task* next = t->nextWaiter;
                 t->nextWaiter = nullptr;
-                t->assignedFiber->Resume();   // handles the WANTS_SUSPEND/SUSPENDED race
+                // Handles the WANTS_SUSPEND/SUSPENDED race exactly as Resume() did; true means this
+                // call won the SUSPENDED -> READY transition and now owns re-queueing the task.
+                if (t->assignedFiber->ResumeQueueless()) {
+                    if (t->hiPri) {
+                        hi[nhi++] = t;
+                        if (nhi == kBuf) { RequeueResumedBatch(hi, nhi, true); nhi = 0; }
+                    } else {
+                        lo[nlo++] = t;
+                        if (nlo == kBuf) { RequeueResumedBatch(lo, nlo, false); nlo = 0; }
+                    }
+                }
                 t = next;
             }
+            RequeueResumedBatch(hi, nhi, true);
+            RequeueResumedBatch(lo, nlo, false);
         }
     };
 };

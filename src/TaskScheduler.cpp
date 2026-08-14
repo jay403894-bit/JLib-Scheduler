@@ -865,7 +865,8 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		}
 	}
 }
-void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment)
+void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment,
+	bool hiPri)
 {
 	if (!tasks || count == 0) return;
 
@@ -881,7 +882,10 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	auto submitRun = [&](size_t first, size_t len, int chosen) {
 		for (size_t i = first; i + 1 < first + len; ++i)
 			tasks[i]->next.store(tasks[i + 1], std::memory_order_relaxed);
-		loPriInboxes[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
+		// Priority is a PARAMETER, not read from the tasks: a batch is documented as homogeneous, and
+		// silently routing a hiPri run into the loPri inbox is a priority inversion no caller could
+		// see. Before this existed, every batch went to loPri unconditionally.
+		(hiPri ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
 		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
 		// is private and nothing wakes it without a notify targeting it specifically.
 		workers[chosen]->MarkQueuedWork();

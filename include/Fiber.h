@@ -44,9 +44,21 @@ namespace JLib {
 		void Init(void (*entryPoint)());
 		void CoYield();    // Swaps back to scheduler                            
 		void Suspend();  // Moves from RUNNING -> SUSPENDED
+		// The CAS half of Resume, WITHOUT the re-queue. Returns true when this call is the one that
+		// moved SUSPENDED -> READY, meaning the CALLER now owns re-queueing owningTask. Lets a waker
+		// with many fibers to wake (Event::SignalAll) collect them and submit one batch instead of
+		// paying a placement, an inbox push and a condition-variable signal per fiber.
+		bool ResumeQueueless();
 		void Resume();   // Moves from SUSPENDED -> READY
 
 		// Safety check for the work-stealer
 		bool IsReady() const { return status == FiberStatus::READY; }
 	};
 } // namespace JLib
+
+namespace JLib {
+	// Re-queue fibers already transitioned to READY by ResumeQueueless. Lives here rather than in
+	// Event.h because Event.h only knows Fiber.h -- reaching TaskScheduler from a header it already
+	// includes would be circular.
+	void RequeueResumedBatch(Task** tasks, size_t n, bool hiPri);
+}

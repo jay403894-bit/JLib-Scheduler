@@ -22,7 +22,9 @@ void Fiber::Suspend() {
 	this->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	ContextSwitch(&this->ctx, this->homeCtx);
 }
-void Fiber::Resume() {
+// The CAS half only -- see the header. Returns true when THIS call performed the SUSPENDED -> READY
+// transition, so the caller owns re-queueing owningTask.
+bool Fiber::ResumeQueueless() {
 	// Robust wake that closes the lost-wakeup window. Two parkable states:
 	//  - SUSPENDED: the worker already saved the context and parked us -> CAS to READY
 	//    and re-queue (Requeue: nothing to re-count, since we were never completed).
@@ -34,20 +36,31 @@ void Fiber::Resume() {
 		FiberStatus s = status.load(std::memory_order_acquire);
 		if (s == FiberStatus::SUSPENDED) {
 			FiberStatus exp = FiberStatus::SUSPENDED;
-			if (status.compare_exchange_strong(exp, FiberStatus::READY, std::memory_order_acq_rel))
-				TaskScheduler::Instance().Requeue(this->owningTask);
-			return;
+			return status.compare_exchange_strong(exp, FiberStatus::READY, std::memory_order_acq_rel);
 		}
 		else if (s == FiberStatus::WANTS_SUSPEND) {
 			FiberStatus exp = FiberStatus::WANTS_SUSPEND;
 			if (status.compare_exchange_strong(exp, FiberStatus::SUSPEND_SIGNALED, std::memory_order_acq_rel))
-				return;                 // worker will wake it when it parks
+				return false;           // worker will wake it when it parks
 			// CAS lost to the worker parking us (now SUSPENDED) -> loop and take that path
 		}
 		else {
 			// RUNNING / READY / SUSPEND_SIGNALED / DEAD: not resumable right now (already
 			// signaled, not waiting, or running). Nothing to do.
-			return;
+			return false;
 		}
 	}
+}
+// Unchanged behaviour for every caller that wakes ONE fiber: CAS, then re-queue if we won it.
+void Fiber::Resume() {
+	if (ResumeQueueless())
+		TaskScheduler::Instance().Requeue(this->owningTask);
+}
+
+void JLib::RequeueResumedBatch(Task** tasks, size_t n, bool hiPri) {
+	if (n == 0) return;
+	// minPerSegment = 1, not the default 64: this batch is a WAKE, and every fiber in it became
+	// runnable at the same instant. Handing all of them to one worker would leave the other 30
+	// stealing them back one at a time, which is most of the cost this exists to remove.
+	TaskScheduler::Instance().PushBatch(tasks, n, 0, /*minPerSegment*/1, hiPri);
 }

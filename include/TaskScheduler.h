@@ -179,7 +179,8 @@ namespace JLib {
 		// N times -- wants 1, because for it any segmenting strictly REDUCES notifies. Getting this
 		// backwards is a real regression in both directions, so it is a parameter rather than a
 		// constant: see ParallelFor's flat path.
-		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0, size_t minPerSegment=64);
+		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0, size_t minPerSegment=64,
+		               bool hiPri=false);
 
 		// Submit [begin, end) as ceil(n/chunkSize) TASKS rather than n of them, each task looping
 		// over its own chunk and calling fn(i) per index. Returns the number of tasks created.
