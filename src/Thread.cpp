@@ -779,6 +779,19 @@ void Thread::Worker() {
 						continue;
 					}
 				}
+				else {
+					// THE DEQUE WAS FULL AND THESE ARE ALREADY OUT OF THE INBOX. Dropping them here
+					// used to be silent: pop() had consumed them, batch[] is reused next iteration,
+					// so the tasks never ran, their slab slots leaked, and every WaitFor on their
+					// WaitGroup waited forever with nothing to show in a pool dump. Losing work is a
+					// worse failure than stalling on it -- a stall is at least diagnosable.
+					// Requeue instead: inboxes are unbounded MPSC queues, so it cannot fail the way
+					// a fixed-capacity deque can. Reachable only past 32768 queued on ONE worker's
+					// deque, which needs a deliberate single-core bulk push (PushBatch with an
+					// explicit cpuaffinity does not spread), but the cost of handling it is one loop.
+					for (size_t i = 0; i < count; ++i)
+						if (batch[i]) scheduler->Requeue(batch[i]);
+				}
 			}
 
 			if (!task_to_run) {
@@ -793,6 +806,12 @@ void Thread::Worker() {
 							task_to_run = *opt;
 							continue;
 						}
+					}
+					else {
+						// Same as the hiPri branch above: these are already out of the inbox, so
+						// dropping them loses them silently. Requeue rather than discard.
+						for (size_t i = 0; i < count; ++i)
+							if (batch[i]) scheduler->Requeue(batch[i]);
 					}
 				}
 			}
