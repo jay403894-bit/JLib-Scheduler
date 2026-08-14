@@ -755,10 +755,19 @@ void Thread::Worker() {
 			// promoting one flag and leaving the others at acquire is precisely the bug that hung
 			// macOS arm64 in 1.2.0. `running` is the exception and does not need it, because Join()
 			// passes force=true and never takes the skip.
+			// The inbox checks are NOT redundant with hasQueuedWork, and the evidence says so. A
+			// captured hang shows a worker SLEEPING with a non-empty loPri inbox and the flag at 0:
+			// the flag is cleared blind at the top of each loop, so a push whose queue write is not
+			// yet visible to this worker's drain, but whose MarkQueuedWork landed before the clear,
+			// leaves the item present and the only signal wiped. Inboxes are not stealable, so that
+			// task strands and every waiter on it hangs.
+			// The flag stays as the cheap common case; the queue is the truth.
 			if (!running.load(std::memory_order_acquire)
 				|| immediate.load(std::memory_order_seq_cst)
 				|| (!scheduler->paused.load(std::memory_order_seq_cst)
-					&& hasQueuedWork.load(std::memory_order_seq_cst))) {
+					&& (hasQueuedWork.load(std::memory_order_seq_cst)
+						|| !scheduler->hiPriInboxes[qIndex]->empty()
+						|| !scheduler->loPriInboxes[qIndex]->empty()))) {
 				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
 				if (!running.load(std::memory_order_acquire)) break;
 				continue;   // work landed while deciding: go search for it instead of parking
@@ -769,10 +778,18 @@ void Thread::Worker() {
 			workerState.compare_exchange_strong(expectedGoing, WS_SLEEPING,
 				std::memory_order_seq_cst, std::memory_order_relaxed);
 
+			// Same inbox checks as the recheck above, and for the same reason: the flag can be wiped
+			// while an item is present, so a predicate that trusts only the flag can decide to sleep
+			// on a non-empty inbox. Being evaluated under the mutex does not help -- the mutex
+			// orders this against a NOTIFIER, and the failure is a push that never notifies because
+			// its flag write was already lost.
 			cv.wait(lock, [this]() {
 				return !running.load(std::memory_order_acquire)
 					|| immediate.load(std::memory_order_acquire)
-					|| (!scheduler->paused.load(std::memory_order_acquire) && hasQueuedWork.load(std::memory_order_acquire));
+					|| (!scheduler->paused.load(std::memory_order_acquire)
+						&& (hasQueuedWork.load(std::memory_order_acquire)
+							|| !scheduler->hiPriInboxes[qIndex]->empty()
+							|| !scheduler->loPriInboxes[qIndex]->empty()));
 				});
 
 			// Back to AWAKE before releasing the mutex, so the very next push skips the signal.

@@ -123,6 +123,30 @@ namespace JLib {
         // incidentally drains the store buffer -- AArch64 is where the weaker version breaks.
         void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
         bool Ready();
+
+        // DIAGNOSTIC ONLY, for TaskScheduler::DumpPoolState(). Reads are relaxed and unsynchronised
+        // because this runs from a watchdog on a pool that is already presumed wedged -- a torn or
+        // slightly stale view is fine, and taking any lock here could hang the diagnostic itself.
+        // The combination worth looking for is state=SLEEPING with queued=1: a worker parked while
+        // holding work only it can drain, which is the lost-wakeup signature.
+        struct DebugState {
+            int  qIndex;
+            int  workerState;      // 0 AWAKE, 1 GOING_TO_SLEEP, 2 SLEEPING
+            bool hasQueuedWork;
+            bool busy;
+            bool immediate;
+            bool running;
+        };
+        DebugState GetDebugState() const {
+            return DebugState{
+                qIndex,
+                workerState.load(std::memory_order_relaxed),
+                hasQueuedWork.load(std::memory_order_relaxed),
+                busy.load(std::memory_order_relaxed),
+                immediate.load(std::memory_order_relaxed),
+                running.load(std::memory_order_relaxed)
+            };
+        }
     private:
         uint64_t GenerateID();
         Fiber* AcquireFiber(Task* task);

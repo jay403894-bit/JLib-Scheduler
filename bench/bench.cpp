@@ -89,6 +89,8 @@ static void StartSectionWatchdog(int perSectionSeconds) {
                 printf("\n*** WATCHDOG: section '%s' exceeded %ds -- treating as a HANG.\n",
                        last, perSectionSeconds);
                 printf("*** This is the scheduler failing to drain, not a slow machine.\n");
+                if (JLib::TaskScheduler::IsInitialized())
+                    JLib::TaskScheduler::Instance().DumpPoolState(last);
                 fflush(stdout);
                 std::_Exit(1);
             }

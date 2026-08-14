@@ -63,6 +63,13 @@ namespace JLib {
 		void WaitForMain(WaitGroup& wg);
 		void Join();
 		void NotifyAll();
+
+		// Print every worker's sleep/queue state to stdout. For a watchdog that has decided the pool
+		// is wedged: a stack trace only shows workers sitting in cv.wait, which is already known.
+		// What identifies a lost wakeup is a worker with state=SLEEPING and queued=1 -- parked while
+		// holding work that only it can drain, because inboxes are not stealable.
+		// Unsynchronised by design; see Thread::GetDebugState.
+		void DumpPoolState(const char* why) const;
 		// Parallel range loop. Decides serial-vs-parallel by MEASURING, not by element count: it runs a
 		// small prefix inline, times it, and parallelizes the rest only if the extrapolated work clears
 		// ~75us. That constant is the fork-join dispatch overhead and is the only thing that
