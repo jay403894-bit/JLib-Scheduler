@@ -1131,7 +1131,7 @@ Task* TaskScheduler::GetTask() {
 		? (isPCore[thief->qIndex] != 0)
 		: (thiefCpu < isPCpu.size() ? (isPCpu[thiefCpu] != 0) : true);
 	const bool degen = pWorkers.empty() || eWorkers.empty();
-	auto fastOnly = [&](Task* t) {
+	auto noFiberOnly = [&](Task* t) {
 		return t->noFiber != 0 && StealClassCompatible(t, thiefIsP, degen);
 	};
 
@@ -1140,7 +1140,7 @@ Task* TaskScheduler::GetTask() {
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
 			size_t target = (start + i) % numThreads;
-			if (auto s = hiPri[target]->steal_if(fastOnly)) {
+			if (auto s = hiPri[target]->steal_if(noFiberOnly)) {
 				consecutiveHiPriSteals++;
 				return *s;
 			}
@@ -1153,7 +1153,7 @@ Task* TaskScheduler::GetTask() {
 	size_t start = rand() % numThreads;
 	for (size_t i = 0; i < numThreads; ++i) {
 		size_t target = (start + i) % numThreads;
-		if (auto s = loPri[target]->steal_if(fastOnly))
+		if (auto s = loPri[target]->steal_if(noFiberOnly))
 			return *s;
 	}
 
