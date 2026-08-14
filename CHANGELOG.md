@@ -3,6 +3,46 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.2 - 2026-08-14
+
+**The AArch64 spin hint is now `isb` rather than `yield`.** Measured on an Android AArch64 device:
+`throughput/mp` -- four producers, the most contended row in the benchmark -- went **3.43 to 5.15 M
+tasks/sec, about 50%**.
+
+`CpuRelax()` had always been `yield` on AArch64 because it is the architectural analogue of x86's
+`PAUSE`. It is also, on nearly all AArch64 hardware, a no-op: `YIELD` is a hint asking an SMT
+implementation to favour the sibling thread, and almost no ARM core is SMT. So every spin loop in
+this scheduler -- the contended-lock path, the steal loop, and `IdlePolicy::NoSleep`'s idle search --
+had been backing off *not at all* on ARM, running at full instruction throughput and re-reading the
+contended line every iteration.
+
+`ISB` is an instruction synchronisation barrier, not a pause. It flushes the pipeline, and that is
+precisely why it works: it costs real cycles, so the loop actually slows down. Fewer iterations per
+microsecond means fewer memory accesses and less coherence traffic, which is why the throughput win
+and lower energy per spin are the same effect seen from two directions.
+
+**How it was measured, because the obvious way to run this on a phone produces a fake result.**
+Running the candidate first on a cool device and the control second on a throttled one manufactures
+exactly this shape. Both builds were therefore run in BOTH orders, on a device left to cool first,
+and `isb` came out ahead each time. `SchedulerBench` stamps the hint into its banner (`spin=isb`,
+`spin=yield`, `spin=nop8`, `spin=pause` on x86) so a pasted result says which variant produced it --
+the same reason it stamps the version.
+
+`-DJLIBSCHED_ARM_SPIN_HINT=yield` restores the old behaviour; `=nop` selects a fixed sled, which is
+the control that would distinguish "delay helps" from "`isb` specifically helps" and has not been
+run. x86-64 is unaffected and always uses `PAUSE`.
+
+**This does not change the mobile power story, and `Sleep` remains the default.** The two are
+different layers: `IdlePolicy` decides whether a worker spins at all -- under `Sleep` it parks on a
+condition variable, the kernel deschedules the thread, and the core is free to idle -- while
+`CpuRelax` only decides how to spin during the short search window before parking. `ISB` is not a
+sleep and does not pretend to be one. The instruction that does sleep a core is `WFE`, and it is
+deliberately not used here: it suspends the core but leaves the thread scheduled, so for a wait of
+unknown length -- which is what an idle worker faces -- descheduling via futex is strictly better,
+and on mobile it is what lets the SoC drop to a low-power state at all.
+
+Every ARM measurement in this project before now was taken with a spin loop that did not spin.
+
 ## 1.3.1 - 2026-08-14
 
 **[CRITICAL] fixes a deadlock when more tasks block at once than the fiber pool holds.** A suspended

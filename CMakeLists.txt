@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "1.3.1")
+set(JLIBSCHED_VERSION "1.3.2")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -36,11 +36,13 @@ set(JLIBSCHED_VERSION "1.3.1")
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
 
-# AArch64 spin hint, for the experiment described at CpuRelax() in platform.h. YIELD is the correct
-# architectural analogue of x86 PAUSE but retires as a NOP on most (non-SMT) ARM cores, so it may
-# provide no backoff at all. isb actually costs cycles; nop is the control. Default is yield.
+# AArch64 spin hint. Default is isb, which is NOT the architectural analogue of x86 PAUSE -- that is
+# YIELD, and YIELD retires as a NOP on non-SMT cores, which is nearly all of them, so it gives a spin
+# loop no backoff at all. ISB flushes the pipeline and therefore costs real cycles. Measured on an
+# Android AArch64 device: throughput/mp 3.43 -> 5.15 M tasks/sec, ~50%, reproduced in both run orders
+# on a cool device. Set to yield to restore the old behaviour, or nop for a fixed sled.
 # Ignored on x86-64, which always uses PAUSE.
-set(JLIBSCHED_ARM_SPIN_HINT "yield" CACHE STRING "AArch64 spin hint: yield, isb or nop")
+set(JLIBSCHED_ARM_SPIN_HINT "isb" CACHE STRING "AArch64 spin hint: isb, yield or nop")
 set_property(CACHE JLIBSCHED_ARM_SPIN_HINT PROPERTY STRINGS yield isb nop)
 
 set(JLIBSCHED_STANDALONE OFF)
@@ -260,14 +262,14 @@ endif()
 
 # PUBLIC because CpuRelax() is inline in a header -- every translation unit that spins must agree,
 # or the library and its caller compile different spin loops and the measurement is meaningless.
-if(JLIBSCHED_ARM_SPIN_HINT STREQUAL "isb")
-    target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_ISB=1)
-    message(STATUS "JLib::Scheduler: AArch64 spin hint = isb (experiment; default is yield)")
+if(JLIBSCHED_ARM_SPIN_HINT STREQUAL "yield")
+    target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_YIELD=1)
+    message(STATUS "JLib::Scheduler: AArch64 spin hint = yield (measured ~50%% slower on the contended path than the isb default)")
 elseif(JLIBSCHED_ARM_SPIN_HINT STREQUAL "nop")
     target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_NOP=1)
     message(STATUS "JLib::Scheduler: AArch64 spin hint = nop sled (control; default is yield)")
-elseif(NOT JLIBSCHED_ARM_SPIN_HINT STREQUAL "yield")
-    message(FATAL_ERROR "JLIBSCHED_ARM_SPIN_HINT must be yield, isb or nop (got: ${JLIBSCHED_ARM_SPIN_HINT})")
+elseif(NOT JLIBSCHED_ARM_SPIN_HINT STREQUAL "isb")
+    message(FATAL_ERROR "JLIBSCHED_ARM_SPIN_HINT must be isb, yield or nop (got: ${JLIBSCHED_ARM_SPIN_HINT})")
 endif()
 
 target_include_directories(Scheduler PUBLIC
