@@ -3,6 +3,42 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.3 - 2026-08-14
+
+**[CRITICAL] fixes tasks being stranded permanently in the inbox of a pinned worker.** Affects every
+release before 1.3.3, and earlier ones worse. If you use `PushImmediate`/`PushFork` for a persistent
+service -- an audio mixer, a network poll loop -- and submit in bulk, take this.
+
+Before taking an immediate/fork task, a worker drains its inboxes and re-queues them. It has to:
+inboxes are owner-drain-only and not stealable, and a pinned worker never returns to its loop to
+drain its own. That drain stopped after ONE `BATCH_SIZE` pass, so anything past 64 entries stayed
+behind, unreachable by anything.
+
+The 64 cap was correct when it was written. `PushLocal` round-robins one task at a time, so an inbox
+rarely held more than a handful. What changed underneath it is `PushBatch`: it now hands a large
+contiguous RUN to a single inbox -- roughly 645 tasks for a 20k batch at the default
+`minPerSegment` -- and before 1.3.0 it was worse still, putting the ENTIRE batch into one worker.
+The overflow stopped being hypothetical without the drain ever being revisited.
+
+For a short fork the leftovers are latency. For a **persistent** pinned service, which is what the
+mechanism exists for, the pin never ends and those tasks are stranded for the life of the process,
+hanging anything that waits on them. That is the particle-demo deadlock again, needing >64 queued
+rather than >0.
+
+The drain now runs until the inbox is actually empty. Termination rests on an invariant rather than
+a count, so it is written down at the call site: `PushToCore` stores `immediateCoresInUse` BEFORE
+`SetImmediateTask`, so by the time a worker observes `immediateTask` its own core is already marked
+and `PickNextWorker` skips it -- `Requeue` cannot hand a task back to the inbox being drained. The
+comment also says not to "fix" the loop by re-adding a cap, because the cap is the bug.
+
+**This is the third defect this cycle of the same shape**, and the pattern is worth naming: code that
+was correct when written, invalidated later by a change somewhere else that quietly rewrote its
+preconditions. The `push_bottom` retry path was fine until fiber exhaustion made a worker re-pop the
+same task forever. `task_to_run` surviving the loop's `continue` was harmless until the task stopped
+going back to the same deque. This drain was sufficient until batches began arriving in runs. None
+were wrong when written; each became wrong when something else moved, and nothing in the tests or
+the type system noticed.
+
 ## 1.3.2 - 2026-08-14
 
 **The AArch64 spin hint is now `isb` rather than `yield`.** Measured on an Android AArch64 device:
