@@ -3,6 +3,69 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.4 - 2026-08-14
+
+**`PushFork` is REMOVED.** Use `Push`. To place a task on a known worker, `Push(cpu_affinity, task)`
+-- one-based, 0 meaning round-robin. Nothing in the library called it.
+
+It placed a child on the CALLING worker, on the theory that the parent was about to `WaitFor` and
+suspend, freeing that core, so the child would run there warm on the parent's data. "Fork" meant
+fork-a-child, never split-and-join. Removing it took answering three separate questions, and the
+answers are recorded here because each one looked like a reason to KEEP it at the time.
+
+**1. It never worked.** It passed a **zero-based** worker index to `PushLocal`'s **one-based**
+affinity parameter, in every release. The fiber path put the child on the NEIGHBOUR (`qIndex - 1`),
+and from worker 0 it passed 0, which that parameter reads as "round-robin", so the child went
+anywhere at all. The non-fiber path claimed `immediateCoresInUse[w]` and pushed the task to `w-1`,
+so the claim was released by whatever unrelated task worker `w` ran next -- or, for a claim made
+against worker 0, never released, silently removing that core from placement for the life of the
+process. Every other caller of that parameter (`Push(cpu, task)`, `PushBatch`, `PushToCore`) already
+used the one-based convention. **The one thing this function existed to do had never once happened**,
+so no code has ever depended on it.
+
+**2. Its fiber-only gate was load-bearing, and that is a mark against the design, not for it.** A
+forked child lands in the target worker's inbox, and inboxes are owner-drain-only -- never
+stealable. Only a parent that actually suspends can guarantee that worker returns to its loop to
+drain it. Widening the gate to "any worker" makes a `noFiber` parent strand its own child in its own
+inbox and spin on it forever. So the function was safe only for fiber parents, and a caller had no
+way to see why.
+
+**3. With the index fixed, it still lost every measurement.** In its own legal configuration -- fiber
+parent, fiber children, recursive fork-join over 1M elements, best-of-7 -- self-spawning is slower at
+every tree size and worst on small trees, where it serialises the top of the tree onto one worker
+until steals redistribute:
+
+```
+leaves            2      4      8     16     32     64    128    256    512
+PushFork / Push  1.01x  2.97x  4.63x  4.43x  3.58x  2.43x  1.82x  1.49x  1.48x
+```
+
+**And the locality premise itself was false.** Tested directly for the first time, with a parent that
+writes a buffer and a child that immediately reduces THAT buffer (median us, spawn->join, 200 reps):
+
+```
+working set        Push   PushFork   ratio
+16 KB  (L1)       10.40      6.70    0.64x
+256 KB (L2)       33.50     29.60    0.88x
+2 MB              203.90   199.20    0.98x
+16 MB            1612.90  1611.30    1.00x
+256 KB NO SHARING  61.10    55.10    0.90x   <- control saves MORE than the sharing case
+```
+
+The gain is a flat few microseconds that only looks large when the child is short, it does not grow
+when the child reuses the parent's data, and it **disappears entirely under
+`IdlePolicy::NoSleep`** (16 KB goes from 0.64x to 1.09x). It was never locality: it was one avoided
+worker WAKE, worth about one `latency`-bench round-trip (~5 us), available only on an idle pool, and
+paid for with a 1.5x-4.6x loss the moment the pool is busy -- which is exactly when a job system is
+being used. A name that reads as "fork-join" attached to that trade had already misled this
+project's own bench and its own docs.
+
+`Task::isForked` goes with it -- nothing else set it -- shrinking `Task` by a byte inside the same
+64-byte budget. `Thread::Worker`'s two `was_forked` core-releases are gone; `is_handling_fork`, which
+serves `PushImmediate` and is sound because an immediate task cannot be stolen off the worker that
+claimed the core, is untouched. `DESIGN.md`'s fork-join example now uses `Push`; it had been
+teaching the slower path.
+
 ## 1.3.3 - 2026-08-14
 
 **[CRITICAL] fixes tasks being stranded permanently in the inbox of a pinned worker.** Affects every

@@ -379,7 +379,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 			t->waitGroup = &wg;
 			// MUST route through Push()/PushLocal or PushBatch, NOT a blind
 			// `loPriInboxes[i % n]->push()` round-robin: both of those consult immediateCoresInUse
-			// and skip any core PINNED by a persistent PushImmediate/PushFork task (e.g. the audio
+			// and skip any core PINNED by a persistent PushImmediate task (e.g. the audio
 			// subsystem's forever-running mixer). A pinned worker never returns to its loop to
 			// drain its inbox, and inboxes are owner-drain-only (never stealable, so
 			// TryRunStolenNoFiberTask can't rescue them) -- so a chunk shoved into a pinned
@@ -425,6 +425,27 @@ void TaskScheduler::ParallelForFJ(int start, int end, int grain, std::function<v
 	// TryRunStolenNoFiberTask), NOT here. The caller's own inline work is not a task and never touches wg.
 	// wg can't hit 0 prematurely: a task increments for all its children (inside rec) BEFORE it
 	// returns (and gets decremented), so pending descendants are always counted.
+	// Round-robin Push, and do NOT "improve" this by spawning the child on the calling worker. That
+	// was tried and measured on 2026-08-14, and it is where the removed PushFork died:
+	//
+	//   heavy body, speedup vs serial   N=256   512   1000   2000   10000   40000   200000
+	//     round-robin Push               1.09  3.57   6.33   9.50   12.04   14.20    17.80
+	//     self-spawn                     2.33  4.14   5.65   7.00    7.40    8.00     8.70
+	//
+	// Self-spawn SATURATES at ~8x on a 31-worker pool where Push climbs past 17x -- the signature of
+	// the tree never reaching most of the pool, because putting it all on one deque leaves
+	// single-item stealing as the only way it can spread. The frame DAG and both throughput rows
+	// were flat across the same A/B, so this is placement and nothing else.
+	//
+	// The apparent 2.1x win at N=256 above is an ARTIFACT of that run, which had to bypass a
+	// fiber-only guard to make the splitter self-spawn at all. Swept in the configuration that guard
+	// allowed (fiber parent, fiber children), self-spawn is slower at EVERY leaf count from 2 to 512
+	// and worst at the small end -- 4.6x at 8 leaves.
+	//
+	// There is also a SAFETY reason it could never have been used here: these children are noFiber
+	// (the CreateTask default, and correct -- the splitter never suspends), and a noFiber task
+	// cannot park in WaitFor, so it must never be the sole owner of the queue its children sit in.
+	// See the nested-ParallelFor hazard.
 	std::function<void(int, int)> rec = [&](int a, int b) {
 		while (b - a > grain) {
 			int mid = a + (b - a) / 2;
@@ -966,34 +987,6 @@ bool TaskScheduler::PushImmediate(uint8_t cpu_affinity, Task* task) {
 	return PushToCore(cpu_affinity, task);
 }
 
-bool TaskScheduler::PushFork(Task* task) {
-	if (!task) return false;
-	if (!poolActive) return false;
-
-	int worker_id;
-	bool is_local_push = false;
-
-	if (IsOnFiber()) {
-		worker_id = Thread::GetCurrent()->qIndex;
-		is_local_push = true;  // Pushing to current worker, skip busy check
-	}
-	else {
-		worker_id = PickNextWorker(task->corePref);
-		if (worker_id < 0) return false;
-	}
-
-	// Only check busy flag if NOT pushing to current worker
-	if (!is_local_push && immediateCoresInUse[worker_id]->load(std::memory_order_acquire))
-		return false;
-
-	if (!is_local_push) {
-		immediateCoresInUse[worker_id]->store(true, std::memory_order_release);
-	}
-
-	task->isForked = 1;
-
-	return PushLocal(task, worker_id);
-}
 void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& arm) {
 	auto* thread = Thread::GetCurrent();
 	Task* myTask = thread->currentRunningTask;
@@ -1281,7 +1274,7 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 	// and fall through to the original full-pool round-robin below.
 
 	// Round-robin a worker subset, returning the first NON-pinned worker (immediateCoresInUse = a
-	// persistent PushImmediate/PushFork claim), or -1 if the set is empty or every worker in it is pinned
+	// persistent PushImmediate claim), or -1 if the set is empty or every worker in it is pinned
 	// -- which tells the caller to SPILL to the other class rather than block on an unavailable core.
 	auto pickFrom = [this](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
 		size_t m = set.size();

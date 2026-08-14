@@ -774,16 +774,19 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
     right->waitGroup = &wg;
     wg.n.fetch_add(2, std::memory_order_relaxed);
 
-    if (!sched.PushFork(left)) {
+    // Push. This used PushFork until 1.3.4, which put both children on the CALLING worker and left
+    // stealing as the only way a 128-leaf tree could spread: 0.32 ms against 0.25 ms here, and up
+    // to 4.6x slower on smaller trees. That measurement is what retired PushFork.
+    if (!sched.Push(left)) {
         fj_failed.fetch_add(1);
-        printf("ERROR: PushFork(left) failed\n");
+        printf("ERROR: Push(left) failed\n");
     } else {
         fj_pushed.fetch_add(1);
     }
 
-    if (!sched.PushFork(right)) {
+    if (!sched.Push(right)) {
         fj_failed.fetch_add(1);
-        printf("ERROR: PushFork(right) failed\n");
+        printf("ERROR: Push(right) failed\n");
     } else {
         fj_pushed.fetch_add(1);
     }
@@ -825,7 +828,7 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
 
         task->waitGroup = &wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        sched.Push(task);  // Use Push (load-balanced), not PushFork (main thread)
+        sched.Push(task);  // load-balanced; submitted from the main thread
         sched.WaitFor(wg);
 
         double ms = MsBetween(t0, Clock::now());

@@ -244,24 +244,13 @@ namespace JLib {
 		// until the task finishes.
 		bool PushImmediate(uint8_t cpu_affinity, Task* task);
 
-		// NOT FORK-JOIN, despite the name, and NOT the same mechanism as PushImmediate above.
-		// "Fork" here is the process sense -- spawn an execution context -- not split-and-join.
-		// Fork-join parallelism is ParallelForFJ (which ParallelFor dispatches to on its own); a
-		// manual fan-out is a WaitGroup, see the README example.
-		//
-		// What it actually does, and the two paths differ in more than placement:
-		//   FROM A FIBER -- targets the CALLING worker, does NOT claim the core, cannot fail.
-		//                   Effectively "spawn this near me", a locality hint.
-		//   FROM ELSEWHERE -- picks a worker, CLAIMS its core (immediateCoresInUse), and RETURNS
-		//                   FALSE if that core is already claimed. Callers must handle false;
-		//                   dropping it while a WaitGroup counted the task hangs the waiter.
-		// Both paths end in PushLocal -- an ordinary inbox push. Neither uses the immediate slot,
-		// which is what makes this a different operation from PushImmediate rather than a variant.
-		//
-		// Both also set Task::isForked, which the worker uses on completion to clear
-		// immediateCoresInUse -- including on the fiber path, where nothing ever set it. That is a
-		// spurious clear rather than a known-harmless one, and this function is due a review.
-		bool PushFork(Task* task);
+		// PushFork was REMOVED in 1.3.4 -- use Push. It placed a child on the CALLING worker, on the
+		// theory that the parent was about to WaitFor and free that core, so the child would run
+		// warm on the parent's data. Measurement killed both halves of that: the win was one
+		// avoided worker WAKE (~5us, gone entirely under IdlePolicy::NoSleep) and not locality at
+		// all -- a control child sharing NO data with its parent saved just as much. Against that,
+		// it was 1.5x-4.6x SLOWER for any fork-join-shaped spawn, worst on small trees. To place a
+		// task on a known worker, Push(cpu_affinity, task) -- one-based, 0 meaning round-robin.
 		static bool IsInitialized() {
 			return instance != nullptr;
 		}
@@ -373,11 +362,6 @@ namespace JLib {
 		void PushImmediate(size_t coreID, F&& f) {
 			auto* t = CreateTask(std::forward<F>(f));
 			PushToCore(coreID, t);
-		}
-		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
-		void PushFork(F&& f) {
-			auto* t = CreateTask(std::forward<F>(f));
-			PushFork(t);
 		}
 
 	private:

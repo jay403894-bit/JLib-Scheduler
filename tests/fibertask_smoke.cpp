@@ -117,7 +117,7 @@ int main() {
 
             child->waitGroup = &inner;
             inner.n.fetch_add(1, std::memory_order_relaxed);
-            sched.PushFork(child);
+            sched.Push(child);
             printf("  [stage 2: outer suspending in WaitFor]\n"); fflush(stdout);
             sched.WaitFor(inner);                 // <-- suspends THIS fiber
             printf("  [stage 2: outer resumed]\n"); fflush(stdout);

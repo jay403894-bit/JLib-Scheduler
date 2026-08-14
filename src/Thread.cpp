@@ -417,13 +417,16 @@ void Thread::Worker() {
 				busy.store(false, std::memory_order_relaxed);
 				currentRunningTask = nullptr;
 
-				bool was_forked = task_to_run->isForked;  // Save before destruction
 				scheduler->CleanupTaskMetadata(task_to_run);
 				DestroyTask(task_to_run);
 				scheduler->GetAllocator()->Free(task_to_run);
 
-				// Clear busy flag for both immediate (is_handling_fork) and load-balanced forks (was_forked)
-				if (is_handling_fork || was_forked) {
+				// Release the core claimed by PushImmediate/PushToCore. Sound because an immediate
+				// task goes into THIS worker's immediate slot and cannot be stolen, so the worker
+				// that releases the claim is always the one it was made against. Task::isForked was
+				// a second, unsound way in -- a queued, stealable task releasing whatever core the
+				// worker that happened to run it had claimed -- and went with PushFork in 1.3.4.
+				if (is_handling_fork) {
 					if (qIndex < (int)scheduler->immediateCoresInUse.size()) {
 						scheduler->immediateCoresInUse[qIndex]->store(false, std::memory_order_release);
 					}
@@ -507,7 +510,6 @@ void Thread::Worker() {
 					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
 						task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
 				}
-				bool was_forked = task_to_run->isForked;  // Save before destruction
 				task_to_run->assignedFiber = nullptr;
 				ReleaseFiber(f);
 
@@ -515,12 +517,9 @@ void Thread::Worker() {
 				DestroyTask(task_to_run);
 				scheduler->GetAllocator()->Free(task_to_run);
 
-				// Clear busy flag if this was a forked task
-				if (was_forked) {
-					if (qIndex < (int)scheduler->immediateCoresInUse.size()) {
-						scheduler->immediateCoresInUse[qIndex]->store(false, std::memory_order_release);
-					}
-				}
+				// No core release here: the is_handling_fork clear below this whole block covers the
+				// fiber path for PushImmediate. The isForked clear that used to sit here went with
+				// PushFork in 1.3.4.
 
 				currentFiber = nullptr;
 				currentRunningTask = nullptr;

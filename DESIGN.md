@@ -199,7 +199,7 @@ JLib::WaitGroup wg;
 Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, /*noFiber*/ false);
 parent->waitGroup = &wg;
 wg.n.fetch_add(1, std::memory_order_release);   // count BEFORE push -- workers decrement on completion
-sched.PushFork(parent);
+sched.Push(parent);
 
 sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing noFiber tasks
 ```
