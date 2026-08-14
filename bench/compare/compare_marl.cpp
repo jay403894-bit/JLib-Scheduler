@@ -30,6 +30,7 @@
 #include <TaskScheduler.h>
 #include <marl/scheduler.h>
 #include <marl/waitgroup.h>
+#include <marl/event.h>
 
 #include <cstdio>
 #include <cstdint>
@@ -190,6 +191,170 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
     printf("\n");
 }
 
+// ---------------------------------------------------------------- blocking crossover
+// THE ONLY LIKE-FOR-LIKE ROW IN THE WHOLE COMPARISON, and the reason marl is worth measuring at
+// all. Against enkiTS and Taskflow this workload is barely a contest: their blocking task holds a
+// THREAD while a fiber here suspends and frees the worker, so the result is close to arithmetic.
+// marl suspends a fiber too -- marl::Event::wait() from inside a marl task yields the fiber and
+// hands the thread back, exactly as WaitOnEvent does. So this measures two implementations of the
+// same idea with no structural advantage on either side.
+//
+// PREDICTION, WRITTEN BEFORE THE FIRST RUN. It is recorded here rather than in a commit message
+// because the whole point is that it cannot be quietly revised after seeing the output:
+//
+//   1. PURE SUSPEND/RESUME: CLOSE. Both are hand-written per-architecture assembly doing the same
+//      register save/restore, and BOTH POOL FIBERS -- marl reuses from Worker::idleFibers, this
+//      reuses from ThreadLocalCache over GlobalFiberPool. Neither pays fresh fiber creation in
+//      steady state, so there is no basis to predict either is faster.
+//
+//   2. MIXED WORKLOAD: THIS SHOULD WIN, by roughly the fraction of tasks that never touch a fiber.
+//      marl fiber-backs EVERY task; here only noFiber=0 tasks do, and this benchmark is 25%
+//      blocking, so 75% of its tasks skip the pool round-trip entirely. That -- not a faster fiber
+//      -- is the hybrid's actual claim, and it is what this row exists to test.
+//
+//   3. AT D=0 the gap should be at its widest in this scheduler's favour, and it should NARROW as D
+//      grows, because once the block dominates, what the other 75% cost stops mattering.
+//
+// Prediction 2 is the one worth being suspicious of: an earlier version of this comment argued the
+// OPPOSITE, on the grounds that opt-in fibers must be the less-tuned path and that marl gets its
+// fibers for free. Both premises were wrong -- "not the default" is not "less optimised", and marl
+// pools fibers exactly as this does. Four other predictions during this comparison work were also
+// refuted by measurement (pendingTasks' cost, SpinBriefly twice, warm-worker placement). Treat the
+// numbers below as the finding and everything above as a hypothesis that was cheap to write down.
+//
+// RESULT, FIRST RUN -- PREDICTION 3 REFUTED, AND INVERTED:
+//
+//     block us     JLib     marl    ratio
+//            0    11.62     4.73    0.41x
+//           50     6.95     5.24    0.75x
+//          150     6.75     6.46    0.96x
+//          300     6.79     7.68    1.13x
+//          600     8.30    10.72    1.29x
+//         2000    22.14    24.49    1.11x
+//
+// The gap is widest in MARL's favour at D=0 (2.4x) and this scheduler only overtakes past ~200 us
+// -- exactly opposite to the predicted shape. Prediction 1 (close) holds only around the crossover.
+//
+// AND THE LIKELY CAUSE IS NOT FIBERS. GetEvent(name) takes a GLOBAL registryMtx and hashes a
+// std::string, and each blocking task here hits it TWICE: once inside WaitOnEventArmed and once in
+// the arm callback's SignalAll. That is ~1280 acquisitions of one mutex per run, spread over 31
+// workers. marl::Event is a bare handle with no registry, no lock and no string. So this row as
+// written compares JLib's NAMED-EVENT REGISTRY against marl's DIRECT HANDLE, and the fiber cost --
+// the thing it was built to isolate -- is buried underneath that.
+//
+// It is still a real finding about this library rather than only a harness fault: the registry lock
+// is a genuine serialisation point on the shared-wait path, and it is the same registryMtx convoy
+// the GetEvent declaration warns about. But it means the number above must NOT be quoted as a fiber
+// comparison.
+//
+// TO ISOLATE: rerun with WaitOnEventDirectArmed, which takes a pooled DirectEvent and touches no map
+// and no global lock -- the true structural analogue of marl::Event. If the D=0 gap collapses, the
+// registry was the whole story and the fiber paths are close as Prediction 1 said. If it does not,
+// the difference is real and belongs to fiber acquisition. That test is not written yet.
+static constexpr int kBatch      = 256;
+static constexpr int kBatches    = 10;
+static constexpr int kBlockEvery = 4;       // 25% of tasks block
+static constexpr int kHeavyIters = 50000;   // ~50 us per non-blocking task
+
+static std::atomic<bool> g_released{ false };
+
+// Spun, not slept: sleep_for(20us) is a full ~15.6 ms quantum on Windows, which is how an earlier
+// version of the enkiTS harness "measured" a 50 us block at 13 ms per batch.
+static void ReleaseAfter(int durationUs, JLib::TaskScheduler* jl, marl::Event* ev) {
+    const auto deadline = Clock::now() + std::chrono::microseconds(durationUs);
+    while (Clock::now() < deadline) std::this_thread::yield();
+    g_released.store(true, std::memory_order_release);
+    if (jl) jl->GetEvent("compare_io").SignalAll();
+    if (ev) ev->signal();
+}
+
+static void BenchBlocking(JLib::TaskScheduler& jl) {
+    printf("  blocking crossover -- 25%% of tasks wait on an external signal\n");
+    printf("     %d batches of %d; ms for all %d tasks, lower is better\n\n",
+           kBatches, kBatch, kBatches * kBatch);
+    printf("     %8s %11s %11s %9s\n", "block us", "JLib", "marl", "ratio");
+
+    const int durations[] = { 0, 50, 150, 300, 600, 2000 };
+    for (int d : durations) {
+        std::vector<double> a, b;
+
+        if (g_doJ) {
+            for (int r = 0; r < 3; ++r) {
+                auto t0 = Clock::now();
+                for (int batch = 0; batch < kBatches; ++batch) {
+                    g_released.store(d == 0, std::memory_order_release);
+                    std::thread rel;
+                    if (d) rel = std::thread(ReleaseAfter, d, &jl, nullptr);
+
+                    JLib::WaitGroup wg;
+                    wg.n.store(kBatch, std::memory_order_relaxed);
+                    for (int i = 0; i < kBatch; ++i) {
+                        // NOT gated on d: the D=0 baseline must run the SAME workload, or it is 256
+                        // heavy tasks against the other rows' 192 and every comparison is garbage.
+                        const bool blocks = (i % kBlockEvery) == 0;
+                        JLib::Task* t = blocks
+                            // Armed, so a release that already happened is caught by self-signalling
+                            // rather than missed -- the same race-freedom marl gets from Mode::Manual.
+                            ? jl.CreateTask(+[](void*) {
+                                  JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+                                  s.WaitOnEventArmed("compare_io", [&s] {
+                                      if (g_released.load(std::memory_order_acquire))
+                                          s.GetEvent("compare_io").SignalAll();
+                                  });
+                              }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0)
+                            : jl.CreateTask(+[](void* p) {
+                                  g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
+                                                   std::memory_order_relaxed);
+                              }, (void*)(intptr_t)i);
+                        if (!t) { printf("     JLib: CreateTask returned null\n"); return; }
+                        t->waitGroup = &wg;
+                        jl.Push(t);
+                    }
+                    jl.WaitFor(wg);
+                    if (rel.joinable()) rel.join();
+                }
+                a.push_back(Ms(t0, Clock::now()));
+            }
+        }
+        if (g_doM) {
+            for (int r = 0; r < 3; ++r) {
+                auto t0 = Clock::now();
+                for (int batch = 0; batch < kBatches; ++batch) {
+                    // Manual: stays signalled, so all 64 waiters unblock and a task that reaches
+                    // wait() after the signal returns immediately instead of stranding.
+                    marl::Event ev(marl::Event::Mode::Manual, d == 0);
+                    g_released.store(d == 0, std::memory_order_release);
+                    std::thread rel;
+                    if (d) rel = std::thread(ReleaseAfter, d, nullptr, &ev);
+
+                    marl::WaitGroup wg(kBatch);
+                    for (int i = 0; i < kBatch; ++i) {
+                        const bool blocks = (i % kBlockEvery) == 0;
+                        if (blocks) {
+                            marl::schedule([wg, ev] { ev.wait(); wg.done(); });
+                        } else {
+                            marl::schedule([wg, i] {
+                                g_sink.fetch_add(Spin((uint64_t)i, kHeavyIters),
+                                                 std::memory_order_relaxed);
+                                wg.done();
+                            });
+                        }
+                    }
+                    wg.wait();
+                    if (rel.joinable()) rel.join();
+                }
+                b.push_back(Ms(t0, Clock::now()));
+            }
+        }
+
+        const double ja = MedOr(a), mb = MedOr(b);
+        printf("     %8d", d);
+        Cell(ja, 11, 2); Cell(mb, 11, 2);
+        if (ja > 0 && mb > 0) printf(" %8.2fx\n", mb / ja); else printf("        -\n");
+    }
+    printf("\n     ratio > 1.00 means JLib is faster.\n\n");
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -243,6 +408,7 @@ int main(int argc, char** argv) {
 
     BenchThroughput(jl);
     BenchLatency(jl);
+    BenchBlocking(jl);
 
     printf("(sink %llu -- printed only so none of the work can be optimised away)\n",
            (unsigned long long)g_sink.load());
