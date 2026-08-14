@@ -1021,9 +1021,17 @@ Task* TaskScheduler::GetTask() {
 	// NOW via GetCurrentProcessorNumber + the per-CPU class table. "Would this noFiber run on a P or
 	// E core?" is answered by where the caller is actually standing.
 	Thread* thief = Thread::GetCurrent();
+	// Bounds-check against the ACTUAL table size, not `& 63`. That mask was the old 64-CPU
+	// assumption and it survived the multi-group work: isPCpu is sized to CpuMask::kMaxCpus now, so
+	// on a machine wider than 64 CPUs the mask silently folded a caller's CPU onto another core's
+	// entry (CPU 100 read slot 36) and answered the P/E question about the wrong core. Never a
+	// crash, only a worse steal decision, which is exactly why nothing surfaced it.
+	// Out of range degrades to "P", matching isPCpu's all-P default for a non-hybrid or query-failed
+	// machine -- the same safe answer the table already gives when it knows nothing.
+	const unsigned thiefCpu = JLib::platform::CurrentCpu();
 	const bool thiefIsP = thief
 		? (isPCore[thief->qIndex] != 0)
-		: (isPCpu[JLib::platform::CurrentCpu() & 63] != 0);
+		: (thiefCpu < isPCpu.size() ? (isPCpu[thiefCpu] != 0) : true);
 	const bool degen = pWorkers.empty() || eWorkers.empty();
 	auto fastOnly = [&](Task* t) {
 		return t->noFiber != 0 && StealClassCompatible(t, thiefIsP, degen);

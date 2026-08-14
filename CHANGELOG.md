@@ -5,6 +5,91 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## 1.2.4 - unreleased
 
+**[CRITICAL] fixes a lost wakeup that could strand a task permanently.** A worker could park while
+its own inbox held work, and inboxes are not stealable, so that task never ran and everything
+waiting on it hung. Reproduced at roughly 25% of runs on a 4-thread CI runner and 3% on a 32-thread
+desktop; anyone on 1.2.0 through 1.2.3 should take this.
+
+**The captured evidence, which is what finally identified it.** A watchdog now dumps pool state when
+a benchmark section overruns, and a hang printed:
+
+```
+pendingTasks=36572  workers=3
+  q  state      queued busy imm run   inbox(hi/lo)
+  1  SLEEPING     0      0    0   1     0/1        <-- SLEEPING WITH WORK
+```
+
+Not a missed notify -- a missed FLAG. The item was in the inbox and `hasQueuedWork` was 0.
+
+**The mechanism, and it is a memory-ordering bug rather than a logic one.** The clear was
+`hasQueuedWork.store(false, memory_order_relaxed)` while `MarkQueuedWork` sets it `seq_cst`. A
+relaxed store is not ordered against the loads that follow it, so it may SINK PAST the inbox drain:
+
+```
+worker: drain inbox                 -> empty
+push:   queue the item; set flag    -> seq_cst
+worker: the stale relaxed clear lands, wiping the flag that was just set
+worker: parks with the item in its own inbox and no signal for it
+```
+
+So the flag was set correctly and cleared LATE, not early. The comment above that line argues that
+"a push landing after the clear re-arms this flag", which is sound only if the clear is genuinely
+ordered before the search it is meant to precede -- and relaxed gave it no defined position at all.
+It is `seq_cst` now.
+
+That ordering fix alone is not the guarantee, which is why the park decision also consults the
+inboxes. The flag and the queue are separate objects and no single operation observes both, so a
+push whose queue write is not yet visible to the drain can still be missed. Ordering the clear
+removes the reordering that made the window easy to hit; consulting the queue removes the window.
+
+**Why the flag existed at all is the interesting part.** The park decision originally consulted the
+queues directly and the flag was added later as an optimisation -- but it REPLACED the queue check
+rather than short-circuiting it. That is the failure mode for this kind of change: once the cheap
+signal is the only signal, losing it is not a slow path, it is a lost task. The fix restores what
+the optimisation should have been: flag first, queue as the truth. Both park decision points get it,
+the unlocked recheck and the `cv.wait` predicate. Being under the mutex does not save the second
+one, because the mutex orders you against a NOTIFIER and the failure is a push that never notifies.
+
+Cost is two `empty()` calls on the park path only, immediately before a thread would otherwise
+block. Nothing is added to the hot loop, which already drains the inbox every iteration.
+
+**The race PREDATES the awake-preference rework, and this was measured rather than argued.** The
+commit timeline was suggestive in the wrong direction: `throughput/mp` -- the first bench to push
+from several workers at once -- ran for sixteen hours clean, and CI hangs began 74 minutes after the
+rework landed. That correlation is a coincidence.
+
+Checking out the rework's parent commit in a worktree (mp present, neither the skip nor this fix)
+and running the same loop gives **5 hangs in 60 runs**, against 2 in 60 with the rework in place. So
+the flag/queue race was already there, and the rework made it slightly LESS frequent, not more.
+
+Worth recording because it was nearly concluded twice from reasoning alone. An earlier experiment
+that disabled only the notify skip also produced MORE hangs, which pointed the same way, and was set
+aside because the timeline looked incriminating. It should not have been: a direct measurement beats
+a commit-date correlation, and the worktree test that settles it takes ten minutes.
+
+What the rework DID do is make the bug findable. `throughput/mp` is the only bench that pushes from
+several workers at once, and the section watchdog plus `DumpPoolState` are what turned a silent
+30-minute CI timeout into a named worker asleep on a non-empty inbox.
+
+Verified: 80 consecutive clean runs on Windows and 40 on Linux at the pool size that reproduced it,
+against a prior rate of roughly 2 per 60.
+
+**`TaskScheduler::DumpPoolState()` is kept as a permanent diagnostic.** A stack trace of this bug
+shows three threads sitting in `cv.wait`, which is what you already knew; the state dump names the
+worker that is asleep holding work. It found in one run what three rounds of reasoning had not.
+
+**`GetTask` still carried the old 64-CPU mask.** The helper-steal path asked "is the calling thread
+on a P core or an E core" with `isPCpu[CurrentCpu() & 63]`. `isPCpu` is sized to `CpuMask::kMaxCpus`
+now, so above 64 logical CPUs that mask silently folded the caller onto another core's entry -- CPU
+100 read slot 36 -- and answered the question about the wrong core. It is bounds-checked against the
+table's actual size, with out-of-range degrading to "P", matching what `isPCpu` already defaults to
+on a non-hybrid or query-failed machine.
+
+Never a crash, only a worse steal decision, which is why nothing surfaced it: the multi-group work
+converted every mask it could find, and this one reads like arithmetic rather than a CPU bound. A
+sweep for the same pattern found no others -- the remaining `1ULL << bit` sites are `GROUP_AFFINITY`
+masks, which genuinely are 64 bits per group, and `CpuMask::BitOf`, where `& 63` is the definition.
+
 **False-sharing padding was half the size it needed to be on Apple Silicon.** Seven places used
 `alignas(64)`; M-series cores have **128-byte** cache lines, so on that platform two supposedly
 separated objects shared a line and the padding bought nothing.

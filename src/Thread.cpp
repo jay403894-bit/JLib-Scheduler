@@ -364,7 +364,20 @@ void Thread::Worker() {
 		// this flag (via MarkQueuedWork(), called by whichever push targeted this worker) for
 		// the sleep predicate to see fresh, later in this same iteration. See hasQueuedWork's
 		// declaration comment in Thread.h for the full reasoning.
-		hasQueuedWork.store(false, std::memory_order_relaxed);
+		// seq_cst, NOT relaxed, and the whole comment above depends on it. A relaxed store is not
+		// ordered against the loads that follow, so it may SINK PAST the drain below: the worker
+		// searches and finds nothing, a push then lands and sets this flag seq_cst, and only then
+		// does the stale clear land and wipe it. The worker parks with a task in its own inbox and
+		// the only signal for it destroyed. That is the lost wakeup, and it is why the reasoning
+		// above ("a push landing AFTER the clear re-arms the flag") did not hold in practice: the
+		// clear had no defined position relative to the search it is supposed to precede.
+		//
+		// This is a tightening, not the guarantee. Ordering the clear cannot make the flag alone
+		// sufficient, because the flag and the queue are separate objects and no single operation
+		// observes both -- a push whose queue write is not yet visible to the drain can still be
+		// missed. That is why the park decision consults the inboxes directly; this just removes the
+		// reordering that made the window easy to hit.
+		hasQueuedWork.store(false, std::memory_order_seq_cst);
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
