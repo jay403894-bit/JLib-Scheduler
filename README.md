@@ -282,10 +282,16 @@ already on the pool runs at **9.8 M/s** -- and single-producer submission gets *
 added. The cost is all in submission, not in finishing: drain-after-submit is 0.00 ms at every pool
 size, so the pool is done before the loop stops pushing.
 
-The reason is structural. The deques are Chase-Lev, so an owner pushes and pops with no atomic in
-the common case and only thieves pay the CAS. A task spawning a task gets that fast path; an outside
-push goes through the shared inbox and round-robins across every worker, so the producer's coherence
-traffic grows with the pool.
+The reason is not a privileged path for workers -- `Push` routes every task through `PickNextWorker`
+into some worker's inbox regardless of who called it, so a task spawning a task pays the same
+placement, inbox push and notify an external thread does. What changes is that four producers do
+that work concurrently while one producer does it serially, and single-producer cost grows with the
+pool because placement round-robins across every worker's inbox, so the producer's coherence traffic
+tracks the worker count.
+
+The Chase-Lev asymmetry does exist, but it is downstream of this: a worker drains its own inbox into
+its deque and pops from it with no atomic in the common case, and only thieves pay the CAS. That is
+what makes the work cheap to *consume*, not cheap to submit.
 
 One submitter is still a normal shape -- a main thread queueing a frame's work is fine. It just means
 that if adding workers stops helping, the loop is the thing to look at. Two ways to fix it in bulk:
