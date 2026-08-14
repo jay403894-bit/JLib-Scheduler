@@ -36,6 +36,13 @@ set(JLIBSCHED_VERSION "1.3.1")
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
 
+# AArch64 spin hint, for the experiment described at CpuRelax() in platform.h. YIELD is the correct
+# architectural analogue of x86 PAUSE but retires as a NOP on most (non-SMT) ARM cores, so it may
+# provide no backoff at all. isb actually costs cycles; nop is the control. Default is yield.
+# Ignored on x86-64, which always uses PAUSE.
+set(JLIBSCHED_ARM_SPIN_HINT "yield" CACHE STRING "AArch64 spin hint: yield, isb or nop")
+set_property(CACHE JLIBSCHED_ARM_SPIN_HINT PROPERTY STRINGS yield isb nop)
+
 set(JLIBSCHED_STANDALONE OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(JLIBSCHED_STANDALONE ON)
@@ -249,6 +256,18 @@ add_library(JLib::Scheduler ALIAS Scheduler)
 if(JLIBSCHED_STEAL_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STEAL_STATS=1)
     message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+
+# PUBLIC because CpuRelax() is inline in a header -- every translation unit that spins must agree,
+# or the library and its caller compile different spin loops and the measurement is meaningless.
+if(JLIBSCHED_ARM_SPIN_HINT STREQUAL "isb")
+    target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_ISB=1)
+    message(STATUS "JLib::Scheduler: AArch64 spin hint = isb (experiment; default is yield)")
+elseif(JLIBSCHED_ARM_SPIN_HINT STREQUAL "nop")
+    target_compile_definitions(Scheduler PUBLIC JLIB_SPIN_HINT_NOP=1)
+    message(STATUS "JLib::Scheduler: AArch64 spin hint = nop sled (control; default is yield)")
+elseif(NOT JLIBSCHED_ARM_SPIN_HINT STREQUAL "yield")
+    message(FATAL_ERROR "JLIBSCHED_ARM_SPIN_HINT must be yield, isb or nop (got: ${JLIBSCHED_ARM_SPIN_HINT})")
 endif()
 
 target_include_directories(Scheduler PUBLIC

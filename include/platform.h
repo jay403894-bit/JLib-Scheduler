@@ -183,8 +183,43 @@ inline void CpuRelax() {
     // unreachable, since CMake refuses Windows on ARM64 (that needs a third context switch), but
     // this file should not be the thing that breaks if anyone ever does the port by hand.
     __yield();
+#elif defined(JLIB_SPIN_HINT_ISB)
+    // Instruction Synchronization Barrier. Not a "pause" at all architecturally -- it flushes the
+    // pipeline -- but that is exactly why it is used as one: it costs real cycles (tens, varying by
+    // implementation), so a spin loop actually backs off. Several performance-oriented codebases
+    // pick this on AArch64 for that reason. Heavier and less predictable than x86's pause.
+    __asm__ __volatile__("isb" ::: "memory");
+#elif defined(JLIB_SPIN_HINT_NOP)
+    // Crude but predictable: a fixed sled with no architectural meaning beyond burning issue slots.
+    // Here as the control -- if isb beats yield it should also beat this, and if it does not then
+    // what was measured is delay rather than anything specific to isb.
+    __asm__ __volatile__("nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory");
 #else
+    // DEFAULT, and worth knowing it may do nothing. YIELD is the architectural analogue of pause,
+    // but it is a hint for SMT implementations to favour the sibling thread -- and almost no
+    // AArch64 core is SMT, so on most of them it retires as a NOP. That makes every spin loop here
+    // a tight loop with no backoff on ARM, which matters most for IdlePolicy::NoSleep, whose whole
+    // cost model assumes the spin is cheap for the rest of the machine.
+    //
+    // Kept as the default anyway: it is the correct hint, it is never wrong, and the alternatives
+    // above are not obviously better without a measurement on the target. Build with
+    // -DJLIBSCHED_ARM_SPIN_HINT=isb (or nop) and compare throughput/mp and the frame DAG -- those
+    // are the contended paths. SchedulerBench prints which hint it was built with.
     __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+// Which spin hint this build compiled in, for the benchmark banner. A spin-hint experiment is
+// exactly the kind whose results get pasted without saying which variant produced them.
+inline const char* SpinHintName() {
+#if JLIB_ARCH_X86_64
+    return "pause";
+#elif defined(JLIB_SPIN_HINT_ISB)
+    return "isb";
+#elif defined(JLIB_SPIN_HINT_NOP)
+    return "nop8";
+#else
+    return "yield";
 #endif
 }
 

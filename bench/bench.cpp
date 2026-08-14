@@ -28,6 +28,7 @@
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
 #include <Thread.h>    // StealStatsRead/Reset -- no-ops unless built with JLIBSCHED_STEAL_STATS
+#include <platform.h>  // SpinHintName -- stamped into the banner, see CpuRelax
 #include <chrono>
 #include <cstdio>
 
@@ -687,10 +688,11 @@ int main(int argc, char** argv) {
 #ifndef JLIBSCHED_VERSION
 #define JLIBSCHED_VERSION "unknown"   // hand-built outside CMake
 #endif
-    printf("JLib::Scheduler %s bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, idle=%s, pool=%s)\n",
+    printf("JLib::Scheduler %s bench  (sizeof(Task)=%zu, hw threads=%u, affinity=%s, idle=%s, pool=%s, spin=%s)\n",
         JLIBSCHED_VERSION,
         sizeof(JLib::Task), std::thread::hardware_concurrency(), policyName, idleName,
-        poolSize ? std::to_string(poolSize).c_str() : "auto");
+        poolSize ? std::to_string(poolSize).c_str() : "auto",
+        JLib::platform::SpinHintName());
     printf("----------------------------------------------------------------\n");
 
     // 180s per section. Generous on purpose: the crossover sweep is legitimately the slowest part
