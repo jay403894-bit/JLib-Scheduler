@@ -47,8 +47,12 @@ Every ARM measurement in this project before now was taken with a spin loop that
 
 **[CRITICAL] fixes a deadlock when more tasks block at once than the fiber pool holds.** A suspended
 task keeps its fiber, so the number of tasks that may be blocked SIMULTANEOUSLY is capped at the
-pool size. Past that cap the pool hung. Anyone on 1.3.0 who fans out more blocking tasks than
-`64 x workers` should take this; the symptom is an unexplained stall, not a crash.
+pool size. Past that cap the pool hung.
+
+THIS AFFECTS EVERY RELEASE BEFORE 1.3.1, NOT JUST 1.3.0. The defect dates to at least 2026-07-06 --
+it was FOUND while testing 1.3.0, not introduced by it -- so 1.2.3 and earlier are affected too.
+Anyone on any earlier version who fans out more blocking tasks than `64 x workers` should take this;
+the symptom is an unexplained stall, not a crash.
 
 Three separate defects, all found by writing the test for a limit that had just been documented:
 
@@ -79,8 +83,8 @@ warning made the stall slower and buried the one line explaining it.
 
 **Test.** `SchedulerPrimitivesTest` now pushes more blocking tasks than the pool has fibers and
 requires completion. The watchdog is the assertion: there is no honest threshold for "too slow", but
-"finishes at all" is the property that broke. It fails on 1.3.0 by timeout and on the intermediate
-fix by segfault, so it tells the three states apart.
+"finishes at all" is the property that broke. It fails on any earlier version by timeout and on
+the intermediate fix by segfault, so it tells the three states apart.
 
 ### Also
 
