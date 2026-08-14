@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.3.0 - unreleased
+## 1.3.0 - 2026-08-14
 
 **[CRITICAL] fixes a lost wakeup that could strand a task permanently.** A worker could park while
 its own inbox held work, and inboxes are not stealable, so that task never ran and everything
