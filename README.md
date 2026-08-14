@@ -18,37 +18,34 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-| | i9-13900K at Intel spec power limits, Release, 1.3.0 |
-|---|---|
-| Task enqueue → dequeue latency | 4.7 µs |
-| 6-node frame DAG (build, validate, execute) | 22.7 µs |
-| 1M-element recursive fork-join (10k leaves) | 0.22 ms |
-| Bulk submission via `PushBatch` | 12.1 M tasks/sec |
-| Bulk submission, 4 producers | 8.4 M tasks/sec |
-| Per-item cost via `PushArray` (chunk 128) | 1.0 ns |
-| `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
-| Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
-| Steal protocol | single-item Chase-Lev CAS |
-
-Medians of five runs on the default affinity policy. Run-to-run spread was 2.4% on latency, 9% on
-the DAG and 19% on fork-join, so treat the last digit as noise.
-
-**Those are the DEFAULT numbers, where idle workers park.** `SetIdlePolicy(IdlePolicy::NoSleep)`
-keeps them searching instead, and the wake path turns out to be the largest single cost in the
-scheduler:
+i9-13900K at Intel spec power limits, Release, 1.3.0. Medians of three runs on the default affinity
+policy. **The two columns are one library under its two idle policies**, not two products -- `Sleep`
+parks idle workers and is the default, `NoSleep` keeps them searching.
 
 | | `Sleep` (default) | `NoSleep` | |
 |---|---|---|---|
-| Task enqueue → dequeue latency | 4.68 µs | **1.15 µs** | 4.1x |
-| 6-node frame DAG | 22.50 µs | **7.76 µs** | 2.9x |
-| 1M recursive fork-join | 0.22 ms | **0.07 ms** | 3.1x |
-| Single-producer submission | 1.21 M/s | **6.30 M/s** | 5.2x |
-| 16 heavy tasks from an idle pool | 11.6x of 16 | 12.6x of 16 | flat |
+| Task enqueue → dequeue latency | 4.67 µs | **1.21 µs** | 3.9x |
+| 6-node frame DAG (build, validate, execute) | 22.5 µs | **7.8 µs** | 2.9x |
+| 1M-element recursive fork-join (10k leaves) | 0.23 ms | **0.06 ms** | 3.8x |
+| Single-producer submission | 0.99 M/s | **6.4 M/s** | 6.5x |
+| Bulk submission via `PushBatch` | **12.2 M/s** | 10.8 M/s | 0.9x |
+| Bulk submission, 4 producers | 9.8 M/s | **12.7 M/s** | 1.3x |
+| Per-item cost via `PushArray` (chunk 128) | 1.0 ns | 1.0 ns | -- |
+| 16 heavy tasks from an idle pool | 11.2x of 16 | 12.6x of 16 | flat |
+
+Run-to-run spread is a few percent on latency and the DAG, wider on single-producer submission --
+treat the last digit as noise. Reproduce either column with `SchedulerBench`, or both side by side
+with `SchedulerBench both`.
+
+**The wake path turned out to be the largest single cost in the scheduler**, and nothing here had
+measured it until 1.3.0. That is what the first four rows are: whether a worker had to be woken by
+the kernel. `NoSleep` is not uniformly better, which is why both columns are shown -- it costs you
+on `PushBatch`, and on the blocking workload further down.
 
 That last row is the control, and it is the reason to believe the others. Its shortfall was
 predicted before measuring to be frequency scaling rather than wake latency -- 16 heavy tasks at
 once settle toward base clock on a chip at Intel spec power limits, where one task alone boosts. It
-stayed flat while everything else moved 3-5x.
+stayed flat while everything else moved 3-6x.
 
 The default stays `Sleep` and should, for a library: spinning workers are a battery and thermal
 problem on Android, they starve whatever else the host process runs, and they make the
@@ -56,7 +53,13 @@ oversubscription policy incoherent. `NoSleep` is for an application that owns th
 fullscreen game does. There is deliberately no middle setting -- a spin-then-park mode was built,
 measured worse than both extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
 
-Run `SchedulerBench nosleep` to reproduce.
+Structural properties, which do not vary by policy:
+
+| | |
+|---|---|
+| `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
+| Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
+| Steal protocol | single-item Chase-Lev CAS |
 
 **This machine runs Intel's specified power limits with unlimited turbo disabled**, so it boosts
 briefly and then settles near base clock under sustained load. That is the part behaving as Intel
