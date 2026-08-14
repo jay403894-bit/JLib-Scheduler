@@ -259,7 +259,7 @@ marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so m
 for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
 and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
 
-### Measured against enkiTS
+### Measured against enkiTS, TaskFlow and marl
 
 Same machine, same harness, same worker count, both libraries expressed the way their authors
 intended. i9-13900K at Intel spec power limits (see the caveat under [Measured](#measured)), 31
