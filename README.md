@@ -289,32 +289,28 @@ int main() {
 
 ### Submit from inside the pool where you can
 
-Tasks that spawn tasks are the path this is built around, and the gap is larger than it sounds. On a
-32-thread i9, pushing 200,000 tasks from one thread runs at 3.4 M/s with 8 workers and **0.8 M/s
-with 31**, going backwards as workers are added. Submitting the same work from four tasks already on
-the pool holds 3.5 to 5 M/s across the whole range.
+Tasks that spawn tasks are the path this is built around. On a 32-thread i9, pushing 200,000 tasks
+from one thread runs at **1.0 M/s**; submitting the same work from four tasks already on the pool
+runs at **9.8 M/s**. Single-producer submission also gets *worse* as workers are added, because
+external pushes round-robin across every worker's inbox, so the producer's coherence traffic grows
+with the pool.
 
-If you must submit in bulk from one thread, `PushBatch` is the answer and it is not a small
-difference: **around 12 M/s, and flat whether the pool has 8 workers or 31.** It links a run of
-tasks locally and hands the chain to one worker with a single wake, instead of paying a worker
-selection, a queue push and a condition-variable signal per task.
+The cost is entirely in submission, not in finishing the work: drain-after-submit is 0.00 ms at
+every pool size, so the pool is already done by the time the loop stops pushing.
 
-The cost is entirely in submission, not in getting the work done. Timing the two halves separately,
-the pool has already finished by the time the loop stops pushing: drain-after-submit is 0.00 ms at
-every pool size from 8 to 31. So this is not the pool struggling to keep up, it is one thread's
-`Push` getting more expensive as the pool grows, and external submission round-robins across every
-worker's inbox, so the producer's working set and its coherence traffic grow with the worker count.
+If you must submit in bulk from one thread, `PushBatch` is the answer -- **12.2 M/s, flat across
+pool sizes.** It links the tasks locally and hands the chain over in segments, instead of paying a
+worker selection, a queue push and a condition-variable signal per task. For a range of items,
+`PushArray` is cheaper still at **1.0 ns per item**, because it submits ceil(n/chunk) tasks rather
+than n.
 
-The deques are also Chase-Lev, which is the structural half: their owner pushes and pops locally
-with no atomic in the common case, and only thieves pay for the CAS. That asymmetry assumes the
-producer is a worker. A task spawning a task gets that fast path; something pushing from outside the
-pool goes through the shared inbox instead.
+The deques are Chase-Lev, which is the structural half: the owner pushes and pops locally with no
+atomic in the common case, and only thieves pay the CAS. That asymmetry assumes the producer is a
+worker -- a task spawning a task gets the fast path, an outside push goes through the shared inbox.
 
-None of which means one submitter is wrong. A main thread submitting a frame's work is a normal
-shape and 3.4 M/s is plenty for it. It means that if you are feeding the pool from a loop and
-wondering why more workers is not helping, the loop is the thing to look at, not the pool size.
-`SchedulerBench` reports both as `throughput/1p` and `throughput/mp` so the difference is visible on
-your own hardware.
+None of which makes one submitter wrong; a main thread submitting a frame's work is a normal shape.
+It means that if more workers is not helping, look at the loop rather than the pool size.
+`SchedulerBench` reports both as `throughput/1p` and `throughput/mp`.
 
 Three things to know while writing against it. A task that will call `WaitFor` must be created with
 `noFiber = false` -- `noFiber` defaults to true, and a task with no fiber under it cannot suspend, so
