@@ -578,13 +578,35 @@ void Thread::Worker() {
 				// net for that rarer case. Only the INBOX needs this treatment -- anything
 				// already sitting in this worker's own deque was already directly stealable via
 				// steal(), it was never actually at risk.
+				// DRAINS UNTIL EMPTY, not one BATCH_SIZE pass. It used to take at most 64 and stop,
+				// which was fine while an inbox rarely held more: PushLocal round-robins one task at
+				// a time. PushBatch now deliberately hands a large contiguous RUN to a single inbox
+				// (~645 tasks for a 20k batch at the default minPerSegment), so the 64 cap would leave
+				// hundreds behind -- in the inbox of a worker that is about to pin, where nothing can
+				// steal them. For a short fork that is latency; for a PERSISTENT pinned service, which
+				// is what this mechanism exists for (an audio mixer, a network poll loop), the pin
+				// never ends and those tasks are stranded for the life of the process. That is the
+				// particle-demo deadlock again, needing >64 queued instead of >0.
+				//
+				// TERMINATION rests on an invariant, since this no longer has a count bound: Requeue
+				// routes through PickNextWorker, which SKIPS any core whose immediateCoresInUse is
+				// set -- and PushToCore stores that flag BEFORE SetImmediateTask, so by the time this
+				// worker observes immediateTask its own core is already marked. Requeue therefore
+				// cannot hand a task back to the inbox being drained. The one exception is every
+				// worker being pinned at once, where Requeue already spins on its own
+				// while(immediateCoresInUse) loop regardless of this drain -- a pre-existing hazard,
+				// not one introduced here. Do NOT "fix" this loop by re-adding a cap: the cap is what
+				// stranded the overflow in the first place.
 				auto drainInbox = [&](TaskMPSCQueue* inbox, TaskDeque* deque) {
-					size_t count = 0;
-					while (count < BATCH_SIZE && inbox->pop(batch[count])) count++;
-					for (size_t i = 0; i < count; ++i) {
-						Task* t = batch[i];
-						if (!t) continue;
-						scheduler->Requeue(t);
+					for (;;) {
+						size_t count = 0;
+						while (count < BATCH_SIZE && inbox->pop(batch[count])) count++;
+						if (count == 0) break;
+						for (size_t i = 0; i < count; ++i) {
+							Task* t = batch[i];
+							if (!t) continue;
+							scheduler->Requeue(t);
+						}
 					}
 				};
 				drainInbox(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
