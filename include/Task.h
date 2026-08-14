@@ -70,7 +70,7 @@ namespace JLib {
         // (Named fastJob until 1.0. "noFiber" states what is checkable -- whether a fiber exists --
         // rather than advertising a benefit, and it puts the constraint in view at the call site.)
         uint8_t noFiber = 0;
-        uint8_t isForked = 0;  // Set by PushFork, cleared when task completes
+        uint8_t isForked = 0;  // Set by PushFork/PushImmediate, cleared when the task completes
         uint8_t priorityBoost = 0;  // Original priority before boost (0 = no boost, otherwise original hiPri)
         // P/E-core placement hint (see CorePref above). Lives in what was tail PADDING -- FiberSize is
         // uint8_t, so the byte block ends at offset 53 with 11 spare bytes under the 64-byte assert.

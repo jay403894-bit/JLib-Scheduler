@@ -235,7 +235,32 @@ namespace JLib {
 				PushBatch(ts.data(), ts.size(), 0, /*minPerSegment*/64, hiPri);
 			return ts.size();
 		}
+		// Hand a task to a SPECIFIC core via that worker's immediate slot, bypassing the queues
+		// entirely. For a persistent service running inside the pool rather than beside it -- an
+		// audio mixer, a network poll loop. Running such a thing as a plain std::thread would work,
+		// but the scheduler could not see it and the pool would silently oversubscribe the machine;
+		// a pinned task is visible to placement, an outside thread is a core that quietly went
+		// missing. The core is marked in immediateCoresInUse and excluded from normal placement
+		// until the task finishes.
 		bool PushImmediate(uint8_t cpu_affinity, Task* task);
+
+		// NOT FORK-JOIN, despite the name, and NOT the same mechanism as PushImmediate above.
+		// "Fork" here is the process sense -- spawn an execution context -- not split-and-join.
+		// Fork-join parallelism is ParallelForFJ (which ParallelFor dispatches to on its own); a
+		// manual fan-out is a WaitGroup, see the README example.
+		//
+		// What it actually does, and the two paths differ in more than placement:
+		//   FROM A FIBER -- targets the CALLING worker, does NOT claim the core, cannot fail.
+		//                   Effectively "spawn this near me", a locality hint.
+		//   FROM ELSEWHERE -- picks a worker, CLAIMS its core (immediateCoresInUse), and RETURNS
+		//                   FALSE if that core is already claimed. Callers must handle false;
+		//                   dropping it while a WaitGroup counted the task hangs the waiter.
+		// Both paths end in PushLocal -- an ordinary inbox push. Neither uses the immediate slot,
+		// which is what makes this a different operation from PushImmediate rather than a variant.
+		//
+		// Both also set Task::isForked, which the worker uses on completion to clear
+		// immediateCoresInUse -- including on the fiber path, where nothing ever set it. That is a
+		// spurious clear rather than a known-harmless one, and this function is due a review.
 		bool PushFork(Task* task);
 		static bool IsInitialized() {
 			return instance != nullptr;
