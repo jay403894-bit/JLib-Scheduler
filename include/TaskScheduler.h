@@ -202,7 +202,11 @@ namespace JLib {
 		// the work). If the arena is exhausted the remaining chunks run INLINE on the caller, which
 		// is the same graceful degradation ParallelFor does rather than dropping work on the floor.
 		template<typename F>
-		size_t PushArray(size_t begin, size_t end, size_t chunkSize, F&& fn, WaitGroup* wg = nullptr) {
+		// hiPri routes every chunk task to the high-priority queue; default is low, matching
+		// CreateTask and PushBatch. Priority here is QUEUE ORDER only -- it never implies placement,
+		// which is CorePref's job (see Task.h).
+		size_t PushArray(size_t begin, size_t end, size_t chunkSize, F&& fn, WaitGroup* wg = nullptr,
+		                 bool hiPri = false) {
 			if (end <= begin) return 0;
 			if (chunkSize == 0) chunkSize = 1;
 			const size_t total  = end - begin;
@@ -213,7 +217,7 @@ namespace JLib {
 			for (size_t c = 0; c < chunks; ++c) {
 				const size_t lo = begin + c * chunkSize;
 				const size_t hi = (lo + chunkSize > end) ? end : lo + chunkSize;
-				Task* t = CreateTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); });
+				Task* t = CreateTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); }, hiPri);
 				if (!t) {                                   // arena exhausted: run it here
 					for (size_t i = lo; i < hi; ++i) fn(i);
 					continue;
@@ -228,7 +232,7 @@ namespace JLib {
 			if (wg && !ts.empty())
 				wg->n.fetch_add((int)ts.size(), std::memory_order_relaxed);
 			if (!ts.empty())
-				PushBatch(ts.data(), ts.size());
+				PushBatch(ts.data(), ts.size(), 0, /*minPerSegment*/64, hiPri);
 			return ts.size();
 		}
 		bool PushImmediate(uint8_t cpu_affinity, Task* task);

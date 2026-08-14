@@ -302,13 +302,22 @@ that if adding workers stops helping, the loop is the thing to look at. Two ways
 
 `SchedulerBench` reports the two cases as `throughput/1p` and `throughput/mp`.
 
-### Two rules
+### Rules worth knowing
 
 A task that will call `WaitFor` must be created with **`noFiber = false`**. It defaults to true, and
 a task with no fiber under it cannot suspend -- it fail-fasts with no message.
 
 Tasks live in 256-byte slab slots, so a lambda capturing more than about **192 bytes** fails a
 `static_assert`. Capture pointers, not payloads.
+
+**How many tasks may be BLOCKED at once is capped at 64 per core.** A suspended task holds its fiber
+for as long as it stays suspended, so concurrent suspensions are bounded by the fiber pool. Past
+that, workers re-queue the tasks they cannot start and retry: it still makes progress, but it looks
+like a stall rather than an error, so one warning is printed and then the pool grinds. Tasks that
+never suspend are unaffected, and so is the total number in flight -- it is specifically the number
+blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need more, remembering
+each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
+one.
 
 ### Placement is a hint, and on some platforms it is nothing
 

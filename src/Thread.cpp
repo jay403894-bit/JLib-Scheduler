@@ -321,7 +321,21 @@ Fiber* Thread::AcquireFiber(Task* task) {
 	f = localCache.Pop();
 
 	if (!f) {
-		std::cerr << "CRITICAL: Global pool exhausted!" << std::endl;
+		// ONCE PER PROCESS, not once per failure. Exhaustion is not a single event: the caller
+		// re-queues the task and yields, so a pool that is genuinely short spins through this path
+		// millions of times. Printing each one turned an eight-minute stall into an eight-minute
+		// stall that also floods the console with synchronised writes, which is slower AND hides
+		// the one line that explains it. The condition is a capacity problem, so one line naming
+		// the cap and the cause is all a reader can act on.
+		static std::atomic<bool> warned{ false };
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			std::cerr << "[JLib::Scheduler] fiber pool exhausted. A SUSPENDED task holds its fiber, "
+			             "so the number of tasks that may be blocked AT ONCE is capped at the pool "
+			             "size (64 per core). Past that, workers re-queue and retry instead of "
+			             "running, which looks like a stall rather than an error. Either block fewer "
+			             "tasks concurrently, or raise standardFiberCount in TaskScheduler::StartPool. "
+			             "This warning prints once.\n";
+		}
 	}
 	return f;
 }
