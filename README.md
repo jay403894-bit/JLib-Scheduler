@@ -250,7 +250,7 @@ int main() {
     // Fire and forget. noFiber is the default: runs inline on a worker, no fiber, no switch.
     sched.Push([] { HeavyMath(); });
 
-    // Fork-join: create tasks against a WaitGroup, then wait.
+    // Scatter-gather: N independent tasks against one WaitGroup, then wait for all of them.
     JLib::WaitGroup wg;
     for (int i = 0; i < 8; ++i) {
         auto* t = sched.CreateTask([i] { Chunk(i); });
@@ -264,6 +264,12 @@ int main() {
     sched.ParallelFor(0, 1'000'000, 4096, [](int a, int b) {
         for (int i = a; i < b; ++i) out[i] = std::sqrt((float)i);
     });
+
+    // Same shape, fire-and-forget: submits ceil(n/chunk) tasks rather than n, and returns
+    // as soon as they are queued. ~1 ns per item at chunk 128.
+    JLib::WaitGroup arr;
+    sched.PushArray(0, 1'000'000, 4096, [](size_t i) { out[i] = std::sqrt((float)i); }, &arr);
+    sched.WaitFor(arr);
 
     sched.Join();
 }
