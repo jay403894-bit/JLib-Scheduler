@@ -261,14 +261,14 @@ int main() {
     sched.WaitFor(wg);
 
     // Data-parallel loop. Decides serial vs parallel by timing a prefix, not by element count.
-    sched.ParallelFor(0, 1'000'000, 4096, [](int a, int b) {
+    sched.ParallelFor(0, 1000000, 4096, [](int a, int b) {
         for (int i = a; i < b; ++i) out[i] = std::sqrt((float)i);
     });
 
     // Same shape, fire-and-forget: submits ceil(n/chunk) tasks rather than n, and returns
     // as soon as they are queued. ~1 ns per item at chunk 128.
     JLib::WaitGroup arr;
-    sched.PushArray(0, 1'000'000, 4096, [](size_t i) { out[i] = std::sqrt((float)i); }, &arr);
+    sched.PushArray(0, 1000000, 4096, [](size_t i) { out[i] = std::sqrt((float)i); }, &arr);
     sched.WaitFor(arr);
 
     sched.Join();
