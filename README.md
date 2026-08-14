@@ -217,44 +217,26 @@ macOS) plus exactly one architecture subdirectory, `src/posix/x86_64/` or `src/p
 Never two of the same kind -- they define the same symbols, and a static library will not diagnose
 that. It silently links whichever one it reaches first.
 
-### iOS and other Apple platforms
+### iOS and Windows on ARM64
 
-Not supported, but probably working. iOS, tvOS, watchOS and visionOS are arm64 Darwin, so they use
-the same AAPCS64 context switch and the same `src/darwin/` OS layer that macOS arm64 uses, and that
-configuration is verified in CI on every push. What is missing is that nobody has ever run the
-result. I have no Apple hardware, so I cannot produce that run and will not claim the platform.
-
-If you can, the build is opt-in:
+**Untested, not supported.** iOS, tvOS, watchOS and visionOS are arm64 Darwin, so they use the same
+context switch and `src/darwin/` layer that macOS arm64 uses and that CI verifies -- but nobody has
+run the result, and I have no Apple hardware to do it. Opt in with:
 
 ```
 cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
       -DJLIBSCHED_ALLOW_UNVERIFIED_PLATFORM=ON
 ```
 
-Without that flag it refuses and tells you the flag exists. With it, it warns and proceeds.
+Without that flag it refuses and names the flag. One caveat worth stating: a pool of persistent
+worker threads does not fit the iOS app lifecycle -- backgrounding freezes threads mid-execution, so
+treat it as foreground-only unless you wire `Pause()`/`Resume()` up yourself.
 
-Expect three things. Placement is a no-op on Apple platforms (see below). An iOS executable has to
-be wrapped in an app bundle before it will run at all, since there is no console. And the third is
-the one that might make this a poor fit regardless of whether it compiles: **a pool of persistent
-worker threads does not map cleanly onto the iOS app lifecycle.** This scheduler is built on the
-assumption that the application largely owns the machine, which is true of a game in the foreground
-and false the instant it is backgrounded -- threads are frozen mid-execution, and anything waiting on
-a fence or a lock stalls until the app resumes. `TaskScheduler::Pause()` and `Resume()` exist as the
-hook for that, but nothing here wires them to `applicationDidEnterBackground`, and a `hardware_concurrency - 1`
-pool is an awkward shape on a phone where the OS is actively managing power. Treat iOS as
-foreground-only unless you do that work yourself.
+**Windows on ARM64** is refused outright. The calling convention matches AAPCS64 on everything a
+context switch touches, so what is missing is only an `armasm64` translation, an MSBuild ARM64
+configuration, and somebody with the hardware -- about a day of mechanical work nobody has asked for.
 
-Please open an issue either way -- a report that it works is as useful as one that it doesn't, and a
-PR from someone with the hardware is very welcome.
-
-Windows on ARM64 is refused outright with no flag, but not because anything about it is hard. The
-Windows ARM64 calling convention matches AAPCS64 on everything a context switch touches, so the
-existing register save/restore carries over; what is actually missing is an `armasm64` translation
-of it, an ARM64 configuration in the MSBuild project, and somebody with a Snapdragon machine who
-wants this. It is roughly a day of mechanical work that nobody has asked for yet.
-
-If you are that somebody, open an issue. That is the signal that would move it, and it is the
-difference between a fifth supported platform and a fifth platform I cannot run.
+Open an issue either way. A report that it works is as useful as one that it doesn't.
 
 ## Using it
 
@@ -330,15 +312,12 @@ timings: thermal throttling is unconstrained and the cores are heterogeneous, so
 on a phone describes the phone. It is also verified by hand on Termux rather than in CI, which
 covers Linux AArch64 on glibc but not bionic.
 
-Machines wider than 64 logical CPUs are handled across all processor groups, up to 256 CPUs. This is
-worth stating because it is the thing most job systems get wrong on Windows: `SetThreadAffinityMask`
-takes its processor group from the calling thread rather than from its argument, so on a 128-thread
-box no mask value can name a CPU in the second group. Binding here goes through
-`SetThreadGroupAffinity` and `SetThreadIdealProcessorEx`, which take the group as data.
-
-That path is written and reasoned through but **has not yet run on a machine wide enough to exercise
-it**, because I do not own one. If you do, that is the single most useful thing you could report.
-Everything at 64 CPUs or below is unaffected and is what the tested numbers come from.
+Machines wider than 64 logical CPUs are handled across all processor groups, up to 256 CPUs --
+binding goes through `SetThreadGroupAffinity`/`SetThreadIdealProcessorEx`, which take the group as
+data, rather than `SetThreadAffinityMask`, which takes it from the calling thread and therefore
+cannot name a CPU in a second group. **Untested above 64 CPUs**, because I do not own one; if you
+do, that is the single most useful thing you could report. Everything at 64 and below is unaffected
+and is where the numbers come from.
 
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.
