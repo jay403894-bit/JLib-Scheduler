@@ -180,8 +180,15 @@ void TaskScheduler::Join() {
 }
 void TaskScheduler::DumpPoolState(const char* why) const {
 	printf("\n=== POOL STATE (%s) ===\n", why);
-	printf("pendingTasks=%d  paused=%d  poolActive=%d  workers=%zu\n",
-		pendingTasks.load(std::memory_order_relaxed),
+	// Queued work is SUMMED FROM THE QUEUES rather than read off a counter. There used to be a
+	// global `pendingTasks` atomic maintained on every push and every completion, and it existed
+	// only to serve this line and WaitAll(); it cost 24 ns per task in contention (27% of the whole
+	// per-task cost, measured) to answer a question the queues already know the answer to. Summing
+	// is O(workers) in a function that only runs when a watchdog has already given up.
+	size_t queued = 0;
+	for (size_t i = 0; i < workers.size(); ++i) queued += hiPri[i]->size() + loPri[i]->size();
+	printf("queuedTasks=%zu  paused=%d  poolActive=%d  workers=%zu\n",
+		queued,
 		(int)paused.load(std::memory_order_relaxed),
 		(int)poolActive.load(std::memory_order_relaxed),
 		workers.size());
@@ -267,6 +274,10 @@ static TaskScheduler::AffinityPolicy g_affinityPolicy = TaskScheduler::AffinityP
 void TaskScheduler::SetAffinityPolicy(AffinityPolicy p) { g_affinityPolicy = p; }
 TaskScheduler::AffinityPolicy TaskScheduler::GetAffinityPolicy() { return g_affinityPolicy; }
 
+static TaskScheduler::IdlePolicy g_idlePolicy = TaskScheduler::IdlePolicy::Sleep;
+void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy = p; }
+TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy; }
+
 static double g_parallelWorthwhileUs = kDefaultParallelWorthwhileUs;
 void TaskScheduler::SetParallelForThresholdUs(double us) { g_parallelWorthwhileUs = us; }
 double TaskScheduler::GetParallelForThresholdUs() { return g_parallelWorthwhileUs; }
@@ -331,6 +342,29 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// (Thread::Worker / TryRunStolenNoFiberTask); the task body must NOT also decrement, or
 		// each task counts down twice and the wait wakes early on half-finished work.
 		WaitGroup wg;
+		// Collected and submitted in ONE PushBatch instead of numTasks-1 individual Push() calls.
+		// Each Push does its own MarkQueuedWork + NotifyWorker, and a notify takes the target
+		// worker's mutex (the lost-wakeup fix); batching cuts that to one notify per SEGMENT.
+		//
+		// minPerSegment=1 below, NOT the default 64. This path only runs at <= 2 tasks per worker
+		// (above that ParallelFor dispatches to ParallelForFJ), so a 64-task floor would collapse
+		// the whole batch onto ONE worker -- strictly worse than the per-task Push it replaces,
+		// which at least round-robined. The default exists for big fire-and-forget batches where
+		// the alternative is a single push; here the alternative is N pushes, so any segmenting
+		// wins and the finest available spread is the right one.
+		//
+		// Stack buffer, no allocation: numTasks is bounded by 2*workers+1 on this path, so the
+		// heap fallback is unreachable in practice and exists only so a huge pool cannot overrun.
+		// ParallelFor runs per-frame in a game loop; a malloc here would be a poor trade.
+		Task* stackBuf[256];
+		std::vector<Task*> heapBuf;
+		Task** pending = stackBuf;
+		if (numTasks - 1 > (int)(sizeof(stackBuf) / sizeof(stackBuf[0]))) {
+			heapBuf.resize((size_t)numTasks - 1);
+			pending = heapBuf.data();
+		}
+		int pendingCount = 0;
+
 		for (int i = 1; i < numTasks; ++i) {
 			int chunkStart = start + i * chunkSize;
 			int chunkEnd = std::min(chunkStart + chunkSize, end);
@@ -343,17 +377,24 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 				continue;
 			}
 			t->waitGroup = &wg;
-			wg.n.fetch_add(1, std::memory_order_relaxed);
-			// MUST route through Push()/PushLocal, NOT a blind `loPriInboxes[i % n]->push()`
-			// round-robin: PushLocal's PickNextWorker skips any core whose immediateCoresInUse
-			// is set (a worker PINNED by a persistent PushImmediate/PushFork task -- e.g. the
-			// audio subsystem's forever-running mixer). A pinned worker never returns to its
-			// loop to drain its inbox, and inboxes are owner-drain-only (never stealable, so
-			// TryRunStolenNoFiberTask can't rescue them) -- so a chunk shoved into a pinned worker's
-			// inbox is stranded forever and WaitFor(wg) spins until the heat death of the app.
-			// This was the particle-demo deadlock: it only bit once the sound thread was pinned.
-			// Push() also handles pendingTasks++/MarkQueuedWork/NotifyWorker.
-			Push(t);
+			// MUST route through Push()/PushLocal or PushBatch, NOT a blind
+			// `loPriInboxes[i % n]->push()` round-robin: both of those consult immediateCoresInUse
+			// and skip any core PINNED by a persistent PushImmediate/PushFork task (e.g. the audio
+			// subsystem's forever-running mixer). A pinned worker never returns to its loop to
+			// drain its inbox, and inboxes are owner-drain-only (never stealable, so
+			// TryRunStolenNoFiberTask can't rescue them) -- so a chunk shoved into a pinned
+			// worker's inbox is stranded forever and WaitFor(wg) spins until the heat death of the
+			// app. This was the particle-demo deadlock: it only bit once the sound thread was
+			// pinned. PushBatch keeps that check per segment, and also handles the
+			// MarkQueuedWork/NotifyWorker that Push() did per task.
+			pending[pendingCount++] = t;
+		}
+
+		// Counted BEFORE publishing: the instant PushBatch hands these over a worker can finish one
+		// and decrement, and adding to n afterwards races a WaitFor that already saw zero.
+		if (pendingCount > 0) {
+			wg.n.fetch_add(pendingCount, std::memory_order_relaxed);
+			PushBatch(pending, (size_t)pendingCount, 0, /*minPerSegment*/1);
 		}
 
 		// Main computes its own lane while the workers churn -- no wasted thread.
@@ -818,46 +859,77 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		}
 	}
 }
-void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity)
+void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment)
 {
-	// 1. Manually link them locally: Task A -> Task B -> Task C
-	for (size_t i = 0; i < count - 1; ++i) {
-		tasks[i]->next.store(tasks[i + 1], std::memory_order_relaxed);
-	}
-	// The last task's next is already handled by the queue's exchange logic
-	pendingTasks.fetch_add(count, std::memory_order_relaxed);
-	// 2. Submit the pointers directly - NO wrappers, NO heap allocation
-	// NOTE (corePref): the whole batch is placed at CorePref::Default (full-pool round-robin) onto ONE
-	// worker regardless of members' individual corePrefs -- a batch is assumed homogeneous/Default.
-	// Class-pinned tasks should go through Push() individually; once batched here, the receiving OWNER
-	// runs them unvetted (see the enforcement-scope note in Task.h), though class-aware STEALING still
-	// applies to whatever other workers try to take from this deque.
-	if (cpuaffinity == 0)
-	{
-		int chosen = PickNextWorker();
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-			chosen = PickNextWorker();
-		}
-		loPriInboxes[chosen]->push_batch(tasks[0], tasks[count - 1]);
-		// FIX: this whole function previously never notified ANYONE after the push -- if
-		// `chosen` happened to be genuinely asleep, the entire batch would sit undiscovered
-		// until that worker was woken for some unrelated reason (a different push landing on
-		// it, etc.). A worker's own cv is private; nothing wakes it without an explicit notify
-		// targeting it specifically.
+	if (!tasks || count == 0) return;
+
+	// NOTE (corePref): a batch is placed at CorePref::Default (full-pool round-robin) regardless of
+	// its members' individual corePrefs -- a batch is assumed homogeneous/Default. Class-pinned
+	// tasks should go through Push() individually; once batched here, a receiving OWNER runs them
+	// unvetted (see the enforcement-scope note in Task.h), though class-aware STEALING still applies
+	// to whatever other workers try to take from that deque.
+	//
+	// A links-and-pushes helper, because the segment loop below and the explicit-affinity path want
+	// the same three steps. push_batch null-terminates the tail itself, so segments never bleed into
+	// one another even though `tasks` is one contiguous array.
+	auto submitRun = [&](size_t first, size_t len, int chosen) {
+		for (size_t i = first; i + 1 < first + len; ++i)
+			tasks[i]->next.store(tasks[i + 1], std::memory_order_relaxed);
+		loPriInboxes[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
+		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
+		// is private and nothing wakes it without a notify targeting it specifically.
 		workers[chosen]->MarkQueuedWork();
 		workers[chosen]->NotifyWorker();
-	}
-	else
-	{
+	};
+
+	if (cpuaffinity != 0) {
+		// Explicit affinity is an explicit request: honour it and do not spread.
 		int chosen = cpuaffinity - 1;
 		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			std::this_thread::yield();
 			chosen = PickNextWorker();
 		}
-		loPriInboxes[chosen]->push_batch(tasks[0], tasks[count - 1]);
-		workers[chosen]->MarkQueuedWork();
-		workers[chosen]->NotifyWorker();
+		submitRun(0, count, chosen);
+		return;
+	}
+
+	// SPREAD ACROSS WORKERS rather than handing the whole batch to one.
+	//
+	// This function used to pick ONE worker and push all `count` tasks into its inbox. Everything
+	// then funnelled through that worker: it alone drains its inbox (inboxes are owner-drain-only),
+	// moving tasks BATCH_SIZE at a time into its local deque, from which the other N-1 workers steal
+	// ONE ITEM AT A TIME. So a 20k-task batch became one drain loop plus ~20k single-item steal CASes
+	// contending on a single deque, while the producer that just paid to build the batch sat idle.
+	// Measured at 31 workers: it is most of the ~90 ns/task dispatch cost, and it is why the cost
+	// barely improved with batch size.
+	//
+	// Segmenting is nearly free -- the links were being written anyway, just in one long chain
+	// instead of W shorter ones -- and it turns one hot deque into W warm ones, giving every worker
+	// local work to pop instead of remote work to steal.
+	// Segment count is NOT simply min(count, workers): each segment costs a MarkQueuedWork +
+	// NotifyWorker, and a notify takes the target worker's mutex (the lost-wakeup fix). Splitting a
+	// 64-task batch 31 ways buys almost no parallelism and pays 31 notifies for it -- measured as a
+	// real regression on the small rows before this floor existed. Keep segments big enough that the
+	// spread is worth the wake-up it costs, and let small batches behave as they always did.
+	if (minPerSegment == 0) minPerSegment = 1;
+	const size_t nw = workers.size();
+	size_t segments = (nw == 0) ? 1 : (count / minPerSegment);
+	if (segments < 1)  segments = 1;
+	if (segments > nw) segments = nw;
+	const size_t per = count / segments;
+	const size_t rem = count % segments;
+
+	size_t first = 0;
+	for (size_t s = 0; s < segments; ++s) {
+		const size_t len = per + (s < rem ? 1 : 0);
+		if (len == 0) continue;
+		int chosen = PickNextWorker();
+		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+			chosen = PickNextWorker();
+		}
+		submitRun(first, len, chosen);
+		first += len;
 	}
 }
 
@@ -895,7 +967,6 @@ bool TaskScheduler::PushFork(Task* task) {
 	}
 
 	task->isForked = 1;
-	pendingTasks.fetch_add(1, std::memory_order_relaxed);
 
 	return PushLocal(task, worker_id);
 }
@@ -1076,9 +1147,8 @@ bool TaskScheduler::TryRunStolenNoFiberTask() {
 		if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
 			task->waitGroup->WakeAll();   // only touches wg if someone registered
 	}
-	task->~Task();
+	DestroyTask(task);
 	taskAllocator.Free(task);
-	pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 
 	if (EpochManager::Instance().RetiredCount() > 512) {
 		EpochManager::Instance().Tick();
@@ -1089,17 +1159,15 @@ bool TaskScheduler::TryRunStolenNoFiberTask() {
 TaskAllocator* TaskScheduler::GetAllocator() {
 	return &taskAllocator;
 }
-void TaskScheduler::WaitAll() {
-	while (pendingTasks.load(std::memory_order_acquire) > 0)
-		std::this_thread::yield();
-}
-
 Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t noFiber, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;
 	Task* t = ::new (mem) Task(fn, data, hipri, size);
 	t->noFiber = noFiber;
 	t->corePref = corePref;
+	// Concrete type is exactly Task, whose destructor is empty -- the completion path can skip the
+	// virtual call entirely. See Task::trivialDtor.
+	t->trivialDtor = 1;
 	return t;
 }
 
@@ -1111,7 +1179,6 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		size_t idx = (size_t)(cpuaffinity - 1);
 		if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
 			loPriInboxes[idx]->push(task);
-			pendingTasks.fetch_add(1, std::memory_order_release);
 			// Targeted at worker idx specifically, not NotifyAll() -- only that one worker's
 			// inbox actually changed. MarkQueuedWork() (release-ordered, matching
 			// Thread.h's hasQueuedWork comment) pairs with the worker's own acquire-load in its
@@ -1132,7 +1199,6 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 			hiPriInboxes[chosen]->push(task);
 		else
 			loPriInboxes[chosen]->push(task);
-		pendingTasks.fetch_add(1, std::memory_order_release);
 		workers[chosen]->MarkQueuedWork();
 		workers[chosen]->NotifyWorker();
 
@@ -1142,7 +1208,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 bool TaskScheduler::Requeue(Task* task) {
 	if (!task) return false;
 	// Re-queue a paused task (resumed after Suspend). Unlike PushLocal this does NOT
-	// bump pendingTasks -- the task was already counted at its original submission and
+	// re-count the task -- it was already accounted for at its original submission and
 	// is only resuming, not newly created. (The yield path does the same, via the
 	// worker's push_bottom.) Otherwise every suspend->resume cycle leaks +1.
 	uint8_t chosen = PickNextWorker(task->corePref);
@@ -1178,7 +1244,6 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	// deques/inboxes entirely (goes straight into workers[idx]->immediateTask below) and wakes
 	// ONLY that one targeted worker via SetImmediateTask's own `immediate` flag + notify --
 	// hasQueuedWork is specifically for the deque/inbox case, which this isn't.
-	pendingTasks.fetch_add(1, std::memory_order_relaxed);
 	workers[idx]->SetImmediateTask(task);
 	workers[idx]->NotifyWorker();
 	return true;

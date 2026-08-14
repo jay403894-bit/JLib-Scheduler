@@ -13,6 +13,7 @@ bench/*.ilk
 build/
 # -DJLIBSCHED_STEAL_STATS=ON gets its own tree so the normal build stays clean
 build-stats/
+build-compare/
 cmake-build*/
 out/
 CMakeCache.txt

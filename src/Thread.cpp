@@ -354,6 +354,10 @@ void Thread::Worker() {
 	Task* batch[BATCH_SIZE];
 	static thread_local Task* task_to_run = nullptr;
 	static thread_local bool is_handling_fork = false;
+	// IdlePolicy spin state for THIS worker. Both are reset the moment work is found, not only on
+	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
+	// task would carry that count into its next idle episode and park early ever after.
+	unsigned idleSpins = 0;
 	while (running.load(std::memory_order_acquire)) {
 
 		ready.store(true, std::memory_order_release);
@@ -401,9 +405,8 @@ void Thread::Worker() {
 
 				bool was_forked = task_to_run->isForked;  // Save before destruction
 				scheduler->CleanupTaskMetadata(task_to_run);
-				task_to_run->~Task();
+				DestroyTask(task_to_run);
 				scheduler->GetAllocator()->Free(task_to_run);
-				scheduler->pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 
 				// Clear busy flag for both immediate (is_handling_fork) and load-balanced forks (was_forked)
 				if (is_handling_fork || was_forked) {
@@ -474,9 +477,8 @@ void Thread::Worker() {
 				ReleaseFiber(f);
 
 				scheduler->CleanupTaskMetadata(task_to_run);
-				task_to_run->~Task();
+				DestroyTask(task_to_run);
 				scheduler->GetAllocator()->Free(task_to_run);
-				scheduler->pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
 
 				// Clear busy flag if this was a forked task
 				if (was_forked) {
@@ -740,9 +742,39 @@ void Thread::Worker() {
 		}
 
 		if (task_to_run) {
+			idleSpins = 0;   // work found: this idle episode is over, next one starts fresh
 			continue;
 		}
 		else {
+			// IDLE POLICY. Found nothing this pass -- decide whether to search again or park.
+			//
+			// This sits BEFORE the WS_GOING_TO_SLEEP publish on purpose. A worker that spins here
+			// never advertises an intent to park, so it stays WS_AWAKE and pushers take the
+			// awake-preference skip instead of paying a notify for it: spinning does not merely
+			// avoid the wake, it removes the wake cost from the PRODUCER too.
+			//
+			// Deliberately NOT a timed wait. The park below stays an unconditional cv.wait, so a
+			// lost wakeup still hangs visibly rather than being masked by a timeout -- see the
+			// IdlePolicy comment in TaskScheduler.h for why that distinction is the whole point.
+			{
+				// Shutdown and Pause both override the policy. Pausing means "stop using the CPU",
+				// and a policy that spun through it would defeat the only thing Pause exists for.
+				const bool mayspin = TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep
+					&& running.load(std::memory_order_acquire)
+					&& !scheduler->paused.load(std::memory_order_seq_cst);
+
+				if (mayspin) {
+					++idleSpins;
+					// Yield periodically even under NoSleep. A pure CpuRelax loop is pathological
+					// if the pool is oversubscribed or shares cores with the host's own threads,
+					// and "I own the machine" is a claim the caller makes, not one this can verify.
+					if ((idleSpins & 0xFF) == 0) std::this_thread::yield();
+					else platform::CpuRelax();
+					continue;   // search again rather than parking
+				}
+				idleSpins = 0;   // policy is Sleep, or shutting down/paused: fall through and park
+			}
+
 			// Per-worker signal, not a pool-wide counter: hasQueuedWork means "a task was pushed
 			// specifically to ME since my last search," which is the only thing that should
 			// keep THIS worker from actually sleeping. Stealable work on OTHER workers' deques

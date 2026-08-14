@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.2.4 - unreleased
+## 1.3.0 - unreleased
 
 **[CRITICAL] fixes a lost wakeup that could strand a task permanently.** A worker could park while
 its own inbox held work, and inboxes are not stealable, so that task never ran and everything
@@ -152,6 +152,165 @@ helper happens to steal one of the queued tasks that wants the held lock. Hence 
 code does not produce a wrong answer, it produces a hang, and a hang in CI burns the whole job
 timeout before reporting anything -- which is precisely what the 1.2.0 macOS bug did for thirty
 minutes a run. Wired into all four CI targets.
+
+### New: `IdlePolicy` -- workers do not have to sleep
+
+`SetIdlePolicy(IdlePolicy::NoSleep)` makes idle workers keep searching instead of parking on their
+condition variable. Default stays `Sleep`. Measured on the reference machine, medians of three:
+
+| | `Sleep` (default) | `NoSleep` | |
+|---|---|---|---|
+| Round-trip latency | 4.68 µs | **1.15 µs** | 4.1x |
+| 6-node frame DAG | 22.50 µs | **7.76 µs** | 2.9x |
+| 1M fork-join | 0.22 ms | **0.07 ms** | 3.1x |
+| throughput/1p | 1.21 M/s | **6.30 M/s** | 5.2x |
+| throughput/mp | 8.89 M/s | 12.40 M/s | 1.4x |
+| burst from idle | 11.6x of 16 | 12.6x of 16 | flat |
+
+The wake path was the largest single cost in the scheduler and nothing here had measured it. That is
+the honest summary: 3-5x on everything latency-shaped, for the price of holding the cores.
+
+**Burst barely moved, and that is the control.** Its shortfall was predicted BEFORE measuring to be
+frequency scaling rather than wake latency -- 16 heavy tasks at once settle toward base clock on a
+chip at Intel spec power limits, where one task alone boosts. It stayed flat while everything else
+moved 3-5x, which is what makes the other rows a signal rather than drift.
+
+**The default stays `Sleep`, deliberately.** Spinning workers are a battery and thermal problem on
+the ARM64/Android target, where throttling costs more clock than the wake ever costs in dispatch;
+they starve whatever else the host runs; and they make the oversubscription policy incoherent, since
+it reserves a core per persistent busy thread and this would make every worker one. `NoSleep` is for
+an application that owns the machine.
+
+**Negative result: there is no middle setting, and not for lack of trying.** A `SpinBriefly` mode
+was built and measured -- search for a configurable number of microseconds, then park -- on the
+classic spin-then-block reasoning that spinning for the cost of a block is 2-competitive. It was
+worse than BOTH neighbours, monotonically worse as the budget grew (frame DAG, µs per graph:
+`Sleep` 22.5 | 2 µs 23.6 | 5 µs 23.6 | 20 µs 27.3 | 100 µs 34.4 | `NoSleep` 7.8). The 2-competitive
+argument assumes spinning is free for everyone else on the machine, and with 31 workers it is not:
+spinners burn memory bandwidth and contend on steal CASes against the workers that actually have
+work, then park anyway and pay the wake plus continuous park/unpark cv churn. Both extremes avoid
+one half of that; the middle collects both. Removed rather than shipped as a trap for anyone
+reasonably expecting a compromise setting.
+
+`Pause()` parks regardless of policy. This is NOT a timed wait: it changes whether a worker parks,
+never how long it stays parked, so the park is still an unconditional `cv.wait` and a lost wakeup
+still hangs visibly rather than being papered over by a timeout.
+
+The primitives suite now takes a `nosleep` argument and CI runs it twice, once per policy. The
+policy changes the park path, which is precisely where the 1.2.0 lost wakeup lived, so the existing
+blocking cases are worth more there than a bespoke test would be.
+
+### Removed: `WaitAll()` and the `pendingTasks` counter
+
+**API REMOVAL, and the reason 1.2.4 became 1.3.0.** `TaskScheduler::WaitAll()` is gone. It spun on a
+global `pendingTasks` atomic that every push and every completion had to maintain, and it had no
+callers anywhere -- not in the library, the bench, or the tests. Wait on a `WaitGroup` instead, which
+is scoped to the work you actually submitted; "all work everywhere" stops being an answerable
+question as soon as two systems share the pool.
+
+It was not removed for tidiness. That counter was **24 ns per task, 27% of the entire per-task
+cost** -- one contended cache line bounced between every producer and all 31 consumers, twice per
+task. Measured by deleting it and re-running, after a first estimate of "3-9 ns" from a
+consumer-only proxy proved badly wrong:
+
+| | before | after |
+|---|---|---|
+| `throughput/mp` (4 producers) | 3.24 M/s | **10.61 M/s** |
+| `throughput/bt` (`PushBatch`) | 11.81 M/s | **12.42 M/s** |
+| `throughput/1p` (1 producer) | 0.81 M/s | **0.89 M/s** |
+| per-task total, 20k tasks | 88.9 ns | **67.2 ns** |
+
+The 3.3x on multi-producer is the counter's real signature: four producers issuing `fetch_add` on
+the same line that 31 workers are issuing `fetch_sub` on.
+
+`DumpPoolState` now SUMS the per-worker deques instead of printing the counter. That is strictly
+better diagnostics -- it says where the work is, not just how much -- and it costs nothing, because
+it only runs when a watchdog has already given up. The per-worker `<-- SLEEPING WITH WORK` line,
+which is what actually identified the lost wakeup above, is untouched.
+
+### Submission throughput
+
+**`PushBatch` now spreads a batch across workers instead of stacking it on one.** It picked a single
+worker and pushed every task into that worker's inbox. Inboxes are owner-drain-only, so that one
+worker then moved the whole batch into its local deque `BATCH_SIZE` at a time while every other
+worker stole from it ONE ITEM AT A TIME -- a 20k-task batch became one drain loop plus ~20k
+single-item steal CASes contending on a single deque, with the producer that had just paid to build
+the batch sitting idle. Segmenting costs nothing (the `next` links were being written anyway, just
+as one long chain instead of several short ones) and turns one hot deque into several warm ones.
+Measured at 31 workers, 20k tasks: dispatch **90 ns -> ~56 ns per task**.
+
+Batches are NOT split below 64 tasks per segment. Each segment costs a `NotifyWorker`, which takes
+the target's mutex, and splitting a small batch every which way pays those wake-ups for parallelism
+it is too small to use -- that was a measured regression on small batches before the floor existed.
+Explicit `cpuaffinity` is still honoured exactly and never spread; it is an explicit request.
+
+**`ParallelFor`'s flat path submits with one `PushBatch`** instead of `numTasks-1` individual
+`Push` calls, collected into a stack buffer so nothing is allocated on a path that runs per frame.
+It passes `minPerSegment=1`, not the default 64: this path only runs at <= 2 tasks per worker, so a
+64-task floor would collapse the batch onto ONE worker -- strictly worse than the per-task `Push` it
+replaces, which at least round-robined.
+
+Reported as neutral, because that is what it measured. ParallelFor floors `chunkSize` so
+`numTasks <= workers*4`, and dispatches to fork-join above `workers*2`, so the flat path only ever
+sees small task counts and the bench moved no further than its run-to-run spread. It is kept for
+being strictly fewer notifies at equal distribution, not for a number.
+
+**Fork-join's dispatch threshold was re-tested and stays.** The comment justifying it blames flat's
+"O(#tasks) serial CreateTask+Push+NotifyWorker on one thread", and `PushBatch` removes exactly that
+notify storm -- so the threshold might have become obsolete. Measured instead of assumed: forcing
+the flat path for a 79-task ParallelFor gives **0.485 ms against fork-join's 0.400 ms**, with 26%
+spread against 7%. Fork-join still wins and the threshold is still earned. The likely mechanism,
+untested: from an idle pool flat issues every notify serially to a SLEEPING worker, while fork-join's
+cascade wakes a few, and the deeper levels' notifies then hit already-awake workers and are skipped
+by the awake-preference fast path.
+
+**New: `PushArray(begin, end, chunkSize, fn, wg)`.** Submits a range as `ceil(n/chunkSize)` tasks,
+each looping its own chunk and calling `fn(i)` per index, instead of one task per item. Per-task
+overhead is a per-TASK cost, not a per-item one -- it buys queueing, stealing, completion accounting
+and reclamation, none of which n known-up-front items each need separately -- so chunking divides the
+whole figure by `chunkSize`. Measured per item at 20k items: **80 ns at chunk 1 -> 14 ns at 8 ->
+4.9 at 32 -> 1.3 at 128**. It is the fire-and-forget sibling of `ParallelFor`, which probes the work,
+picks its own split, runs a chunk on the calling thread and blocks; use `PushArray` when the caller
+has other work to do, wants to submit several ranges before waiting on them together, or already
+knows its own grain.
+
+**Task completion can skip the virtual destructor** when the concrete type provably has nothing to
+destroy (`Task::trivialDtor`, set by both `CreateTask` overloads; the lambda overload keys off
+`std::is_trivially_destructible_v<F>`). Reported for completeness rather than as a win: A/B measured
+**~2.6 ns against a 49-61 ns run-to-run spread**, so it is not distinguishable from noise here. Kept
+because it is free and correct, and the default is 0 -- "not known to be trivial" -- so a task built
+anywhere other than `CreateTask` keeps paying the call and an oversight can only ever be slow,
+never wrong.
+
+Not done: batching the per-task `WaitGroup` decrement. A contended shared atomic measures ~3-9 ns of
+the ~80 ns total here, and deferring a completion signal so it can be flushed in bulk reintroduces
+exactly the lost-wakeup shape this release exists to fix. `PushArray` already collapses those
+decrements to one per chunk, which is the same benefit with none of the risk.
+
+Tests: `PushArray` index coverage (exactly once, no gap and no duplicate -- the failure mode of a
+chunked API is an off-by-one at a chunk boundary, which no timing benchmark would catch), chunk
+larger than the range, empty and inverted ranges, `chunkSize == 0`, and a 5000-task spread
+`PushBatch` arrival check.
+
+### Comparison harness
+
+**New opt-in `bench/compare`** measuring against enkiTS -- the closest architectural peer, so a gap
+localises to implementation rather than design. Requires `-DJLIBSCHED_ENKITS_DIR`; without it the
+target does not exist, so normal builds and CI never see it, and enkiTS is not vendored.
+
+It takes an optional `nosleep` argument, and the file says in capitals not to quote that run as a
+comparison. Both schedulers live in the harness's one process, so under `NoSleep` JLib's workers spin
+through enkiTS's benchmarks as well -- 63 threads on 32 CPUs. The confound is visible in enkiTS's own
+column, which cannot legitimately move when a JLib setting changes and does: ranged per-item 15.3 →
+8.7 ns, latency 21.4 → 18.2 µs. enkiTS measured ~40% FASTER because JLib stopped sleeping, almost
+certainly core parking. Head-to-head numbers come from the default run; `NoSleep` figures come from
+`SchedulerBench`, which runs JLib alone.
+
+Five workloads, with predictions recorded in the file before measuring and every harness fault
+recorded next to the number it corrupted -- the first draft reported enkiTS as 15x slower and all
+four faults were the harness (N waits against one, `WaitforAll` not being a per-batch wait,
+`sleep_for(20us)` costing a full 15.6 ms Windows quantum, and mismatched baselines). It also fixes
+one pointed the other way: the JLib column now reports `PushBatch` as well as per-task `Push`.
 
 ## 1.2.3 - 2026-08-13
 

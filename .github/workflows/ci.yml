@@ -101,6 +101,14 @@ jobs:
         run: ./${{ matrix.prims }}
         shell: bash
 
+      # Same suite again under IdlePolicy::NoSleep. That policy changes the worker's park path --
+      # the exact code the 1.2.0 lost wakeup lived in -- so running the existing blocking cases
+      # under it is worth far more than a bespoke test would be. Cheap: the suite is seconds, and
+      # it carries its own watchdog, so a regression here fails fast instead of hanging the job.
+      - name: Run primitives test under NoSleep
+        run: ./${{ matrix.prims }} nosleep
+        shell: bash
+
       # The steal counters compile out entirely in a normal build, which is the point but also the
       # hazard: code that is never compiled rots silently, and the first person to need it would
       # discover that months later while chasing something else. This is the one place it gets built,

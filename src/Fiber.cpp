@@ -25,7 +25,7 @@ void Fiber::Suspend() {
 void Fiber::Resume() {
 	// Robust wake that closes the lost-wakeup window. Two parkable states:
 	//  - SUSPENDED: the worker already saved the context and parked us -> CAS to READY
-	//    and re-queue (Requeue: no pendingTasks bump, since we were never decremented).
+	//    and re-queue (Requeue: nothing to re-count, since we were never completed).
 	//  - WANTS_SUSPEND: we asked to suspend but the worker hasn't published SUSPENDED
 	//    yet (context maybe not saved) -> we must NOT resume now. Flip to SUSPEND_SIGNALED
 	//    so the worker's park step wakes us once the context is safely saved.

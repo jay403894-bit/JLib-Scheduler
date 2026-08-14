@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "1.2.4")
+set(JLIBSCHED_VERSION "1.3.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -200,6 +200,14 @@ endforeach()
 if(WIN32)
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/*.cpp")
     set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/ContextSwitch.asm")
+    # Pin the language explicitly rather than letting CMake infer it from the .asm extension.
+    # Inference works right up until something ELSE in the same build tree enables the generic ASM
+    # language -- a third-party add_subdirectory is enough -- at which point .asm becomes ambiguous,
+    # CMake stops routing this file through MASM, and the whole library links with ContextSwitch and
+    # FiberTrampoline undefined. Found when the marl comparison target was added: it broke every
+    # other target in that tree, not just its own, and the error names our symbols rather than
+    # anything to do with marl.
+    set_source_files_properties("${JLIBSCHED_ASM}" PROPERTIES LANGUAGE ASM_MASM)
 else()
     # OS layer: src/posix/ (Linux, Android) or src/darwin/ (macOS). They diverge wholesale --
     # sysfs text versus sysctl, and macOS has no thread-affinity API at all -- so they are separate
@@ -292,6 +300,10 @@ target_compile_features(SchedulerTopologyTest PRIVATE cxx_std_17)
 # The fiber-aware locks. Least-tested code in the library and the most recently changed, including a
 # regression test for the 1.2.3 self-deadlock. Every blocking case runs under a watchdog, so a
 # regression fails in seconds instead of hanging CI for the whole job timeout.
+# Third-party comparison harness. Adds nothing unless -DJLIBSCHED_ENKITS_DIR is passed, so a normal
+# build and CI never see it -- see bench/compare/CMakeLists.txt for why it is opt-in.
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/bench/compare")
+
 add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primitives_test.cpp")
 target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)
 target_compile_features(SchedulerPrimitivesTest PRIVATE cxx_std_17)

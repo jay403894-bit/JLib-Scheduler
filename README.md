@@ -18,18 +18,45 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
 
-| | i9-13900K at Intel spec power limits, Release, 1.2.0 |
+| | i9-13900K at Intel spec power limits, Release, 1.3.0 |
 |---|---|
 | Task enqueue → dequeue latency | 4.7 µs |
-| 6-node frame DAG (build, validate, execute) | 22.1 µs |
-| 1M-element recursive fork-join (10k leaves) | 0.23 ms |
-| Bulk submission via `PushBatch` | 11.9 M tasks/sec |
+| 6-node frame DAG (build, validate, execute) | 22.7 µs |
+| 1M-element recursive fork-join (10k leaves) | 0.22 ms |
+| Bulk submission via `PushBatch` | 12.1 M tasks/sec |
+| Bulk submission, 4 producers | 8.4 M tasks/sec |
+| Per-item cost via `PushArray` (chunk 128) | 1.0 ns |
 | `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
 | Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
 | Steal protocol | single-item Chase-Lev CAS |
 
 Medians of five runs on the default affinity policy. Run-to-run spread was 2.4% on latency, 9% on
 the DAG and 19% on fork-join, so treat the last digit as noise.
+
+**Those are the DEFAULT numbers, where idle workers park.** `SetIdlePolicy(IdlePolicy::NoSleep)`
+keeps them searching instead, and the wake path turns out to be the largest single cost in the
+scheduler:
+
+| | `Sleep` (default) | `NoSleep` | |
+|---|---|---|---|
+| Task enqueue → dequeue latency | 4.68 µs | **1.15 µs** | 4.1x |
+| 6-node frame DAG | 22.50 µs | **7.76 µs** | 2.9x |
+| 1M recursive fork-join | 0.22 ms | **0.07 ms** | 3.1x |
+| Single-producer submission | 1.21 M/s | **6.30 M/s** | 5.2x |
+| 16 heavy tasks from an idle pool | 11.6x of 16 | 12.6x of 16 | flat |
+
+That last row is the control, and it is the reason to believe the others. Its shortfall was
+predicted before measuring to be frequency scaling rather than wake latency -- 16 heavy tasks at
+once settle toward base clock on a chip at Intel spec power limits, where one task alone boosts. It
+stayed flat while everything else moved 3-5x.
+
+The default stays `Sleep` and should, for a library: spinning workers are a battery and thermal
+problem on Android, they starve whatever else the host process runs, and they make the
+oversubscription policy incoherent. `NoSleep` is for an application that owns the machine, which a
+fullscreen game does. There is deliberately no middle setting -- a spin-then-park mode was built,
+measured worse than both extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
+
+Run `SchedulerBench nosleep` to reproduce.
 
 **This machine runs Intel's specified power limits with unlimited turbo disabled**, so it boosts
 briefly and then settles near base clock under sustained load. That is the part behaving as Intel
@@ -231,6 +258,91 @@ decisions that were tried and removed.
 marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so middleware written
 for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
 and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
+
+### Measured against enkiTS
+
+Same machine, same harness, same worker count, both libraries expressed the way their authors
+intended. i9-13900K at Intel spec power limits (see the caveat under [Measured](#measured)), 31
+workers, Release, 1.3.0. `--` is not measured yet.
+
+**Every column below was measured with only that scheduler running.** The harness takes `--only=jlib`
+/ `--only=enki` and starts nothing else, so no library's threads are alive while another is timed.
+
+| | this (Sleep) | this (NoSleep) | enkiTS | Taskflow | marl |
+|---|---|---|---|---|---|
+| Round-trip submit→run→wait | 4.6 µs | 0.97 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
+| Independent tasks, per task | 74 ns | **69 ns** | 21.8 µs | 310 ns | 290 ns |
+| Range work, per item | 36 ns | 24 ns | **15 ns** | -- | -- |
+| Bulk parallel-for, 20k items | 0.39 ms | **0.29 ms** | 0.33 ms | 0.49 ms | -- |
+| 25% of tasks blocked 600 µs | **8.2 ms** | 10.1 ms | 15.4 ms | -- | -- |
+
+Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
+(**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
+recommendation).
+
+**The latency row is an idle-policy axis, not an architecture one.** Taskflow and marl both keep
+their workers searching before parking — Taskflow tries ~64 steals then yields 150 more times before
+sleeping — so their defaults sit where `NoSleep` sits, and all three land within a few hundred
+nanoseconds of each other. enkiTS parks promptly, like the default here, and is far slower again
+because it suspends on a *shared* completion semaphore. Comparing anyone's default to `Sleep` here
+would be measuring configuration and calling it design.
+
+Independent-task throughput is the row where the architecture actually shows: 69-74 ns against
+290-310 ns for the two fiber/graph libraries, and enkiTS is not really in this race at all because
+submitting N single-item task sets is the usage it tells you to avoid.
+
+`Sleep` is the default and the mobile/embedded configuration; `NoSleep` holds every worker core and
+is for an application that owns the machine. They are close to two different products, which is why
+both are listed rather than only the flattering one.
+
+Note that `NoSleep` is not uniformly better: it **loses** on the blocking row (10.1 ms against
+8.2 ms). Parked fibers have nothing for the spinning workers to do there, so the spin is pure waste.
+It wins where dispatch latency dominates and costs you where it does not.
+
+**Isolation is not optional here, and it took a wrong result to learn that.** An earlier version ran
+both libraries in one process. Under `Sleep` that is harmless, because the pool not being
+benchmarked is parked -- enkiTS measured alone (15.4 ns/item, 21.7 µs, 0.334 ms) matches what it
+measured beside a sleeping JLib (15.3, 21.4, 0.331). Under `NoSleep` it is not harmless at all:
+JLib's 31 workers spin through enkiTS's benchmarks too, 63 threads on 32 CPUs, and enkiTS's own
+numbers moved ~40% -- ranged per-item 15.3 → 8.7 ns, latency 21.4 → 18.2 µs -- purely because a JLib
+setting changed. A library's numbers moving when you reconfigure a different library is the signal
+that a harness is measuring the machine rather than the code.
+
+**The first two rows are the same quantity measured on each library's own terms, and they disagree
+by 200x in opposite directions -- which is the point.** enkiTS's scheduled entity is a 16-byte
+`SubTaskSet` in a contiguous fixed ring: no allocation, no pointer chase, and the caller owns the
+`ITaskSet` and keeps it alive. That is why its per-ITEM cost is so low, and why its per-TASK cost is
+so high when you actually need n independent task objects -- every `AddTaskSetToPipe` wakes the
+waiting pool so one thread can claim one task. A `Task` here is 64 bytes carrying its own callable,
+so it costs more per entity and can be fire-and-forget with captures. The size difference IS the API
+difference; neither is a missed optimisation.
+
+Read the rows accordingly: use `PushArray`/`ParallelFor` for range work and compare against row 3,
+use individual tasks for a heterogeneous frame graph and compare against row 2.
+
+Blocking is the row the fiber hybrid exists for, and it is a crossover rather than a win: even at
+25% blocked it needs blocks longer than ~50 µs before parking beats simply holding the thread, peaks
+at **1.75x around 600 µs**, and tapers again by 2 ms. Below that the fiber costs more than it saves.
+
+Reproduce with the opt-in harness -- it is not built by default and enkiTS is not vendored:
+
+```
+git clone https://github.com/dougbinks/enkiTS
+cmake -B build-compare -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_ENKITS_DIR=/path/to/enkiTS
+cmake --build build-compare --config Release --target CompareEnkiTS
+./build-compare/bin/Release/CompareEnkiTS --only=jlib
+./build-compare/bin/Release/CompareEnkiTS --only=jlib nosleep
+./build-compare/bin/Release/CompareEnkiTS --only=enki
+```
+
+Three runs, one scheduler each. With no `--only` it measures both in one process, which is valid only
+while every library present parks when idle -- so `nosleep` forces `--only=jlib` and says so, rather
+than quietly emitting a confounded column.
+
+`bench/compare/compare_enkits.cpp` records the predictions made before measuring and, next to each
+number, the harness faults that corrupted it first. The initial draft reported enkiTS as 15x slower
+and every one of those faults was the harness, not enkiTS -- worth reading before trusting any row
+here, and before writing a comparison of your own.
 
 ## Versioning
 

@@ -104,6 +104,47 @@ namespace JLib {
 		static void           SetAffinityPolicy(AffinityPolicy p);
 		static AffinityPolicy GetAffinityPolicy();
 
+		// What an idle worker does when it has no local work and stole nothing. Set BEFORE Init().
+		//
+		//   Sleep (default) -- park on the condition variable. Costs a kernel transition to wake,
+		//                      which is the single largest item in dispatch latency, and gives the
+		//                      core back to everything else on the machine.
+		//   NoSleep         -- never park while running. Lowest possible dispatch latency, and it
+		//                      holds every worker core permanently. Measured on the reference machine:
+		//                      4.1x on round-trip latency, 2.9x on the frame DAG, 3.1x on fork-join,
+		//                      5.2x on single-producer throughput. That is what a core each buys.
+		//
+		// THE DEFAULT IS Sleep AND SHOULD STAY THAT WAY for a library rather than an application.
+		// Spinning workers are a battery and thermal problem on the ARM64/Android target, where the
+		// throttling costs more clock than the wake latency ever costs in dispatch; they starve
+		// whatever else the host runs (an audio device thread, a render thread, Jolt through the
+		// JobSystem adapter); and they make the oversubscription policy incoherent, since that
+		// policy reserves a core per persistent busy thread and this would make EVERY worker one.
+		// NoSleep is for an application that genuinely owns the machine -- a fullscreen game is the
+		// obvious one, and the gains above are large enough to be worth the cores there.
+		//
+		// Pause() parks regardless of policy -- pausing means "stop using the CPU", and a policy
+		// that kept spinning through it would be ignoring the only thing Pause is for.
+		//
+		// NOT A TIMED WAIT, and the distinction matters: this changes how long a worker searches
+		// BEFORE parking, and the park itself stays an unconditional cv.wait. A lost wakeup still
+		// hangs, unconditionally and visibly, instead of being silently papered over by a timeout.
+		// It does make such a race rarer, which is a real debugging cost -- the 1.2.0 lost wakeup
+		// was only findable because it reproduced at ~25% on a slow runner.
+		// THERE IS DELIBERATELY NO MIDDLE SETTING. A SpinBriefly mode existed here, searching for a
+		// configurable number of microseconds before parking, on the classic spin-then-block
+		// reasoning that spinning for the cost of a block is 2-competitive. It was measured and it
+		// was WORSE THAN BOTH NEIGHBOURS, monotonically worse as the budget grew (frame DAG, µs per
+		// graph: Sleep 22.5 | brief@2 23.6 | brief@5 23.6 | brief@20 27.3 | brief@100 34.4 |
+		// NoSleep 7.8). The 2-competitive argument assumes spinning is free for everyone else, and
+		// with 31 workers it is not: spinners burn memory bandwidth and contend on steal CASes
+		// against the workers that actually have work, and then park anyway, paying the wake cost
+		// plus continuous park/unpark cv churn on top. Both extremes avoid one half of that; the
+		// middle gets both. Removed rather than kept as a trap for anyone expecting a compromise.
+		enum class IdlePolicy : uint8_t { Sleep = 0, NoSleep };
+		static void       SetIdlePolicy(IdlePolicy p);
+		static IdlePolicy GetIdlePolicy();
+
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
 		// dispatch+join overhead, and an unoptimized build pays roughly an order of magnitude more of it.
@@ -132,7 +173,63 @@ namespace JLib {
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
 		bool Requeue(Task* task);
-		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0);
+		// minPerSegment: the smallest run this is willing to hand to a single worker. The default of
+		// 64 suits a big fire-and-forget batch, where the alternative is ONE push and the notifies
+		// are pure added cost. A caller replacing N individual Push() calls -- which already notify
+		// N times -- wants 1, because for it any segmenting strictly REDUCES notifies. Getting this
+		// backwards is a real regression in both directions, so it is a parameter rather than a
+		// constant: see ParallelFor's flat path.
+		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0, size_t minPerSegment=64);
+
+		// Submit [begin, end) as ceil(n/chunkSize) TASKS rather than n of them, each task looping
+		// over its own chunk and calling fn(i) per index. Returns the number of tasks created.
+		//
+		// WHY THIS EXISTS. Per-task scheduler overhead is ~85-105 ns measured (create + dispatch +
+		// execute + reclaim), and it is a per-TASK cost, not a per-item one: it buys queueing,
+		// stealing, completion accounting and reclamation, none of which n independent items each
+		// need separately when they are known up front. Chunking divides that whole figure by
+		// chunkSize -- at 32 it is ~3 ns/item -- which is the same amortisation a range-based API
+		// gets, without giving up a per-item callable.
+		//
+		// NOT A REPLACEMENT FOR ParallelFor, which probes the work, picks its own split, runs a
+		// chunk on the calling thread and blocks until done. PushArray is the fire-and-forget
+		// sibling: it returns as soon as the work is queued, so use it when the caller has other
+		// things to do, wants to submit several arrays before waiting on them together, or already
+		// knows its own chunk size. Pass a WaitGroup to be able to wait; pass nullptr not to.
+		//
+		// fn is COPIED into every chunk task (so it must be copyable, and its captures must outlive
+		// the work). If the arena is exhausted the remaining chunks run INLINE on the caller, which
+		// is the same graceful degradation ParallelFor does rather than dropping work on the floor.
+		template<typename F>
+		size_t PushArray(size_t begin, size_t end, size_t chunkSize, F&& fn, WaitGroup* wg = nullptr) {
+			if (end <= begin) return 0;
+			if (chunkSize == 0) chunkSize = 1;
+			const size_t total  = end - begin;
+			const size_t chunks = (total + chunkSize - 1) / chunkSize;
+
+			std::vector<Task*> ts;
+			ts.reserve(chunks);
+			for (size_t c = 0; c < chunks; ++c) {
+				const size_t lo = begin + c * chunkSize;
+				const size_t hi = (lo + chunkSize > end) ? end : lo + chunkSize;
+				Task* t = CreateTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); });
+				if (!t) {                                   // arena exhausted: run it here
+					for (size_t i = lo; i < hi; ++i) fn(i);
+					continue;
+				}
+				t->waitGroup = wg;
+				ts.push_back(t);
+			}
+
+			// Count BEFORE the push, never after: the instant PushBatch publishes these, a worker
+			// can run one and decrement. Adding to n afterwards races a WaitFor that already saw
+			// zero and returned on half-submitted work.
+			if (wg && !ts.empty())
+				wg->n.fetch_add((int)ts.size(), std::memory_order_relaxed);
+			if (!ts.empty())
+				PushBatch(ts.data(), ts.size());
+			return ts.size();
+		}
 		bool PushImmediate(uint8_t cpu_affinity, Task* task);
 		bool PushFork(Task* task);
 		static bool IsInitialized() {
@@ -174,7 +271,11 @@ namespace JLib {
 		void Resume();
 		void Stop(Task* worker_task);
 		TaskAllocator* GetAllocator();
-		void WaitAll();
+		// WaitAll() was REMOVED in 1.3.0. It spun on a global `pendingTasks` atomic that every push
+		// and every completion had to maintain -- 24 ns per task in contention, 27% of the whole
+		// per-task cost, to serve one method with no callers anywhere. Wait on a WaitGroup instead,
+		// which is scoped to the work you actually submitted; "all work everywhere" is not a
+		// question a caller can ask meaningfully once more than one system shares the pool.
 
 		// Lets a non-worker caller (e.g. main, while spinning on a WaitGroup/counter) safely
 		// help drain the pool instead of pure-spinning. Steals ONE noFiber task via GetTask(), which
@@ -183,9 +284,8 @@ namespace JLib {
 		// to), so it stays queued for a real worker. This replaced the old steal-then-Requeue
 		// relocation, which was pure contention churn (claim CAS + re-push + notify, task moved
 		// nowhere). On a successful steal: runs Execute() inline, then frees with the EXACT SAME
-		// sequence Worker()'s fast path uses (~Task(), Free(), pendingTasks decrement, EBR tick
-		// check) -- required so the slab and pendingTasks/WaitAll() stay correct; skipping any
-		// one of these either leaks a slab slot or hangs a WaitAll().
+		// sequence Worker()'s fast path uses (DestroyTask(), Free(), EBR tick check) -- required so
+		// the slab stays correct; skipping either of these leaks a slab slot.
 		// Returns true if it ran a task, false if nothing stealable -- callers should yield()
 		// on false to avoid a hot spin.
 		bool TryRunStolenNoFiberTask();
@@ -217,6 +317,10 @@ namespace JLib {
 			t->requiredSize = size;
 			t->noFiber = noFiber;
 			t->corePref = corePref;
+			// ~LambdaTask is empty and its only member is the functor, so the destructor has work
+			// to do only when the CAPTURES do. Non-capturing lambdas and captures of scalars or
+			// raw pointers -- the overwhelming majority of task bodies -- skip the virtual call.
+			t->trivialDtor = std::is_trivially_destructible_v<std::decay_t<F>> ? 1 : 0;
 			return t;
 		}
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
@@ -245,7 +349,6 @@ namespace JLib {
 
 		// ---------- former SharedQueues state ----------
 		std::atomic<uint64_t> nextId{ 0 };
-		std::atomic<int> pendingTasks{ 0 };
 		std::vector<std::unique_ptr<std::atomic<bool>>> immediateCoresInUse;
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> loPri;
@@ -277,12 +380,12 @@ namespace JLib {
 		Task* GetTask();
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
+		int PickNextWorker(CorePref pref = CorePref::Default);
 		bool PushToCore(size_t core_id, Task* task);
 		// Picks a worker from the requested class set (P/E), SPILLING to the other class if unavailable;
 		// Default/Any/Wide (and non-hybrid / all-pinned) use the original full-pool round-robin. Placement
 		// is governed SOLELY by CorePref -- hiPri is queue order only, never consulted for placement.
 		// Preference is a hint -- never a constraint.
-		int PickNextWorker(CorePref pref = CorePref::Default);
 
 		// NOTE: an external-submitter fan-out cap was tried here and REMOVED. See CHANGELOG 1.1.1.
 		// It made single-producer submission much faster and burst parallelism much worse, and it

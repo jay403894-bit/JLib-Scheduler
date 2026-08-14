@@ -16,6 +16,7 @@
 #include <TaskScheduler.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -211,9 +212,91 @@ static void TestNoSelfDeadlock(JLib::TaskScheduler& sched) {
           "every queued task that wanted the held lock completed");
 }
 
-int main() {
-    StartWatchdog(30, "primitives test");
+// PushArray: every index runs EXACTLY once, the chunk count is what was asked for, and the
+// WaitGroup covers all of it. "Exactly once" is the property worth guarding -- the failure mode of
+// a chunked submit API is an off-by-one at a chunk boundary that either skips the last item or runs
+// it twice, and neither shows up in a timing benchmark. A per-index counter catches both directions
+// at once, which a plain total would not.
+static void TestPushArray(JLib::TaskScheduler& sched) {
+    constexpr size_t kN = 1000;
+    static std::atomic<int> visits[kN];
+    for (size_t i = 0; i < kN; ++i) visits[i].store(0, std::memory_order_relaxed);
 
+    JLib::WaitGroup wg;
+    const size_t made = sched.PushArray(0, kN, 32, [](size_t i) {
+        visits[i].fetch_add(1, std::memory_order_relaxed);
+    }, &wg);
+    sched.WaitFor(wg);
+
+    Check(made == (kN + 31) / 32, "PushArray created ceil(n/chunk) tasks");
+    bool once = true;
+    for (size_t i = 0; i < kN; ++i)
+        if (visits[i].load(std::memory_order_relaxed) != 1) { once = false; break; }
+    Check(once, "every index ran exactly once (no gap, no duplicate)");
+
+    // A chunk larger than the range must collapse to one task, not overrun the end.
+    for (size_t i = 0; i < kN; ++i) visits[i].store(0, std::memory_order_relaxed);
+    JLib::WaitGroup wg2;
+    const size_t big = sched.PushArray(0, 10, 4096, [](size_t i) {
+        visits[i].fetch_add(1, std::memory_order_relaxed);
+    }, &wg2);
+    sched.WaitFor(wg2);
+    bool clipped = (big == 1) && visits[9].load(std::memory_order_relaxed) == 1
+                              && visits[10].load(std::memory_order_relaxed) == 0;
+    Check(clipped, "chunk larger than the range clips to one task and stops at end");
+
+    // Degenerate inputs return 0 and submit nothing, rather than dividing by zero or looping.
+    JLib::WaitGroup wg3;
+    Check(sched.PushArray(5, 5, 8, [](size_t) {}, &wg3) == 0, "empty range creates no tasks");
+    Check(sched.PushArray(9, 4, 8, [](size_t) {}, &wg3) == 0, "inverted range creates no tasks");
+
+    // chunkSize 0 is treated as 1 rather than dividing by zero.
+    for (size_t i = 0; i < kN; ++i) visits[i].store(0, std::memory_order_relaxed);
+    JLib::WaitGroup wg4;
+    const size_t z = sched.PushArray(0, 16, 0, [](size_t i) {
+        visits[i].fetch_add(1, std::memory_order_relaxed);
+    }, &wg4);
+    sched.WaitFor(wg4);
+    bool zok = (z == 16);
+    for (size_t i = 0; i < 16 && zok; ++i)
+        if (visits[i].load(std::memory_order_relaxed) != 1) zok = false;
+    Check(zok, "chunkSize 0 behaves as 1");
+}
+
+// PushBatch spreads a large batch across workers instead of stacking it on one. The property that
+// must hold regardless of how it segments: every task arrives exactly once. Segmenting relinks the
+// `next` chain per run, so a bug here loses or duplicates whole segments -- the exact failure the
+// old single-target version could not have.
+static void TestPushBatchSpread(JLib::TaskScheduler& sched) {
+    constexpr int kTasks = 5000;
+    static std::atomic<int> ran{ 0 };
+    ran.store(0, std::memory_order_relaxed);
+
+    JLib::WaitGroup wg;
+    wg.n.store(kTasks, std::memory_order_relaxed);
+    std::vector<JLib::Task*> ts(kTasks);
+    for (int i = 0; i < kTasks; ++i) {
+        ts[i] = sched.CreateTask(+[](void*) { ran.fetch_add(1, std::memory_order_relaxed); }, nullptr);
+        ts[i]->waitGroup = &wg;
+    }
+    sched.PushBatch(ts.data(), ts.size());
+    sched.WaitFor(wg);
+
+    Check(ran.load(std::memory_order_relaxed) == kTasks,
+          "every task in a spread PushBatch ran exactly once");
+}
+
+// Pass "nosleep" to run the ENTIRE suite under IdlePolicy::NoSleep. Reusing every existing case
+// under both policies beats writing one bespoke NoSleep test: the policy changes the worker's park
+// path, which is exactly where the 1.2.0 lost wakeup lived, and the cases that would expose a
+// regression there are the blocking ones already written -- contention, the semaphore handoff, and
+// the spin-help deadlock guard. CI runs this binary twice, once per policy.
+int main(int argc, char** argv) {
+    const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
+    std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
+    StartWatchdog(30, noSleep ? "primitives test (nosleep)" : "primitives test");
+
+    if (noSleep) JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
     JLib::TaskScheduler::Init(4);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
@@ -222,6 +305,8 @@ int main() {
     TestSemaphore();
     TestScopedPermit(sched);
     TestNoSelfDeadlock(sched);
+    TestPushArray(sched);
+    TestPushBatchSpread(sched);
 
     sched.Join();
     g_done.store(true, std::memory_order_release);
