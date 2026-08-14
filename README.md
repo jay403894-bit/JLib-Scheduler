@@ -277,61 +277,57 @@ int main() {
 
 ### Submit from inside the pool where you can
 
-Tasks that spawn tasks are the path this is built around. On a 32-thread i9, pushing 200,000 tasks
-from one thread runs at **1.0 M/s**; submitting the same work from four tasks already on the pool
-runs at **9.8 M/s**. Single-producer submission also gets *worse* as workers are added, because
-external pushes round-robin across every worker's inbox, so the producer's coherence traffic grows
-with the pool.
+Pushing 200,000 tasks from one thread runs at **1.0 M/s**; submitting the same work from four tasks
+already on the pool runs at **9.8 M/s** -- and single-producer submission gets *worse* as workers are
+added. The cost is all in submission, not in finishing: drain-after-submit is 0.00 ms at every pool
+size, so the pool is done before the loop stops pushing.
 
-The cost is entirely in submission, not in finishing the work: drain-after-submit is 0.00 ms at
-every pool size, so the pool is already done by the time the loop stops pushing.
+The reason is structural. The deques are Chase-Lev, so an owner pushes and pops with no atomic in
+the common case and only thieves pay the CAS. A task spawning a task gets that fast path; an outside
+push goes through the shared inbox and round-robins across every worker, so the producer's coherence
+traffic grows with the pool.
 
-If you must submit in bulk from one thread, `PushBatch` is the answer -- **12.2 M/s, flat across
-pool sizes.** It links the tasks locally and hands the chain over in segments, instead of paying a
-worker selection, a queue push and a condition-variable signal per task. For a range of items,
-`PushArray` is cheaper still at **1.0 ns per item**, because it submits ceil(n/chunk) tasks rather
-than n.
+One submitter is still a normal shape -- a main thread queueing a frame's work is fine. It just means
+that if adding workers stops helping, the loop is the thing to look at. Two ways to fix it in bulk:
 
-The deques are Chase-Lev, which is the structural half: the owner pushes and pops locally with no
-atomic in the common case, and only thieves pay the CAS. That asymmetry assumes the producer is a
-worker -- a task spawning a task gets the fast path, an outside push goes through the shared inbox.
+- **`PushBatch`** -- 12.2 M/s, flat across pool sizes. Links the tasks and hands them over in
+  segments, instead of paying a worker selection, a queue push and a condition-variable signal each.
+- **`PushArray`** -- 1.0 ns per item, because it submits ceil(n/chunk) tasks rather than n.
 
-None of which makes one submitter wrong; a main thread submitting a frame's work is a normal shape.
-It means that if more workers is not helping, look at the loop rather than the pool size.
-`SchedulerBench` reports both as `throughput/1p` and `throughput/mp`.
+`SchedulerBench` reports the two cases as `throughput/1p` and `throughput/mp`.
 
-Three things to know while writing against it. A task that will call `WaitFor` must be created with
-`noFiber = false` -- `noFiber` defaults to true, and a task with no fiber under it cannot suspend, so
-it fail-fasts with no message. Tasks live in 256-byte slab slots, so a lambda capturing more than
-about 192 bytes fails a `static_assert`: capture pointers, not payloads.
+### Two rules
 
-And `CorePref::P` / `CorePref::E` are Windows-only. Elsewhere the scheduler has no way to tell the
-core classes apart, so those requests are silently ignored rather than rejected -- leave tasks at
-`Default` or `Any` on other platforms, and don't build a design that assumes the placement held.
+A task that will call `WaitFor` must be created with **`noFiber = false`**. It defaults to true, and
+a task with no fiber under it cannot suspend -- it fail-fasts with no message.
 
-On **Android, placement does not work at all**, and that is the platform's decision rather than a
-gap here. Its cgroups own thread placement, so the affinity calls either fail for an unprivileged
-app or succeed and are immediately overridden. `Hard` and `Ideal` are effectively `None` there, and
-the topology-aware steal ordering they enable is correspondingly approximate. Android is supported
-for correctness, not for placement, and it is the one target where you should read nothing into
-timings: thermal throttling is unconstrained and the cores are heterogeneous, so a benchmark run
-on a phone describes the phone. It is also verified by hand on Termux rather than in CI, which
-covers Linux AArch64 on glibc but not bionic.
+Tasks live in 256-byte slab slots, so a lambda capturing more than about **192 bytes** fails a
+`static_assert`. Capture pointers, not payloads.
 
-Machines wider than 64 logical CPUs are handled across all processor groups, up to 256 CPUs --
-binding goes through `SetThreadGroupAffinity`/`SetThreadIdealProcessorEx`, which take the group as
-data, rather than `SetThreadAffinityMask`, which takes it from the calling thread and therefore
-cannot name a CPU in a second group. **Untested above 64 CPUs**, because I do not own one; if you
-do, that is the single most useful thing you could report. Everything at 64 and below is unaffected
-and is where the numbers come from.
+### Placement is a hint, and on some platforms it is nothing
+
+`CorePref::P` / `CorePref::E` are **Windows-only**. Elsewhere the scheduler cannot tell the core
+classes apart, so the request is silently ignored rather than rejected -- leave tasks at `Default`
+and do not build a design that assumes placement held.
+
+**Android ignores placement entirely**, by the platform's decision rather than a gap here: its
+cgroups own thread placement, so the affinity calls either fail for an unprivileged app or succeed
+and are immediately overridden. `Hard` and `Ideal` are effectively `None`, and topology-aware
+stealing is correspondingly approximate. Read nothing into timings there -- unconstrained thermal
+throttling and heterogeneous cores mean a phone benchmark describes the phone. Verified by hand on
+Termux rather than in CI, which covers Linux AArch64 on glibc but not bionic.
+
+**Above 64 logical CPUs**, binding goes through `SetThreadGroupAffinity`/`SetThreadIdealProcessorEx`,
+which take the processor group as data -- `SetThreadAffinityMask` takes it from the calling thread
+and so cannot name a CPU in a second group. Handled up to 256 CPUs, but **untested above 64**; if you
+have such a machine, that is the most useful thing you could report.
 
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.
 
-
 ## Versioning
 
-1.0.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
+1.3.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
 not break without a 2.0. Every header is installed because the supported ones need them to compile,
 but the rest are implementation detail and may change in any release. If you need something only
 reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
