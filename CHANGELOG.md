@@ -3,6 +3,62 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.1 - 2026-08-14
+
+**[CRITICAL] fixes a deadlock when more tasks block at once than the fiber pool holds.** A suspended
+task keeps its fiber, so the number of tasks that may be blocked SIMULTANEOUSLY is capped at the
+pool size. Past that cap the pool hung. Anyone on 1.3.0 who fans out more blocking tasks than
+`64 x workers` should take this; the symptom is an unexplained stall, not a crash.
+
+Three separate defects, all found by writing the test for a limit that had just been documented:
+
+**The pool hung instead of degrading.** When `AcquireFiber` failed, the worker pushed the task onto
+the BOTTOM of its own deque -- the LIFO end it pops from -- so the next pop returned the same task.
+The worker span pop/no-fiber/push forever and never reached its inbox drain, which is exactly where
+`SignalAll` deposits the resumed tasks whose completion would have freed the fibers it was waiting
+for. Every worker doing that at once is a deadlock. The comment there called the condition
+"transient -- fibers are in use and will free up", and that claim had already been copied into the
+warning text and the README before anyone tested it. Now routed through `Requeue`.
+
+**The retry path leaked `task_to_run`.** It is a `thread_local` that survives the loop's `continue`,
+and the loop top tests it before searching, so a worker kept re-processing a task it had already
+queued and added another copy each pass. The old `push_bottom` hid this, because the task it
+re-popped WAS the duplicate; routing the task anywhere else turns it into one `Task*` live in two
+queues and run by two workers. It surfaced as a segfault the moment the deadlock was fixed.
+
+**The fiber pool was sized from the machine rather than the pool.** `coreCount` was
+`hardware_concurrency() - 1` instead of the resolved worker count, so `Init(4)` on a 32-thread
+machine allocated 1984 standard + 248 heavy fibers -- about 248 MB of commit for four workers -- and
+`Init(8)` on a 128-thread machine allocated roughly 1 GB. That is backwards for the embedding case
+this library exists for. It remains fully automatic and the default `Init()` is unchanged; only an
+explicitly smaller pool costs less than it used to.
+
+**The exhaustion warning now prints once per process.** It fired on every failed acquire, and since
+the caller re-queues and retries, a short pool spun through that path millions of times -- so the
+warning made the stall slower and buried the one line explaining it.
+
+**Test.** `SchedulerPrimitivesTest` now pushes more blocking tasks than the pool has fibers and
+requires completion. The watchdog is the assertion: there is no honest threshold for "too slow", but
+"finishes at all" is the property that broke. It fails on 1.3.0 by timeout and on the intermediate
+fix by segfault, so it tells the three states apart.
+
+### Also
+
+`Event::SignalAll` re-queues woken fibers in one batch instead of one at a time. Each individual
+re-queue is a placement, an inbox push, a `seq_cst` flag and a condition-variable signal, and a
+broadcast waking 64 fibers paid all of it 64 times, serially, on the signalling thread. Measured on
+the marl blocking comparison: the broadcast-heavy case went 13.5 -> 8.5 ms. Cases with a single
+broadcast per batch are unchanged, so this helps where wakes are frequent rather than large.
+
+`PushBatch` gained a `hiPri` parameter and `PushArray` gained one too, both defaulting to low.
+`PushBatch` routed every batch into the low-priority inboxes unconditionally, which was a silent
+priority inversion for anyone batching high-priority work.
+
+`WaitOnEvent` and `WaitOnEventArmed` gained `Event&` overloads; the name-taking versions forward
+through `GetEvent`. A caller waiting on the same event repeatedly can hoist the lookup to startup and
+keep a global mutex and a string hash off the hot path. The reference is stable for the process
+lifetime -- the registry owns `unique_ptr<Event>`, so a rehash moves the pointer, not the object.
+
 ## 1.3.0 - 2026-08-14
 
 **[CRITICAL] fixes a lost wakeup that could strand a task permanently.** A worker could park while

@@ -107,7 +107,7 @@ workers, Release, 1.3.0. `--` is not measured yet.
 | Independent tasks, per task | 74 ns | **69 ns** | 21.8 µs | 310 ns | 290 ns |
 | Range work, per item | 36 ns | 24 ns | **15 ns** | -- | -- |
 | Bulk parallel-for, 20k items | 0.39 ms | **0.29 ms** | 0.33 ms | 0.49 ms | -- |
-| 25% of tasks blocked 600 µs | **8.2 ms** | 10.1 ms | 15.4 ms | -- | -- |
+| 25% of tasks blocked 600 µs | **7.4 ms** | 10.1 ms | 15.4 ms | -- | 8.8 ms |
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
@@ -119,6 +119,30 @@ sleeping — so their defaults sit where `NoSleep` sits, and all three land with
 nanoseconds of each other. enkiTS parks promptly, like the default here, and is far slower again
 because it suspends on a *shared* completion semaphore. Comparing anyone's default to `Sleep` here
 would be measuring configuration and calling it design.
+
+
+**The blocking row is a crossover, not a verdict, and marl is the only honest peer for it.** enkiTS
+and Taskflow have no fibers, so a blocked task there holds a thread and the comparison is
+architectural rather than close. marl suspends a fiber exactly as this does, so it measures two
+implementations of the same idea. Swept by how long each task blocks (10 batches of 256, 25%
+blocking, ms for all 2560 tasks, each library measured alone):
+
+| block for | this (`Sleep`) | marl |
+|---|---|---|
+| 50 µs | 8.0 | **5.0** |
+| 150 µs | 7.4 | **4.9** |
+| 300 µs | 6.6 | **5.6** |
+| 600 µs | **7.4** | 8.8 |
+| 2000 µs | **22.2** | 22.6 |
+
+marl leads below roughly 400 µs and this leads above it. Two things worth knowing rather than
+smoothing over. Its `Event` carries sticky signalled state and waits on a predicate, so an
+already-satisfied wait costs it nothing, while `JLib::Event` is a stateless rendezvous and always
+pays a suspend/resume round trip -- that is a capability difference, not a slower fiber. And the
+fiber machinery itself is not where this row's cost lives: measured separately, attaching a fiber is
+free within noise and a full suspend/resume round trip is ~166 ns, against a ~1.3 µs baseline cost
+to submit a task at all. Three earlier explanations for this row -- the event registry lock, the
+serial resume path, and fiber acquisition -- were each measured and each wrong.
 
 Independent-task throughput is the row where the architecture actually shows: 69-74 ns against
 290-310 ns for the two fiber/graph libraries, and enkiTS is not really in this race at all because
