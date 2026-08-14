@@ -291,6 +291,58 @@ static void TestPushBatchSpread(JLib::TaskScheduler& sched) {
 // path, which is exactly where the 1.2.0 lost wakeup lived, and the cases that would expose a
 // regression there are the blocking ones already written -- contention, the semaphore handoff, and
 // the spin-help deadlock guard. CI runs this binary twice, once per policy.
+
+// ---- 8. THE FIBER CAP: more tasks blocked at once than there are fibers -----------------------
+//
+// A SUSPENDED task holds its fiber, so the number of tasks that may block SIMULTANEOUSLY is capped
+// at the pool size (64 standard per worker). Past that, AcquireFiber returns null and the worker
+// re-queues the task and yields rather than running it. That still makes progress -- a resumable
+// task takes the existing-fiber path and needs no free fiber -- but it looks like a stall, and it
+// cost eight minutes of a benchmark run to discover by accident.
+//
+// THE WATCHDOG IS THE ASSERTION. There is no clean threshold for "too slow" here, and inventing one
+// would make the test flaky on a loaded machine. "Finishes at all, within longer than a person
+// would wait" is the property that matters: over-subscribing the pool must degrade, not deadlock.
+static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
+    std::printf("fiber cap: more blocked tasks than fibers\n");
+
+    // Init(4) below -> 4 * 64 = 256 standard fibers. Deliberately past it.
+    constexpr int kBlocked = 320;
+    static std::atomic<int> finished{ 0 };
+    static std::atomic<bool> released{ false };
+    finished.store(0, std::memory_order_relaxed);
+    released.store(false, std::memory_order_relaxed);
+
+    // One lookup, then the Event& overload -- no registry lock on the hot path.
+    JLib::Event& ev = sched.GetEvent("captest");
+    static JLib::Event* evp = &ev;
+
+    JLib::WaitGroup wg;
+    wg.n.store(kBlocked, std::memory_order_relaxed);
+    for (int i = 0; i < kBlocked; ++i) {
+        JLib::Task* t = sched.CreateTask(+[](void*) {
+            JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+            // Armed, so a release that already landed is caught by self-signalling rather than
+            // stranding this fiber -- the same shape the comparison harness uses.
+            s.WaitOnEventArmed(*evp, [] {
+                if (released.load(std::memory_order_acquire)) evp->SignalAll();
+            });
+            finished.fetch_add(1, std::memory_order_relaxed);
+        }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0);
+        if (!t) { Check(false, "CreateTask returned null under fiber pressure"); return; }
+        t->waitGroup = &wg;
+        sched.Push(t);
+    }
+
+    // Let the pool saturate before releasing, so the over-subscribed state is actually entered.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    released.store(true, std::memory_order_release);
+    ev.SignalAll();
+
+    sched.WaitFor(wg);
+    Check(finished.load(std::memory_order_relaxed) == kBlocked,
+          "every task completed with more blocked than fibers");
+}
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
     std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
@@ -307,6 +359,7 @@ int main(int argc, char** argv) {
     TestNoSelfDeadlock(sched);
     TestPushArray(sched);
     TestPushBatchSpread(sched);
+    TestFiberCapOversubscribed(sched);
 
     sched.Join();
     g_done.store(true, std::memory_order_release);

@@ -457,8 +457,29 @@ void Thread::Worker() {
 						immediate.store(true, std::memory_order_seq_cst);
 					}
 					else {
-						scheduler->loPri[qIndex]->push_bottom(task_to_run);
+						// NOT push_bottom on our own deque. That end is LIFO for the owner (see
+						// TaskDeque's header), so the next pop_bottom takes THE SAME TASK back and
+						// this worker spins pop -> no fiber -> push -> pop forever on one task. It
+						// therefore never reaches its inbox drain -- which is exactly where a
+						// SignalAll deposits the resumed tasks whose completion would FREE the
+						// fibers this one is waiting for. Every worker doing that at once is a
+						// deadlock, not the "transient, fibers will free up" this comment used to
+						// claim: over-subscribing the pool hung the primitives suite until its
+						// watchdog fired.
+						//
+						// Requeue routes it through PickNextWorker to a worker inbox, so it leaves
+						// this worker's hands and this pass continues to the steal and inbox-drain
+						// steps that can actually make progress.
+						scheduler->Requeue(task_to_run);
 					}
+					// MUST clear it. task_to_run is a thread_local that survives `continue`, and the
+					// loop top runs `if (task_to_run)` before searching -- so leaving it set makes
+					// this worker keep re-processing a task it has already handed to a queue, adding
+					// one more copy each pass. With the old push_bottom that was hidden, because the
+					// worker re-popped the very same task and the duplicate was itself; routing the
+					// task anywhere else turns it into the same Task* live in two queues and run by
+					// two workers, which is a use-after-free.
+					task_to_run = nullptr;
 					std::this_thread::yield();
 					continue;
 				}

@@ -684,7 +684,21 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		(isPCore[q] ? pWorkers : eWorkers).push_back((int)q);
 	stopFlag.store(false, std::memory_order_release);
 	nextWorker = 0;
-	unsigned int coreCount = std::thread::hardware_concurrency()-1;
+	// Sized from THE POOL, not the machine. This used to be hardware_concurrency()-1, which meant a
+	// caller asking for a small pool still paid for a machine-sized fiber arena: Init(4) on a
+	// 32-thread box allocated 1984 standard + 248 heavy fibers, ~248 MB of commit for four workers,
+	// and Init(8) on a 128-thread machine allocated ~1 GB. That is exactly backwards for the case
+	// this library is built for -- embedding inside an application that owns thread placement and
+	// hands the scheduler a deliberately small pool.
+	//
+	// Still fully automatic: for the default Init() (poolSize 0 -> hw-1) this is the same number it
+	// always was. It only changes what an EXPLICIT smaller pool costs.
+	//
+	// 64 standard + 8 heavy per worker is the count of tasks that may be SUSPENDED AT ONCE per
+	// worker, since a suspended task holds its fiber -- not the number of tasks in flight. See the
+	// README's rules section. Each standard fiber carries a 64 KB stack and each heavy one 512 KB,
+	// so this is ~8 MB of commit per worker; the pages are reserved and only materialise on touch.
+	unsigned int coreCount = num_workers;
 	if (coreCount == 0) coreCount = 4; // Fallback
 
 	size_t standardFiberCount = coreCount * 64;
