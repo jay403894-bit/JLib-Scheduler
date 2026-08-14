@@ -45,6 +45,8 @@
 #include <cstdint>
 #include <vector>
 #include <thread>
+#include <atomic>     // the section watchdog
+#include <cstdlib>    // std::_Exit, used by the watchdog
 #include <algorithm>
 #include <string>      // std::to_string, for the pool-size label
 #include <cstdlib>     // strtoul, for the pool-size argument
@@ -54,6 +56,44 @@
 using Clock = std::chrono::steady_clock;
 static double MsBetween(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// ---- section watchdog ---------------------------------------------------------------------------
+// This benchmark is the scheduler's smoke test in CI, which means a HANG here is a real signal and
+// not just an inconvenience. Twice now the macOS arm64 job has sat at 30 minutes and been killed by
+// the job timeout, reporting nothing except which STEP it died in -- so an intermittent lost wakeup
+// cost half an hour of runner time and produced no information about where it happened.
+//
+// A per-section deadline fixes that. Each bench announces itself, and if one overruns, the watchdog
+// names it and exits nonzero within a few minutes instead of thirty. That turns "the bench hung"
+// into "the bench hung in fork-join", which is the difference between a guess and a lead.
+//
+// _Exit rather than abort: a deadlocked process cannot be relied on to unwind, and a nonzero exit is
+// all CI needs. The limit is deliberately generous -- the crossover sweep is legitimately the
+// slowest section and CI runners are shared VMs -- because a false positive here would be worse
+// than the thing it is catching.
+static std::atomic<const char*> g_section{ "startup" };
+static std::atomic<bool> g_benchDone{ false };
+
+static void Section(const char* name) { g_section.store(name, std::memory_order_release); }
+
+static void StartSectionWatchdog(int perSectionSeconds) {
+    std::thread([perSectionSeconds] {
+        const char* last = g_section.load(std::memory_order_acquire);
+        auto since = Clock::now();
+        while (!g_benchDone.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const char* now = g_section.load(std::memory_order_acquire);
+            if (now != last) { last = now; since = Clock::now(); continue; }
+            if (Clock::now() - since > std::chrono::seconds(perSectionSeconds)) {
+                printf("\n*** WATCHDOG: section '%s' exceeded %ds -- treating as a HANG.\n",
+                       last, perSectionSeconds);
+                printf("*** This is the scheduler failing to drain, not a slow machine.\n");
+                fflush(stdout);
+                std::_Exit(1);
+            }
+        }
+    }).detach();
 }
 
 // ------------------------------------------------- 1a. throughput, ONE producer (the main thread)
@@ -601,6 +641,11 @@ int main(int argc, char** argv) {
         poolSize ? std::to_string(poolSize).c_str() : "auto");
     printf("----------------------------------------------------------------\n");
 
+    // 180s per section. Generous on purpose: the crossover sweep is legitimately the slowest part
+    // and CI runners are shared VMs, so a false positive would be worse than what it catches. Even
+    // so it reports in three minutes instead of the thirty a job timeout takes.
+    StartSectionWatchdog(180);
+
     JLib::TaskScheduler::Init(poolSize);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
@@ -616,21 +661,24 @@ int main(int argc, char** argv) {
         sched.WaitFor(wg);
     }
 
-    BenchThroughputSingleProducer(sched);
-    BenchThroughputBatched(sched);
-    BenchThroughputMultiProducer(sched);
-    BenchLatency(sched);
-    BenchParallelFor(sched);
-    BenchRecursiveForkJoin(sched);
-    BenchFrameDag(sched);
+    // Every section announces itself so the watchdog can name the one that hangs. Twice the macOS
+    // job has been killed by the 30-minute job timeout knowing only that "the benchmark step" hung.
+    Section("throughput/1p");  BenchThroughputSingleProducer(sched);
+    Section("throughput/bt");  BenchThroughputBatched(sched);
+    Section("throughput/mp");  BenchThroughputMultiProducer(sched);
+    Section("latency");        BenchLatency(sched);
+    Section("ParallelFor");    BenchParallelFor(sched);
+    Section("fork-join");      BenchRecursiveForkJoin(sched);
+    Section("frame DAG");      BenchFrameDag(sched);
     // LAST, and deliberately. This one sleeps 50 ms before each of its five runs so the pool is
     // genuinely parked, which is the whole point of it. Run earlier, it leaves every worker cold and
     // the next section pays the wake-up: with it sitting before the frame DAG, that section read
     // 30.88 us/graph against 22.7 to 24.7 measured on its own. Anything that deliberately idles the
     // pool has to go after everything it would otherwise contaminate.
-    BenchIdleBurst(sched);
-    if (runSweep) BenchParallelForCrossover(sched);
+    Section("burst");          BenchIdleBurst(sched);
+    if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
 
+    g_benchDone.store(true, std::memory_order_release);
     printf("----------------------------------------------------------------\n");
     printf("done.\n");
     return 0;
