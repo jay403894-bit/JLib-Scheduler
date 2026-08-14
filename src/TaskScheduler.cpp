@@ -781,7 +781,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	poolMutex.unlock();
 }
 
-void TaskScheduler::WaitOnEvent(const std::string& eventName) {
+void TaskScheduler::WaitOnEvent(Event& event) {
 	auto* thread = Thread::GetCurrent();
 	Task* myTask = thread->currentRunningTask;
 	Fiber* myFiber = myTask->assignedFiber;
@@ -791,8 +791,6 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName) {
 		throw std::runtime_error("WaitOnEvent called from a task with no assigned fiber -- "
 			"noFiber tasks must never suspend.");
 	}
-
-	auto& event = GetEvent(eventName);
 
 	// Order matters. Become parkable (WANTS_SUSPEND) BEFORE registering, so any signal
 	// that races in sees a resumable state (Resume() flips WANTS_SUSPEND->SUSPEND_SIGNALED
@@ -807,6 +805,14 @@ void TaskScheduler::WaitOnEvent(const std::string& eventName) {
 	// event signal lands on, which may differ from this one.
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 }
+
+// Name-taking convenience: one registry lookup, then the real wait. Callers that wait on the SAME
+// event repeatedly should hoist GetEvent() to startup and use the Event& overload -- GetEvent takes
+// a global mutex and hashes a string, and on a hot shared-wait path that serialises every waiter.
+// The reference stays valid for the process lifetime: the registry owns unique_ptr<Event>, so a
+// rehash moves the pointer and not the object, and entries are never erased.
+void TaskScheduler::WaitOnEvent(const std::string& eventName) { WaitOnEvent(GetEvent(eventName)); }
+
 bool TaskScheduler::Push(Task* task) {
 	return PushLocal(task);
 }
@@ -970,7 +976,7 @@ bool TaskScheduler::PushFork(Task* task) {
 
 	return PushLocal(task, worker_id);
 }
-void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::function<void()>& arm) {
+void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& arm) {
 	auto* thread = Thread::GetCurrent();
 	Task* myTask = thread->currentRunningTask;
 	Fiber* myFiber = myTask->assignedFiber;
@@ -978,8 +984,6 @@ void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::fu
 		throw std::runtime_error("WaitOnEventArmed called from a task with no assigned fiber -- "
 			"noFiber tasks must never suspend.");
 	}
-
-	auto& event = GetEvent(eventName);
 
 	// Same ordering as WaitOnEvent: become parkable, then register as a waiter, so a signal
 	// that races in is not lost (Resume flips WANTS_SUSPEND->SUSPEND_SIGNALED and the worker
@@ -992,6 +996,11 @@ void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::fu
 	if (arm) arm();
 
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
+}
+
+// See WaitOnEvent above: the name overload costs one registry lookup per call.
+void TaskScheduler::WaitOnEventArmed(const std::string& eventName, const std::function<void()>& arm) {
+	WaitOnEventArmed(GetEvent(eventName), arm);
 }
 
 void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*)>& arm) {

@@ -252,12 +252,18 @@ namespace JLib {
 		// DirectEvent, touches no map and no global lock, and is the reason no eviction policy is
 		// needed here: the unbounded case has its own API.
 		Event& GetEvent(const std::string& name);
+		// Event& overloads: no registry lookup, no global mutex, no string hash. Prefer these on any
+		// path that waits on the SAME event repeatedly -- hoist GetEvent() to startup and keep the
+		// reference. It stays valid for the process lifetime (the registry owns unique_ptr<Event>, so
+		// a rehash moves the pointer not the object, and nothing erases entries).
+		void WaitOnEvent(Event& ev);
 		void WaitOnEvent(const std::string& eventName);
 		// Like WaitOnEvent, but runs 'arm' AFTER this fiber is registered as a waiter and
 		// marked parkable (WANTS_SUSPEND), and BEFORE it actually suspends. Use it to arm an
 		// external wakeup (e.g. a GPU-fence completion callback that will SignalAll this
 		// event) with no lost-wakeup race: any signal that fires once 'arm' has run is
 		// guaranteed to find a registered, resumable waiter. Must be called from a fiber.
+		void WaitOnEventArmed(Event& ev, const std::function<void()>& arm);
 		void WaitOnEventArmed(const std::string& eventName, const std::function<void()>& arm);
 		// Direct/handle variant of WaitOnEventArmed: no name, no registry, no global lock. Takes
 		// a pooled DirectEvent and hands its pointer to 'arm' so the external signaler can wake

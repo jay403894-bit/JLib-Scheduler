@@ -222,35 +222,46 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
 // refuted by measurement (pendingTasks' cost, SpinBriefly twice, warm-worker placement). Treat the
 // numbers below as the finding and everything above as a hypothesis that was cheap to write down.
 //
-// RESULT, FIRST RUN -- PREDICTION 3 REFUTED, AND INVERTED:
+// RESULT. Two runs, two refuted hypotheses, and the answer is in neither of them.
 //
-//     block us     JLib     marl    ratio
-//            0    11.62     4.73    0.41x
-//           50     6.95     5.24    0.75x
-//          150     6.75     6.46    0.96x
-//          300     6.79     7.68    1.13x
-//          600     8.30    10.72    1.29x
-//         2000    22.14    24.49    1.11x
+//     block us    JLib   marl  ratio        (second run, Event& overload -- no registry lookup)
+//            0   13.54   4.58  0.34x
+//           50    6.49   4.91  0.76x
+//          150    6.70   5.22  0.78x
+//          300    6.32   5.50  0.87x
+//          600    8.08   8.57  1.06x
+//         2000   22.00  23.72  1.08x
 //
-// The gap is widest in MARL's favour at D=0 (2.4x) and this scheduler only overtakes past ~200 us
-// -- exactly opposite to the predicted shape. Prediction 1 (close) holds only around the crossover.
+// PREDICTION 3 (widest in this scheduler's favour at D=0, narrowing) -- REFUTED AND INVERTED. The
+// gap is widest in MARL's favour at D=0 and closes as D grows.
 //
-// AND THE LIKELY CAUSE IS NOT FIBERS. GetEvent(name) takes a GLOBAL registryMtx and hashes a
-// std::string, and each blocking task here hits it TWICE: once inside WaitOnEventArmed and once in
-// the arm callback's SignalAll. That is ~1280 acquisitions of one mutex per run, spread over 31
-// workers. marl::Event is a bare handle with no registry, no lock and no string. So this row as
-// written compares JLib's NAMED-EVENT REGISTRY against marl's DIRECT HANDLE, and the fiber cost --
-// the thing it was built to isolate -- is buried underneath that.
+// PREDICTION 2 (this wins the mixed workload by the fraction of tasks that skip fibers) -- NOT
+// SUPPORTED. The best case anywhere is 1.08x, which is not the effect that was predicted.
 //
-// It is still a real finding about this library rather than only a harness fault: the registry lock
-// is a genuine serialisation point on the shared-wait path, and it is the same registryMtx convoy
-// the GetEvent declaration warns about. But it means the number above must NOT be quoted as a fiber
-// comparison.
+// PREDICTION 1 (close on suspend/resume) -- CONFIRMED, but only where both libraries actually
+// suspend. At D >= 600 the ratio is 1.06-1.08x, which is as close as this harness can resolve.
 //
-// TO ISOLATE: rerun with WaitOnEventDirectArmed, which takes a pooled DirectEvent and touches no map
-// and no global lock -- the true structural analogue of marl::Event. If the D=0 gap collapses, the
-// registry was the whole story and the fiber paths are close as Prediction 1 said. If it does not,
-// the difference is real and belongs to fiber acquisition. That test is not written yet.
+// FIRST HYPOTHESIS FOR THE D=0 GAP, REFUTED: the registry. GetEvent(name) takes a global mutex and
+// hashes a string, and the first version paid that twice per blocking task. Adding Event& overloads
+// and hoisting the lookup to startup changed D=0 from 11.62 to 13.54 -- i.e. nothing. The overloads
+// are worth keeping on their own merits, but they were not the story.
+//
+// WHAT IT ACTUALLY IS: the two Events are not the same primitive. marl::Event::Shared::wait() is
+// cv.wait(lock, []{ return signalled; }) -- a PREDICATE wait over sticky state, so on an already
+// signalled Manual event it returns without suspending anything. JLib::Event has no signalled state
+// at all; it is a pure rendezvous (SignalAll takes the waiter list), so "already signalled" is not
+// representable and WaitOnEventArmed always pays WANTS_SUSPEND + AddWaiter + ContextSwitch out +
+// requeue + reschedule + ContextSwitch in.
+//
+// So D=0 is not a fiber measurement and must not be quoted as one -- it is stateful-event versus
+// stateless-rendezvous, and marl skips the work entirely rather than doing it faster. The rows where
+// both genuinely suspend are D >= 600, and there they are level.
+//
+// THE ACTIONABLE PART, for a later release: an already-satisfied wait costing a full suspend/resume
+// round trip is a real cost on a real pattern -- a GPU fence that has already completed by the time
+// the task looks is the obvious one. Giving Event an optional signalled state, or a predicate
+// overload that checks before suspending, would remove it. That changes Event's semantics, so it is
+// not a 1.3.x change.
 static constexpr int kBatch      = 256;
 static constexpr int kBatches    = 10;
 static constexpr int kBlockEvery = 4;       // 25% of tasks block
@@ -258,13 +269,18 @@ static constexpr int kHeavyIters = 50000;   // ~50 us per non-blocking task
 
 static std::atomic<bool> g_released{ false };
 
+// Looked up ONCE. The point of the Event& overloads: GetEvent takes a global registryMtx and hashes
+// a string, and the first version of this benchmark paid that twice per blocking task -- once in
+// WaitOnEventArmed and once in the arm callback -- which is what it actually measured.
+static JLib::Event* g_ioEvent = nullptr;
+
 // Spun, not slept: sleep_for(20us) is a full ~15.6 ms quantum on Windows, which is how an earlier
 // version of the enkiTS harness "measured" a 50 us block at 13 ms per batch.
 static void ReleaseAfter(int durationUs, JLib::TaskScheduler* jl, marl::Event* ev) {
     const auto deadline = Clock::now() + std::chrono::microseconds(durationUs);
     while (Clock::now() < deadline) std::this_thread::yield();
     g_released.store(true, std::memory_order_release);
-    if (jl) jl->GetEvent("compare_io").SignalAll();
+    if (jl) g_ioEvent->SignalAll();
     if (ev) ev->signal();
 }
 
@@ -297,9 +313,9 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                             // rather than missed -- the same race-freedom marl gets from Mode::Manual.
                             ? jl.CreateTask(+[](void*) {
                                   JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
-                                  s.WaitOnEventArmed("compare_io", [&s] {
+                                  s.WaitOnEventArmed(*g_ioEvent, [] {
                                       if (g_released.load(std::memory_order_acquire))
-                                          s.GetEvent("compare_io").SignalAll();
+                                          g_ioEvent->SignalAll();
                                   });
                               }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0)
                             : jl.CreateTask(+[](void* p) {
@@ -377,6 +393,7 @@ int main(int argc, char** argv) {
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
     JLib::TaskScheduler::Init(pool);
     JLib::TaskScheduler& jl = JLib::TaskScheduler::Instance();
+    if (g_doJ) g_ioEvent = &jl.GetEvent("compare_io");   // the one and only registry lookup
     if (!g_doJ) jl.Join();   // real teardown: nothing of JLib runs while marl is timed
 
     const uint32_t workers = (uint32_t)(pool ? pool : std::thread::hardware_concurrency() - 1);
