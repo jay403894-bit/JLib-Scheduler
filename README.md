@@ -12,6 +12,19 @@ I built this scheduler to solve the problem of scheduling for my custom 2d/3d en
 I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, marl can but was archived in April.
 
 ---
+## How it compares
+
+| | enkiTS | Taskflow | marl | this |
+|---|---|---|---|---|
+| Work-stealing | yes | yes | yes | yes |
+| Suspend/resume inside a task | no | no | yes | yes |
+| Dependency DAG with AND/OR gates | partial | yes | no | yes |
+| Cache/SMT topology-aware stealing | no | no | no | yes |
+| Maintained | yes | yes | archived Apr 2026 | yes |
+
+marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so middleware written
+for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
+and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
 
 ## Measured
 
@@ -78,19 +91,6 @@ data. If a pasted run has no version line at all, it predates 1.0.1 and should b
 Run them yourself with `SchedulerBench`. It takes an affinity policy argument and defaults to the
 same one the library does.
 
-## How it compares
-
-| | enkiTS | Taskflow | marl | this |
-|---|---|---|---|---|
-| Work-stealing | yes | yes | yes | yes |
-| Suspend/resume inside a task | no | no | yes | yes |
-| Dependency DAG with AND/OR gates | partial | yes | no | yes |
-| Cache/SMT topology-aware stealing | no | no | no | yes |
-| Maintained | yes | yes | archived Apr 2026 | yes |
-
-marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so middleware written
-for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
-and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
 
 ### Measured against enkiTS, TaskFlow and marl
 
