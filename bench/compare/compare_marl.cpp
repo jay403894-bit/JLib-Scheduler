@@ -302,6 +302,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                     std::thread rel;
                     if (d) rel = std::thread(ReleaseAfter, d, &jl, nullptr);
 
+                    static JLib::Task* blk[kBatch];
                     JLib::WaitGroup wg;
                     wg.n.store(kBatch, std::memory_order_relaxed);
                     for (int i = 0; i < kBatch; ++i) {
@@ -371,6 +372,78 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
     printf("\n     ratio > 1.00 means JLib is faster.\n\n");
 }
 
+
+// ---------------------------------------------------------------- where the blocking cost goes
+// JLib-only. The blocking row above works out to roughly 5 us per blocking task, and three guesses
+// at which stage owns it have now been wrong (the event registry, the serial requeue, and before
+// that fiber tuning). So measure the stages instead of arguing about them.
+//
+// Three variants, each differing from the previous by exactly ONE stage:
+//   A  noFiber=1, empty body   -- baseline: create, place, claim, run, destroy. No fiber at all.
+//   B  noFiber=0, empty body   -- adds fiber acquire from the pool, ContextSwitch in, ContextSwitch
+//                                 out, fiber release. The task never suspends.
+//   C  noFiber=0, waits on an ALREADY-SIGNALLED event -- adds AddWaiter, SignalAll, the
+//                                 SUSPENDED->READY CAS, the re-queue, a second trip through
+//                                 placement/inbox/deque, and a second ContextSwitch pair.
+//
+// So B-A is what a fiber costs to attach and run on, and C-B is what a full suspend/resume round
+// trip through the scheduler costs. Together they should account for the 5 us; if they do not, the
+// cost is in the wait itself and not in any of this.
+static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
+    if (!g_doJ) return;
+    // N MUST STAY WELL UNDER THE FIBER POOL. Variant C suspends every task, and a suspended task
+    // HOLDS its fiber, so concurrent suspensions are bounded by standardFiberCount (64 per core,
+    // ~1984 here). At 20000 this livelocked: AcquireFiber returns null, the worker re-queues and
+    // yields, and prints to cerr on every failed acquire -- minutes of console flooding rather than
+    // a measurement. 1000 keeps every variant inside the pool with room to spare.
+    constexpr int N = 1000;
+    printf("  fiber cost breakdown -- ns per task, empty bodies, JLib only\n\n");
+
+    std::vector<double> a, b, c;
+    for (int r = 0; r < 5; ++r) {
+        {   // A: no fiber
+            JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
+            auto t0 = Clock::now();
+            for (int i = 0; i < N; ++i) {
+                JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr);
+                t->waitGroup = &wg; jl.Push(t);
+            }
+            jl.WaitFor(wg);
+            a.push_back(Ms(t0, Clock::now()) * 1e6 / N);
+        }
+        {   // B: fiber-backed, never suspends
+            JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
+            auto t0 = Clock::now();
+            for (int i = 0; i < N; ++i) {
+                JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr,
+                                              false, JLib::FiberSize::Standard, /*noFiber*/0);
+                t->waitGroup = &wg; jl.Push(t);
+            }
+            jl.WaitFor(wg);
+            b.push_back(Ms(t0, Clock::now()) * 1e6 / N);
+        }
+        {   // C: fiber-backed, full suspend/resume on an already-signalled event
+            g_released.store(true, std::memory_order_release);
+            JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
+            auto t0 = Clock::now();
+            for (int i = 0; i < N; ++i) {
+                JLib::Task* t = jl.CreateTask(+[](void*) {
+                    JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+                    s.WaitOnEventArmed(*g_ioEvent, [] { g_ioEvent->SignalAll(); });
+                }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0);
+                t->waitGroup = &wg; jl.Push(t);
+            }
+            jl.WaitFor(wg);
+            c.push_back(Ms(t0, Clock::now()) * 1e6 / N);
+        }
+    }
+
+    const double ma = Median(a), mb = Median(b), mc = Median(c);
+    printf("     %-34s %8.0f ns\n", "A  no fiber (baseline)", ma);
+    printf("     %-34s %8.0f ns   (+%.0f for the fiber)\n", "B  fiber, never suspends", mb, mb - ma);
+    printf("     %-34s %8.0f ns   (+%.0f for suspend/resume)\n", "C  fiber, suspend + resume", mc, mc - mb);
+    printf("\n");
+}
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -426,6 +499,7 @@ int main(int argc, char** argv) {
     BenchThroughput(jl);
     BenchLatency(jl);
     BenchBlocking(jl);
+    BenchFiberBreakdown(jl);
 
     printf("(sink %llu -- printed only so none of the work can be optimised away)\n",
            (unsigned long long)g_sink.load());
