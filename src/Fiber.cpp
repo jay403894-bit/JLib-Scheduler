@@ -12,13 +12,15 @@ std::atomic<uint64_t> JLib::Fiber::idGenerator{ 0 };
 // rather than here. Everything below is platform-independent scheduler logic.
 
 void Fiber::CoYield() {
+	JLIB_EPOCH_CHECK_NO_GUARD("Fiber::CoYield");
 	// Record intent and switch out.
 	this->status.store(FiberStatus::WANTS_YIELD, std::memory_order_release);
 	ContextSwitch(&this->ctx, this->homeCtx);
 }
 
 void Fiber::Suspend() {
-	// Record intent and switch out. 
+	JLIB_EPOCH_CHECK_NO_GUARD("Fiber::Suspend");
+	// Record intent and switch out.
 	this->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	ContextSwitch(&this->ctx, this->homeCtx);
 }

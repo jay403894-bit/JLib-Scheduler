@@ -104,6 +104,11 @@ void GlobalFiberPool::FiberEntryWrapper()
 
 	self->status.store(FiberStatus::DEAD, std::memory_order_release);
 
+	// A task that RETURNS while still announced would leave this fiber's slot pinned at an old
+	// epoch, and the fiber then goes back to the pool carrying it. ReturnBatch() already scrubs
+	// localEpoch to SIZE_MAX for exactly that reason -- this catches the CAUSE instead, since a
+	// guard that outlives its traversal is a bug wherever it happens.
+	JLIB_EPOCH_CHECK_NO_GUARD("fiber exit (task returned)");
 
 	ContextSwitch(&self->ctx, self->homeCtx);
 }

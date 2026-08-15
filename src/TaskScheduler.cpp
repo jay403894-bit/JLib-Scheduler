@@ -835,6 +835,7 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
 
+	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEvent");
 	// Return via the fiber's homeCtx (the worker stamps it before each switch-in),
 	// not thread_local schedulerCtx -- the waiter resumes on whatever worker the
 	// event signal lands on, which may differ from this one.
@@ -1006,6 +1007,7 @@ void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& 
 
 	if (arm) arm();
 
+	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEventArmed");
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 }
 
@@ -1036,6 +1038,7 @@ void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*
 
 	if (arm) arm(e);
 
+	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEventDirectArmed");
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 
 	// Resumed: WE own release. Signal() already exchanged waiter->null and will not touch e again.

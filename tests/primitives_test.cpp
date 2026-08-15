@@ -343,6 +343,229 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
     Check(finished.load(std::memory_order_relaxed) == kBlocked,
           "every task completed with more blocked than fibers");
 }
+// ---- 9. SchedulerMutex under FIBER contention ---------------------------------------------------
+// Section 2 covers two BARE THREADS, which take a completely different path: they spin and help.
+// A fiber SUSPENDS on contention instead, so none of section 2's coverage says anything about this
+// one. Given the whole reason these primitives exist is to be fiber-aware, the suspend path being
+// untested was the larger half of the gap.
+static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
+    std::printf("mutex contention between two FIBERS (suspend path)\n");
+
+    JLib::SchedulerMutex m;
+    std::atomic<int> counter{ 0 };
+    std::atomic<int> inside{ 0 };
+    std::atomic<int> maxSeen{ 0 };
+    constexpr int kIters = 500;
+
+    JLib::WaitGroup wg;
+    wg.n.store(2, std::memory_order_relaxed);
+    for (int t = 0; t < 2; ++t) {
+        JLib::Task* task = sched.CreateTask([&m, &counter, &inside, &maxSeen] {
+            for (int i = 0; i < kIters; ++i) {
+                m.Lock();
+                const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
+                int prev = maxSeen.load(std::memory_order_relaxed);
+                while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
+                counter.fetch_add(1, std::memory_order_relaxed);
+                inside.fetch_sub(1, std::memory_order_acq_rel);
+                m.Unlock();
+            }
+            }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+        if (!task) { Check(false, "CreateTask returned null"); return; }
+        task->waitGroup = &wg;
+        sched.Push(task);
+    }
+    sched.WaitFor(wg);
+
+    Check(counter.load() == 2 * kIters, "both fibers completed every iteration");
+    Check(maxSeen.load() == 1,          "never two fiber holders at once");
+}
+
+// ---- 10. Mixed FIBER vs BARE-THREAD contention --------------------------------------------------
+// The two paths have to interoperate on the SAME mutex: a suspending fiber and a spin-helping bare
+// thread, each of which must see the other's ownership. Neither single-path test covers the handoff
+// between them.
+static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
+    std::printf("mutex contention between a fiber and a bare thread\n");
+
+    JLib::SchedulerMutex m;
+    std::atomic<int> inside{ 0 };
+    std::atomic<int> maxSeen{ 0 };
+    std::atomic<int> done{ 0 };
+    constexpr int kIters = 300;
+
+    auto body = [&m, &inside, &maxSeen, &done]() {
+        for (int i = 0; i < kIters; ++i) {
+            m.Lock();
+            const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
+            int prev = maxSeen.load(std::memory_order_relaxed);
+            while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
+            inside.fetch_sub(1, std::memory_order_acq_rel);
+            m.Unlock();
+        }
+        done.fetch_add(1, std::memory_order_release);
+    };
+
+    JLib::WaitGroup wg;
+    wg.n.store(1, std::memory_order_relaxed);
+    JLib::Task* t = sched.CreateTask(body, false, JLib::FiberSize::Standard, /*noFiber*/0);
+    if (!t) { Check(false, "CreateTask returned null"); return; }
+    t->waitGroup = &wg;
+    sched.Push(t);
+
+    std::thread bare(body);          // same body, bare-thread path
+    bare.join();
+    sched.WaitFor(wg);
+
+    Check(done.load(std::memory_order_acquire) == 2, "fiber and bare thread both finished");
+    Check(maxSeen.load() == 1,                       "never two holders across the two paths");
+}
+
+// ---- 11. SchedulerConditionVariable on a fiber --------------------------------------------------
+// Had NO tests at all, and it has the subtlest contract of the three: Wait must release the mutex
+// while parked and re-acquire it before returning.
+//
+// The release is proved BY CONSTRUCTION rather than by an assert: main cannot take the mutex at all
+// unless the waiting fiber gave it up inside Wait. If that ever regresses, main blocks forever and
+// the watchdog reports it. The re-acquire is asserted directly, from the waiter.
+static void TestConditionVariableFiber(JLib::TaskScheduler& sched) {
+    std::printf("condition variable: fiber waits, mutex released while parked, Notify_One wakes it\n");
+
+    JLib::SchedulerMutex m;
+    JLib::SchedulerConditionVariable cv;
+    bool ready = false;                       // guarded by m
+    std::atomic<bool> inWait{ false };
+    std::atomic<bool> heldAfterWake{ false };
+    std::atomic<bool> finished{ false };
+
+    JLib::WaitGroup wg;
+    wg.n.store(1, std::memory_order_relaxed);
+    JLib::Task* waiter = sched.CreateTask([&] {
+        m.Lock();
+        inWait.store(true, std::memory_order_release);
+        while (!ready) cv.Wait(m);            // predicate loop: the only correct way to use Wait
+        // We are back and must own the mutex again. Try_Lock is non-recursive, so it failing here
+        // means it is held -- and main released it before notifying, so the holder can only be us.
+        heldAfterWake.store(!m.Try_Lock(), std::memory_order_release);
+        m.Unlock();
+        finished.store(true, std::memory_order_release);
+        }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+    if (!waiter) { Check(false, "CreateTask returned null"); return; }
+    waiter->waitGroup = &wg;
+    sched.Push(waiter);
+
+    while (!inWait.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));   // let it actually park
+
+    m.Lock();                                 // blocks unless Wait released it
+    Check(true, "main acquired the mutex while the fiber was parked in Wait");
+    ready = true;
+    m.Unlock();
+    cv.Notify_One();
+
+    sched.WaitFor(wg);
+    Check(finished.load(std::memory_order_acquire),      "Notify_One woke the parked fiber");
+    Check(heldAfterWake.load(std::memory_order_acquire), "Wait re-acquired the mutex before returning");
+}
+
+// ---- 12. Notify_All wakes EVERY waiter ----------------------------------------------------------
+// Notify_One draining the queue one entry at a time and Notify_All draining it fully are easy to
+// confuse in an implementation; a single-waiter test passes under either.
+static void TestConditionVariableNotifyAll(JLib::TaskScheduler& sched) {
+    std::printf("condition variable: Notify_All releases every waiter\n");
+
+    JLib::SchedulerMutex m;
+    JLib::SchedulerConditionVariable cv;
+    bool ready = false;                       // guarded by m
+    constexpr int kWaiters = 8;
+    std::atomic<int> parked{ 0 };
+    std::atomic<int> woke{ 0 };
+
+    JLib::WaitGroup wg;
+    wg.n.store(kWaiters, std::memory_order_relaxed);
+    for (int i = 0; i < kWaiters; ++i) {
+        JLib::Task* t = sched.CreateTask([&] {
+            m.Lock();
+            parked.fetch_add(1, std::memory_order_release);
+            while (!ready) cv.Wait(m);
+            m.Unlock();
+            woke.fetch_add(1, std::memory_order_release);
+            }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+        if (!t) { Check(false, "CreateTask returned null"); return; }
+        t->waitGroup = &wg;
+        sched.Push(t);
+    }
+
+    while (parked.load(std::memory_order_acquire) < kWaiters) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    m.Lock();
+    ready = true;
+    m.Unlock();
+    cv.Notify_All();
+
+    sched.WaitFor(wg);
+    Check(woke.load(std::memory_order_acquire) == kWaiters, "all 8 waiters resumed after one Notify_All");
+}
+
+// ---- 13. The bare-thread Wait() CONTRACT --------------------------------------------------------
+// Worth pinning down because it surprises people: on a bare thread Wait() does NOT wait for a
+// notification. It unlocks, takes one spin-help step, and re-locks -- so it returns promptly whether
+// or not anyone signalled, and only a caller that re-checks its predicate in a loop is correct.
+// (Fibers park properly; see test 11. The asymmetry is the point.) A caller that wrote
+// `if (!ready) cv.Wait(m);` would be broken on a bare thread and fine on a fiber, which is exactly
+// the kind of bug that survives review.
+static void TestConditionVariableBareThreadContract() {
+    std::printf("condition variable: bare-thread Wait() returns without a notification\n");
+
+    JLib::SchedulerMutex m;
+    JLib::SchedulerConditionVariable cv;
+
+    m.Lock();
+    const auto t0 = std::chrono::steady_clock::now();
+    cv.Wait(m);                               // nothing will ever notify this
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    m.Unlock();
+
+    Check(ms < 1000.0, "returns promptly with no notification (predicate loop REQUIRED)");
+
+    // And the loop form still makes progress once another thread sets the predicate.
+    std::atomic<bool> ready{ false };
+    std::atomic<bool> got{ false };
+    std::thread setter([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        ready.store(true, std::memory_order_release);
+        cv.Notify_All();
+        });
+    m.Lock();
+    while (!ready.load(std::memory_order_acquire)) cv.Wait(m);
+    got.store(true, std::memory_order_release);
+    m.Unlock();
+    setter.join();
+    Check(got.load(std::memory_order_acquire), "predicate loop makes progress once the predicate holds");
+}
+
+// ---- 14. A permit returned by a DIFFERENT thread than took it -----------------------------------
+// A semaphore is not a lock and deliberately tracks no ownership, which is what lets it be used as a
+// producer/consumer signal. That is a design decision worth a test, because "helpfully" adding an
+// ownership check later would look like a hardening improvement and would break this.
+static void TestSemaphoreCrossThreadRelease() {
+    std::printf("semaphore: a permit may be returned by a thread that never took it\n");
+
+    JLib::SchedulerSemaphore sem(1, 4);
+
+    std::atomic<bool> took{ false };
+    std::thread taker([&] { sem.Wait(); took.store(true, std::memory_order_release); });
+    taker.join();
+    Check(took.load(std::memory_order_acquire), "one thread took the only permit");
+    Check(!sem.Try_Wait(),                      "the permit is genuinely gone");
+
+    std::thread giver([&] { sem.Signal(); });   // never held it
+    giver.join();
+    Check(sem.Try_Wait(), "a permit released by a different thread is usable");
+}
+
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
     std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
@@ -360,6 +583,12 @@ int main(int argc, char** argv) {
     TestPushArray(sched);
     TestPushBatchSpread(sched);
     TestFiberCapOversubscribed(sched);
+    TestMutexFiberContention(sched);
+    TestMutexMixedContention(sched);
+    TestConditionVariableFiber(sched);
+    TestConditionVariableNotifyAll(sched);
+    TestConditionVariableBareThreadContract();
+    TestSemaphoreCrossThreadRelease();
 
     sched.Join();
     g_done.store(true, std::memory_order_release);

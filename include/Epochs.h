@@ -6,6 +6,8 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <cstdio>    // fprintf -- the debug-only EpochGuard suspend tripwire below
+#include <cassert>   // assert   -- ditto
 #include "Task.h"
 #include "concurrentqueue.h"
 
@@ -159,6 +161,64 @@ namespace JLib {
 	};
 };
 
+// THE INVARIANT: a fiber must not SUSPEND OR YIELD while inside an EpochGuard.
+//
+// Why it matters. Reclamation frees only up to MinActiveEpoch(), the minimum announced epoch across
+// the whole (static) participant set. A fiber that parks inside a guard keeps its slot announced at
+// the epoch it entered for as long as it stays parked -- a GPU fence, an event, indefinitely. While
+// it sits there NOTHING retired afterwards can ever be reclaimed, and the retired list grows without
+// bound.
+//
+// This is a LIVENESS bug, not a safety one, and knowing which matters for diagnosing it.
+// CurrentEpochSlot() hands a fiber its OWN slot (see LockFreeList.h), and that slot travels across a
+// context switch, so the destructor always writes the right place no matter which worker resumes it.
+// Nothing is corrupted. Instead memory creeps, and it surfaces as an unrelated allocator dying an
+// hour into a session -- precisely the profile of the LockFreeList destructor leak this project
+// already paid for once. That is why this is a tripwire and not a comment.
+//
+// Not a defect peculiar to this design: bounded critical sections are what EBR IS, in the paper too.
+// A stalled participant stalls reclamation everywhere; hazard pointers dodge it by protecting
+// per-object and pay on every read. What fibers change is only how EASY the violation is to write,
+// because suspending here is cheap and idiomatic. Today it holds by construction rather than by
+// discipline -- guards live only inside LockFreeList's operations, which never wait. The fix at any
+// future call site is always the same: finish the traversal, drop the guard, then wait.
+//
+// The counter is thread_local even though a guard is per-FIBER. That is sound precisely BECAUSE the
+// thing being detected is the violation: if no yield happens inside a guard, the guard never spans a
+// migration and thread-local and fiber-local agree. They diverge only in the case this exists to
+// catch, and they diverge in the direction that fires.
+//
+// DEBUG/DEVELOPMENT ONLY. Release builds carry neither the counter nor the checks, so this costs a
+// shipped binary nothing -- same policy as GetEvent's registry tripwire.
+#if defined(_DEBUG) || defined(JLIB_DEVELOPMENT)
+namespace JLib {
+	inline thread_local int t_epochGuardDepth = 0;
+
+	// `where` names the suspend point, so the message says which call has to drop its guard first
+	// rather than leaving you to find it.
+	inline void EpochGuardSuspendCheck(const char* where) {
+		if (t_epochGuardDepth > 0) {
+			fprintf(stderr,
+				"[JLib::Scheduler] INVARIANT VIOLATED: fiber suspended inside an EpochGuard at %s "
+				"(depth %d). The fiber's epoch slot stays announced for the whole suspension, so "
+				"MinActiveEpoch() cannot advance and NOTHING retired from now on will ever be "
+				"reclaimed. This does not crash -- it leaks, and shows up much later as allocator "
+				"exhaustion. Fix: end the guarded traversal and let the EpochGuard destruct BEFORE "
+				"waiting.\n",
+				where, t_epochGuardDepth);
+			assert(false && "fiber suspended while holding an EpochGuard -- see stderr");
+		}
+	}
+}
+#define JLIB_EPOCH_GUARD_ENTER()        (++JLib::t_epochGuardDepth)
+#define JLIB_EPOCH_GUARD_LEAVE()        (--JLib::t_epochGuardDepth)
+#define JLIB_EPOCH_CHECK_NO_GUARD(where) JLib::EpochGuardSuspendCheck(where)
+#else
+#define JLIB_EPOCH_GUARD_ENTER()        ((void)0)
+#define JLIB_EPOCH_GUARD_LEAVE()        ((void)0)
+#define JLIB_EPOCH_CHECK_NO_GUARD(where) ((void)0)
+#endif
+
 struct EpochGuard {
 	std::atomic<size_t>* slot;
 
@@ -166,10 +226,18 @@ struct EpochGuard {
 		// Enter: store global epoch
 		slot->store(JLib::EpochManager::Instance().CurrentEpoch(),
 			std::memory_order_release);
+		JLIB_EPOCH_GUARD_ENTER();
 	}
 
 	~EpochGuard() {
-		// Leave: mark as SIZE_MAX
+		// Leave: mark as SIZE_MAX.
+		//
+		// NOTE, unstated until now: this stores SIZE_MAX unconditionally rather than restoring the
+		// previous value, so NESTED guards sharing one slot break the outer one -- the inner exit
+		// un-announces a traversal that is still running. Not reachable from today's call sites
+		// (LockFreeList's operations never wait, so a guarded region cannot re-enter), but the
+		// bare-thread fallback shares a single slot per thread, which is where it would surface.
 		slot->store(SIZE_MAX, std::memory_order_release);
+		JLIB_EPOCH_GUARD_LEAVE();
 	}
 };
