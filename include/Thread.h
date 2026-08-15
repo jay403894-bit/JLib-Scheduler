@@ -95,6 +95,17 @@ namespace JLib {
 
         int GetQueueLoad();
         void SetQueueIndex(size_t index);
+
+        // Move everything in THIS worker's inboxes onto its own deques. Returns true if anything
+        // moved. Only ever called on the calling thread's own Thread object -- both queues are
+        // owner-only on the drain side, and this is that owner.
+        //
+        // Exists for one situation: a worker BLOCKED INSIDE A TASK (a noFiber task spinning in
+        // WaitFor/SchedulerMutex/SchedulerConditionVariable). It will not return to Worker()'s loop
+        // while it spins, and nothing else may drain its inboxes, so anything sitting there is
+        // invisible to the ENTIRE pool -- including, potentially, the very task it is waiting for.
+        // Deques are stealable, so moving the work across makes it reachable again.
+        bool DrainOwnInboxesToDeques();
         void Join();
         static Thread* GetCurrent();
         static void CoYield(Fiber* targetFiber);

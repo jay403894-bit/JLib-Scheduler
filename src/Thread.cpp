@@ -220,6 +220,42 @@ void Thread::SetQueueIndex(size_t index)
 {
 	qIndex = index;
 };
+
+bool Thread::DrainOwnInboxesToDeques() {
+	// Pushes to our OWN deque, and NOT via Requeue the way Worker()'s pre-immediate drain does. That
+	// difference is about THIS caller, not about Requeue -- the other drain is correct:
+	// PushToCore stores immediateCoresInUse BEFORE SetImmediateTask, so by the time that worker sees
+	// an immediate task its own core is already flagged, and PickNextWorker skips flagged workers.
+	// Requeue there provably cannot hand a task back into the inbox being emptied.
+	//
+	// A worker spinning in WaitFor carries NO such flag -- it is running an ordinary task -- so
+	// PickNextWorker can and will select it, and Requeue would put the task straight back where we
+	// found it. Taking the flag to borrow that guarantee is worse than it looks: it marks the core
+	// pinned for ALL placement, makes targeted Push(cpu, task) start returning false against us, and
+	// has to be cleared on every exit from the spin. push_bottom needs none of that and is monotone
+	// progress -- once on the deque the task is stealable by every other worker AND visible to our
+	// own GetTask, which scans every deque including this one.
+	const size_t BATCH = 64;
+	Task* batch[BATCH];
+	bool moved = false;
+
+	auto drain = [&](TaskMPSCQueue* inbox, TaskDeque* deque) {
+		for (;;) {
+			size_t count = 0;
+			while (count < BATCH && inbox->pop(batch[count])) count++;
+			if (count == 0) break;
+			for (size_t i = 0; i < count; ++i) {
+				if (!batch[i]) continue;
+				deque->push_bottom(batch[i]);
+				moved = true;
+			}
+		}
+	};
+
+	drain(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
+	drain(scheduler->loPriInboxes[qIndex].get(), scheduler->loPri[qIndex].get());
+	return moved;
+}
 void Thread::Join() {
 	bool expected = false;
 	if (!joining.compare_exchange_strong(expected, true)) return;

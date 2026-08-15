@@ -1159,7 +1159,33 @@ bool TaskScheduler::TryRunStolenNoFiberTask() {
 	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue
 	// relocation path (claim CAS + re-push + notify = contention/thrash) no longer exists.
 	Task* task = GetTask();
-	if (!task) return false;
+	if (!task) {
+		// Nothing stealable anywhere -- but "anywhere" only covers DEQUES, and if this caller is a
+		// WORKER it is here because it is blocked inside a task (a noFiber task spinning in
+		// WaitFor / SchedulerMutex / SchedulerConditionVariable). It will not return to Worker()'s
+		// loop while it spins, and inboxes are owner-drain-only, so anything in ITS OWN inbox is
+		// unreachable by the entire pool -- including, possibly, the task it is waiting for. That
+		// is a real deadlock, not a slow path: a noFiber task calling ParallelFor from a worker
+		// hangs deterministically, because PushLocal round-robins chunks over every worker
+		// INCLUDING the calling one, and the chunk that lands at home is then stranded.
+		//
+		// NON-WORKERS SKIP THIS ENTIRELY, which is the common case: main and any app thread hitting
+		// a scheduler primitive have no inbox and no qIndex to index one with. Thread::GetCurrent()
+		// is null for them, and they are also not part of the hazard -- main blocking in WaitFor
+		// blocks nobody's queue but its own, and it has none.
+		Thread* self = Thread::GetCurrent();
+		if (!self) return false;
+		if (!self->DrainOwnInboxesToDeques()) return false;
+
+		// A drained task may be FIBER-BACKED, which this fiberless caller can never run itself --
+		// it now needs some other worker to steal it, and they may all be parked (in the repro,
+		// every one of the other 30 was SLEEPING). Only reached when a drain actually moved
+		// something, so this is not on any hot path.
+		NotifyAll();
+
+		task = GetTask();
+		if (!task) return false;
+	}
 
 	task->Execute();
 	if (task->waitGroup) {

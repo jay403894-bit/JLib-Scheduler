@@ -5,6 +5,71 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## 1.3.4 - 2026-08-14
 
+**[CRITICAL] fixes a deterministic deadlock when a task waits from inside a worker.** Affects every
+release. If any `noFiber` task calls `ParallelFor`, `WaitFor`, `SchedulerMutex::Lock` or
+`SchedulerConditionVariable::Wait` while running on a worker, take this.
+
+`noFiber` is the `CreateTask` default, so "push a task that runs a parallel-for" -- the obvious
+thing to write -- hangs, and hangs 100% of the time:
+
+1. `PushLocal` round-robins chunks across ALL workers, **including the calling one**.
+2. One chunk lands in the calling worker's own **inbox**.
+3. A `noFiber` task cannot suspend, so its `WaitFor` spins in place rather than parking, and the
+   worker never returns to `Worker()`'s loop.
+4. Inboxes are owner-drain-only and never stealable, so that chunk is now invisible to the entire
+   pool -- and the only thread that could drain it is the one spinning on it.
+
+The pool dump at the hang is unambiguous: the calling worker `AWAKE`, `busy=1`, one task in its lo
+inbox, every deque empty and all 30 other workers `SLEEPING`.
+
+`TryRunStolenNoFiberTask` now handles this. When a steal finds nothing AND the caller is a worker,
+it moves its own inboxes onto its own deques (`Thread::DrainOwnInboxesToDeques`) and retries.
+Deques are stealable, so the work becomes reachable by the whole pool and by the spinner's own
+`GetTask`, which already scans every deque including its own. A `NotifyAll` follows a productive
+drain, because a drained task may be fiber-backed and unrunnable by the fiberless spinner while
+every other worker is parked.
+
+**Non-workers skip the whole path** -- main and app threads have no inbox and are not part of the
+hazard. The drain runs only after a steal has already failed, so it is off the hot path: `latency`,
+`burst`, `fork-join`, `frame DAG` and both `ParallelFor` rows are unchanged. The single-`ParallelFor`
+repro goes from hanging 3/3 to completing in ~25 ms, matching the fiber-backed control. Verified on
+MSVC and on GCC/Linux, where the hang also reproduced.
+
+**It is not really a `ParallelFor` bug, and a fiber-backed outer caller does not protect you.** An
+8-case matrix, each case in a fresh process (see below), against a build with the drain disabled:
+
+```
+                                    drain OFF   drain ON
+1 level  ParallelFor    [noFiber]      HANG        OK
+2 levels ParallelFor    [noFiber]      HANG        OK
+3 levels ParallelFor    [noFiber]      HANG        OK
+manual WaitGroup fanout [noFiber]      HANG        OK     <- no ParallelFor involved at all
+1 level  ParallelFor    [fiber]        OK          OK
+2 levels ParallelFor    [fiber]        HANG        OK     <- outer caller is a FIBER
+3 levels ParallelFor    [fiber]        OK          OK
+manual WaitGroup fanout [fiber]        OK          OK
+```
+
+A hand-rolled `WaitGroup` fan-out hangs with no `ParallelFor` anywhere, so the trigger is the wait,
+not the loop. And nesting under a fiber-backed outer caller still hangs, because `ParallelFor`'s
+chunks are themselves `noFiber` tasks -- an inner `ParallelFor` therefore waits from inside one,
+regardless of what the outermost caller was. The cases that pass with the drain off pass by
+alignment, not by construction.
+
+**Test-design note, because the first version of this matrix was wrong:** run ONE case per process.
+`PickNextWorker`'s cursor is process-global, so whether a chunk ever lands back in the calling
+worker's own inbox depends on scheduler state left by earlier cases. Run sequentially in one
+process, all 8 cases passed with the drain disabled -- a clean false negative that would have
+"confirmed" a fix that was not being exercised.
+
+It pushes to the worker's OWN deque rather than going through `Requeue`, and that is about the
+caller rather than about `Requeue`. `Worker()`'s pre-immediate drain uses `Requeue` correctly:
+`PushToCore` stores `immediateCoresInUse` **before** `SetImmediateTask`, so that worker's core is
+already flagged by the time it sees the task, `PickNextWorker` skips flagged workers, and the task
+cannot come back to the inbox being emptied. A worker spinning in `WaitFor` carries no such flag --
+it is running an ordinary task -- so `PickNextWorker` can select it and `Requeue` would return the
+task to where it was found. `push_bottom` is monotone progress and needs no flag.
+
 **`PushFork` is REMOVED.** Use `Push`. To place a task on a known worker, `Push(cpu_affinity, task)`
 -- one-based, 0 meaning round-robin. Nothing in the library called it.
 
