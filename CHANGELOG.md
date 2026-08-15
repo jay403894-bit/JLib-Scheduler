@@ -3,6 +3,45 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.5 - 2026-08-15
+
+**`CreateTask` now accepts a NAMED callable, not only a temporary.** This did not compile:
+
+```cpp
+auto body = [&] { /* ... */ };
+sched.CreateTask(body);            // error: cannot bind rvalue reference to lvalue
+std::thread t(body);               // ...while this always did
+```
+
+`CreateTask` decays `F` before instantiating `LambdaTask<std::decay_t<F>>`, so that class's
+`LambdaTask(F&&)` is a plain **rvalue reference**, not a forwarding reference, and an lvalue had
+nothing to bind to. Fixed by adding a `LambdaTask(const F&)` overload that copies. **No API change:**
+`CreateTask`'s signature is untouched, an rvalue still selects `F&&` and still moves exactly as
+before, and an lvalue can only select the new overload, so there is no ambiguity. Rebuilt against
+the full JLib solution and Game01 to confirm no existing call site changed meaning.
+
+Guarded by a new case in `SchedulerPrimitivesTest`, which is mostly a compile-time assertion -- if
+the overload is removed the test file stops building.
+
+**Sync-primitive test coverage.** `SchedulerConditionVariable` had **no tests at all**, and the
+mutex was only exercised from bare threads -- never from a fiber, which takes an entirely different
+path (suspend rather than spin-and-help). Added: fiber-vs-fiber contention, mixed fiber-vs-bare
+contention, CV `Wait`/`Notify_One` with the mutex provably released while parked and re-acquired
+before returning, `Notify_All` across 8 waiters, and a semaphore permit returned by a thread that
+never took it.
+
+Also pinned down, because it is a genuine footgun: **on a bare thread `SchedulerConditionVariable::
+Wait()` does not wait for a notification.** It unlocks, takes one spin-help step, re-locks and
+returns. So `if (!ready) cv.Wait(m);` is correct on a fiber and broken on a bare thread; only a
+predicate LOOP is correct in both. There is now a test asserting exactly that.
+
+One note on the tests themselves. The first fiber-contention test asserted "never two holders" and
+passed -- and measured with the mutex REMOVED it still passed **1 run in 3**, because two fibers
+frequently never overlap at all. A mutual-exclusion test that passes while the mutex is broken is
+worse than no test. It now runs an unlocked probe first and asserts overlap was actually observed
+before trusting the locked result, behind a rendezvous so both fibers are resident before either
+starts.
+
 ## 1.3.4 - 2026-08-14
 
 **[CRITICAL] fixes a deterministic deadlock when a task waits from inside a worker.** Affects every

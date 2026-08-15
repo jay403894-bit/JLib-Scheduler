@@ -20,6 +20,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <utility>   // std::pair -- the contention probe returns two counters
 
 static int failures = 0;
 static void Check(bool ok, const char* what) {
@@ -348,38 +349,70 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
 // A fiber SUSPENDS on contention instead, so none of section 2's coverage says anything about this
 // one. Given the whole reason these primitives exist is to be fiber-aware, the suspend path being
 // untested was the larger half of the gap.
+// PROVES ITS OWN PREMISE, and it has to. The first version of this ran the locked loop and asserted
+// "max one holder", which was measured to pass even with NO mutex at all in 1 of 3 runs -- with only
+// two fibers on the pool they frequently just never overlap, and then the assertion is vacuous. A
+// mutual-exclusion test that can pass while the mutex is broken is worse than no test, because it
+// reports "ok".
+//
+// So it runs twice: an UNLOCKED probe that must observe overlap (otherwise the run is reported
+// inconclusive rather than green), then the locked loop. Both start behind a rendezvous so the two
+// fibers are actually resident at the same time instead of running back to back.
+// File scope, not a local: it is used inside two nested lambdas, and MSVC (correctly, and more
+// strictly than GCC) requires a constexpr local to be captured explicitly to be usable there.
+static constexpr int kFiberContentionIters = 2000;
+
 static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
     std::printf("mutex contention between two FIBERS (suspend path)\n");
 
+    // useLock=false -> probe: how much overlap is there when nothing excludes them?
+    // useLock=true  -> the real check.
+    auto run = [&sched](bool useLock, JLib::SchedulerMutex* m) {
+        std::atomic<int> arrived{ 0 }, inside{ 0 }, maxSeen{ 0 }, counter{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.store(2, std::memory_order_relaxed);
+        for (int t = 0; t < 2; ++t) {
+            JLib::Task* task = sched.CreateTask([&arrived, &inside, &maxSeen, &counter, useLock, m] {
+                // Rendezvous: don't start until BOTH fibers are running, so the loops overlap
+                // instead of the first finishing before the second is scheduled. Bounded so a
+                // starved pool degrades to a weaker test rather than a hang.
+                arrived.fetch_add(1, std::memory_order_acq_rel);
+                for (int spin = 0; spin < 1000000 && arrived.load(std::memory_order_acquire) < 2; ++spin)
+                    std::this_thread::yield();
+
+                for (int i = 0; i < kFiberContentionIters; ++i) {
+                    if (useLock) m->Lock();
+                    const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    int prev = maxSeen.load(std::memory_order_relaxed);
+                    while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                    inside.fetch_sub(1, std::memory_order_acq_rel);
+                    if (useLock) m->Unlock();
+                }
+                }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+            if (!task) return std::pair<int, int>{ -1, -1 };
+            task->waitGroup = &wg;
+            sched.Push(task);
+        }
+        sched.WaitFor(wg);
+        return std::pair<int, int>{ maxSeen.load(), counter.load() };
+    };
+
+    const auto probe = run(false, nullptr);
+    if (probe.first < 0) { Check(false, "CreateTask returned null"); return; }
+    Check(probe.first > 1, "PREMISE: the two fibers genuinely overlap when unlocked");
+
     JLib::SchedulerMutex m;
-    std::atomic<int> counter{ 0 };
-    std::atomic<int> inside{ 0 };
-    std::atomic<int> maxSeen{ 0 };
-    constexpr int kIters = 500;
+    const auto locked = run(true, &m);
+    if (locked.first < 0) { Check(false, "CreateTask returned null"); return; }
 
-    JLib::WaitGroup wg;
-    wg.n.store(2, std::memory_order_relaxed);
-    for (int t = 0; t < 2; ++t) {
-        JLib::Task* task = sched.CreateTask([&m, &counter, &inside, &maxSeen] {
-            for (int i = 0; i < kIters; ++i) {
-                m.Lock();
-                const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
-                int prev = maxSeen.load(std::memory_order_relaxed);
-                while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
-                counter.fetch_add(1, std::memory_order_relaxed);
-                inside.fetch_sub(1, std::memory_order_acq_rel);
-                m.Unlock();
-            }
-            }, false, JLib::FiberSize::Standard, /*noFiber*/0);
-        if (!task) { Check(false, "CreateTask returned null"); return; }
-        task->waitGroup = &wg;
-        sched.Push(task);
-    }
-    sched.WaitFor(wg);
-
-    Check(counter.load() == 2 * kIters, "both fibers completed every iteration");
-    Check(maxSeen.load() == 1,          "never two fiber holders at once");
+    Check(locked.second == 2 * kFiberContentionIters, "both fibers completed every iteration");
+    Check(locked.first == 1,           "never two fiber holders at once");
 }
+
+// File scope for the same reason as kFiberContentionIters above: used inside a lambda with an
+// explicit capture list, which MSVC requires to be captured if it is a local.
+static constexpr int kMixedContentionIters = 300;
 
 // ---- 10. Mixed FIBER vs BARE-THREAD contention --------------------------------------------------
 // The two paths have to interoperate on the SAME mutex: a suspending fiber and a spin-helping bare
@@ -392,10 +425,9 @@ static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
     std::atomic<int> inside{ 0 };
     std::atomic<int> maxSeen{ 0 };
     std::atomic<int> done{ 0 };
-    constexpr int kIters = 300;
 
     auto body = [&m, &inside, &maxSeen, &done]() {
-        for (int i = 0; i < kIters; ++i) {
+        for (int i = 0; i < kMixedContentionIters; ++i) {
             m.Lock();
             const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
             int prev = maxSeen.load(std::memory_order_relaxed);
@@ -408,6 +440,8 @@ static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
 
     JLib::WaitGroup wg;
     wg.n.store(1, std::memory_order_relaxed);
+    // `body` passed directly, as an lvalue. This did not compile until LambdaTask gained a const&
+    // constructor -- see TestCreateTaskAcceptsNamedCallable below, which guards it.
     JLib::Task* t = sched.CreateTask(body, false, JLib::FiberSize::Standard, /*noFiber*/0);
     if (!t) { Check(false, "CreateTask returned null"); return; }
     t->waitGroup = &wg;
@@ -566,6 +600,32 @@ static void TestSemaphoreCrossThreadRelease() {
     Check(sem.Try_Wait(), "a permit released by a different thread is usable");
 }
 
+// ---- 15. CreateTask accepts a NAMED callable, not just a temporary -------------------------------
+// Regression guard. LambdaTask's F is already decayed by CreateTask, so its `F&&` constructor is a
+// plain rvalue reference; before the const& overload was added, passing a named lambda was a compile
+// error. This test is mostly a COMPILE-TIME assertion -- if the overload is ever removed, this file
+// stops building, which is the loudest possible failure and exactly what is wanted for an API shape.
+// The runtime checks confirm the copy actually carried the captures.
+static void TestCreateTaskAcceptsNamedCallable(JLib::TaskScheduler& sched) {
+    std::printf("CreateTask accepts a named (lvalue) callable\n");
+
+    std::atomic<int> ran{ 0 };
+    const int captured = 41;
+    auto named = [&ran, captured] { ran.fetch_add(captured + 1, std::memory_order_relaxed); };
+
+    JLib::WaitGroup wg;
+    wg.n.store(2, std::memory_order_relaxed);
+
+    JLib::Task* a = sched.CreateTask(named);              // lvalue -> copies
+    JLib::Task* b = sched.CreateTask(std::move(named));   // rvalue -> still moves, as before
+    if (!a || !b) { Check(false, "CreateTask returned null"); return; }
+    a->waitGroup = &wg; b->waitGroup = &wg;
+    sched.Push(a); sched.Push(b);
+    sched.WaitFor(wg);
+
+    Check(ran.load(std::memory_order_relaxed) == 84, "both the copied and the moved callable ran with captures intact");
+}
+
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
     std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
@@ -589,6 +649,7 @@ int main(int argc, char** argv) {
     TestConditionVariableNotifyAll(sched);
     TestConditionVariableBareThreadContract();
     TestSemaphoreCrossThreadRelease();
+    TestCreateTaskAcceptsNamedCallable(sched);
 
     sched.Join();
     g_done.store(true, std::memory_order_release);

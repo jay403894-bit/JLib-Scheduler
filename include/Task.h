@@ -151,9 +151,26 @@ namespace JLib {
         F func;
     public:
         static_assert(sizeof(F) <= (256 - sizeof(Task)), "LambdaTask exceeds 256-byte slab capacity");
+        // NOTE: F here is the CLASS template parameter, which CreateTask has already run through
+        // std::decay_t. So this is a plain rvalue reference, NOT a forwarding reference, and it
+        // accepts temporaries only. That is why a NAMED callable used to fail to compile:
+        //     auto body = [&]{ ... };
+        //     sched.CreateTask(body, ...);      // F deduced as lambda&, could not bind here
+        // which is a perfectly reasonable thing to write, especially when the same body is also
+        // handed to a std::thread. The const& overload below fixes it by copying.
         LambdaTask(F&& f)
             : Task(LambdaTask::ExecuteWrapper, nullptr),
-            func(std::forward<F>(f))
+            func(std::move(f))
+        {
+            this->data = this;
+        }
+
+        // Lvalue overload: copies the callable. No ambiguity with the one above -- an rvalue prefers
+        // F&&, an lvalue can only bind here -- and no API change, since CreateTask's own signature is
+        // untouched and callers that pass a temporary still move exactly as before.
+        LambdaTask(const F& f)
+            : Task(LambdaTask::ExecuteWrapper, nullptr),
+            func(f)
         {
             this->data = this;
         }
