@@ -383,6 +383,23 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                 for (int i = 0; i < kFiberContentionIters; ++i) {
                     if (useLock) m->Lock();
                     const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+                    // PROBE ONLY: hold the section open until the other fiber is also inside, so
+                    // overlap is FORCED rather than hoped for. Without this the window is a few
+                    // nanoseconds wide and whether anyone observes it depends on how many cores the
+                    // machine has -- which is why this passed 5/5 locally on 32 threads and failed
+                    // on a 2-vCPU CI runner. Bounded, so a machine that genuinely cannot run them
+                    // concurrently falls through instead of hanging.
+                    // FIRST ITERATION ONLY. The rendezvous above already proved both fibers are
+                    // running, so one held section is enough to observe the overlap -- and bounding
+                    // it here matters: forcing on every iteration would make whichever fiber
+                    // finishes second spin the full budget on each of its remaining iterations,
+                    // waiting for a partner that has already exited.
+                    if (!useLock && i == 0) {
+                        for (int spin = 0; spin < 200000 && inside.load(std::memory_order_acquire) < 2; ++spin)
+                            std::this_thread::yield();
+                    }
+
                     int prev = maxSeen.load(std::memory_order_relaxed);
                     while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
                     counter.fetch_add(1, std::memory_order_relaxed);
@@ -400,14 +417,25 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
 
     const auto probe = run(false, nullptr);
     if (probe.first < 0) { Check(false, "CreateTask returned null"); return; }
-    Check(probe.first > 1, "PREMISE: the two fibers genuinely overlap when unlocked");
+
+    // NOT a Check(). A premise about achievable concurrency is a property of the MACHINE, not of the
+    // code under test, so it must never fail the build: a 2-vCPU CI runner that cannot get two
+    // fibers running at once has found nothing wrong with the mutex. It reports which of two things
+    // the run below is worth -- proof, or a weaker "did not misbehave". This started life as a
+    // Check() and failed exactly that way on CI while passing 5/5 on a 32-thread desktop.
+    const bool overlapProven = probe.first > 1;
+    std::printf("  %-58s %s\n",
+        overlapProven ? "PREMISE: the two fibers genuinely overlap when unlocked"
+                      : "PREMISE: could not force overlap on this machine",
+        overlapProven ? "ok" : "INCONCLUSIVE (next check is weaker, not failed)");
 
     JLib::SchedulerMutex m;
     const auto locked = run(true, &m);
     if (locked.first < 0) { Check(false, "CreateTask returned null"); return; }
 
     Check(locked.second == 2 * kFiberContentionIters, "both fibers completed every iteration");
-    Check(locked.first == 1,           "never two fiber holders at once");
+    Check(locked.first == 1, overlapProven ? "never two fiber holders at once (overlap proven)"
+                                           : "never two fiber holders at once (overlap unproven)");
 }
 
 // File scope for the same reason as kFiberContentionIters above: used inside a lambda with an
