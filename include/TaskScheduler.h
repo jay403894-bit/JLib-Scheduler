@@ -254,6 +254,22 @@ namespace JLib {
 		static bool IsInitialized() {
 			return instance != nullptr;
 		}
+
+		// How many worker threads this pool ACTUALLY has. Use this to size per-worker resources --
+		// command allocators, context pools, a third-party job system's concurrency hint -- rather
+		// than recomputing it from std::thread::hardware_concurrency(), which is a guess about a
+		// number this object already knows. The auto pool is hw-1, but Init(poolSize) accepts an
+		// explicit size and an app with a persistent audio thread is told to pass hw-2, so any
+		// hardware_concurrency-derived count is wrong on exactly the machines that were configured
+		// deliberately.
+		//
+		// NOT the same question as GetSafeTC(), which answers "what size SHOULD the pool be" and is
+		// only meaningful before Init(). This answers "what size is it".
+		//
+		// Fixed after Init() and safe to call from anywhere; the vector is built once in StartPool
+		// and never resized while the pool is running.
+		size_t GetWorkerCount() const;
+
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
 		// "level_loaded", the handful of names your app knows at compile time. The registry is

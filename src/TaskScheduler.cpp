@@ -1205,6 +1205,10 @@ bool TaskScheduler::TryRunStolenNoFiberTask() {
 TaskAllocator* TaskScheduler::GetAllocator() {
 	return &taskAllocator;
 }
+
+size_t TaskScheduler::GetWorkerCount() const {
+	return workers.size();
+}
 Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t noFiber, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;
