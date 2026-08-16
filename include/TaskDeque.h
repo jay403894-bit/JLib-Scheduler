@@ -110,16 +110,29 @@ namespace JLib {
                 Task* item = buffer_[b & mask_];
                 if (t == b) {
                     // Last item: race the stealer for it.
-                    // acq_rel, not seq_cst. Le/Pop/Cohen/Zappa Nardelli's verified Chase-Lev
-                    // (PPoPP 2013) uses seq_cst for the steal-side CAS; MODEL CHECKED with GenMC
-                    // v0.17.0 on 2026-08-11 (tests/verify/deque_model.c, one owner + two thieves,
-                    // 174 complete executions) and acq_rel is sufficient -- the seq_cst FENCES on
-                    // both sides carry the store-load ordering, so the CAS strength is not what
-                    // makes this correct. seq_cst here would cost a stronger barrier on ARM64
-                    // (casal vs casa) for nothing.
+                    // seq_cst, matching Le/Pop/Cohen/Zappa Nardelli's verified Chase-Lev (PPoPP
+                    // 2013). This was acq_rel from 2026-08-11 to 2026-08-15, on the strength of a
+                    // GenMC v0.17.0 run (tests/verify/deque_model.c, ONE OWNER + TWO THIEVES, 174
+                    // complete executions) that found acq_rel sufficient. Restored to the paper's
+                    // ordering deliberately -- read this before weakening it again.
+                    //
+                    // The GenMC result is probably CORRECT: the last-element race is a Dekker
+                    // pattern, resolved by the two seq_cst FENCES, so this CAS only has to publish
+                    // and observe. But note the asymmetry in what that tool proves. Its OTHER
+                    // finding -- that deleting the fence above double-claims in under a second -- is
+                    // a concrete counterexample, i.e. proof. "No counterexample found" is only
+                    // bounded evidence, and the bound here is literally two thieves; this pool runs
+                    // 31. Same tool, very different confidence, easy to file both under "verified".
+                    //
+                    // What decides it is that the weakening buys NOTHING where this runs: on x86-64
+                    // acq_rel and seq_cst emit the identical `lock cmpxchg` (checked). It differs
+                    // only on AArch64 -- the newest, least-exercised port -- and what it would buy
+                    // there is unmeasured, while what it risks is two workers claiming one task:
+                    // a double-free that would never be reproducible. If you want it back, measure
+                    // the barrier on ARM first and widen the model to more thieves.
                     if (!top_.compare_exchange_strong(
                         t, t + 1,
-                        std::memory_order_acq_rel,
+                        std::memory_order_seq_cst,
                         std::memory_order_relaxed))
                     {
                         // Stealer won.
@@ -149,7 +162,7 @@ namespace JLib {
                 Task* item = buffer_[t & mask_];
                 if (top_.compare_exchange_strong(
                     t, t + 1,
-                    std::memory_order_acq_rel,
+                    std::memory_order_seq_cst,   // see pop_bottom: paper ordering, not GenMC's weaker acq_rel
                     std::memory_order_relaxed))
                 {
                     return item;
@@ -186,7 +199,7 @@ namespace JLib {
                     return std::nullopt;   // incompatible: leave it for a matching thief, NO claim
                 if (top_.compare_exchange_strong(
                     t, t + 1,
-                    std::memory_order_acq_rel,
+                    std::memory_order_seq_cst,   // see pop_bottom: paper ordering, not GenMC's acq_rel
                     std::memory_order_relaxed))
                 {
                     return item;
