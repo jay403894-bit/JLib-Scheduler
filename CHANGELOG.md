@@ -3,7 +3,42 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.3.5 - 2026-08-15
+## 1.3.4 - UNRELEASED
+
+Everything below is one batch: v1.3.3 is the last tag, so all of it ships as 1.3.4.
+
+**Work-stealing deque: the three `top_` CAS sites are back to the paper's `seq_cst`.** They were
+weakened to `acq_rel` on 2026-08-11 because GenMC found that sufficient. The finding is probably
+correct -- the last-element race is a Dekker pattern resolved by the two `seq_cst` FENCES, so the
+CAS only has to publish and observe -- but note the asymmetry in what a model checker proves. Its
+other result, that deleting the `pop_bottom` fence double-claims in under a second, is a concrete
+counterexample and therefore PROOF. "No counterexample found" is bounded evidence, and the bound
+was literally **one owner and two thieves**; this pool runs 31. Same tool, very different
+confidence.
+
+What decided it: the weakening buys **nothing** where this runs. On x86-64 both orderings emit the
+identical `lock cmpxchg` (verified on GCC and MSVC). It differs only on AArch64 -- the newest,
+least-exercised port -- and what it would buy there is unmeasured, while what it risks is two
+workers claiming one task: a double-free that would never be reproducible. To weaken it again,
+measure the barrier on ARM first and widen the model beyond two thieves.
+
+**`PickNextWorker`'s `nextWorker` was `seq_cst` by accident.** Bare `operator T()`/`operator=` on a
+`std::atomic` default to sequential consistency, so on x86 every push emitted a locked `xchg` on one
+globally shared counter -- and `PickNextWorker` is called from `PushLocal` (both branches),
+`Requeue`, `PushBatch` and `PushToCore`. Now explicit `relaxed`, matching the P/E picker beside it
+which always was. Safe by construction: it is a round-robin HINT, nothing reads it for correctness,
+and the loop re-checks `immediateCoresInUse` on whatever it picks.
+
+**Measured: zero.** `throughput/mp` over 6 runs each, mean 3.06 -> 3.07 M tasks/sec. Kept on
+semantics, not performance -- and it is not a no-op, MSVC codegen confirms `xchg` -> `mov`. The
+saving is invisible because every push also does `NotifyWorker`, which takes the target worker's
+mutex (the lost-wakeup fix); a mutex acquire/release dwarfs one locked instruction. That is why
+`PushBatch` batches notifies per segment, and why the awake-preference optimisation was worth 26% on
+latency while this is worth 0%. **There is no third `pendingTasks`-shaped atomic left on the push
+path** -- anything further has to come from the notify, not from counters.
+
+**Removed the dead `nextId`** and `Thread::GenerateID()`: a process-wide atomic counter whose only
+reader had no callers anywhere. Never executed, so it cost no time; it just implied task IDs existed.
 
 **`CreateTask` now accepts a NAMED callable, not only a temporary.** This did not compile:
 
@@ -41,8 +76,6 @@ frequently never overlap at all. A mutual-exclusion test that passes while the m
 worse than no test. It now runs an unlocked probe first and asserts overlap was actually observed
 before trusting the locked result, behind a rendezvous so both fibers are resident before either
 starts.
-
-## 1.3.4 - 2026-08-14
 
 **[CRITICAL] fixes a deterministic deadlock when a task waits from inside a worker.** Affects every
 release. If any `noFiber` task calls `ParallelFor`, `WaitFor`, `SchedulerMutex::Lock` or

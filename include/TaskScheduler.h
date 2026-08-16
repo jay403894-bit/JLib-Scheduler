@@ -384,7 +384,9 @@ namespace JLib {
 		explicit TaskScheduler(size_t poolSize);
 
 		// ---------- former SharedQueues state ----------
-		std::atomic<uint64_t> nextId{ 0 };
+		// (`nextId` removed in 1.3.4: a process-wide atomic counter whose only reader,
+		//  Thread::GenerateID(), had no callers anywhere. Never executed, so it cost no time -- but
+		//  it sat in the shared struct implying task IDs existed. Nothing assigns or reads one.)
 		std::vector<std::unique_ptr<std::atomic<bool>>> immediateCoresInUse;
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> loPri;

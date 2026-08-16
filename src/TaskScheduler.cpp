@@ -704,7 +704,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	for (unsigned int q = 0; q < num_workers; ++q)
 		(isPCore[q] ? pWorkers : eWorkers).push_back((int)q);
 	stopFlag.store(false, std::memory_order_release);
-	nextWorker = 0;
+	nextWorker.store(0, std::memory_order_relaxed);   // init, single-threaded; explicit to match PickNextWorker
 	// Sized from THE POOL, not the machine. This used to be hardware_concurrency()-1, which meant a
 	// caller asking for a small pool still paid for a machine-sized fiber arena: Init(4) on a
 	// 32-thread box allocated 1984 standard + 248 heavy fibers, ~248 MB of commit for four workers,
@@ -1336,16 +1336,27 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 
 	// Default/Any/Wide land here directly (no class preference); for P/E it's the last resort -- sets
 	// empty (not built) or EVERY worker pinned. The original full-pool round-robin, unchanged.
+	// RELAXED, explicitly. These were bare `nextWorker + i` / `nextWorker = ...`, and bare
+	// operator T() / operator= on std::atomic default to SEQ_CST -- which on x86 makes the store a
+	// locked `xchg`, a full barrier, on one globally shared counter, on EVERY push (PickNextWorker
+	// is called from PushLocal's both branches, Requeue, PushBatch and PushToCore). Same shape as
+	// the two costs already removed from this path: `pendingTasks` (24 ns/task, 27% of per-task
+	// cost, deleted in 1.3.0) and TaskAllocator's shared `liveCount` (sharded).
+	//
+	// Relaxed is not a risk here: nextWorker is a round-robin HINT and nothing reads it for
+	// correctness. A stale or racing value just selects a different worker, which is always legal --
+	// the loop re-checks immediateCoresInUse on whatever it picks. The P/E picker above already
+	// does exactly this (cur.load/store relaxed); this path was simply the one that never said so.
 	size_t n = workers.size();
 	for (size_t i = 0; i < n; ++i) {
-		size_t j = (nextWorker + i) % n;
+		size_t j = (nextWorker.load(std::memory_order_relaxed) + i) % n;
 		if (!immediateCoresInUse[j]->load(std::memory_order_acquire)) {
-			nextWorker = (j + 1) % n;
+			nextWorker.store((int)((j + 1) % n), std::memory_order_relaxed);
 			return static_cast<int>(j);
 		}
 	}
-	int fallback = static_cast<int>(nextWorker);
-	nextWorker = (fallback + 1) % n;
+	int fallback = nextWorker.load(std::memory_order_relaxed);
+	nextWorker.store((int)((fallback + 1) % n), std::memory_order_relaxed);
 	return fallback;
 }
 

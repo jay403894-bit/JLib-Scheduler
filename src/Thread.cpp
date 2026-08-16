@@ -303,9 +303,6 @@ void Thread::Suspend(Fiber* targetFiber){
 	 GetCurrent()->currentFiber->Suspend();
  }
 
- uint64_t Thread::GenerateID() {
-	 return scheduler->nextId.fetch_add(1, std::memory_order_relaxed);
- }
 void Thread::NotifyWorker(bool force){
 	// THE OPTIMISATION: if this worker is running, say nothing. It clears hasQueuedWork and
 	// re-searches every loop pass, so it will find the task on its own, and MarkQueuedWork has

@@ -159,7 +159,6 @@ namespace JLib {
             };
         }
     private:
-        uint64_t GenerateID();
         Fiber* AcquireFiber(Task* task);
         void ReleaseFiber(Fiber* f);
         uint32_t FastRand();
