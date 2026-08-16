@@ -1336,27 +1336,35 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 
 	// Default/Any/Wide land here directly (no class preference); for P/E it's the last resort -- sets
 	// empty (not built) or EVERY worker pinned. The original full-pool round-robin, unchanged.
-	// RELAXED, explicitly. These were bare `nextWorker + i` / `nextWorker = ...`, and bare
-	// operator T() / operator= on std::atomic default to SEQ_CST -- which on x86 makes the store a
-	// locked `xchg`, a full barrier, on one globally shared counter, on EVERY push (PickNextWorker
-	// is called from PushLocal's both branches, Requeue, PushBatch and PushToCore). Same shape as
-	// the two costs already removed from this path: `pendingTasks` (24 ns/task, 27% of per-task
-	// cost, deleted in 1.3.0) and TaskAllocator's shared `liveCount` (sharded).
+	// SEQ_CST, explicitly, and deliberately NOT relaxed. These were bare `nextWorker + i` /
+	// `nextWorker = ...`, which default to seq_cst; on 2026-08-16 they were made explicitly RELAXED
+	// on the reasoning that this is only a round-robin HINT (true -- nothing reads it for
+	// correctness, and the loop re-checks immediateCoresInUse on whatever it picks).
 	//
-	// Relaxed is not a risk here: nextWorker is a round-robin HINT and nothing reads it for
-	// correctness. A stale or racing value just selects a different worker, which is always legal --
-	// the loop re-checks immediateCoresInUse on whatever it picks. The P/E picker above already
-	// does exactly this (cur.load/store relaxed); this path was simply the one that never said so.
+	// REVERTED the same day. That change measured EXACTLY ZERO on throughput/mp (mean 3.06 -> 3.07
+	// M tasks/sec over 6 runs each) -- and the very next CI run hung the primitives test on macOS
+	// arm64, on a test that had passed at the same iteration count one commit earlier. It is the
+	// only ordering WEAKENING in that commit (the deque CAS went the other way, to seq_cst), so it
+	// is the prime suspect for having removed a fence something else was accidentally leaning on --
+	// which is exactly the class of bug that shows on ARM and never on x86, and this project has
+	// already shipped one of those (the 1.2.0 sleep-predicate lost wakeup, hung macOS arm64 one run
+	// in three, invisible on TSO -- see NotifyWorker).
+	//
+	// NOT PROVEN: one pass and one fail is weak evidence against a historically ~1-in-3 flake, and
+	// no mechanism has been constructed -- this store happens BEFORE the inbox push, and the
+	// push/MarkQueuedWork/NotifyWorker sequence carries its own ordering. It is reverted because the
+	// benefit was measured at zero, so there is nothing to weigh against the suspicion. If the macOS
+	// hang reproduces WITH this at seq_cst, this is exonerated and the search moves on.
 	size_t n = workers.size();
 	for (size_t i = 0; i < n; ++i) {
-		size_t j = (nextWorker.load(std::memory_order_relaxed) + i) % n;
+		size_t j = (nextWorker.load(std::memory_order_seq_cst) + i) % n;
 		if (!immediateCoresInUse[j]->load(std::memory_order_acquire)) {
-			nextWorker.store((int)((j + 1) % n), std::memory_order_relaxed);
+			nextWorker.store((int)((j + 1) % n), std::memory_order_seq_cst);
 			return static_cast<int>(j);
 		}
 	}
-	int fallback = nextWorker.load(std::memory_order_relaxed);
-	nextWorker.store((int)((fallback + 1) % n), std::memory_order_relaxed);
+	int fallback = nextWorker.load(std::memory_order_seq_cst);
+	nextWorker.store((int)((fallback + 1) % n), std::memory_order_seq_cst);
 	return fallback;
 }
 

@@ -109,6 +109,33 @@ jobs:
         run: ./${{ matrix.prims }} nosleep
         shell: bash
 
+      # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
+      #
+      # The fiber-contention case at 2000 iterations (~4000 contended fiber suspend/resume round
+      # trips) blew the 30s watchdog here on 2026-08-16 -- but the SAME test at the SAME count had
+      # passed one commit earlier, so the failure is INTERMITTENT. Lowering the default to 200 may
+      # therefore have cut the odds of hitting a race by ~10x rather than fixing anything, and this
+      # project has already shipped exactly this shape once: the 1.2.0 sleep-predicate lost wakeup
+      # hung macOS arm64 about one run in three and never reproduced on x86, because TSO hides it.
+      #
+      # Ten runs at the high count with a RAISED watchdog is what separates the two explanations:
+      #   all ten complete (even if slowly) -> suspend/resume here is just slow; nothing to fix
+      #   any run hangs to the 120s watchdog -> a race, and the iteration count is irrelevant
+      # continue-on-error: this is diagnostic, so a hit must not turn main red until it is
+      # understood -- read the step's log, do not trust the job's colour for this one.
+      - name: macOS arm64 race hunt (high-iteration reproducer, diagnostic)
+        if: matrix.os == 'macos-14'
+        continue-on-error: true
+        env:
+          JLIB_TEST_CONTENTION_ITERS: 2000
+          JLIB_TEST_WATCHDOG_SECS: 120
+        run: |
+          for i in $(seq 1 10); do
+            echo "=== run $i ==="
+            ./${{ matrix.prims }} || echo "RUN $i FAILED (exit $?)"
+          done
+        shell: bash
+
       # The steal counters compile out entirely in a normal build, which is the point but also the
       # hazard: code that is never compiled rots silently, and the first person to need it would
       # discover that months later while chasing something else. This is the one place it gets built,

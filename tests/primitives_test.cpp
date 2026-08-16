@@ -360,12 +360,29 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
 // fibers are actually resident at the same time instead of running back to back.
 // File scope, not a local: it is used inside two nested lambdas, and MSVC (correctly, and more
 // strictly than GCC) requires a constexpr local to be captured explicitly to be usable there.
-// 200, not 2000. When this test relied on LUCK to observe overlap, a big count was how it bought
-// enough chances. Overlap is now FORCED on the first iteration, so the count does no statistical
-// work any more -- it only multiplies contended Lock/Unlock round trips, each of which SUSPENDS and
-// resumes a fiber. At 2000 x 2 fibers that was ~4000 suspend/resume cycles and it blew the suite's
-// 30s watchdog on the macOS arm64 CI runner, which is far slower on that path than Windows or Linux.
-static constexpr int kFiberContentionIters = 200;
+// 200 by default, overridable via JLIB_TEST_CONTENTION_ITERS.
+//
+// When this test relied on LUCK to observe overlap, a big count was how it bought enough chances.
+// Overlap is now FORCED on the first iteration, so the count does no statistical work -- it only
+// multiplies contended Lock/Unlock round trips, each of which SUSPENDS and resumes a fiber.
+//
+// WHY IT IS A KNOB AND NOT JUST 200: at 2000 this blew the 30s watchdog on macOS arm64 -- but the
+// SAME test at the SAME count had passed one commit earlier, so the failure is INTERMITTENT, and
+// dropping to 200 may have reduced the odds of hitting a race by ~10x rather than fixing anything.
+// The high count is the reproducer. CI hammers macOS with it (see .github/workflows/ci.yml) at a
+// raised watchdog, which is what separates the two hypotheses:
+//   completes every time, just slowly -> genuinely slow suspend/resume, nothing to fix
+//   hangs intermittently              -> a race in the park/wake or mutex-waiter handshake, and
+//                                        this project has shipped one of those before (1.2.0,
+//                                        macOS arm64, ~1 run in 3, invisible on x86's TSO)
+static int FiberContentionIters() {
+    if (const char* e = std::getenv("JLIB_TEST_CONTENTION_ITERS")) {
+        const int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    return 200;
+}
+static const int kFiberContentionIters = FiberContentionIters();
 
 static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
     std::printf("mutex contention between two FIBERS (suspend path)\n");
@@ -672,7 +689,15 @@ static void TestCreateTaskAcceptsNamedCallable(JLib::TaskScheduler& sched) {
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
     std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
-    StartWatchdog(30, noSleep ? "primitives test (nosleep)" : "primitives test");
+    // 30s default, overridable via JLIB_TEST_WATCHDOG_SECS. Raising it is what lets a high-iteration
+    // reproducer distinguish SLOW from STUCK: if the run completes in 60s it was merely slow, and if
+    // it never completes it is a hang no matter how long you wait.
+    int watchdogSecs = 30;
+    if (const char* w = std::getenv("JLIB_TEST_WATCHDOG_SECS")) {
+        const int v = std::atoi(w);
+        if (v > 0) watchdogSecs = v;
+    }
+    StartWatchdog(watchdogSecs, noSleep ? "primitives test (nosleep)" : "primitives test");
 
     if (noSleep) JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
     JLib::TaskScheduler::Init(4);
