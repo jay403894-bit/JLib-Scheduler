@@ -273,7 +273,7 @@ configuration, and somebody with the hardware -- about a day of mechanical work 
 Open an issue either way. A report that it works is as useful as one that it doesn't.
 
 ## Using it
-
+Synchronization primitives: JLib provides fiber-aware SchedulerMutex, SchedulerSemaphore, SchedulerConditionVariable, Event, DirectEvent, and WaitGroup primitives.
 ```cpp
 #include <TaskScheduler.h>
 
