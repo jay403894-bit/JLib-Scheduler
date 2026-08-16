@@ -3,9 +3,9 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.3.4 - UNRELEASED
+## 1.3.4 - 2026-08-16
 
-Everything below is one batch: v1.3.3 is the last tag, so all of it ships as 1.3.4.
+Everything below is one batch: v1.3.3 was the last tag, so all of it ships as 1.3.4.
 
 **Work-stealing deque: the three `top_` CAS sites are back to the paper's `seq_cst`.** They were
 weakened to `acq_rel` on 2026-08-11 because GenMC found that sufficient. The finding is probably
