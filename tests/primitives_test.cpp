@@ -360,7 +360,12 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
 // fibers are actually resident at the same time instead of running back to back.
 // File scope, not a local: it is used inside two nested lambdas, and MSVC (correctly, and more
 // strictly than GCC) requires a constexpr local to be captured explicitly to be usable there.
-static constexpr int kFiberContentionIters = 2000;
+// 200, not 2000. When this test relied on LUCK to observe overlap, a big count was how it bought
+// enough chances. Overlap is now FORCED on the first iteration, so the count does no statistical
+// work any more -- it only multiplies contended Lock/Unlock round trips, each of which SUSPENDS and
+// resumes a fiber. At 2000 x 2 fibers that was ~4000 suspend/resume cycles and it blew the suite's
+// 30s watchdog on the macOS arm64 CI runner, which is far slower on that path than Windows or Linux.
+static constexpr int kFiberContentionIters = 200;
 
 static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
     std::printf("mutex contention between two FIBERS (suspend path)\n");
@@ -376,9 +381,17 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                 // Rendezvous: don't start until BOTH fibers are running, so the loops overlap
                 // instead of the first finishing before the second is scheduled. Bounded so a
                 // starved pool degrades to a weaker test rather than a hang.
+                // Bounded IN TIME, not in yields. A yield-count budget is not portable: a yield
+                // costs wildly different amounts across Windows, Linux and macOS QoS scheduling, so
+                // "1,000,000 yields" is a different timeout on every platform and unbounded on the
+                // slowest. A deadline is the same everywhere.
                 arrived.fetch_add(1, std::memory_order_acq_rel);
-                for (int spin = 0; spin < 1000000 && arrived.load(std::memory_order_acquire) < 2; ++spin)
-                    std::this_thread::yield();
+                {
+                    const auto rvDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                    while (arrived.load(std::memory_order_acquire) < 2 &&
+                           std::chrono::steady_clock::now() < rvDeadline)
+                        std::this_thread::yield();
+                }
 
                 for (int i = 0; i < kFiberContentionIters; ++i) {
                     if (useLock) m->Lock();
@@ -396,7 +409,9 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                     // finishes second spin the full budget on each of its remaining iterations,
                     // waiting for a partner that has already exited.
                     if (!useLock && i == 0) {
-                        for (int spin = 0; spin < 200000 && inside.load(std::memory_order_acquire) < 2; ++spin)
+                        const auto ovDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                        while (inside.load(std::memory_order_acquire) < 2 &&
+                               std::chrono::steady_clock::now() < ovDeadline)
                             std::this_thread::yield();
                     }
 
