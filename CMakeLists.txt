@@ -336,14 +336,41 @@ if(JLIBSCHED_STANDALONE)
     include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
 
+    # Headers go in a SUBDIRECTORY, and the exported target carries the include path so that
+    # `#include <TaskScheduler.h>` keeps working unchanged. Flat was untenable for a system install:
+    # this library ships Task.h, Thread.h, Event.h, Fiber.h, Context.h, Topology.h and platform.h,
+    # plus moodycamel's concurrentqueue.h -- dropping those into /usr/include is hostile to whatever
+    # else is on the machine, and the moodycamel ones would fight any other library vendoring them.
+    #
+    # Costs consumers NOTHING: INCLUDES DESTINATION below puts <prefix>/include/JLibScheduler on the
+    # imported target's INTERFACE_INCLUDE_DIRECTORIES, so find_package + target_link_libraries gives
+    # the same short include paths as before, and the internal #include "concurrentqueue.h" still
+    # resolves. Only someone hand-writing -I<prefix>/include instead of using the package breaks --
+    # and they were already colliding with everything else there.
+    set(JLIBSCHED_INCDEST "${CMAKE_INSTALL_INCLUDEDIR}/JLibScheduler")
+
+    # $<CONFIG> ONLY for multi-config generators. It expands on single-config ones too, which is how
+    # a Linux install ended up putting the archive in lib/Release/ -- wrong for any distro layout.
+    # Windows genuinely wants lib/Debug and lib/Release side by side, so keep it there.
+    if(CMAKE_CONFIGURATION_TYPES)
+        set(JLIBSCHED_LIBDEST "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>")
+    else()
+        set(JLIBSCHED_LIBDEST "${CMAKE_INSTALL_LIBDIR}")
+    endif()
+
     install(TARGETS Scheduler EXPORT JLibSchedulerTargets
-            ARCHIVE DESTINATION "lib/$<CONFIG>"
-            INCLUDES DESTINATION include)
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/" DESTINATION include)
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" DESTINATION .)
+            ARCHIVE DESTINATION "${JLIBSCHED_LIBDEST}"
+            INCLUDES DESTINATION "${JLIBSCHED_INCDEST}")
+    # FILES_MATCHING *.h: include/ also holds moodycamel's LICENSE.md and README.md, which were
+    # being installed into the include directory as if they were headers.
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
+            DESTINATION "${JLIBSCHED_INCDEST}"
+            FILES_MATCHING PATTERN "*.h")
+    # share/doc/JLibScheduler/, not the prefix ROOT -- this used to land as a bare /usr/LICENSE.
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
     install(EXPORT JLibSchedulerTargets
             FILE JLibSchedulerTargets.cmake NAMESPACE JLib::
-            DESTINATION lib/cmake/JLibScheduler)
+            DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JLibScheduler")
 
     write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfigVersion.cmake"
@@ -356,8 +383,8 @@ if(JLIBSCHED_STANDALONE)
     configure_package_config_file(
         "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake.in"
         "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake"
-        INSTALL_DESTINATION lib/cmake/JLibScheduler)
+        INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JLibScheduler")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake"
                   "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfigVersion.cmake"
-            DESTINATION lib/cmake/JLibScheduler)
+            DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JLibScheduler")
 endif()
