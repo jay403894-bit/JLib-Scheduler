@@ -128,6 +128,28 @@ namespace JLib {
 		// self-trigger Tick() under load, so reclamation no longer depends solely on an
 		// external (engine) Tick() call.
 		size_t RetiredCount() const { return retiredCount.load(std::memory_order_relaxed); }
+
+		// How many retirements should accumulate before a self-triggered Tick() is worth paying for.
+		//
+		// SCALES WITH THE PARTICIPANT SET, because that is what a reclaim actually costs:
+		// MinActiveEpoch() scans EVERY participant -- one atomic load per worker slot AND per fiber
+		// slot, and the fiber pool is sized per core, so the scan grows with the machine while a
+		// fixed constant does not. At a hardcoded 512 the amortised cost per retirement was
+		// scan_length/512, i.e. it got WORSE the bigger the pool: a 4-worker box scanned a handful of
+		// slots, a 31-worker box with a full fiber pool scans on the order of two thousand.
+		//
+		// One retirement per participant makes that ratio exactly O(1) per retirement at any pool
+		// size, which is the property worth holding fixed. The floor keeps small pools from
+		// reclaiming so eagerly that the scan dominates a nearly-empty retire list.
+		//
+		// Safe to read on the hot path: `participants` is built once in StartPool and frozen before
+		// any worker runs (see MinActiveEpoch's comment), so this is a plain size read with no
+		// synchronisation -- and it sits behind a relaxed atomic load that already happened.
+		size_t ReclaimThreshold() const {
+			constexpr size_t kFloor = 512;
+			const size_t p = participants.size();
+			return p > kFloor ? p : kFloor;
+		}
 		size_t CurrentEpoch() { return globalEpoch.load(std::memory_order_acquire); }
 		size_t MinActiveEpoch() {
 			size_t minEpoch = globalEpoch.load(std::memory_order_acquire);

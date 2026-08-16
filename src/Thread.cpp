@@ -465,7 +465,7 @@ void Thread::Worker() {
 					}
 					is_handling_fork = false;
 				}
-				if (EpochManager::Instance().RetiredCount() > 512) {
+				if (EpochManager::Instance().RetiredCount() > EpochManager::Instance().ReclaimThreshold()) {
 					EpochManager::Instance().Tick();
 				}
 				task_to_run = nullptr;
@@ -589,7 +589,7 @@ void Thread::Worker() {
 				is_handling_fork = false;
 			}
 
-			if (EpochManager::Instance().RetiredCount() > 512) {
+			if (EpochManager::Instance().RetiredCount() > EpochManager::Instance().ReclaimThreshold()) {
 				EpochManager::Instance().Tick();
 			}
 
@@ -644,7 +644,7 @@ void Thread::Worker() {
 				drainInbox(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
 				drainInbox(scheduler->loPriInboxes[qIndex].get(), scheduler->loPri[qIndex].get());
 
-				if (EpochManager::Instance().RetiredCount() > 512) {
+				if (EpochManager::Instance().RetiredCount() > EpochManager::Instance().ReclaimThreshold()) {
 					EpochManager::Instance().Tick();
 				}
 
