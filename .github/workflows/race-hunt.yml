@@ -1,0 +1,72 @@
+# Nightly race hunt: macOS arm64 only, high iteration count, deliberately LOUD.
+#
+# WHY THIS EXISTS SEPARATELY FROM ci.yml
+# On 2026-08-16 the primitives suite hung on macos-14 at 2000 contention iterations -- on a test that
+# had PASSED at the same count one commit earlier. So the failure is intermittent, and it is the
+# second time this project has seen an ARM-only intermittent hang (the 1.2.0 sleep-predicate lost
+# wakeup went about one run in three on macOS arm64 and never once reproduced on x86, because TSO
+# hides it). The suspect was reverted -- PickNextWorker's nextWorker went back to seq_cst, the only
+# ordering WEAKENING in the commit that hung -- and it has been clean since. But "clean since" was
+# ten runs, and ten runs against a ~1-in-3 flake is a 1.7% outcome: suggestive, not conclusive.
+#
+# ci.yml carries the same reproducer as a continue-on-error step, which is right there: a diagnostic
+# must not turn main red mid-development. But it only samples on PUSH, so a quiet week samples
+# nothing. This one samples on a schedule and IS allowed to go red, because by the time it fires the
+# question is no longer "is development blocked" but "is there still a missing fence".
+#
+# READ A FAILURE THIS WAY: nextWorker was reverted, so a hit here means the revert only HID the
+# problem and the real ordering gap is still in the park/wake or mutex-waiter handshake. That is
+# more valuable to know than a green run, and it is exactly what ten push-triggered runs cannot tell
+# you. The sleep predicate itself is modelled (tests/verify/sleepwake_model.c); SchedulerMutex's
+# fiber-wait path is NOT, and it is the code this reproducer stresses hardest.
+name: Race hunt (macOS arm64)
+
+on:
+  schedule:
+    # 07:00 UTC daily. Any time works; this one is deliberately not on the hour boundary that
+    # everyone else picks, since GitHub drops scheduled runs under load at popular times.
+    - cron: '17 7 * * *'
+  workflow_dispatch:      # so it can be run on demand while chasing something
+
+jobs:
+  hunt:
+    name: macOS arm64 high-iteration reproducer
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release -j 2
+        shell: bash
+
+      # 20 runs at 2000 iterations (~4000 contended fiber suspend/resume round trips each) with the
+      # watchdog raised to 120s. The raised watchdog is what separates SLOW from STUCK: a run that
+      # merely takes a while still completes, and only a genuine hang reaches the limit. For
+      # reference, a healthy run of this whole suite on macos-14 takes about one second.
+      - name: Hunt
+        env:
+          JLIB_TEST_CONTENTION_ITERS: 2000
+          JLIB_TEST_WATCHDOG_SECS: 120
+        run: |
+          fails=0
+          for i in $(seq 1 20); do
+            echo "=== run $i ==="
+            if ! ./build/bin/SchedulerPrimitivesTest; then
+              echo "RUN $i FAILED"
+              fails=$((fails + 1))
+            fi
+          done
+          echo "----------------------------------------"
+          echo "failures: $fails / 20"
+          if [ "$fails" -ne 0 ]; then
+            echo "A hang or failure reproduced with nextWorker at seq_cst."
+            echo "That means the revert only masked the problem and the ordering gap is still live."
+            exit 1
+          fi
+        shell: bash
