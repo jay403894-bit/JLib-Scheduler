@@ -51,6 +51,17 @@ namespace JLib {
 		// the contract ever changes to allow runtime flips, and change the contract first.
 		bool selfReclaim = true;
 
+		// Bookkeeping for the "disabled and never ticked" warning in RetirePtr. Only the CODE that
+		// touches these is conditional; the MEMBERS are unconditional and deliberately so.
+		//
+		// EpochManager is header-only, so an #if around a member makes sizeof() depend on the
+		// including translation unit's build flags -- a Release library with a Development consumer
+		// would then disagree about this class's layout. That is precisely the failure this file's
+		// own stale-library guard exists to catch, and manufacturing more of it to save 16 bytes in
+		// a singleton would be a bad trade. Unused in Release; costs nothing there.
+		std::atomic<size_t> devRetiredWhileDisabled{ 0 };
+		std::atomic<bool>   devNoTickWarned{ false };
+
 		std::atomic<size_t> globalEpoch{ 0 };
 
 		struct ThreadEpoch {
@@ -87,6 +98,13 @@ namespace JLib {
 		{
 			AdvanceEpoch();
 			TryReclaim();
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+			// Reset the dev warning counter. It measures retirements SINCE THE LAST TICK, not
+			// cumulative -- a cumulative count would fire on CORRECT usage (ticking every frame)
+			// as soon as enough frames had gone by, and a warning that fires when you did the right
+			// thing is worse than no warning at all.
+			devRetiredWhileDisabled.store(0, std::memory_order_relaxed);
+#endif
 		}
 	
 		void Init(size_t maxThreads)
@@ -199,11 +217,20 @@ namespace JLib {
 		// idle point. It buys nothing for throughput, and a batch job with no idle point should
 		// leave it alone.
 		//
-		// WHY THE DEFAULT IS ON, and why you should not flip it casually. This is a LIBRARY, and the
-		// embedder may have no loop to tick from -- a headless server, a batch job, a plugin inside
-		// someone else's engine, a Join()-and-exit tool. With self-reclaim off and no Tick(),
-		// retired memory grows WITHOUT BOUND and nothing complains. That is a much worse failure
-		// than an atomic increment.
+		// WHY THE DEFAULT IS ON. Not because a library may not require an explicit pump -- plenty do,
+		// legitimately, and "tick me from your loop" is a perfectly reasonable contract. It is on
+		// because it is the SAFE FAILURE MODE: an embedder with no loop to tick from (a headless
+		// server, a batch job, a plugin inside someone else's engine, a Join()-and-exit tool) gets
+		// working reclamation without having read this comment, whereas the reverse default gets
+		// unbounded growth without having read this comment.
+		//
+		// Both modes are supported and neither is a fallback. If your application has an idle point,
+		// turning this off is a real choice with a measured benefit (below), not a workaround.
+		//
+		// The genuine hazard in the OFF mode is that forgetting Tick() used to fail SILENTLY. It no
+		// longer does: Development and debug builds keep counting retirements even while disabled,
+		// purely so the "disabled and never ticked" case can say so once. See the warning in
+		// RetirePtr. Release pays nothing for that.
 		//
 		// AND MEASURE BEFORE ASSUMING IT BUYS ANYTHING. The `fetch_add` sits immediately after a
 		// lock-free MPSC enqueue that is itself at least one atomic RMW plus a node link, so it is
@@ -262,9 +289,28 @@ namespace JLib {
 			incoming.enqueue(GlobalRetired{ (void*)p, epoch, d });   // lock-free
 			// The ONLY atomic in this path, and the only reason it exists is to let workers
 			// self-trigger. With self-reclaim off the counter has no reader, so skip it entirely --
-			// that is the whole saving SetSelfReclaim(false) offers. Guarded rather than removed
-			// because the default keeps reclamation independent of the embedder having a loop.
+			// that is the whole saving SetSelfReclaim(false) offers.
 			if (selfReclaim) retiredCount.fetch_add(1, std::memory_order_relaxed);
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+			// DEV-ONLY: make "disabled and never ticked" loud instead of silent.
+			//
+			// Turning self-reclaim off is a legitimate choice -- but the failure mode when you forget
+			// the matching Tick() is unbounded memory growth with nothing to point at, which is the
+			// one genuinely bad property of the OFF path. Counting here costs a relaxed increment in
+			// builds where that is irrelevant, and buys a single sentence naming the exact mistake.
+			// Release keeps paying nothing: the branch above is all it sees.
+			else {
+				const size_t n = devRetiredWhileDisabled.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n > 100000 && !devNoTickWarned.exchange(true, std::memory_order_relaxed)) {
+					std::fprintf(stderr,
+						"[JLib::Scheduler] %zu pointers retired with self-reclaim DISABLED and Tick() "
+						"never called. Memory will grow without bound. Call "
+						"EpochManager::Instance().Tick() from your idle path, or re-enable "
+						"SetSelfReclaim(true). This warning prints once.\n", n);
+					std::fflush(stderr);
+				}
+			}
+#endif
 		}
 
 	
