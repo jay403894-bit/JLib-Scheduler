@@ -21,7 +21,7 @@ staffed. Hand-written context switching,
 lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and
 hybrid-core aware placement.
 
-Windows x64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 · BSD
+Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 · BSD
 
 
 I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
@@ -78,11 +78,19 @@ predicted before measuring to be frequency scaling rather than wake latency -- 1
 once settle toward base clock on a chip at Intel spec power limits, where one task alone boosts. It
 stayed flat while everything else moved 3-6x.
 
-The default stays `Sleep` and should, for a library: spinning workers are a battery and thermal
-problem on Android, they starve whatever else the host process runs, and they make the
-oversubscription policy incoherent. `NoSleep` is for an application that owns the machine, which a
-fullscreen game does. There is deliberately no middle setting -- a spin-then-park mode was built,
-measured worse than both extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
+The default stays `Sleep`. Spinning workers are a battery and thermal problem on Android, they starve
+whatever else the host process runs, and they make the oversubscription policy incoherent.
+
+**A fullscreen game is NOT the case for `NoSleep`,** despite the table above -- an earlier version of
+this README said it was, and measurement says otherwise. The benchmarks flatter `NoSleep` because in
+a scheduler benchmark the pool *is* the workload: there is no render or audio thread for the spinning
+to tax, so only the wake saving shows up. Measured with an idle pool against a memory-bound main
+thread, `NoSleep` costs ~3.5% to every other thread in the process; measured inside a real 2D game it
+cost **23%**. `NoSleep` is for batch and offline work where the task graph is the entire program, or
+for pipelines whose idle gaps are under ~100 µs.
+
+There is deliberately no middle setting -- a spin-then-park mode was built, measured worse than both
+extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
 
 Structural properties, which do not vary by policy:
 
