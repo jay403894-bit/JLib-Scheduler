@@ -1,6 +1,22 @@
 # JLib::Scheduler
 
-A fiber-based, work-stealing task scheduler for real-time engines. Hand-written context switching,
+a hybrid runtime for C++17+ that gives you:
+
+Cilk‑style work‑stealing for fast parallel loops (PushArray, ParallelFor),
+TaskFlow‑style dependency graphs (TaskDAG) with AND/OR gates,
+Middleware‑safe threads by default (no TLS surprises),
+Fiber‑based blocking only when you actually suspend — so you never pay fiber overhead unless you need it.
+Built for real‑time engines that mix compute‑heavy loops, dependency‑aware pipelines, and I/O‑bound middleware in the same frame.
+
+**Maturity.** Test it in your own project before you depend on it. Run your workload, run your
+tests, and if it holds up, use it. What it should not be is dropped into a commercial project
+untested on the strength of a benchmark table -- including this one's.
+
+Bugs do get fixed: four defects were found and released inside a day in 1.3.x, two of which could
+hang a pool. But that was a day off. This is one person with a full-time job, so read it as evidence
+that reports get acted on -- not as a response time. During a work week the same four fixes would
+have taken weeks, and a report may sit for a while before anyone looks at it. Nothing here is
+staffed. Hand-written context switching,
 lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and
 hybrid-core aware placement.
 
@@ -11,15 +27,7 @@ Windows x64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silic
 I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
 I needed tasks that could wait on a gpu fence without parking a worker thread, enkiTS and taskflow cannot do this, marl can but was archived in April.
 
-**Maturity.** Test it in your own project before you depend on it. Run your workload, run your
-tests, and if it holds up, use it. What it should not be is dropped into a commercial project
-untested on the strength of a benchmark table -- including this one's.
 
-Bugs do get fixed: four defects were found and released inside a day in 1.3.x, two of which could
-hang a pool. But that was a day off. This is one person with a full-time job, so read it as evidence
-that reports get acted on -- not as a response time. During a work week the same four fixes would
-have taken weeks, and a report may sit for a while before anyone looks at it. Nothing here is
-staffed.
 
 ---
 ## How it compares
