@@ -7,8 +7,33 @@
 #include <cstddef>
 #include <mutex>
 #include <atomic>
-#ifdef _DEBUG
-#include <Windows.h> // OutputDebugStringA/__debugbreak for the free-list canary check below
+// THE FREE-LIST CANARY SWITCH.
+//
+// These checks were `#ifdef _DEBUG`, which meant they were OFF in the Development configuration --
+// the optimized-with-assertions build this project is actually run and debugged in (it uses /MD, so
+// _DEBUG is not defined; it gets /DJLIB_DEVELOPMENT instead). A use-after-free detector that does
+// not run in the build you debug in is not a detector.
+//
+// That gap cost real time: a slot written through after being freed corrupted the free list, and the
+// first visible symptom was a garbage pointer several subsystems away -- once inside
+// LockFreeList::add, once inside TaskAllocator::refill -- with nothing pointing at the write that
+// actually did it. The canary catches it at the next Alloc() of that exact slot.
+#if defined(_DEBUG) || defined(JLIB_DEVELOPMENT)
+    #define JLIBSCHED_ALLOC_CANARY 1
+#endif
+
+// PORTABLE, and it has to be: JLIB_DEVELOPMENT is set on Linux and macOS as well (see
+// CMAKE_CXX_FLAGS_DEVELOPMENT), so gating this on Windows.h / OutputDebugStringA / __debugbreak
+// would have broken every POSIX Development build the moment the canary stopped being _DEBUG-only.
+#ifdef JLIBSCHED_ALLOC_CANARY
+  #include <cstdio>
+  #if JLIB_PLATFORM_WINDOWS
+    #include <Windows.h>   // OutputDebugStringA/__debugbreak -- so the break lands in the debugger
+    #define JLIBSCHED_CANARY_REPORT(msg) do { OutputDebugStringA(msg); std::fprintf(stderr, "%s", msg); __debugbreak(); } while (0)
+  #else
+    #include <csignal>
+    #define JLIBSCHED_CANARY_REPORT(msg) do { std::fprintf(stderr, "%s", msg); std::fflush(stderr); std::raise(SIGTRAP); } while (0)
+  #endif
 #endif
 namespace JLib {
     namespace detail {
@@ -69,8 +94,28 @@ namespace JLib {
 
         // ---- per-thread cache (the lock-Free hot path) ----
         struct Cache { void* head = nullptr; size_t count = 0; };
+
+        // THE CAVEAT, which this comment used to promise ("see caveat below") and then never state.
+        //
+        // `c` is a static thread_local inside a STATIC function, so there is one cache PER THREAD --
+        // not one per thread per allocator. Every TaskAllocator instance in the process shares it.
+        //
+        // That is sound today only because there is exactly ONE instance
+        // (TaskScheduler::taskAllocator). Construct a second with a different slot size or a
+        // different backing vector and this silently breaks: a slot freed through allocator A lands
+        // on the calling thread's single cache, and allocator B hands it straight back out. Neither
+        // the size nor the ownership matches, and nothing diagnoses it -- Free() cannot tell which
+        // allocator a slot came from, because the free list is intrusive and carries no tag.
+        //
+        // So: adding a second TaskAllocator is not a drop-in. It needs the cache keyed per instance
+        // (a member rather than a function-static), which costs a pointer chase on the hot path, or
+        // a tag in the slot header. Decide that deliberately; do not discover it.
+        //
+        // Freeing a slot on a DIFFERENT thread than allocated it is fine, and is normal here --
+        // epoch reclamation runs the deleter on whichever thread happens to reclaim. Slots are
+        // interchangeable within one allocator, so a slot simply migrates to that thread's cache.
         static Cache& local() {
-            static thread_local Cache c;       // ONE per thread (see caveat below)
+            static thread_local Cache c;
             return c;
         }
 
@@ -78,7 +123,7 @@ namespace JLib {
         explicit TaskAllocator(size_t slots) : mem(slots) {
             for (auto& blk : mem) {
                 next(&blk) = sharedHead; sharedHead = &blk;
-#ifdef _DEBUG
+#ifdef JLIBSCHED_ALLOC_CANARY
                 // Every slot starts life "free" -- stamp the canary here too (not just in
                 // Free()), or the FIRST-ever Alloc() of a never-before-freed slot reads
                 // whatever value(std::byte)-initialization left at bytes[8,16) (zero), which
@@ -88,7 +133,7 @@ namespace JLib {
             }
         }
 
-#ifdef _DEBUG
+#ifdef JLIBSCHED_ALLOC_CANARY
         // Bytes [8,16) of a slot hold the intrusive "next free" link's tail + are otherwise
         // unused while free (the link itself only needs the first 8 bytes). Free() stamps a
         // canary there; Alloc() verifies it's UNCHANGED before handing the slot back out. If
@@ -106,9 +151,8 @@ namespace JLib {
         static void CheckCanary(void* slot) {
             uint64_t v = *reinterpret_cast<uint64_t*>(reinterpret_cast<std::byte*>(slot) + 8);
             if (v != kFreeCanary) {
-                OutputDebugStringA("TaskAllocator: corrupted freed slot detected "
+                JLIBSCHED_CANARY_REPORT("TaskAllocator: corrupted freed slot detected "
                     "(use-after-free or double-free) -- breaking at the Alloc() that noticed.\n");
-                __debugbreak();
             }
         }
 #endif
@@ -118,7 +162,7 @@ namespace JLib {
             if (!c.head) refill(c);
             if (!c.head) return nullptr;       // backing fully exhausted
             void* slot = c.head;
-#ifdef _DEBUG
+#ifdef JLIBSCHED_ALLOC_CANARY
             CheckCanary(slot);
 #endif
             c.head = next(slot);
@@ -132,7 +176,7 @@ namespace JLib {
         void Free(void* slot) {                // lock-Free unless the cache overflows
             Cache& c = local();
             next(slot) = c.head;
-#ifdef _DEBUG
+#ifdef JLIBSCHED_ALLOC_CANARY
             StampCanary(slot);
 #endif
             c.head = slot;

@@ -9,6 +9,8 @@
 #include "TaskDeque.h"
 #include "TaskAllocator.h"
 #include "Topology.h"   // topology::CpuMask -- llcMaskOfWorker is one per worker
+#include <cstdio>   // the stale-library guard reports through stderr
+#include <cstdlib>  // ...and aborts rather than corrupting the heap
 #include <atomic>
 #include <array>
 #include <vector>
@@ -712,5 +714,56 @@ namespace JLib {
 		// Unblocks all waiting fiber contexts
 		void Notify_All();
 	};
+
+	// ================================ STALE-LIBRARY GUARD ==========================================
+	// Aborts at startup if the Scheduler library was compiled against a DIFFERENT version of these
+	// headers than the code including them now.
+	//
+	// WHY THIS EARNS ITS KEEP. Several classes here are header-only with real data members --
+	// EpochManager, Task, TaskAllocator -- so adding a single member changes their layout in the
+	// consumer's translation unit while the already-built .lib still uses the old offsets. Nothing
+	// diagnoses that. The symptoms are heap corruption at an unrelated address, and they are
+	// spectacularly misleading: this has produced an access violation inside std::vector::resize
+	// (iterator-debug machinery walking a garbage proxy), a garbage epoch-slot pointer surfacing
+	// inside LockFreeList::add, and a corrupted free list surfacing inside TaskAllocator::refill --
+	// none of which are anywhere near the actual mistake, which was simply "you did not rebuild".
+	//
+	// This project has now lost time to it TWICE. A one-time comparison at static init is a much
+	// better trade than the diagnosis.
+	//
+	// _ITERATOR_DEBUG_LEVEL is in the signature deliberately: on MSVC it changes std::vector's
+	// layout, so mixing /MDd (level 2) with /MD (level 0) breaks exactly the same way and is the
+	// other half of this failure mode.
+	namespace detail {
+		inline constexpr uint64_t kHeaderAbiSignature =
+			(uint64_t)sizeof(EpochManager) * 1000003ull
+			^ (uint64_t)sizeof(Task) * 10007ull
+			^ (uint64_t)sizeof(TaskAllocator) * 65537ull
+#if defined(_ITERATOR_DEBUG_LEVEL)
+			^ ((uint64_t)_ITERATOR_DEBUG_LEVEL << 48)
+#endif
+			;
+
+		// Defined in TaskScheduler.cpp, so it carries the value as the LIBRARY saw it.
+		uint64_t LibraryAbiSignature();
+
+		// Runs once per program, in every TU that includes this header. No caller action required --
+		// a guard you have to remember to invoke is a guard that is not there when it matters.
+		inline const bool g_abiChecked = [] {
+			const uint64_t lib = LibraryAbiSignature();
+			if (lib != kHeaderAbiSignature) {
+				std::fprintf(stderr,
+					"[JLib::Scheduler] FATAL: the Scheduler library was built against DIFFERENT headers "
+					"than this translation unit (library signature %llu, header signature %llu).\n"
+					"  Rebuild the Scheduler for THIS configuration. Note the library ships Debug, "
+					"Development and Release, and rebuilding only some of them causes exactly this.\n"
+					"  Continuing would corrupt the heap at an unrelated address -- refusing instead.\n",
+					(unsigned long long)lib, (unsigned long long)kHeaderAbiSignature);
+				std::fflush(stderr);
+				std::abort();
+			}
+			return true;
+		}();
+	}
 }
 

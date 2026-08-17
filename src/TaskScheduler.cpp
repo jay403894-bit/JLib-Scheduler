@@ -293,6 +293,13 @@ static std::atomic<TaskScheduler::IdlePolicy> g_idlePolicy{ TaskScheduler::IdleP
 void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy.store(p, std::memory_order_relaxed); }
 TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.load(std::memory_order_relaxed); }
 
+// The stale-library guard's other half. Compiled INTO the library, so it reports the signature as
+// the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
+// the including translation unit's view; a mismatch means somebody rebuilt one and not the other.
+namespace JLib { namespace detail {
+	uint64_t LibraryAbiSignature() { return kHeaderAbiSignature; }
+}}
+
 // Forwarders. The state lives on EpochManager (it is the thing that reclaims); these exist so the
 // option is discoverable beside every other tuning knob. See the header for why that mattered.
 void TaskScheduler::SetSelfReclaim(bool on) { EpochManager::Instance().SetSelfReclaim(on); }
