@@ -135,8 +135,18 @@ workers, Release, 1.3.0. `--` is not measured yet.
 | Round-trip submit→run→wait | 4.6 µs | 0.97 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
 | Independent tasks, per task | 74 ns | **69 ns** | 21.8 µs | 310 ns | 290 ns |
 | Range work, per item | 36 ns | 24 ns | **15 ns** | -- | -- |
-| Bulk parallel-for, 20k items | 0.39 ms | **0.29 ms** | 0.33 ms | 0.49 ms | -- |
+| Bulk parallel-for, 20k items (`ParallelRange`, 1.4) | 0.38 ms | -- | 0.375 ms | 0.49 ms | -- |
+| &nbsp;&nbsp;same row via `ParallelFor` | 0.44 ms | 0.29 ms | 0.375 ms | -- | -- |
 | 25% of tasks blocked 600 µs | **7.4 ms** | 10.1 ms | 15.4 ms | -- | 8.8 ms |
+
+**The two bulk rows are the same work through two of our APIs**, added in 1.4. `ParallelRange` is
+the mechanism-matched counterpart to enkiTS — both hand workers slices off a shared cursor rather
+than creating a task per chunk — and at **0.38 ms against 0.375 ms it is a tie**, not a win; enkiTS
+is marginally ahead and far steadier (2% spread against our 13%). The gap to `ParallelFor` on the
+second row is its **probe**: it runs ~312 of the 20,000 items serially to decide whether
+parallelising is worth it, which is a third of the wall time on a job this size. That probe is the
+right default when you don't know your workload and pure overhead when you do, which is exactly why
+both exist. See [Choosing a range API](#choosing-a-range-api-parallelfor-vs-parallelrange).
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
@@ -382,6 +392,38 @@ never suspend are unaffected, and so is the total number in flight -- it is spec
 blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need more, remembering
 each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
 one.
+
+### Choosing a range API: `ParallelFor` vs `ParallelRange`
+
+Both take a `(lo, hi)` callable and block until the whole range has run. They differ in how the
+range is split, and **the right one depends on the shape of your workload, not on which is
+"faster"** — each loses to the other on the wrong input.
+
+**`ParallelFor`** measures before it splits. It runs a small prefix serially, times it, and
+parallelizes only if the extrapolated work is worth it — then hands out coarse chunks, up to 4 per
+worker. Use it when iterations cost roughly the same, or when you don't know what they cost. Coarse
+chunks mean fewer scheduling entities and less coordination, which is what you want when there is
+nothing to balance.
+
+**`ParallelRange`** skips the probe and slices 16x finer, up to 64 slices per worker, handed out
+from a shared cursor. A worker that draws a cheap region comes straight back for more instead of
+idling while another grinds through the expensive end. Use it when iteration cost **varies** —
+early-out branches, per-element data sizes, spatial queries whose depth depends on position — or
+when you already know the range is big and don't want to pay for the probe.
+
+Measured, 4M items, 31 workers:
+
+| body | `ParallelFor` | `ParallelRange` |
+| --- | --- | --- |
+| uniform cost per item | **0.09–0.11 ms** | 0.18–0.23 ms |
+| cost varies ~20x across the range | 0.95–1.07 ms | **0.80–0.89 ms** |
+
+The uniform row is the important one to notice: finer slicing is **not free**. It buys load
+balancing at the price of more coordination, so it loses by ~2x when there is no imbalance to fix.
+Reach for `ParallelRange` because your work is irregular, not because it sounds better.
+
+If in doubt, use `ParallelFor` — the probe exists precisely so it can decline to parallelize work
+that isn't worth it, and a wrong guess there costs more than a wrong guess about grain.
 
 ### You can take garbage collection off the workers
 
