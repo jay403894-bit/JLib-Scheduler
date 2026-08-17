@@ -739,6 +739,16 @@ static void TestCreateTaskAcceptsNamedCallable(JLib::TaskScheduler& sched) {
 
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
+    // "noreclaim" runs the WHOLE suite with worker self-triggered reclamation disabled, the way an
+    // application that ticks EpochManager from its own idle path would run.
+    //
+    // Set here, BEFORE Init, rather than flipped inside a test -- because SetSelfReclaim's contract
+    // is init-only (it is a plain bool read by every worker). A test that flipped it on a live pool
+    // would be racing the very readers it is meant to exercise, and would be testing something the
+    // API does not promise. Reusing the whole suite is also better coverage than one bespoke case:
+    // every retire path in every test runs with the counter disabled.
+    const bool noReclaim = (argc > 1) && std::strcmp(argv[1], "noreclaim") == 0;
+    if (noReclaim) JLib::EpochManager::Instance().SetSelfReclaim(false);
     std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
     // 30s default, overridable via JLIB_TEST_WATCHDOG_SECS. Raising it is what lets a high-iteration
     // reproducer distinguish SLOW from STUCK: if the run completes in 60s it was merely slow, and if
@@ -762,6 +772,23 @@ int main(int argc, char** argv) {
     TestPushArray(sched);
     TestPushBatchSpread(sched);
     TestFiberCapOversubscribed(sched);
+    // Only meaningful in the "noreclaim" run; a no-op otherwise. Placed AFTER the tests above so
+    // real retire traffic has already happened -- asserting the counter is zero before anything has
+    // retired would pass for the wrong reason.
+    if (noReclaim) {
+        auto& em = JLib::EpochManager::Instance();
+        std::printf("self-reclaim disabled (noreclaim)\n");
+        Check(!em.SelfReclaimEnabled(), "flag actually took");
+        Check(!em.ShouldSelfReclaim(), "workers will not self-trigger");
+        // The point of the flag: RetirePtr skips its fetch_add entirely, so the counter must still
+        // read zero after a suite's worth of retirements.
+        Check(em.RetiredCount() == 0, "no counter traffic while disabled");
+        // And a MANUAL tick must be safe. The decrement in TryReclaim is guarded symmetrically with
+        // the increment; unguarded it would wrap size_t here, since nothing ever incremented.
+        em.Tick();
+        Check(em.RetiredCount() == 0, "manual Tick did not underflow the counter");
+    }
+
     TestIdlePolicySwitchUnderLoad(sched);
     TestMutexFiberContention(sched);
     TestMutexMixedContention(sched);

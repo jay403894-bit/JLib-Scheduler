@@ -41,6 +41,16 @@ namespace JLib {
 		std::atomic<bool>   reclaiming{ false };   // only one reclaimer at a time
 		std::atomic<size_t> retiredCount{ 0 };     // approx live retired count; drives self-reclaim
 
+		// Whether workers self-trigger reclamation. See SetSelfReclaim() for the contract.
+		//
+		// A PLAIN bool, NOT atomic, and that is a deliberate difference from
+		// TaskScheduler::SetIdlePolicy -- which is atomic precisely BECAUSE it is documented as
+		// changeable on a running pool. This one is documented as settable only before StartPool,
+		// so a worker hoisting the read out of its loop is not a bug here, it is the point: the
+		// branch folds away and the disabled build pays nothing at all. Make this atomic only if
+		// the contract ever changes to allow runtime flips, and change the contract first.
+		bool selfReclaim = true;
+
 		std::atomic<size_t> globalEpoch{ 0 };
 
 		struct ThreadEpoch {
@@ -120,7 +130,13 @@ namespace JLib {
 				}
 			}
 			pending.resize(kept);
-			if (freed) retiredCount.fetch_sub(freed, std::memory_order_relaxed);
+			// Guarded symmetrically with the increment in RetirePtr. With self-reclaim off nothing
+			// ever increments this, so an unguarded subtract would wrap size_t to a huge value on
+			// the first manual Tick(). Harmless while disabled -- ShouldSelfReclaim() short-circuits
+			// on the flag before ever reading the count -- but it would poison any diagnostic read
+			// of RetiredCount(), which is exactly the sort of quietly-wrong number that wastes an
+			// afternoon later.
+			if (selfReclaim && freed) retiredCount.fetch_sub(freed, std::memory_order_relaxed);
 
 			reclaiming.store(false, std::memory_order_release);
 		}
@@ -128,6 +144,41 @@ namespace JLib {
 		// self-trigger Tick() under load, so reclamation no longer depends solely on an
 		// external (engine) Tick() call.
 		size_t RetiredCount() const { return retiredCount.load(std::memory_order_relaxed); }
+
+		// THE ONE PLACE that decides whether a worker should stop and reclaim. The four call sites
+		// (three in Worker(), one in TaskScheduler) previously each spelled the comparison out, so
+		// this also removes four copies of a predicate that must agree.
+		bool ShouldSelfReclaim() const {
+			return selfReclaim && RetiredCount() > ReclaimThreshold();
+		}
+
+		// Turn OFF worker self-triggered reclamation, making Tick() the caller's job.
+		//
+		// MUST be called before StartPool, and never again. It is a plain bool read from every
+		// worker; flipping it on a live pool is a data race, and a worker may have hoisted the read
+		// out of its loop and never see it anyway. That is not a defect -- see the member's comment.
+		//
+		// WHY YOU MIGHT: when disabled, RetirePtr does no atomic at all. The `fetch_add` per retired
+		// pointer is the only atomic in the retire path, and an application that already has an idle
+		// moment each frame can move reclamation there and pay nothing on the hot path.
+		//
+		// WHY THE DEFAULT IS ON, and why you should not flip it casually. This is a LIBRARY, and the
+		// embedder may have no loop to tick from -- a headless server, a batch job, a plugin inside
+		// someone else's engine, a Join()-and-exit tool. With self-reclaim off and no Tick(),
+		// retired memory grows WITHOUT BOUND and nothing complains. That is a much worse failure
+		// than an atomic increment.
+		//
+		// AND MEASURE BEFORE ASSUMING IT BUYS ANYTHING. The `fetch_add` sits immediately after a
+		// lock-free MPSC enqueue that is itself at least one atomic RMW plus a node link, so it is
+		// the cheaper half of an operation you cannot remove. The directly comparable experiment --
+		// making PickNextWorker's `nextWorker` relaxed, a locked xchg removed from the hotter PUSH
+		// path, codegen-verified -- measured EXACTLY ZERO, because the neighbouring notify mutex
+		// dominated. Expect the same here unless a profile says otherwise.
+		//
+		// If you turn this off, call EpochManager::Instance().Tick() from your idle path. It is
+		// already public and needs no other change.
+		void SetSelfReclaim(bool on) { selfReclaim = on; }
+		bool SelfReclaimEnabled() const { return selfReclaim; }
 
 		// How many retirements should accumulate before a self-triggered Tick() is worth paying for.
 		//
@@ -172,7 +223,11 @@ namespace JLib {
 		template<typename T>
 		void RetirePtr(T* p, size_t epoch, DeleterFunc d) {
 			incoming.enqueue(GlobalRetired{ (void*)p, epoch, d });   // lock-free
-			retiredCount.fetch_add(1, std::memory_order_relaxed);
+			// The ONLY atomic in this path, and the only reason it exists is to let workers
+			// self-trigger. With self-reclaim off the counter has no reader, so skip it entirely --
+			// that is the whole saving SetSelfReclaim(false) offers. Guarded rather than removed
+			// because the default keeps reclamation independent of the embedder having a loop.
+			if (selfReclaim) retiredCount.fetch_add(1, std::memory_order_relaxed);
 		}
 
 	

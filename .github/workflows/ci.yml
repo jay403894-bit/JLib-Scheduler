@@ -109,6 +109,14 @@ jobs:
         run: ./${{ matrix.prims }} nosleep
         shell: bash
 
+      # Third mode: worker self-triggered reclamation OFF -- how an application that ticks
+      # EpochManager from its own idle path runs. Exercises the branch where RetirePtr skips its
+      # atomic entirely, and the guarded decrement in TryReclaim that would otherwise wrap size_t
+      # on the first manual Tick(). Neither has any other coverage.
+      - name: Run primitives test with self-reclaim disabled
+        run: ./${{ matrix.prims }} noreclaim
+        shell: bash
+
       # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
       #
       # The fiber-contention case at 2000 iterations (~4000 contended fiber suspend/resume round
@@ -223,6 +231,10 @@ jobs:
 
       - name: Run primitives test under NoSleep
         run: ./build/bin/Release/SchedulerPrimitivesTest.exe nosleep
+        shell: bash
+
+      - name: Run primitives test with self-reclaim disabled
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe noreclaim
         shell: bash
 
       - name: Run benchmark (smoke test)

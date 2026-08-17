@@ -1214,7 +1214,7 @@ bool TaskScheduler::TryRunStolenNoFiberTask() {
 	DestroyTask(task);
 	taskAllocator.Free(task);
 
-	if (EpochManager::Instance().RetiredCount() > EpochManager::Instance().ReclaimThreshold()) {
+	if (EpochManager::Instance().ShouldSelfReclaim()) {
 		EpochManager::Instance().Tick();
 	}
 	return true;
