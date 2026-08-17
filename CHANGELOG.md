@@ -40,11 +40,25 @@ medians of 15, stable across three runs:
 changed.** The prediction was wrong, and the measurement is the only reason we know that rather than
 having shipped a tuned-by-guess constant.
 
-The cheap row is the more useful finding, and it is a limit no gate value can fix: when per-item
-cost is low enough that the loop is bounded by memory rather than compute, parallelising is
-*actively harmful* at these sizes -- 0.52x, not 1.0x. The gate decides WHEN to parallelise, not
-whether the work can benefit at all, and no threshold rescues a body that does not scale. This is
-the same effect the `ParallelFor` memory-bound bench row already carries a caveat about.
+The cheap row looks alarming and is not. That 0.52x is at 64 µs of serial work, which is BELOW the
+gate -- `ParallelFor` correctly declines to parallelise there, and the number is what you would get
+if it did not. Checked what actually happens once such a body clears the threshold, using a
+memory-bound loop over a buffer far past L3, forced-serial against the default gate:
+
+| elements | buffer | forced serial | default gate | |
+| --- | --- | --- | --- | --- |
+| 1,048,576 | 4 MB | 0.093 ms | 0.093 ms | 1.00x |
+| 4,194,304 | 16 MB | 0.416 ms | 0.115 ms | **3.62x** |
+| 16,777,216 | 64 MB | 3.708 ms | 1.259 ms | **2.95x** |
+| 67,108,864 | 256 MB | 16.200 ms | 8.279 ms | **1.96x** |
+
+It ties at the boundary and wins 2-3.6x past it. So the gate declines below its threshold and pays
+off above it, which is exactly the job.
+
+What does remain true is that 75 µs is calibrated on ONE machine. The memory-bound `ParallelFor`
+bench row already records 0.75x on a Ryzen laptop APU and 1.09x on an M1 Air against ~3.3x here, so
+the crossover genuinely moves with core count and memory bandwidth. That is what
+`SetParallelForThresholdUs` exists for, and why the constant is exposed rather than baked in.
 
 **`ParallelRange(begin, end, grain, fn)`** is new, and exists for the one thing `ParallelFor` cannot
 do: skip the probe. `ParallelFor` runs a serial prefix and times it to decide serial-vs-parallel,

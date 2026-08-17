@@ -229,12 +229,17 @@ void TaskScheduler::NotifyAll() {
 // timing), sweeping element counts so serial work spans 0.1us to 9ms, medians of 15, stable over
 // three runs: heavy body breaks even at 69us, medium at 88us. 75 sits between them, unchanged.
 //
-// The cheap body did not break even AT ALL in that range -- still 0.52x at 64us of serial work --
-// and that is the limitation worth knowing, because no value of this constant fixes it. When
-// per-item cost is low enough that the loop is bounded by memory rather than compute, splitting it
-// is actively HARMFUL rather than merely unprofitable. This gate decides WHEN to parallelize, not
-// whether the body can benefit at all. Same effect the memory-bound ParallelFor bench row carries
-// its own caveat about.
+// The cheap body never broke even in that range -- 0.52x at 64us -- which looks like an indictment
+// and is not: 64us is BELOW this threshold, so ParallelFor declines there and that number is what
+// you would get if it did not. Checked the other side too, memory-bound loop over a buffer far past
+// L3, forced-serial vs the default gate: 1.00x at 4MB (the boundary), then 3.62x at 16MB, 2.95x at
+// 64MB, 1.96x at 256MB. It declines below the threshold and pays off above it.
+//
+// WHAT IS STILL A REAL LIMITATION: this is one number measured on ONE machine. The crossover moves
+// with core count and memory bandwidth -- the memory-bound bench row records 0.75x on a Ryzen
+// laptop APU and 1.09x on an M1 Air against ~3.3x here. A static default cannot be right
+// everywhere, which is why SetParallelForThresholdUs is public. An adaptive gate would need the
+// PARALLEL rate, and the probe can only measure the serial one without speculating.
 // Keyed on OPTIMIZATION, not on NDEBUG alone. A "Development"/RelWithDebInfo build is optimized but
 // deliberately keeps assertions live, so it does NOT define NDEBUG -- testing NDEBUG by itself would
 // hand an optimized build the unoptimized threshold and serialize work that should be parallel.
