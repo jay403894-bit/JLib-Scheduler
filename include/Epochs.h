@@ -158,9 +158,24 @@ namespace JLib {
 		// worker; flipping it on a live pool is a data race, and a worker may have hoisted the read
 		// out of its loop and never see it anyway. That is not a defect -- see the member's comment.
 		//
-		// WHY YOU MIGHT: when disabled, RetirePtr does no atomic at all. The `fetch_add` per retired
-		// pointer is the only atomic in the retire path, and an application that already has an idle
-		// moment each frame can move reclamation there and pay nothing on the hot path.
+		// WHY YOU MIGHT -- and it is NOT the atomic, which was the original guess and measured
+		// nothing. The real win is TAIL LATENCY, and it is large. Frame-shaped DAG loop, 32 nodes
+		// per frame, 4000 frames after 400 warm-up, three interleaved rounds, per-frame us:
+		//
+		//     self-reclaim  p50 58.1/58.9/60.2   p90 67.7/66.8/69.0   p99 331/331/336
+		//     tick on main  p50 60.5/58.7/58.5   p90 69.3/67.8/66.3   p99 125/111/104
+		//
+		// Median and p90 are a wash -- the fetch_add really is free, exactly as the comparable
+		// nextWorker experiment predicted. But p99 improves ~3x, and the reason is WHERE the work
+		// happens, not how much of it there is: TryReclaim calls MinActiveEpoch(), which scans EVERY
+		// participant slot (~2280 in that run, and it scales with the pool -- see ReclaimThreshold).
+		// Under self-reclaim a WORKER stops to do that scan in the middle of a frame, stalling work
+		// on the critical path at an unpredictable moment. Ticking from an idle main thread moves
+		// the identical scan into the gap between frames.
+		//
+		// So this is for an application that cares about frame-time CONSISTENCY and has a natural
+		// idle point. It buys nothing for throughput, and a batch job with no idle point should
+		// leave it alone.
 		//
 		// WHY THE DEFAULT IS ON, and why you should not flip it casually. This is a LIBRARY, and the
 		// embedder may have no loop to tick from -- a headless server, a batch job, a plugin inside
