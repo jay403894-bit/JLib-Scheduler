@@ -1432,10 +1432,31 @@ void SchedulerMutex::Lock() {
 				}
 				return;
 			}
+			// Become PARKABLE before becoming DISCOVERABLE. Same order as WaitOnEvent, same
+			// reason, and this had it backwards until 1.3.5.
+			//
+			// With the push first, there is a window between clearing spinLock and the status
+			// store inside Fiber::Suspend where this fiber sits in waitingFibers but is still
+			// RUNNING. An Unlock landing there pops us and calls Resume() -- and ResumeQueueless
+			// does not treat RUNNING as resumable, so it silently DROPS the wake. We then park as
+			// SUSPENDED with no reference to us left anywhere, while that Unlock has already
+			// handed ownership over (it leaves `locked` true whenever it pops a waiter). The mutex
+			// stays locked forever with no holder: a deadlock, not a stall. This is what hung the
+			// primitives test in CI on both Windows and macOS arm64.
+			//
+			// Storing WANTS_SUSPEND first closes it. A Resume racing in now sees a resumable state
+			// and flips us to SUSPEND_SIGNALED, and the worker's park step wakes us instead of
+			// parking.
+			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 			waitingFibers.push(current);
 			spinLock.clear(std::memory_order_release);
 		}
-		Thread::Suspend(current);
+		// Deliberately NOT Thread::Suspend(). Fiber::Suspend() stores WANTS_SUSPEND
+		// UNCONDITIONALLY, which would clobber a SUSPEND_SIGNALED written by a Resume that raced
+		// in above -- reintroducing the exact lost wakeup this ordering just closed. WaitOnEvent
+		// switches directly for the same reason.
+		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerMutex::Lock");
+		ContextSwitch(&current->ctx, current->homeCtx);
 		// Resumed: we have the lock
 		{
 			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
@@ -1524,10 +1545,17 @@ void SchedulerSemaphore::Wait() {
 				spinLock.clear(std::memory_order_release);
 				return;
 			}
+			// Identical lost-wakeup window to SchedulerMutex::Lock -- see the long comment there.
+			// Publishing to waitingFibers while still RUNNING lets a racing Signal() pop this
+			// fiber and drop the resume on the floor; the permit is consumed by the pop and the
+			// fiber parks forever. Become parkable first, and switch directly rather than through
+			// Fiber::Suspend so a SUSPEND_SIGNALED set in between is not clobbered.
+			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 			waitingFibers.push(current);
 			spinLock.clear(std::memory_order_release);
 		}
-		Thread::Suspend(current);
+		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerSemaphore::Wait");
+		ContextSwitch(&current->ctx, current->homeCtx);
 	}
 	else {
 		// Same contended-wait discipline as SchedulerMutex; see ContendedSpinStep.

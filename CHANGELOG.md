@@ -3,6 +3,66 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.5 - 2026-08-16
+
+**[CRITICAL] Lost wakeup in the fiber wait path of `SchedulerMutex` and `SchedulerSemaphore`.**
+Without this, two fibers contending for the same mutex can deadlock permanently: the mutex is left
+locked with no holder and the waiter is parked with nothing able to wake it. Present in every
+release up to and including 1.3.4. `SchedulerConditionVariable::Wait`'s fiber path inherited it
+through its stack-local semaphore, so all three primitives were affected by one root cause. Anyone
+on 1.3.4 or earlier who locks a `SchedulerMutex` from inside a fiber task should treat this as a
+must-pull.
+
+Both wait paths made the fiber **discoverable before making it parkable**:
+
+```cpp
+waitingFibers.push(current);   // discoverable...
+spinLock.clear(release);       // ...but status is still RUNNING
+Thread::Suspend(current);      // only NOW -> WANTS_SUSPEND
+```
+
+An `Unlock()`/`Signal()` landing between the clear and the status store pops the fiber and calls
+`Resume()`. `ResumeQueueless` does not treat `RUNNING` as resumable -- it takes the "not resumable
+right now" branch and returns false, **silently discarding the wake**. It does not crash, which is
+why this presented as a silent hang rather than an access violation. The fiber then parks
+`SUSPENDED` with no reference to it left anywhere, while the unlocker has already handed ownership
+over: `Unlock` deliberately leaves `locked == true` whenever it pops a waiter, because that is a
+direct handoff. The result is a mutex locked forever with no holder. In the semaphore's case the
+pop also consumes the permit.
+
+The fix is ordering, not new machinery. `Fiber::status`'s `WANTS_SUSPEND -> SUSPEND_SIGNALED`
+transition already *is* the suspend-pending handshake, and `ResumeQueueless` already defers
+correctly -- a resume that arrives too early flips the state and the worker's park step wakes the
+fiber instead of parking it. `WaitOnEvent` has always used it correctly and states the rule:
+*become parkable BEFORE registering.* These two callers simply set it too late.
+
+**The direct `ContextSwitch` is load-bearing, not a micro-optimisation.** `Fiber::Suspend()` stores
+`WANTS_SUSPEND` *unconditionally*, so calling it after the reorder would clobber a
+`SUSPEND_SIGNALED` written by a racing `Resume` and reintroduce the identical lost wakeup. That is
+why `WaitOnEvent` switches directly too.
+
+**How it was verified.** The race did not reproduce locally in ~30 runs before OR after the change,
+so a green run proved nothing on its own. Widening the window (a bounded spin between
+`spinLock.clear()` and the suspend) made it deterministic, and the failure reproduced the CI output
+exactly, `PREMISE ... ok` immediately followed by the watchdog:
+
+| build | result |
+| --- | --- |
+| old ordering + widened window | **4/4 deadlock** |
+| fix + widened window | **6/6 pass** |
+| fix, unmodified | **24/24 pass** (12 `sleep`, 12 `nosleep`) |
+
+Ordering is the only variable between the first two rows.
+
+Found by the fiber-contention case added to the primitives suite in 1.3.4 -- the first test that
+ever exercised this path. It hit macOS arm64 under `sleep` and Windows/MSVC under `nosleep`. The
+`nosleep` failure is the informative one: workers never park there, so this is not the park/wake
+handshake covered by `tests/verify/sleepwake_model.c`.
+
+**Still owed:** this handshake has no GenMC model. The deque and the sleep predicate both have one;
+this is now the last unmodelled synchronisation in the scheduler, and it is the one that shipped a
+bug.
+
 ## 1.3.4 - 2026-08-16
 
 Everything below is one batch: v1.3.3 was the last tag, so all of it ships as 1.3.4.
