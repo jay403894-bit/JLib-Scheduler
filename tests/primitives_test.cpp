@@ -396,6 +396,49 @@ static const int kFiberContentionIters = FiberContentionIters();
 // outside without instrumentation that would perturb the thing being measured. What is asserted is
 // the property that matters -- every task completes across every transition -- plus that the scoped
 // guard restores exactly, including nested.
+// ParallelRange: EXACTLY-ONCE coverage, which is the only property slice-stealing can plausibly get
+// wrong. A cursor hands out [lo, lo+grain) to whichever worker asks next, so the failure modes are
+// an element visited twice (two workers got overlapping slices) or never (the tail was dropped by
+// an off-by-one). Both are silent in a benchmark -- a loop that skips 3 of 4 million elements just
+// looks fast.
+//
+// Sizes are chosen so the last slice does NOT divide evenly, because that ragged tail is exactly
+// where an off-by-one lives. A range that divides cleanly would pass with a broken clamp.
+static void TestParallelRangeCoverage(JLib::TaskScheduler& sched) {
+    std::printf("ParallelRange exactly-once coverage\n");
+
+    struct Case { int n; int grain; };
+    const Case cases[] = {
+        { 1000000, 64 },      // grain divides badly into the tail
+        {  999983, 97 },      // prime-ish n, grain not a factor of anything
+        {     100,  1 },      // grain below the internal floor of 64 -- must still cover exactly
+        {       1, 64 },      // single element, grain far larger than the range
+        {       0, 64 },      // empty range must call nothing and must not hang
+    };
+
+    for (const Case& c : cases) {
+        std::vector<std::atomic<int>> visits(c.n > 0 ? c.n : 1);
+        for (auto& v : visits) v.store(0, std::memory_order_relaxed);
+
+        sched.ParallelRange(0, c.n, c.grain, [&visits](int lo, int hi) {
+            for (int i = lo; i < hi; ++i)
+                visits[i].fetch_add(1, std::memory_order_relaxed);
+            });
+
+        int missed = 0, doubled = 0;
+        for (int i = 0; i < c.n; ++i) {
+            const int v = visits[i].load(std::memory_order_relaxed);
+            if (v == 0) ++missed;
+            else if (v > 1) ++doubled;
+        }
+        char what[96];
+        std::snprintf(what, sizeof(what), "n=%d grain=%d: every element exactly once", c.n, c.grain);
+        Check(missed == 0 && doubled == 0, what);
+        if (missed || doubled)
+            std::printf("      missed %d, visited-twice %d\n", missed, doubled);
+    }
+}
+
 static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
     std::printf("IdlePolicy change on a live pool\n");
 
@@ -789,6 +832,7 @@ int main(int argc, char** argv) {
         Check(em.RetiredCount() == 0, "manual Tick did not underflow the counter");
     }
 
+    TestParallelRangeCoverage(sched);
     TestIdlePolicySwitchUnderLoad(sched);
     TestMutexFiberContention(sched);
     TestMutexMixedContention(sched);

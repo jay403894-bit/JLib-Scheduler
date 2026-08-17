@@ -350,6 +350,25 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// ~15k tasks; each notify also takes the worker mutex from the lost-wakeup fix). Fork-join
 		// distributes the spawn across the whole pool and wins decisively past a few dozen tasks. Cross
 		// over at ~2 tasks/worker (below that flat wins/ties; above, FJ pulls ahead). See ParallelForFJ.
+		// CURSOR PATH. Past this point the range wants more pieces than the pool has lanes, and both
+		// alternatives pay a TASK PER CHUNK -- flat spawns them serially on the caller, FJ
+		// distributes the spawning but still creates them. Measured, that task is ~80-140 ns
+		// (slab slot + push + epoch retirement), which is why chunkSize had to be floored at 4 per
+		// worker above: finer pieces balance better but cost a task each.
+		//
+		// The cursor removes the trade. One task PER WORKER, each pulling [lo, lo+grain) off a
+		// shared atomic until the range is consumed -- so the number of scheduled entities is fixed
+		// at the pool size no matter how fine the grain, and load balancing becomes free. It is what
+		// enkiTS's ITaskSet does, and the reason its range numbers do not degrade at small
+		// partitions.
+		//
+		// Everything it needs lives on THIS stack frame, which is sound only because ParallelFor
+		// BLOCKS: cursor, wg and func all outlive every task by construction. ParallelForNB cannot
+		// use this without heap state and a refcount, which is why it is not wired up there.
+		if ((size_t)numTasks > 2 * workers.size() && !workers.empty()) {
+			RunCursorRange(start, end, chunkSize, func);
+			return;
+		}
 		if ((size_t)numTasks > 2 * workers.size()) {
 			ParallelForFJ(start, end, chunkSize, func);
 			return;
@@ -491,6 +510,82 @@ void TaskScheduler::ParallelForFJ(int start, int end, int grain, std::function<v
 
 	rec(start, end);   // caller does the leftmost spine + spawns the rest of the tree
 	WaitFor(wg);
+}
+
+// THE SLICE-STEALING CORE, shared by ParallelFor's large-range path and by ParallelRange.
+//
+// One task PER WORKER rather than per chunk. Each pulls [lo, lo+grain) off a shared atomic until the
+// range is consumed, so the number of scheduled entities is the pool size no matter how fine the
+// grain -- which is the whole point. The per-chunk alternatives (flat spawn, fork-join) pay ~80-140
+// ns per chunk for a slab slot, a push and an epoch retirement, and that is why chunk size had to be
+// floored at 4 per worker: finer pieces balance better but cost a task each. Here grain controls
+// balancing ONLY.
+//
+// Measured against the fork-join path it replaces, 4M items, 31 workers, medians of 4 runs:
+//     uniform body   1.7-1.9x        body whose cost varies 20x across the range   1.2-1.3x
+//
+// EVERYTHING LIVES ON THE CALLER'S STACK, which is sound only because both entry points BLOCK:
+// cursor, wg and func all outlive every task by construction. A non-blocking version would need
+// heap state and a refcount, which is why ParallelForNB is not wired through here.
+void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func) {
+	if (end <= start) return;
+	if (workers.empty()) { func(start, end); return; }   // no pool: just run it
+
+	const int W = (int)workers.size();
+
+	// GRAIN FLOOR, and it must scale with the range -- a flat floor is a trap.
+	//
+	// The cursor makes the number of TASKS independent of grain, but not the number of fetch_adds:
+	// that is (range / grain), all contending on one line. A flat floor of 64 looked fine and was
+	// measured 15x SLOWER than ParallelFor on a 4M range, because 4M/64 is 65,536 contended atomics
+	// against ParallelFor's ~124. Fine grain is cheaper here than with per-chunk tasks, but it is
+	// not free, and pretending otherwise just moves the cost from the allocator to the cache line.
+	//
+	// So: at most 64 slices per worker. That is 16x finer than the 4-per-worker cap the per-chunk
+	// paths need -- which is the real improvement, and an honest one -- while keeping the atomic
+	// count in the low thousands. The absolute floor of 64 items then covers tiny ranges, where
+	// range/(W*64) rounds to nothing.
+	{
+		const long long total = (long long)end - start;
+		const long long maxSlices = (long long)W * 64;
+		const int balanced = (int)((total + maxSlices - 1) / maxSlices);
+		grain = std::max({ grain, balanced, 64 });
+	}
+
+	std::atomic<int> cursor{ start };
+	WaitGroup wg;
+	wg.n.store(W, std::memory_order_relaxed);
+
+	for (int w = 0; w < W; ++w) {
+		Task* t = CreateTask([cur = &cursor, f = &func, end, grain]() {
+			for (;;) {
+				const int lo = cur->fetch_add(grain, std::memory_order_relaxed);
+				if (lo >= end) return;
+				const int hi = (lo + grain > end) ? end : lo + grain;
+				(*f)(lo, hi);
+			}
+			}, false, FiberSize::Standard, /*noFiber*/1);
+		// Arena exhausted: drop this lane rather than the work. The cursor is self-balancing, so the
+		// remaining workers simply take what this one would have.
+		if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
+		t->waitGroup = &wg;
+		Push(t);
+	}
+
+	// The caller pulls too, same as the flat path keeping chunk 0 for itself. It is blocked here
+	// regardless, so leaving a whole lane idle would be waste -- and on a pool already busy with
+	// other work, this is what keeps the range moving at all.
+	for (;;) {
+		const int lo = cursor.fetch_add(grain, std::memory_order_relaxed);
+		if (lo >= end) break;
+		func(lo, (lo + grain > end) ? end : lo + grain);
+	}
+	WaitFor(wg);
+}
+
+// No probe, straight to slice-stealing. See the header for when to prefer this over ParallelFor.
+void TaskScheduler::ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func) {
+	RunCursorRange(begin, end, grain, func);
 }
 
 void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {

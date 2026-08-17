@@ -250,7 +250,49 @@ namespace JLib {
 		// ~15k tasks. Call this directly only to bypass ParallelFor's serial-vs-parallel probe, which
 		// is what the crossover benchmark does deliberately.
 		void ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func);
+		// Shared slice-stealing core behind ParallelFor's large-range path and ParallelRange. Takes func
+		// by REFERENCE: both callers block, so the object outlives every task, and copying a
+		// std::function per worker would reintroduce an allocation this exists to remove.
+		void RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func);
 		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
+
+		// Blocking range loop with ATOMIC SLICE-STEALING, and no probe.
+		//
+		// Same shape and same guarantees as ParallelFor -- calls func(lo, hi) over disjoint
+		// sub-ranges covering [begin, end) exactly once each, and returns when all of them have run.
+		// Two differences, both deliberate:
+		//
+		//   NO PROBE. ParallelFor cannot know what an element costs, so it runs a prefix SERIALLY,
+		//   times it, and decides serial-vs-parallel from that. That is the right default, but it is
+		//   serialization on the critical path before any parallelism starts, and it is pure waste
+		//   for a caller who already knows the range is large. This skips it and goes straight to
+		//   work. Use ParallelFor when you do not know; use this when you do.
+		//
+		//   FINER SLICING BY DEFAULT. Workers do not get a task per chunk: one task per worker is
+		//   created, and each pulls [lo, lo+grain) off a shared atomic until the range is consumed.
+		//   Because the task count no longer varies with grain, this can afford up to 64 slices per
+		//   worker where ParallelFor's per-chunk paths cap out at 4.
+		//
+		// USE ParallelRange WHEN COST VARIES ACROSS THE RANGE, and ParallelFor otherwise. That is not
+		// a preference, it is what the numbers say -- 4M items, 31 workers, medians of 3 runs:
+		//
+		//     uniform body   ParallelFor 0.09-0.11 ms   ParallelRange 0.18-0.23 ms   (ParallelFor ~2x)
+		//     ragged  body   ParallelFor 0.95-1.07 ms   ParallelRange 0.80-0.89 ms   (this ~1.2x)
+		//
+		// Finer slicing is pure overhead when every item costs the same -- more atomics, nothing to
+		// balance. It pays when it lets a worker that drew a cheap region come back for more instead
+		// of idling while another grinds through the expensive end.
+		//
+		// GRAIN IS A FLOOR, NOT A PROMISE, and it is raised to keep at most 64 slices per worker.
+		// The cursor makes the TASK count independent of grain but not the fetch_add count, which is
+		// range/grain on one contended line. A flat floor of 64 measured 15x SLOWER than ParallelFor
+		// on a 4M range -- 65,536 atomics against ~124. Fine grain is cheaper here than with
+		// per-chunk tasks; it is not free.
+		//
+		// The calling thread PARTICIPATES rather than blocking idle, same as ParallelFor's flat path
+		// keeping chunk 0 for itself -- it is stuck here anyway, so leaving a whole lane idle would
+		// be waste.
+		void ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func);
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
