@@ -175,10 +175,10 @@ namespace JLib {
 		// IF YOU FLIP IT AT RUNTIME, RESTORE IT ON EVERY PATH. Leaking NoSleep on an exception or an
 		// early return does not fail loudly -- it silently taxes every other thread in the process
 		// for the rest of the run, at a cost measured below in real digits. A scoped RAII wrapper
-		// for this existed briefly in 1.3.6 and was removed: measurement (also below) showed the
-		// phase-switching use case it was built for did not pay, and an unused public class is worse
-		// than a one-line discipline. If you find yourself flipping this in more than one place,
-		// write the guard locally rather than asking for it back.
+		// for this was written and then removed before it ever shipped in a release: measurement
+		// (also below) showed the phase-switching use case it was built for did not pay, and an
+		// unused public class is worse than a one-line discipline. If you find yourself flipping
+		// this in more than one place, write the guard locally rather than asking for it back.
 		//
 		// COST MODEL -- why the default is Sleep and why you should think hard before changing it.
 		// Measured 2026-08-16, 31 workers, IDLE pool, memory-bound main thread:
