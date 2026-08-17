@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.3.6 - unreleased
+## 1.3.6 - 2026-08-17
 
 **Windows on ARM64 is supported.** Snapdragon X and any other WoA machine. It needed a third
 hand-written context switch -- `src/win32/aarch64/ContextSwitch.asm`, in armasm64 syntax -- because a

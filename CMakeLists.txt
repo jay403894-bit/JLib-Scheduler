@@ -12,9 +12,12 @@
 # must agree about the platform split forever. That is precisely the drift this project has been
 # bitten by, so there is one definition and both repos consume it.
 #
-# Supported: Windows x64 (MSVC), and Linux/Android on x86-64 or AArch64 (GCC/Clang). The context
-# switch is hand-written assembly per ABI, so a new platform needs a new ContextSwitch, not a
-# compiler flag -- hence the two-axis source layout below.
+# Supported: Windows on x64 AND ARM64 (MSVC), Linux/Android on x86-64 or AArch64 (GCC/Clang), and
+# macOS on arm64 (AppleClang). Every one of those runs the full suite in CI. The context switch is
+# hand-written assembly per ABI, so a new platform needs a new ContextSwitch, not a compiler flag --
+# hence the two-axis source layout below. Note the axes are NOT fully orthogonal: a calling
+# convention belongs to the (OS, ARCH) pair, which is why src/win32/aarch64/ exists alongside
+# src/posix/aarch64/ even though both are AArch64.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -28,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "1.3.5")
+set(JLIBSCHED_VERSION "1.3.6")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -124,9 +127,10 @@ endif()
 #
 # Only two categories exist here, and the difference matters. A platform is refused outright when a
 # build would produce something BROKEN -- i.e. an arch with no context switch of its own, which no
-# flag should let through. (Windows on ARM64 WAS the example here until 2026-08-17, when it got
-# src/win32/aarch64/ContextSwitch.asm and moved into the UNVERIFIED category below.) A platform is
-# merely UNVERIFIED when every piece it
+# flag should let through. (Windows on ARM64 WAS the example here until 2026-08-17. It now has
+# src/win32/aarch64/ContextSwitch.asm and a REQUIRED CI leg on a windows-11-arm runner, so it is
+# neither refused nor unverified -- it is supported.) A platform is merely UNVERIFIED when every
+# piece it
 # needs already exists and is tested elsewhere, and the only thing missing is that nobody has run
 # it. iOS is the motivating case: same AAPCS64 context switch as macOS arm64, same src/darwin/ OS
 # layer, same sysctl topology, same 16K pages -- all of it verified on macos-14 in CI. What is

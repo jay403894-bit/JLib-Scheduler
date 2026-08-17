@@ -150,13 +150,18 @@ jobs:
         shell: bash
 
   # ---------------------------------------------------------------------------------------------
-  # Windows on ARM64 -- BRING-UP, ALLOWED TO FAIL.
+  # Windows on ARM64 -- REQUIRED as of 1.3.6.
   #
-  # continue-on-error on the WHOLE JOB, deliberately: src/win32/aarch64/ContextSwitch.asm is a
-  # hand-written switch for an ABI nobody here has hardware for, and it must not be able to turn
-  # main red while it is being brought up. Flip this to a required leg (and fold it into the build
-  # matrix) only once it has passed consistently -- at which point Windows/ARM64 can be called
-  # supported, and NOT before.
+  # Landed 2026-08-17 as continue-on-error, because src/win32/aarch64/ContextSwitch.asm is a
+  # hand-written switch for an ABI nobody here has hardware for and one green run on fresh assembly
+  # is not evidence. Promoted after FIVE consecutive green runs, four of which included the isolated
+  # ABI harness below. Windows/ARM64 is a supported platform from that point, and this leg is what
+  # backs the claim -- if it goes red, the claim is wrong, not the CI.
+  #
+  # Kept as its own job rather than folded into the `build` matrix on purpose: it runs a test no
+  # other platform has (SchedulerFiberAbiTest), and the matrix shares one step list, so folding it
+  # in would mean conditioning that step on the matrix entry. A separate job is the honest shape --
+  # same reasoning as context-switch-abi below.
   #
   # THE TEST THAT MATTERS IS THE PRIMITIVES SUITE, not the build. A context switch that is wrong
   # about the callee-saved set, or that clobbers x18 (the TEB pointer -- and fibers MIGRATE between
@@ -168,11 +173,10 @@ jobs:
   # The isolated ABI harness IS covered, by SchedulerFiberAbiTest -- a Windows port of
   # tests/fibertest_aarch64.cpp. It runs FIRST below, because it localises a bad switch to the
   # specific register that moved instead of leaving it to be inferred from a scheduler crash.
-  windows-arm64-bringup:
-    name: Windows ARM64 (MSVC) -- bring-up, allowed to fail
+  windows-arm64:
+    name: Windows ARM64 (MSVC)
     runs-on: windows-11-arm
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
