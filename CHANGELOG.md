@@ -3,6 +3,53 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.7 - unreleased
+
+**Epoch reclamation can be handed to the application: `EpochManager::SetSelfReclaim(false)`, then
+call `Tick()` from your own idle point.** Default is unchanged.
+
+By default a worker performs reclamation -- once enough pointers are retired, whichever worker
+notices next stops and runs a pass. That pass calls `MinActiveEpoch()`, which scans every epoch
+participant, and the participant set scales with the pool (~2,300 slots on a 31-worker machine). The
+total work is small; the problem is that it lands on a thread that was supposed to be running a
+frame, at an unpredictable moment.
+
+**Measured** -- frame-shaped DAG, 32 nodes per frame, 4,000 frames after 400 warm-up, three
+interleaved rounds, per-frame microseconds:
+
+| | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| default (workers reclaim) | 58.1 / 58.9 / 60.2 | 67.7 / 66.8 / 69.0 | **331 / 331 / 336** |
+| `Tick()` on the app's thread | 60.5 / 58.7 / 58.5 | 69.3 / 67.8 / 66.3 | **125 / 111 / 104** |
+
+**Throughput is unchanged** -- median and p90 are a wash. **p99 improves ~3x**, consistently, with
+the ranges nowhere near overlapping. The win is *where* the scan runs, not how much of it there is.
+
+Worth recording that this is not the reason the flag was written. It was proposed to remove the one
+atomic in the retire path (`retiredCount.fetch_add`, per retired pointer), and that part measures
+**nothing** -- exactly as the comparable `nextWorker` experiment predicted, because the `fetch_add`
+sits next to a lock-free MPSC enqueue that costs more and cannot be removed. The tail-latency win was
+found by measuring and was not predicted by anyone.
+
+The flag is a plain `bool`, not an atomic, and that is deliberate: it is documented as settable only
+before `StartPool`, so a worker hoisting the read out of its loop is the point -- the branch folds
+away and the disabled build pays nothing. That is the exact inverse of `SetIdlePolicy`, which is
+atomic *because* it is documented as changeable at runtime. Different contract, different storage.
+
+Default stays on because this is a library and the embedder may have no loop to tick from -- a
+headless server, a batch job, a plugin inside someone else's engine. Disabled with no `Tick()`,
+retired memory grows without bound and nothing warns.
+
+Also in this change: the decrement in `TryReclaim` is now guarded symmetrically with the increment
+(unguarded, with nothing ever incrementing, the first manual `Tick()` wrapped `size_t` and poisoned
+any diagnostic read of `RetiredCount()`), and four hand-copied trigger predicates collapse onto one
+`ShouldSelfReclaim()`.
+
+Tested as a third whole-suite mode rather than a bespoke case: `noreclaim` sets the flag before
+`Init` and runs everything, so every retire path in every test exercises the disabled branch. It runs
+on all five platforms in CI. Flipping the flag inside a test would have raced the very readers it is
+meant to exercise.
+
 ## 1.3.6 - 2026-08-17
 
 **Windows on ARM64 is supported.** Snapdragon X and any other WoA machine. It needed a third

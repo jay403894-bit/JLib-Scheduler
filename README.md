@@ -248,10 +248,23 @@ To consume an installed copy, `find_package(JLibScheduler)` and link `JLib::Sche
 Adding the sources to your own build directly: take `src/*.cpp` plus exactly one platform directory.
 That is either `src/win32/` with its `ContextSwitch.asm`, or `src/posix/` (or `src/darwin/` on
 macOS) plus exactly one architecture subdirectory, `src/posix/x86_64/` or `src/posix/aarch64/`.
+On Windows ARM64 it is `src/win32/` **plus** `src/win32/aarch64/ContextSwitch.asm` **instead of**
+the flat `ContextSwitch.asm`, and `src/posix/aarch64/FiberInit.cpp` -- that last file is ABI-common
+and shared with the POSIX AArch64 build rather than duplicated.
 Never two of the same kind -- they define the same symbols, and a static library will not diagnose
 that. It silently links whichever one it reaches first.
 
-### iOS and Windows on ARM64
+Every platform below runs the full test suite in CI on every push:
+
+| OS | Arch | Toolchain |
+| --- | --- | --- |
+| Windows | x86-64 | MSVC |
+| Windows | ARM64 | MSVC (`armasm64`) |
+| Linux | x86-64 | GCC |
+| Linux / Android | AArch64 | GCC / Clang |
+| macOS | arm64 | AppleClang |
+
+### iOS
 
 **Untested, not supported.** iOS, tvOS, watchOS and visionOS are arm64 Darwin, so they use the same
 context switch and `src/darwin/` layer that macOS arm64 uses and that CI verifies -- but nobody has
@@ -262,13 +275,11 @@ cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=ar
       -DJLIBSCHED_ALLOW_UNVERIFIED_PLATFORM=ON
 ```
 
-Without that flag it refuses and names the flag. One caveat worth stating: a pool of persistent
+Without that flag it refuses and names the flag. Two caveats worth stating. A pool of persistent
 worker threads does not fit the iOS app lifecycle -- backgrounding freezes threads mid-execution, so
-treat it as foreground-only unless you wire `Pause()`/`Resume()` up yourself.
-
-**Windows on ARM64** is refused outright. The calling convention matches AAPCS64 on everything a
-context switch touches, so what is missing is only an `armasm64` translation, an MSBuild ARM64
-configuration, and somebody with the hardware -- about a day of mechanical work nobody has asked for.
+treat it as foreground-only unless you wire `Pause()`/`Resume()` up yourself. And the fiber stack
+arena commits 64 fibers per core by default, which is sized for a desktop rather than for jetsam
+limits; that is the first knob to turn down if you try it.
 
 Open an issue either way. A report that it works is as useful as one that it doesn't.
 
@@ -352,6 +363,45 @@ never suspend are unaffected, and so is the total number in flight -- it is spec
 blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need more, remembering
 each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
 one.
+
+### You can take garbage collection off the workers
+
+Reclamation is epoch-based, and by default a **worker** performs it: once enough pointers are
+retired, whichever worker notices next stops and runs a reclaim pass. That pass scans every epoch
+participant, and the participant set scales with the pool -- roughly 2,300 slots on a 31-worker
+machine. It is not much total work, but it lands on a thread that was supposed to be running your
+frame, at a moment you do not choose.
+
+If your application has a natural idle point, hand it over:
+
+```cpp
+JLib::EpochManager::Instance().SetSelfReclaim(false);   // BEFORE StartPool
+JLib::TaskScheduler::Init(workerCount);
+
+while (running) {
+    RunFrame();
+    JLib::EpochManager::Instance().Tick();   // reclaim here, where the pool is idle anyway
+}
+```
+
+**What that actually buys, measured** -- frame-shaped DAG, 32 nodes per frame, 4,000 frames after
+400 warm-up, three interleaved rounds, per-frame microseconds:
+
+| | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| default (workers reclaim) | 58.1 / 58.9 / 60.2 | 67.7 / 66.8 / 69.0 | **331 / 331 / 336** |
+| `Tick()` on your thread | 60.5 / 58.7 / 58.5 | 69.3 / 67.8 / 66.3 | **125 / 111 / 104** |
+
+**Throughput does not change.** Median and p90 are a wash, and if that is what you care about there
+is nothing here for you. What changes is the tail: **p99 improves about 3x**, because the same scan
+now happens between frames instead of stalling a worker inside one. It is a frame-time *consistency*
+feature.
+
+Two things to know before you flip it. It must be set **before `StartPool`** and never again -- it
+is a plain `bool` read by every worker, so changing it on a live pool is a data race and a worker may
+have hoisted the read out of its loop anyway. And **if you disable it and then never call `Tick()`,
+retired memory grows without bound and nothing warns you.** The default is on precisely because a
+library cannot assume its embedder has a loop to tick from.
 
 ### Placement is a hint, and on some platforms it is nothing
 
