@@ -120,8 +120,34 @@ namespace JLib {
 		// whatever else the host runs (an audio device thread, a render thread, Jolt through the
 		// JobSystem adapter); and they make the oversubscription policy incoherent, since that
 		// policy reserves a core per persistent busy thread and this would make EVERY worker one.
-		// NoSleep is for an application that genuinely owns the machine -- a fullscreen game is the
-		// obvious one, and the gains above are large enough to be worth the cores there.
+		// WHICH ONE TO PICK, and do NOT decide this from the scheduler benchmarks. They make NoSleep
+		// look free, because in a scheduler benchmark the pool IS the workload: there is no render
+		// or audio thread for the spinning to tax, so the wake saving is all that shows up. Measured
+		// with an IDLE pool and a memory-bound main thread (31 workers, 2026-08-16):
+		//
+		//     no pool at all   14.65 ms/frame        Sleep (parked)   14.65 ms   +0.0%
+		//     NoSleep          15.17 ms   +3.5%
+		//
+		// An idle Sleep pool is FREE. Any spinning pool costs ~3.5% to every other thread in the
+		// process. And it is not the steal sweep doing it -- a control pool of pure CpuRelax threads
+		// touching NO shared memory reproduced almost all of it (15.15 ms), so the cost is core
+		// OCCUPANCY: all-core boost, SMT siblings, power budget. That also means there is no
+		// spin-loop optimisation to be had; the measured ceiling on cheapening the spin is 0.8%.
+		//
+		// The two effects scale with OPPOSITE things. NoSleep's benefit scales with how OFTEN the
+		// pool idles (wakes avoided); its cost scales with how LONG it idles. Break-even is roughly
+		// where 0.035 * idle_gap ~= one 4.6us wake, i.e. an idle gap near 130us. Order of magnitude
+		// only -- it assumes a single memory-bound victim thread -- but enough to decide with.
+		//
+		//   Sleep (the default, and the right answer for interactive apps): anything with a busy
+		//     main/render thread, anything sharing the machine, anything whose idle gaps are long.
+		//     A GAME IS THIS CASE, not the NoSleep case: a 60 FPS frame is 16,600us and even a
+		//     2000 FPS frame is 500us, both orders of magnitude past break-even. An earlier version
+		//     of this comment recommended NoSleep for a fullscreen game; that was wrong, and it was
+		//     wrong because it reasoned from the benchmark rather than from an embedded pool.
+		//   NoSleep: batch/offline work where the task graph is the entire program (asset bakes,
+		//     offline renders, simulation runs), tight pipelines with sub-100us idle gaps, or a
+		//     reserved-core deployment where the pool really does own the hardware.
 		//
 		// Pause() parks regardless of policy -- pausing means "stop using the CPU", and a policy
 		// that kept spinning through it would be ignoring the only thing Pause is for.
