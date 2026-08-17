@@ -171,76 +171,46 @@ namespace JLib {
 		// SAFE TO CALL ON A RUNNING POOL as of 1.3.6 -- the backing store is atomic. It was not
 		// before: a plain global read inside the worker loop could be hoisted out of it, so a
 		// change might never be observed at all. That was undocumented, which made it a trap.
+		//
+		// IF YOU FLIP IT AT RUNTIME, RESTORE IT ON EVERY PATH. Leaking NoSleep on an exception or an
+		// early return does not fail loudly -- it silently taxes every other thread in the process
+		// for the rest of the run, at a cost measured below in real digits. A scoped RAII wrapper
+		// for this existed briefly in 1.3.6 and was removed: measurement (also below) showed the
+		// phase-switching use case it was built for did not pay, and an unused public class is worse
+		// than a one-line discipline. If you find yourself flipping this in more than one place,
+		// write the guard locally rather than asking for it back.
+		//
+		// COST MODEL -- why the default is Sleep and why you should think hard before changing it.
+		// Measured 2026-08-16, 31 workers, IDLE pool, memory-bound main thread:
+		//     no pool at all   14.65 ms/frame       Sleep (parked)  14.65 ms   +0.0%
+		//     NoSleep          15.17 ms  +3.5%
+		// An idle Sleep pool is FREE. An idle NoSleep pool taxes every OTHER thread in the process.
+		// The cost is core OCCUPANCY, not cache traffic: a control pool of pure CpuRelax threads
+		// touching no shared memory reproduced almost all of it -- which also means there is no
+		// spin-loop optimisation to be had (measured ceiling 0.8%). The tax is therefore
+		// proportional to IDLE TIME, not to work done.
+		//
+		// AND THAT 3.5% IS A LOWER BOUND, NOT THE NUMBER. Re-measured inside a real 2D game
+		// (5-node frame DAG, vsync off, 600 frames after 120 warm-up, two interleaved rounds,
+		// median frame time):
+		//     Sleep    383.3 / 374.1 us            NoSleep  462.0 / 464.9 us   <- 23% WORSE
+		// A game has the render thread, GPU driver threads and audio all competing, and spinning
+		// workers land on them at exactly the latency-sensitive moments. The synthetic figure
+		// understated the real cost by ~7x.
+		//
+		// WHY THERE IS NO ADAPTIVE MODE, since it is the obvious next idea (proposed and rejected
+		// 2026-08-17). Switching automatically on queue depth / steal rate / suspension rate / DAG
+		// pressure / idle ratio fails for two reasons that no amount of tuning fixes. First, the
+		// controller cannot observe its own cost function: the tax lands on the RENDER thread and
+		// every available signal is scheduler-internal, so it would converge on NoSleep in exactly
+		// the cases measured as losing. Second, the signals are anti-correlated with the decision --
+		// they describe the PRESENT, the decision needs the NEXT idle gap, and in a frame workload a
+		// heavy burst is precisely what precedes a long idle tail. It would be most confident right
+		// before it was most wrong. Keeping a small number of workers hot instead was also dropped:
+		// permanent cost, intermittent benefit, and the cost is proportional to the hot count while
+		// the benefit is sub-proportional (the other workers still wake cold).
 		static void       SetIdlePolicy(IdlePolicy p);
 		static IdlePolicy GetIdlePolicy();
-
-		// Scoped idle-policy override, for an application that KNOWS its own phase structure.
-		//
-		// This exists because the scheduler cannot infer the one thing that decides the policy: how
-		// long the NEXT idle gap will be. Queue depth, steal rate and DAG pressure all describe the
-		// PRESENT, and in a frame-structured workload the present is ANTI-correlated with what
-		// follows -- a heavy burst is precisely what precedes a long idle tail. An adaptive
-		// controller built on those signals would be most confident right before it was most wrong.
-		// The application never has to guess: it knows it is about to block on vsync, or that it
-		// just opened a menu.
-		//
-		// COST MODEL (measured 2026-08-16, 31 workers, memory-bound main thread): an idle Sleep
-		// pool is FREE -- 14.65 ms/frame against 14.65 with no pool at all. An idle NoSleep pool
-		// costs ~3.5% to every OTHER thread in the process. That cost is core OCCUPANCY, not cache
-		// traffic: a control pool of pure CpuRelax threads touching no shared memory reproduced
-		// almost all of it, which also means there is no spin-loop optimisation to be had (measured
-		// ceiling 0.8%). So the tax is proportional to IDLE TIME, not to work done. Hold NoSleep
-		// across the busy phase and drop it before anything long:
-		//
-		//     while (running) {
-		//         {
-		//             JLib::TaskScheduler::ScopedIdlePolicy busy(IdlePolicy::NoSleep);
-		//             Simulate();
-		//             RecordAndSubmit();
-		//         }                          // <-- parks BEFORE the wait below
-		//         PresentAndWaitForVsync();  // 5+ ms idle at 144 Hz; spinning here is pure waste
-		//     }
-		//
-		// WHAT IT DOES NOT BUY, because the transitions are asymmetric. Leaving the scope takes
-		// effect at once -- spinning workers re-read the policy each pass and park on the next empty
-		// one. ENTERING it is lazy: parked workers are blocked in cv.wait and cannot see the change
-		// until something wakes them, so the first burst inside the scope still pays full wake cost.
-		// The win is therefore the idle gaps BETWEEN dependent stages inside the region, not
-		// first-task latency. A frame with one wide fan-out gains close to nothing; a frame with
-		// many small dependent batches gains most of it. Measure before believing it helps.
-		//
-		// MEASURED IN A REAL GAME, AND IT DID NOTHING (2026-08-17). Recorded here rather than in a
-		// changelog nobody reads at the call site, because the honest expectation for this API is
-		// "probably no win". A 2D game, 5-node frame DAG, vsync off, 600 frames after 120 warm-up,
-		// two interleaved rounds, median frame time:
-		//
-		//     Sleep    383.3 / 374.1 us        <- shipped default
-		//     NoSleep  462.0 / 464.9 us        <- 23% WORSE
-		//     Scoped   374.8 / 377.5 us        <- indistinguishable from Sleep
-		//
-		// Consistent with the asymmetry above: entering the scope is lazy, so first-task latency is
-		// unchanged, and a 5-node mostly-main-affinity DAG has almost no inter-stage idle gaps for
-		// the guard to win back. It is kept because the case it was built for -- many small
-		// DEPENDENT batches per frame, or parking the pool across menus and loading screens -- is
-		// real and simply is not what that game does. Do not assume it helps; measure.
-		//
-		// The NoSleep row is the other lesson: the synthetic idle-pool benchmark predicted a ~3.5%
-		// tax and the real frame showed 23%. A game has the render thread, GPU driver threads and
-		// audio all competing, and spinning workers land on them at exactly the latency-sensitive
-		// moments. Treat the synthetic number as a LOWER BOUND.
-		//
-		// GLOBAL, not per-worker and not per-task. Drive it from ONE thread -- the frame thread.
-		// Overlapping guards on two threads are last-writer-wins, and the restore on scope exit
-		// will clobber whatever the other one set.
-		class ScopedIdlePolicy {
-		public:
-			explicit ScopedIdlePolicy(IdlePolicy p) : prev_(GetIdlePolicy()) { SetIdlePolicy(p); }
-			~ScopedIdlePolicy() { SetIdlePolicy(prev_); }
-			ScopedIdlePolicy(const ScopedIdlePolicy&) = delete;
-			ScopedIdlePolicy& operator=(const ScopedIdlePolicy&) = delete;
-		private:
-			IdlePolicy prev_;
-		};
 
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join

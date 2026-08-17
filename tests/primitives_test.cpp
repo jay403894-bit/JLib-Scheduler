@@ -402,29 +402,16 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
     using IP = JLib::TaskScheduler::IdlePolicy;
     const IP entry = JLib::TaskScheduler::GetIdlePolicy();
 
-    // Save/restore, including nesting. Cheap, and it is the half that a refactor would break
-    // silently: a guard that restored a default instead of the previous value would still pass any
-    // test that only ran it once at the top level.
-    {
-        JLib::TaskScheduler::ScopedIdlePolicy outer(IP::NoSleep);
-        Check(JLib::TaskScheduler::GetIdlePolicy() == IP::NoSleep, "guard applies its policy");
-        {
-            JLib::TaskScheduler::ScopedIdlePolicy inner(IP::Sleep);
-            Check(JLib::TaskScheduler::GetIdlePolicy() == IP::Sleep, "nested guard applies");
-        }
-        Check(JLib::TaskScheduler::GetIdlePolicy() == IP::NoSleep,
-              "nested guard restores the OUTER policy, not a default");
-    }
-    Check(JLib::TaskScheduler::GetIdlePolicy() == entry, "guard restores on scope exit");
+    Check(JLib::TaskScheduler::GetIdlePolicy() == entry, "GetIdlePolicy round-trips");
 
-    // Now hammer the transition with work in flight. Each round parks or unparks the pool while
-    // tasks are being pushed, so the flip lands in the middle of the handshake rather than between
-    // quiet periods.
+    // Hammer the transition with work in flight. Each round parks or unparks the pool while tasks
+    // are being pushed, so the flip lands in the middle of the handshake rather than between quiet
+    // periods.
     constexpr int kRounds = 40;
     constexpr int kPerRound = 64;
     std::atomic<int> ran{ 0 };
     for (int r = 0; r < kRounds; ++r) {
-        JLib::TaskScheduler::ScopedIdlePolicy flip((r & 1) ? IP::NoSleep : IP::Sleep);
+        JLib::TaskScheduler::SetIdlePolicy((r & 1) ? IP::NoSleep : IP::Sleep);
         JLib::WaitGroup wg;
         wg.n.store(kPerRound, std::memory_order_relaxed);
         for (int i = 0; i < kPerRound; ++i) {
@@ -436,6 +423,11 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
         }
         sched.WaitFor(wg);    // hangs here if a transition ever stranded one
     }
+    // Restore explicitly. There is no RAII guard for this by design (see SetIdlePolicy's comment),
+    // so the discipline it used to enforce is now the caller's -- including this test's, and a run
+    // that left NoSleep set would silently tax every case after it.
+    JLib::TaskScheduler::SetIdlePolicy(entry);
+
     Check(ran.load(std::memory_order_relaxed) <= kRounds * kPerRound, "no task ran twice");
     std::printf("  %d tasks across %d policy flips on a live pool          %s\n",
                 ran.load(std::memory_order_relaxed), kRounds,
