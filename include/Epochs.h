@@ -102,6 +102,28 @@ namespace JLib {
 		}
 		// Fallback epoch slot for a bare thread (one not running on a fiber), by thread_id.
 		std::atomic<size_t>* ThreadSlot(size_t tid) {
+			// BOUNDS TRIPWIRE. This had no check, and the failure mode was terrible: an out-of-range
+			// tid indexes past the vector, returns whatever garbage pointer was there, and the
+			// EpochGuard constructor writes through it -- surfacing as an access violation inside
+			// LockFreeList::add with nothing pointing at the real cause (the thread_id).
+			//
+			// tid comes from the thread_local `thread_id`, which is assigned in exactly two places:
+			// Thread::StartWorker for each worker, and the tail of StartPool for the MAIN thread.
+			// The vector is sized num_workers + 1 for precisely that reason. A tid past the end
+			// therefore means a thread that took an id without a slot being reserved for it, or a
+			// thread that never got one and is still carrying the default 0 while ALIASING worker 0.
+			// Both are real bugs, and both are silent today.
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+			if (tid >= threadEpochs.size()) {
+				std::fprintf(stderr,
+					"[JLib::Scheduler] FATAL: epoch slot %zu requested but only %zu exist. "
+					"A thread is using an epoch guard without a reserved slot -- see thread_id's "
+					"assignment in Thread::StartWorker and TaskScheduler::StartPool.\n",
+					tid, threadEpochs.size());
+				std::fflush(stderr);
+				assert(false && "epoch slot index out of range -- see stderr");
+			}
+#endif
 			return &threadEpochs[tid]->localEpoch;
 		}
 		void TryReclaim() {

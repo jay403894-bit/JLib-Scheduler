@@ -219,6 +219,19 @@ namespace JLib {
 		// has profiled its own workload knows better. Set it enormous (1e12) to force every ParallelFor
 		// serial, which is the fastest way to answer "is ParallelFor causing this?" without a rebuild.
 		// Set once at startup; read-only thereafter.
+		// Hand epoch reclamation to the caller: workers stop self-triggering, and you call
+		// EpochManager::Instance().Tick() from your own idle point instead. MUST be called before
+		// StartPool. See EpochManager::SetSelfReclaim in Epochs.h for the full contract, the
+		// measured numbers, and the warning about what happens if you disable it and never Tick().
+		//
+		// A FORWARDER, and it exists because the real function was unfindable. Every other knob in
+		// this library is a static on TaskScheduler, so that is where people look -- the first
+		// person to go looking for this one searched for TaskScheduler::SetSelfReclaim, did not
+		// find it, and reasonably concluded the feature did not exist. An implementation detail
+		// being the only entry point to a tuning option is an API bug, not a naming preference.
+		static void SetSelfReclaim(bool on);
+		static bool SelfReclaimEnabled();
+
 		static void   SetParallelForThresholdUs(double us);
 		static double GetParallelForThresholdUs();
 

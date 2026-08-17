@@ -293,6 +293,11 @@ static std::atomic<TaskScheduler::IdlePolicy> g_idlePolicy{ TaskScheduler::IdleP
 void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy.store(p, std::memory_order_relaxed); }
 TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.load(std::memory_order_relaxed); }
 
+// Forwarders. The state lives on EpochManager (it is the thing that reclaims); these exist so the
+// option is discoverable beside every other tuning knob. See the header for why that mattered.
+void TaskScheduler::SetSelfReclaim(bool on) { EpochManager::Instance().SetSelfReclaim(on); }
+bool TaskScheduler::SelfReclaimEnabled()    { return EpochManager::Instance().SelfReclaimEnabled(); }
+
 static double g_parallelWorthwhileUs = kDefaultParallelWorthwhileUs;
 void TaskScheduler::SetParallelForThresholdUs(double us) { g_parallelWorthwhileUs = us; }
 double TaskScheduler::GetParallelForThresholdUs() { return g_parallelWorthwhileUs; }
