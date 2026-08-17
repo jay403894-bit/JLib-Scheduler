@@ -274,9 +274,24 @@ static TaskScheduler::AffinityPolicy g_affinityPolicy = TaskScheduler::AffinityP
 void TaskScheduler::SetAffinityPolicy(AffinityPolicy p) { g_affinityPolicy = p; }
 TaskScheduler::AffinityPolicy TaskScheduler::GetAffinityPolicy() { return g_affinityPolicy; }
 
-static TaskScheduler::IdlePolicy g_idlePolicy = TaskScheduler::IdlePolicy::Sleep;
-void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy = p; }
-TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy; }
+// ATOMIC, and the reason is not tearing. This was a plain global read by every worker on every idle
+// pass, which made SetIdlePolicy safe ONLY before StartPool -- a constraint nothing documented and
+// nothing enforced. The practical failure of calling it on a running pool was not a torn read: a
+// non-atomic load of a global the compiler can prove is not modified inside the worker loop is free
+// to be HOISTED OUT of that loop, so a running worker could never observe the change at all.
+//
+// Relaxed is sufficient, deliberately. This is a HINT about how hard to look for work, never a
+// correctness input: the sleep predicate and the whole wake handshake are untouched, so a worker
+// reading a stale value spins one pass longer or parks one pass early, and BOTH are safe states.
+// No new lost-wakeup surface -- see tests/verify/sleepwake_model.c, which this does not affect.
+//
+// Note the two transitions are NOT symmetric, which matters to callers (see ScopedIdlePolicy):
+// NoSleep -> Sleep applies immediately, because spinning workers re-read this every pass. Sleep ->
+// NoSleep applies LAZILY, because parked workers are blocked in cv.wait and cannot see it until
+// something wakes them.
+static std::atomic<TaskScheduler::IdlePolicy> g_idlePolicy{ TaskScheduler::IdlePolicy::Sleep };
+void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy.store(p, std::memory_order_relaxed); }
+TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.load(std::memory_order_relaxed); }
 
 static double g_parallelWorthwhileUs = kDefaultParallelWorthwhileUs;
 void TaskScheduler::SetParallelForThresholdUs(double us) { g_parallelWorthwhileUs = us; }

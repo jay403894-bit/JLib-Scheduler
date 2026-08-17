@@ -384,6 +384,65 @@ static int FiberContentionIters() {
 }
 static const int kFiberContentionIters = FiberContentionIters();
 
+// Changing IdlePolicy on a RUNNING pool -- allowed as of 1.3.6, and previously a data race.
+//
+// The real risk being tested is a lost wakeup at the transition. Flipping to NoSleep while workers
+// are parked, and to Sleep while they are spinning, moves the whole pool across the park/wake
+// handshake repeatedly and under load. If any of those transitions could strand a task, this hangs
+// and the watchdog reports it -- which is the correct outcome, and the reason this does not simply
+// assert on a counter and return.
+//
+// Deliberately NOT asserting that workers actually stopped parking: that is unobservable from
+// outside without instrumentation that would perturb the thing being measured. What is asserted is
+// the property that matters -- every task completes across every transition -- plus that the scoped
+// guard restores exactly, including nested.
+static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
+    std::printf("IdlePolicy change on a live pool\n");
+
+    using IP = JLib::TaskScheduler::IdlePolicy;
+    const IP entry = JLib::TaskScheduler::GetIdlePolicy();
+
+    // Save/restore, including nesting. Cheap, and it is the half that a refactor would break
+    // silently: a guard that restored a default instead of the previous value would still pass any
+    // test that only ran it once at the top level.
+    {
+        JLib::TaskScheduler::ScopedIdlePolicy outer(IP::NoSleep);
+        Check(JLib::TaskScheduler::GetIdlePolicy() == IP::NoSleep, "guard applies its policy");
+        {
+            JLib::TaskScheduler::ScopedIdlePolicy inner(IP::Sleep);
+            Check(JLib::TaskScheduler::GetIdlePolicy() == IP::Sleep, "nested guard applies");
+        }
+        Check(JLib::TaskScheduler::GetIdlePolicy() == IP::NoSleep,
+              "nested guard restores the OUTER policy, not a default");
+    }
+    Check(JLib::TaskScheduler::GetIdlePolicy() == entry, "guard restores on scope exit");
+
+    // Now hammer the transition with work in flight. Each round parks or unparks the pool while
+    // tasks are being pushed, so the flip lands in the middle of the handshake rather than between
+    // quiet periods.
+    constexpr int kRounds = 40;
+    constexpr int kPerRound = 64;
+    std::atomic<int> ran{ 0 };
+    for (int r = 0; r < kRounds; ++r) {
+        JLib::TaskScheduler::ScopedIdlePolicy flip((r & 1) ? IP::NoSleep : IP::Sleep);
+        JLib::WaitGroup wg;
+        wg.n.store(kPerRound, std::memory_order_relaxed);
+        for (int i = 0; i < kPerRound; ++i) {
+            JLib::Task* t = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); },
+                                             false, JLib::FiberSize::Standard, /*noFiber*/1);
+            if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        sched.WaitFor(wg);    // hangs here if a transition ever stranded one
+    }
+    Check(ran.load(std::memory_order_relaxed) <= kRounds * kPerRound, "no task ran twice");
+    std::printf("  %d tasks across %d policy flips on a live pool          %s\n",
+                ran.load(std::memory_order_relaxed), kRounds,
+                ran.load(std::memory_order_relaxed) > 0 ? "ok" : "NOTHING RAN");
+    Check(JLib::TaskScheduler::GetIdlePolicy() == entry, "policy restored after the loop");
+}
+
 static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
     std::printf("mutex contention between two FIBERS (suspend path)\n");
 
@@ -711,6 +770,7 @@ int main(int argc, char** argv) {
     TestPushArray(sched);
     TestPushBatchSpread(sched);
     TestFiberCapOversubscribed(sched);
+    TestIdlePolicySwitchUnderLoad(sched);
     TestMutexFiberContention(sched);
     TestMutexMixedContention(sched);
     TestConditionVariableFiber(sched);

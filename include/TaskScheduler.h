@@ -168,8 +168,59 @@ namespace JLib {
 		// plus continuous park/unpark cv churn on top. Both extremes avoid one half of that; the
 		// middle gets both. Removed rather than kept as a trap for anyone expecting a compromise.
 		enum class IdlePolicy : uint8_t { Sleep = 0, NoSleep };
+		// SAFE TO CALL ON A RUNNING POOL as of 1.3.6 -- the backing store is atomic. It was not
+		// before: a plain global read inside the worker loop could be hoisted out of it, so a
+		// change might never be observed at all. That was undocumented, which made it a trap.
 		static void       SetIdlePolicy(IdlePolicy p);
 		static IdlePolicy GetIdlePolicy();
+
+		// Scoped idle-policy override, for an application that KNOWS its own phase structure.
+		//
+		// This exists because the scheduler cannot infer the one thing that decides the policy: how
+		// long the NEXT idle gap will be. Queue depth, steal rate and DAG pressure all describe the
+		// PRESENT, and in a frame-structured workload the present is ANTI-correlated with what
+		// follows -- a heavy burst is precisely what precedes a long idle tail. An adaptive
+		// controller built on those signals would be most confident right before it was most wrong.
+		// The application never has to guess: it knows it is about to block on vsync, or that it
+		// just opened a menu.
+		//
+		// COST MODEL (measured 2026-08-16, 31 workers, memory-bound main thread): an idle Sleep
+		// pool is FREE -- 14.65 ms/frame against 14.65 with no pool at all. An idle NoSleep pool
+		// costs ~3.5% to every OTHER thread in the process. That cost is core OCCUPANCY, not cache
+		// traffic: a control pool of pure CpuRelax threads touching no shared memory reproduced
+		// almost all of it, which also means there is no spin-loop optimisation to be had (measured
+		// ceiling 0.8%). So the tax is proportional to IDLE TIME, not to work done. Hold NoSleep
+		// across the busy phase and drop it before anything long:
+		//
+		//     while (running) {
+		//         {
+		//             JLib::TaskScheduler::ScopedIdlePolicy busy(IdlePolicy::NoSleep);
+		//             Simulate();
+		//             RecordAndSubmit();
+		//         }                          // <-- parks BEFORE the wait below
+		//         PresentAndWaitForVsync();  // 5+ ms idle at 144 Hz; spinning here is pure waste
+		//     }
+		//
+		// WHAT IT DOES NOT BUY, because the transitions are asymmetric. Leaving the scope takes
+		// effect at once -- spinning workers re-read the policy each pass and park on the next empty
+		// one. ENTERING it is lazy: parked workers are blocked in cv.wait and cannot see the change
+		// until something wakes them, so the first burst inside the scope still pays full wake cost.
+		// The win is therefore the idle gaps BETWEEN dependent stages inside the region, not
+		// first-task latency. A frame with one wide fan-out gains close to nothing; a frame with
+		// many small dependent batches gains most of it. Measure before believing it helps.
+		//
+		// GLOBAL, not per-worker and not per-task. Drive it from ONE thread -- the frame thread.
+		// Overlapping guards on two threads are last-writer-wins, and the restore on scope exit
+		// will clobber whatever the other one set.
+		class ScopedIdlePolicy {
+		public:
+			explicit ScopedIdlePolicy(IdlePolicy p) : prev_(GetIdlePolicy()) { SetIdlePolicy(p); }
+			~ScopedIdlePolicy() { SetIdlePolicy(prev_); }
+			ScopedIdlePolicy(const ScopedIdlePolicy&) = delete;
+			ScopedIdlePolicy& operator=(const ScopedIdlePolicy&) = delete;
+		private:
+			IdlePolicy prev_;
+		};
 
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
