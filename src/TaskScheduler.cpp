@@ -222,6 +222,19 @@ void TaskScheduler::NotifyAll() {
 // 75us sits in the measured cluster. The error is asymmetric -- being slightly too eager can cost
 // multiples, being slightly too cautious costs a few percent near the boundary -- so when in doubt
 // this leans serial.
+//
+// RE-MEASURED 2026-08-17, AFTER slice-stealing replaced fork-join here. The prediction was that this
+// must now be too conservative, since the constant is a dispatch cost and dispatch had got cheaper
+// twice. It is not. Raw serial loop against ParallelRange (no probe, so nothing contaminates the
+// timing), sweeping element counts so serial work spans 0.1us to 9ms, medians of 15, stable over
+// three runs: heavy body breaks even at 69us, medium at 88us. 75 sits between them, unchanged.
+//
+// The cheap body did not break even AT ALL in that range -- still 0.52x at 64us of serial work --
+// and that is the limitation worth knowing, because no value of this constant fixes it. When
+// per-item cost is low enough that the loop is bounded by memory rather than compute, splitting it
+// is actively HARMFUL rather than merely unprofitable. This gate decides WHEN to parallelize, not
+// whether the body can benefit at all. Same effect the memory-bound ParallelFor bench row carries
+// its own caveat about.
 // Keyed on OPTIMIZATION, not on NDEBUG alone. A "Development"/RelWithDebInfo build is optimized but
 // deliberately keeps assertions live, so it does NOT define NDEBUG -- testing NDEBUG by itself would
 // hand an optimized build the unoptimized threshold and serialize work that should be parallel.

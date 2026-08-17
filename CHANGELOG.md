@@ -24,10 +24,27 @@ The crossover sweep moved with it. Against the same sweep before the change:
 | medium @ 4000 | 1.44x | **2.55x** |
 | heavy @ 200k | 16.60x | **20.86x** |
 
-Note what that implies about the ~75 µs gate: it was calibrated when dispatch was more expensive,
-and dispatch has now got cheaper twice (fork-join, then this). It is probably conservative. The
-sweep's granularity jumps 40,000 to 200,000, so it cannot say where the gate should sit -- that
-wants its own measurement before anyone moves it.
+**The ~75 µs gate was then measured, and it stays.** The reasonable-sounding prediction was that it
+must be conservative: it was calibrated before fork-join existed, and dispatch has since got cheaper
+twice. Measured directly -- raw serial loop against `ParallelRange` (no probe to contaminate the
+timing), sweeping element counts so total serial work spans ~0.1 µs to ~9 ms, three body costs,
+medians of 15, stable across three runs:
+
+| body | parallel breaks even at |
+| --- | --- |
+| heavy, ~64 flop/item | **69 µs** |
+| medium, ~8 flop/item | **88 µs** |
+| cheap, ~1 flop/item | never in range -- still 0.52x at 64 µs of serial work |
+
+75 µs sits almost exactly between the two compute-bound crossovers. **It is well placed and was not
+changed.** The prediction was wrong, and the measurement is the only reason we know that rather than
+having shipped a tuned-by-guess constant.
+
+The cheap row is the more useful finding, and it is a limit no gate value can fix: when per-item
+cost is low enough that the loop is bounded by memory rather than compute, parallelising is
+*actively harmful* at these sizes -- 0.52x, not 1.0x. The gate decides WHEN to parallelise, not
+whether the work can benefit at all, and no threshold rescues a body that does not scale. This is
+the same effect the `ParallelFor` memory-bound bench row already carries a caveat about.
 
 **`ParallelRange(begin, end, grain, fn)`** is new, and exists for the one thing `ParallelFor` cannot
 do: skip the probe. `ParallelFor` runs a serial prefix and times it to decide serial-vs-parallel,
