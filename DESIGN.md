@@ -220,12 +220,24 @@ sched.PushImmediate(/*coreID*/ 2, audioService);   // evicts core 2's queue, loc
 ### ParallelFor
 
 `ParallelFor(start, end, chunk, fn)` picks between flat dispatch, where the caller spawns every
-chunk, and recursive fork-join splitting, where the tree is built by the pool. Flat wins up to about
-2 tasks per worker; past that its O(#tasks) serial spawn on one thread collapses, and fork-join
-measured roughly 8x faster at ~15k tasks.
+chunk, and **slice-stealing**, where one task per worker pulls `[lo, lo+grain)` off a shared cursor
+until the range is consumed. Flat wins up to about 2 tasks per worker; past that its O(#tasks)
+serial spawn on one thread collapses.
+
+That crossover used to hand off to recursive fork-join splitting, which built the spawn tree with
+the pool and measured roughly 8x faster than flat at ~15k tasks. Slice-stealing replaced it in 1.4
+because it removes the per-chunk task entirely -- fork-join distributes the *spawning* but still
+creates one task per chunk, at ~80-140 ns each for a slab slot, a push and an epoch retirement.
+Measured against it: 1.7-1.9x on a uniform body, 1.2-1.3x when cost varies ~20x across the range.
+`ParallelForFJ` remains public for callers who want the fork-join tree directly; it is simply not
+what `ParallelFor` selects any more.
 
 Whether to parallelize at all is decided by measurement, not element count: it runs a small prefix
-inline, times it, extrapolates, and only splits if the estimated work clears ~75 µs. See
+inline, times it, extrapolates, and only splits if the estimated work clears ~75 µs. **That probe is
+the one thing `ParallelRange` does not do** -- on a 20,000-item job the prefix is ~312 items run
+serially, about a third of the wall time, which is worth skipping when you already know the range is
+large and worth keeping when you do not. See
+[Choosing a range API](README.md#choosing-a-range-api-parallelfor-vs-parallelrange), and see
 [the crossover note](#parallelfor-is-gated-on-measured-work-not-element-count) below for why the
 element count was the wrong unit, and for the limitation that remains.
 

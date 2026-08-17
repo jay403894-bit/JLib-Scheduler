@@ -316,6 +316,23 @@ namespace JLib {
 		// chunkSize -- at 32 it is ~3 ns/item -- which is the same amortisation a range-based API
 		// gets, without giving up a per-item callable.
 		//
+		// NOT MADE OBSOLETE BY ParallelRange (1.4), and the reason is structural rather than a
+		// performance argument. ParallelFor and ParallelRange BLOCK: their cursor, wait group and
+		// callable all live on the caller's stack frame, which is the only thing that makes a
+		// zero-allocation slice-stealing loop possible. PushArray does not block -- it hands you a
+		// WaitGroup and returns, so you can submit range work and go do something else, or never
+		// wait at all. A non-blocking cursor would need heap state and a refcount to keep it alive
+		// past the caller's frame, which is a different design with a different cost.
+		//
+		// So the split is: PushArray when you want the range submitted and control back, the other
+		// two when you want it done before the next line runs. It is also the only one of the three
+		// taking a PER-ITEM callable rather than fn(lo, hi).
+		//
+		// ONE SHARP EDGE, since nothing here floors chunkSize for you: this creates a task per
+		// chunk, so a tiny chunkSize over a large range creates a task per few items and will
+		// exhaust the slab (measured: chunk 1 over 4M items exhausted a 1M-slot arena and fell back
+		// to running inline, at 32 ns/item against 0.06 at chunk 4096). Pick a chunk size.
+		//
 		// NOT A REPLACEMENT FOR ParallelFor, which probes the work, picks its own split, runs a
 		// chunk on the calling thread and blocks until done. PushArray is the fire-and-forget
 		// sibling: it returns as soon as the work is queued, so use it when the caller has other

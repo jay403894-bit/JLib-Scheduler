@@ -365,12 +365,13 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// Everything it needs lives on THIS stack frame, which is sound only because ParallelFor
 		// BLOCKS: cursor, wg and func all outlive every task by construction. ParallelForNB cannot
 		// use this without heap state and a refcount, which is why it is not wired up there.
-		if ((size_t)numTasks > 2 * workers.size() && !workers.empty()) {
-			RunCursorRange(start, end, chunkSize, func);
-			return;
-		}
+		// Past ~2 tasks per worker, slice-stealing beats both per-chunk strategies -- see
+		// RunCursorRange, which also handles the no-pool case by running inline. This is where
+		// ParallelForFJ used to be called; it stays PUBLIC for callers who want the fork-join tree
+		// directly (same reason ParallelForNB is public), it is simply no longer what ParallelFor
+		// picks. The flat path below still wins at small task counts and is unchanged.
 		if ((size_t)numTasks > 2 * workers.size()) {
-			ParallelForFJ(start, end, chunkSize, func);
+			RunCursorRange(start, end, chunkSize, func);
 			return;
 		}
 
