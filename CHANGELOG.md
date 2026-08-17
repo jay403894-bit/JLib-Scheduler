@@ -3,6 +3,102 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 1.3.6 - unreleased
+
+**Windows on ARM64 is supported.** Snapdragon X and any other WoA machine. It needed a third
+hand-written context switch -- `src/win32/aarch64/ContextSwitch.asm`, in armasm64 syntax -- because a
+calling convention belongs to the **(OS, ARCH) pair**, not to the arch. That is the one place this
+library's "the OS axis and the arch axis are orthogonal" claim does not hold, and it is now a
+documented caveat rather than something designed around: `src/win32/aarch64/` sits beside
+`src/posix/aarch64/`.
+
+The real difference turned out to be much narrower than expected. Windows ARM64 and AAPCS64 agree on
+the callee-saved set (x19-x28, x29, x30, and the low 64 bits of v8-v15) and therefore on the frame
+layout, so **`src/posix/aarch64/FiberInit.cpp` is reused verbatim** rather than duplicated -- only
+the assembler syntax and the unwind-data format actually differ.
+
+`x18` is never touched, and that is load-bearing rather than incidental. It is the TEB pointer on
+Windows, and fibers in this scheduler **migrate between worker threads**, so saving it into a fiber's
+frame and restoring it after that fiber resumes on a different worker would install a stale TEB on a
+thread that did nothing wrong -- corrupting thread-local state and surfacing later as
+nondeterministic damage in unrelated code.
+
+**Two things the previous documentation asserted were wrong**, found while doing this:
+
+- The CMake guard claimed a Windows fiber switch "must update the TEB's `StackBase`/`StackLimit` --
+  the fixup the x64 MASM does". **It does not.** There is no TEB access anywhere in `src/win32/`.
+  The ARM64 port matches the shipped x64 behaviour instead of inventing a third one. The consequence
+  is identical on both: a fiber-stack overflow arrives as an access violation on the arena's guard
+  page rather than as a proper stack-overflow exception, and SEH across a fiber boundary is limited.
+  That is the normal trade for lightweight fibers and has shipped on x64 for the life of the library.
+- **Windows needs two assembler languages.** CMake's `ASM_MASM` is ml/ml64 and is x86-only; ARM64
+  requires `ASM_MARMASM` (armasm64, CMake 3.26+). It fails loudly rather than degrading, and the
+  choice has to be made at `project()` time -- before `CMAKE_SYSTEM_PROCESSOR` exists -- so it comes
+  from the generator platform or the host environment.
+
+`tests/fibertest_win_aarch64.cpp` is the Windows ABI harness, and it is a separate file rather than
+`#ifdef`s over the POSIX one because **MSVC supports no inline assembly on ARM64 at all**. The POSIX
+harness is built almost entirely from `register uint64_t v asm("x19")` pins, which have no MSVC
+spelling, so the register work moved into `tests/win32/fibertest_probe_aarch64.asm`. That version is
+arguably better: `AbiProbe` seeds all eighteen callee-saved registers, drives one switch, verifies
+branchlessly, and returns a **bitmask naming exactly which registers moved**, where the POSIX harness
+needs two passes of five because pinning ten GPRs at once starves the register allocator. The
+guard-page check uses SEH instead of `fork()`.
+
+Verified on a GitHub `windows-11-arm` runner: the isolated ABI harness (round trips, callee-saved
+GPRs, d8-d15, FPCR isolation, guard page) plus the full scheduler suite under both idle policies.
+
+**`SetIdlePolicy` is now safe to call on a running pool.** It was not, and the failure mode was not
+tearing: `g_idlePolicy` was a plain global read by every worker on every idle pass, and a non-atomic
+load of a global the compiler can prove is not modified inside the worker loop is free to be
+**hoisted out of that loop** -- so a running worker could never observe the change at all. Nothing
+documented the before-`StartPool`-only constraint, which made it a trap. Now `std::atomic`, relaxed:
+the policy is a hint about how hard to look for work, never a correctness input, so a stale read
+means a worker spins one pass longer or parks one pass early and both are safe states. No new
+lost-wakeup surface -- `sleepwake_model.c` is unaffected.
+
+**`tests/verify/fiberwait_model.c`** model-checks the fiber wait/resume handshake shared by
+`SchedulerMutex`, `SchedulerSemaphore` and (transitively) `SchedulerConditionVariable`. This was the
+last unmodelled synchronisation in the library, and it is the one that shipped the 1.3.5 deadlock.
+Two negative controls, both of which fail as required: `-DOLD_ORDERING` reproduces that deadlock, and
+`-DCLOBBER_SUSPEND` reproduces the `Thread::Suspend` trap an otherwise correct-looking reorder would
+walk into. The notable result is `-DSEQ_CST` exploring the **identical** state space to the shipped
+release/acquire version: the spinlock already supplies the happens-before edge, so this was never a
+memory-ordering bug and no barrier would have fixed it. When a lost wakeup turns up, check program
+order before reaching for stronger orderings.
+
+**The `IdlePolicy` guidance was recommending the wrong policy, and is corrected.** It named a
+fullscreen game as the obvious case *for* `NoSleep`; that is precisely where `NoSleep` loses. The
+error came from reasoning off the scheduler benchmarks, where the pool IS the workload so there is no
+render or audio thread for the spinning to tax and only the wake saving shows up. Measured with an
+idle pool and a memory-bound main thread (31 workers):
+
+| | median frame | vs no pool |
+| --- | --- | --- |
+| no pool at all | 14.65 ms | -- |
+| `Sleep` (parked) | 14.65 ms | +0.0% |
+| `NoSleep` (spinning) | 15.17 ms | +3.5% |
+
+An idle `Sleep` pool is free. An idle `NoSleep` pool taxes every other thread in the process, and the
+cost is core **occupancy**, not cache traffic -- a control pool of pure `CpuRelax` threads touching no
+shared memory reproduced almost all of it, which also means there is no spin-loop optimisation
+available (measured ceiling 0.8%).
+
+**And 3.5% is a lower bound, not the number.** Re-measured inside a real 2D game (5-node frame DAG,
+vsync off, 600 frames after 120 warm-up, two interleaved rounds, median frame time): `Sleep`
+383.3/374.1 us against `NoSleep` 462.0/464.9 us -- **23% worse**. A game has the render thread, GPU
+driver threads and audio all competing, and spinning workers land on them at exactly the
+latency-sensitive moments. The synthetic figure understated the real cost by roughly 7x.
+
+`SetIdlePolicy`'s comment now carries all of that, plus why an **adaptive** mode was rejected: a
+controller switching on queue depth, steal rate, suspension rate, DAG pressure or idle ratio cannot
+observe its own cost function (the tax lands on the render thread; every available signal is
+scheduler-internal), and those signals describe the present while the decision needs the next idle
+gap -- in a frame workload a heavy burst is exactly what precedes a long idle tail, so it would be
+most confident right before it was most wrong. A scoped RAII wrapper for phase-switching was written,
+measured in the same game, found to change nothing (374.8/377.5 us, indistinguishable from `Sleep`),
+and removed before release.
+
 ## 1.3.5 - 2026-08-16
 
 **[CRITICAL] Lost wakeup in the fiber wait path of `SchedulerMutex` and `SchedulerSemaphore`.**
