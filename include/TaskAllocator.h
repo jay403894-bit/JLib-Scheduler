@@ -4,6 +4,7 @@
 #pragma once
 #include "platform.h"   // platform::kCacheLine
 #include <vector>
+#include <memory>   // unique_ptr<Block[]> -- the lazy slab backing
 #include <cstddef>
 #include <mutex>
 #include <atomic>
@@ -55,7 +56,27 @@ namespace JLib {
         static void*& next(void* slot) { return *reinterpret_cast<void**>(slot); }
 
         // ---- shared backing (touched rarely, in batches, under the lock) ----
-        std::vector<Block> mem;
+        //
+        // LAZY. This was `std::vector<Block> mem` plus a constructor loop that linked every block
+        // into the free list, and the pair cost a quarter of a gigabyte of RESIDENT memory before a
+        // single task ran. Measured 2026-08-17 at the default 1M slots x 256 bytes:
+        //
+        //     Init(): 261 MB resident, ~50 ms -- and FIXED, identical at pool size 1 and 31
+        //
+        // Both halves were to blame. `vector<Block>(n)` value-initializes, so 256 MB of memset; then
+        // the link loop wrote into every block, faulting all of it in. Invisible on desktop,
+        // disqualifying on Android/iOS where a whole app may have a few hundred MB.
+        //
+        // Now: unique_ptr<Block[]> with `new Block[n]`, which DEFAULT-initializes a trivial type and
+        // therefore writes nothing, plus a bump cursor so slots are linked in BATCH-sized groups the
+        // first time they are actually needed. Resident cost becomes proportional to PEAK LIVE
+        // TASKS instead of capacity, with the full 1M capacity and no API change.
+        std::unique_ptr<Block[]> mem;
+        size_t memSlots = 0;
+        // Index of the first slot never yet handed out. Everything below it has been through the
+        // free list at least once; everything at or above it has never been touched. Guarded by mtx,
+        // like sharedHead -- refill is the only reader and writer.
+        size_t bumpNext = 0;
         void* sharedHead = nullptr;
         std::mutex mtx;
 
@@ -120,18 +141,11 @@ namespace JLib {
         }
 
     public:
-        explicit TaskAllocator(size_t slots) : mem(slots) {
-            for (auto& blk : mem) {
-                next(&blk) = sharedHead; sharedHead = &blk;
-#ifdef JLIBSCHED_ALLOC_CANARY
-                // Every slot starts life "free" -- stamp the canary here too (not just in
-                // Free()), or the FIRST-ever Alloc() of a never-before-freed slot reads
-                // whatever value(std::byte)-initialization left at bytes[8,16) (zero), which
-                // doesn't match the canary and looks exactly like corruption on startup.
-                *reinterpret_cast<uint64_t*>(reinterpret_cast<std::byte*>(&blk) + 8) = 0xFEEDFACECAFEBEEFULL;
-#endif
-            }
-        }
+        // Allocates address space and touches NONE of it. `new Block[n]` rather than a vector
+        // because Block is trivial and this form DEFAULT-initializes -- no memset, so no pages are
+        // faulted in here. The free list starts empty and grows from the bump cursor in refill().
+        explicit TaskAllocator(size_t slots)
+            : mem(new Block[slots]), memSlots(slots) {}
 
 #ifdef JLIBSCHED_ALLOC_CANARY
         // Bytes [8,16) of a slot hold the intrusive "next free" link's tail + are otherwise
@@ -205,7 +219,7 @@ namespace JLib {
                 n += s_live[i].v.load(std::memory_order_relaxed);
             return n;
         }
-        size_t Capacity() const { return mem.size(); }
+        size_t Capacity() const { return memSlots; }
 
     private:
         // Move up to BATCH slots shared -> local by SPLICING a sub-chain instead of relinking
@@ -215,21 +229,50 @@ namespace JLib {
         // and do the local attach (2 writes) after the lock drops. Free-list order is irrelevant
         // (slots are interchangeable), so keeping the sub-chain's original order is fine.
         void refill(Cache& c) {
-            void* batchHead;
+            void* batchHead = nullptr;
             void* batchTail = nullptr;
             size_t moved = 0;
             {
                 std::lock_guard<std::mutex> lk(mtx);
-                batchHead = sharedHead;
-                if (!batchHead) return;             // pool exhausted
-                void* curr = batchHead;
-                while (curr && moved < BATCH) {
-                    batchTail = curr;
-                    curr = next(curr);
-                    ++moved;
+
+                // 1. RECYCLED slots first. Preferring these over never-touched ones is what keeps
+                //    the resident set at peak-live rather than creeping toward capacity: a steady
+                //    workload churns the same pages forever and never advances the bump cursor.
+                if (sharedHead) {
+                    batchHead = sharedHead;
+                    void* curr = batchHead;
+                    while (curr && moved < BATCH) {
+                        batchTail = curr;
+                        curr = next(curr);
+                        ++moved;
+                    }
+                    sharedHead = curr;              // detach [batchHead .. batchTail] in ONE store
                 }
-                sharedHead = curr;                  // detach [batchHead .. batchTail] in ONE store
+
+                // 2. Top up from the NEVER-USED region. This is the only place a fresh page is
+                //    touched, and it happens BATCH slots at a time rather than 1M at construction.
+                if (moved < BATCH && bumpNext < memSlots) {
+                    size_t take = BATCH - moved;
+                    if (take > memSlots - bumpNext) take = memSlots - bumpNext;
+                    for (size_t k = 0; k < take; ++k) {
+                        void* slot = &mem[bumpNext + k];
+                        // Prepend, so the tail of the combined chain stays whatever step 1 found
+                        // (or the first bump slot if step 1 found nothing).
+                        next(slot) = batchHead;
+                        if (!batchHead) batchTail = slot;
+                        batchHead = slot;
+#ifdef JLIBSCHED_ALLOC_CANARY
+                        // Stamped HERE, not in the constructor. `new Block[n]` leaves these bytes
+                        // indeterminate, so without this the first Alloc() of a never-used slot
+                        // would read garbage at [8,16) and report corruption that never happened.
+                        StampCanary(slot);
+#endif
+                    }
+                    bumpNext += take;
+                    moved += take;
+                }
             }
+            if (!batchHead) return;                 // recycled list empty AND capacity exhausted
             // Thread-local from here -- batchTail's chain is ours alone now.
             next(batchTail) = c.head;
             c.head = batchHead;
