@@ -54,8 +54,37 @@ if(JLIBSCHED_STANDALONE)
     # MASM only exists on Windows; the Linux context switch is GAS, which CMake treats as ASM.
     # The language has to be enabled at project() time, which is why this is not simply a
     # per-target property.
+    #
+    # AND ON WINDOWS THERE ARE TWO OF THEM. CMake's ASM_MASM is ml/ml64 -- x86 only. ARM64 assembly
+    # goes through a SEPARATE language, ASM_MARMASM (armasm64), added in CMake 3.26. Enabling the
+    # wrong one does not fall back gracefully: ml64 does not exist in an ARM64 toolchain, so
+    # project() itself fails.
+    #
+    # The awkward part is that this decision has to be made BEFORE project() runs, and
+    # CMAKE_SYSTEM_PROCESSOR does not exist until AFTER it. So the arch is taken from the generator
+    # platform (-A ARM64, i.e. a cross build) or, when that is unset, from the host environment
+    # (a native build on an ARM64 Windows machine -- what the CI runner does). The real arch
+    # selection further down still uses CMAKE_SYSTEM_PROCESSOR; this is only about which assembler
+    # to switch on, and the two must agree.
     if(WIN32)
-        project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM_MASM)
+        set(_jlibsched_win_arm OFF)
+        if(CMAKE_GENERATOR_PLATFORM MATCHES "^(ARM64|arm64|aarch64)$")
+            set(_jlibsched_win_arm ON)
+        elseif(NOT CMAKE_GENERATOR_PLATFORM AND
+               "$ENV{PROCESSOR_ARCHITECTURE}" MATCHES "^(ARM64|arm64|aarch64)$")
+            set(_jlibsched_win_arm ON)
+        endif()
+
+        if(_jlibsched_win_arm)
+            if(CMAKE_VERSION VERSION_LESS 3.26)
+                message(FATAL_ERROR
+                    "Windows on ARM64 needs CMake 3.26+ for the ASM_MARMASM language (armasm64). "
+                    "Found ${CMAKE_VERSION}.")
+            endif()
+            project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM_MARMASM)
+        else()
+            project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM_MASM)
+        endif()
     else()
         project(JLibScheduler VERSION ${JLIBSCHED_VERSION} LANGUAGES CXX ASM)
     endif()
@@ -94,8 +123,10 @@ endif()
 # Opt-in escape hatch for a platform that SHOULD work but has never been run.
 #
 # Only two categories exist here, and the difference matters. A platform is refused outright when a
-# build would produce something BROKEN -- Windows on ARM64 would hand the x64 MASM switch to an ARM
-# target, and no flag should let that through. A platform is merely UNVERIFIED when every piece it
+# build would produce something BROKEN -- i.e. an arch with no context switch of its own, which no
+# flag should let through. (Windows on ARM64 WAS the example here until 2026-08-17, when it got
+# src/win32/aarch64/ContextSwitch.asm and moved into the UNVERIFIED category below.) A platform is
+# merely UNVERIFIED when every piece it
 # needs already exists and is tested elsewhere, and the only thing missing is that nobody has run
 # it. iOS is the motivating case: same AAPCS64 context switch as macOS arm64, same src/darwin/ OS
 # layer, same sysctl topology, same 16K pages -- all of it verified on macos-14 in CI. What is
@@ -140,22 +171,27 @@ endif()
 
 # Normalise the many spellings a toolchain may use for the same instruction set.
 if(WIN32)
-    # Windows is x64-only, and this refuses ARM64 rather than quietly handing the x64 MASM file to
-    # an ARM64 build (which fails deep inside ml64 with nothing pointing at the real cause).
+    # Windows on ARM64 (Snapdragon X) got its own switch in src/win32/aarch64/, so this is now an
+    # arch SELECTION rather than the refusal it used to be.
     #
-    # Windows-on-ARM is NOT "the Linux AAPCS64 switch with a different #ifdef". It needs a THIRD
-    # hand-written switch, because (1) MSVC's ARM64 assembler is armasm64, whose syntax is unrelated
-    # to the GAS syntax src/posix/aarch64/ContextSwitch.S is written in, and (2) a Windows fiber
-    # switch must update the TEB's StackBase/StackLimit -- the fixup the x64 MASM does and the
-    # Linux/macOS AAPCS64 switch deliberately omits because it has no equivalent. x18 is also
-    # reserved as the TEB pointer there (the current switch happens not to touch it).
+    # It needed a THIRD hand-written switch rather than an #ifdef over the Linux one, because a
+    # calling convention belongs to the (OS, ARCH) PAIR and not to the arch. That is the one place
+    # this library's OS-orthogonal-to-arch claim does not hold, and it is a documented caveat rather
+    # than something to design around. The real difference turned out to be NARROW: MSVC's armasm64
+    # syntax is unrelated to GAS, and Windows uses .pdata/.xdata instead of DWARF CFI. The register
+    # set and frame layout are identical, which is why FiberInit is shared below.
+    #
+    # CORRECTION, 2026-08-17: this comment previously claimed a Windows fiber switch "must update
+    # the TEB's StackBase/StackLimit -- the fixup the x64 MASM does". The x64 MASM does NOT do that;
+    # there is no TEB access anywhere in src/win32/. The ARM64 port matches the shipped x64
+    # behaviour instead of inventing a third one. See the header of src/win32/aarch64/ContextSwitch.asm
+    # for what that costs (guard-page AV instead of a stack-overflow exception) and why it is the
+    # normal trade for lightweight fibers.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$" OR CMAKE_GENERATOR_PLATFORM MATCHES "^(ARM64|arm64)$")
-        message(FATAL_ERROR
-            "Windows on ARM64 is not supported: the context switch is MASM for x64 only. It needs a "
-            "third ContextSwitch (armasm64 syntax, plus the TEB stack-bounds fixup), not a compiler "
-            "flag. Linux and macOS on AArch64 ARE supported -- see src/posix/aarch64/.")
+        set(JLIBSCHED_ARCH "aarch64")
+    else()
+        set(JLIBSCHED_ARCH "x86_64")
     endif()
-    set(JLIBSCHED_ARCH "x86_64")   # the MASM switch is x64-only; the MSVC guard above is the gate
 elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
     # Apple cross-builds (iOS, or an explicit -DCMAKE_OSX_ARCHITECTURES on macOS) leave
     # CMAKE_SYSTEM_PROCESSOR as the HOST's or empty, so the target arch has to come from here
@@ -189,8 +225,11 @@ endif()
 #
 # Linux/x86-64 and Linux/AArch64 share everything that is not the context switch -- sysfs topology,
 # affinity, the mmap arena -- so src/posix/*.cpp is common and only src/posix/<arch>/ differs.
-# win32/ stays flat: the MASM switch is x64-only, and Scheduler.vcxproj references these paths, so
-# an arch level there would be churn for a dimension with one member.
+# win32/ is HALF split, and deliberately so. The x86-64 switch and FiberInit stay flat at
+# src/win32/ because Scheduler.vcxproj hard-codes those paths and MSBuild is the build that actually
+# ships; only the ARM64 switch got a src/win32/aarch64/ subdirectory. The asymmetry is ugly but
+# contained -- see the REMOVE_ITEM in the WIN32 branch below, which is what keeps the flat x86-64
+# FiberInit from being globbed into an ARM64 build alongside the AAPCS64 one.
 file(GLOB JLIBSCHED_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
 # A leftover arch file directly under src/posix/ is not a harmless stray. Both it and the real
@@ -208,7 +247,31 @@ endforeach()
 
 if(WIN32)
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/*.cpp")
-    set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/ContextSwitch.asm")
+
+    if(JLIBSCHED_ARCH STREQUAL "aarch64")
+        # win32/ is NOT arch-split the way posix/ is: FiberInit.cpp and ContextSwitch.asm sit
+        # directly in src/win32/ and are x86-64, because Scheduler.vcxproj hard-codes those paths
+        # and moving them would break the MSBuild build for the one platform that actually ships.
+        # So the ARM64 build subtracts rather than restructures.
+        #
+        # THIS REMOVE IS LOAD-BEARING, and it is the same hazard the src/posix/ stale-file guard
+        # above exists for: src/win32/FiberInit.cpp and src/posix/aarch64/FiberInit.cpp BOTH define
+        # Fiber::Init. Leave both in and they both land in Scheduler.lib, where static-archive
+        # linking picks whichever member comes first WITHOUT a duplicate-symbol error -- an ARM64
+        # build seeding an x86-64 stack frame, which would fault on the first switch-in with
+        # nothing pointing at the cause.
+        list(REMOVE_ITEM JLIBSCHED_PLAT "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/FiberInit.cpp")
+
+        # Reused verbatim, not copied: Windows ARM64 and AAPCS64 agree on the callee-saved set
+        # (x19-x28, x29, x30, low 64 bits of v8-v15) and therefore on the frame layout, so this file
+        # is ABI-common and only the ASSEMBLER differs. A duplicate would be two files that must
+        # stay in step forever -- exactly the trap the two-tree sync keeps producing.
+        list(APPEND JLIBSCHED_PLAT "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/aarch64/FiberInit.cpp")
+
+        set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/aarch64/ContextSwitch.asm")
+    else()
+        set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/ContextSwitch.asm")
+    endif()
     # Pin the language explicitly rather than letting CMake infer it from the .asm extension.
     # Inference works right up until something ELSE in the same build tree enables the generic ASM
     # language -- a third-party add_subdirectory is enough -- at which point .asm becomes ambiguous,
@@ -216,7 +279,14 @@ if(WIN32)
     # FiberTrampoline undefined. Found when the marl comparison target was added: it broke every
     # other target in that tree, not just its own, and the error names our symbols rather than
     # anything to do with marl.
-    set_source_files_properties("${JLIBSCHED_ASM}" PROPERTIES LANGUAGE ASM_MASM)
+    # ...and the language must match the one enabled at project() time: ASM_MARMASM (armasm64) on
+    # ARM64, ASM_MASM (ml64) on x64. Pinning the wrong one here is not a soft failure -- ml64 cannot
+    # assemble AArch64 mnemonics and armasm64 cannot assemble x86.
+    if(JLIBSCHED_ARCH STREQUAL "aarch64")
+        set_source_files_properties("${JLIBSCHED_ASM}" PROPERTIES LANGUAGE ASM_MARMASM)
+    else()
+        set_source_files_properties("${JLIBSCHED_ASM}" PROPERTIES LANGUAGE ASM_MASM)
+    endif()
 else()
     # OS layer: src/posix/ (Linux, Android) or src/darwin/ (macOS). They diverge wholesale --
     # sysfs text versus sysctl, and macOS has no thread-affinity API at all -- so they are separate

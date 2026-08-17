@@ -149,6 +149,74 @@ jobs:
           ./build-stats/bin/SchedulerBench none 4 nosweep
         shell: bash
 
+  # ---------------------------------------------------------------------------------------------
+  # Windows on ARM64 -- BRING-UP, ALLOWED TO FAIL.
+  #
+  # continue-on-error on the WHOLE JOB, deliberately: src/win32/aarch64/ContextSwitch.asm is a
+  # hand-written switch for an ABI nobody here has hardware for, and it must not be able to turn
+  # main red while it is being brought up. Flip this to a required leg (and fold it into the build
+  # matrix) only once it has passed consistently -- at which point Windows/ARM64 can be called
+  # supported, and NOT before.
+  #
+  # THE TEST THAT MATTERS IS THE PRIMITIVES SUITE, not the build. A context switch that is wrong
+  # about the callee-saved set, or that clobbers x18 (the TEB pointer -- and fibers MIGRATE between
+  # worker threads here, so a stale TEB lands on an innocent thread), compiles and links perfectly
+  # and then corrupts thread-local state nondeterministically. The primitives suite is thousands of
+  # real fiber suspend/resume round trips under contention, which is what actually exercises that.
+  # A green build here proves almost nothing on its own.
+  #
+  # NOT covered yet: tests/fibertest_aarch64.cpp, the isolated ABI harness, is POSIX-only (mmap, and
+  # a fork-based guard-page check). A Windows port of it would localise failures to the assembly
+  # instead of inferring them from a scheduler crash, and is the obvious follow-up.
+  windows-arm64-bringup:
+    name: Windows ARM64 (MSVC) -- bring-up, allowed to fail
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the target
+        run: |
+          cmake --version
+          echo "PROCESSOR_ARCHITECTURE=$PROCESSOR_ARCHITECTURE"
+        shell: bash
+
+      # Expect "Windows / aarch64 (os layer: win32)". If it says x86_64, the arch detection in
+      # CMakeLists.txt did not fire and everything below is testing the wrong switch.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release -j 2
+        shell: bash
+
+      # Ordered cheapest-signal-first. The event smoke test is the shortest thing that drives real
+      # fibers, so a switch that cannot complete one round trip dies here with a clear symptom
+      # rather than as a hang thirty seconds into the primitives suite.
+      - name: Run event test (lock-free waiter stack)
+        run: ./build/bin/Release/SchedulerEventSmoke.exe
+        shell: bash
+
+      # Not fiber-related, but it is the one test that reads the Windows topology API, and the
+      # ARM64 machines are big.LITTLE -- so P/E classification is genuinely untested territory here.
+      - name: Run topology test (wide-CPU logic)
+        run: ./build/bin/Release/SchedulerTopologyTest.exe
+        shell: bash
+
+      - name: Run primitives test (the real check -- fiber suspend/resume under contention)
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe
+        shell: bash
+
+      - name: Run primitives test under NoSleep
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe nosleep
+        shell: bash
+
+      - name: Run benchmark (smoke test)
+        run: ./build/bin/Release/SchedulerBench.exe none
+        shell: bash
+
   # The ABI harness: links against ONE object (the context switch) with no scheduler attached, so a
   # failure here is unambiguously the assembly's fault. Run at BOTH -O0 and -O2 -- register
   # allocation around the pinned callee-saved sentinels differs enough between them that a broken
