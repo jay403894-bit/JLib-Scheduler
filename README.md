@@ -1,13 +1,18 @@
 # JLib::Scheduler
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
-a hybrid runtime for C++17+ that gives you:
+A hybrid runtime for C++17+ that gives you:
 
-Cilk‑style work‑stealing for fast parallel loops (PushArray, ParallelFor),
-TaskFlow‑style dependency graphs (TaskDAG) with AND/OR gates,
-Middleware‑safe threads by default (no TLS surprises),
-Fiber‑based blocking only when you actually suspend — so you never pay fiber overhead unless you need it.
-Built for real‑time engines that mix compute‑heavy loops, dependency‑aware pipelines, and I/O‑bound middleware in the same frame.
+- **Cilk-style work-stealing** for fast parallel loops (`PushArray`, `ParallelFor`)
+- **TaskFlow-style dependency graphs** (`TaskDAG`) with AND/OR gates
+- **Middleware-safe threads by default** -- no TLS surprises
+- **Fiber-based blocking only when you actually suspend**, so you never pay fiber overhead unless you need it
+
+Built for real-time engines that mix compute-heavy loops, dependency-aware pipelines, and I/O-bound
+middleware in the same frame.
+
+Under the hood: hand-written context switching, lock-free Chase-Lev deques, a slab-allocated task
+system, frame DAGs with logic gates, and hybrid-core aware placement.
 
 **Maturity.** Test it in your own project before you depend on it. Run your workload, run your
 tests, and if it holds up, use it. What it should not be is dropped into a commercial project
@@ -17,9 +22,7 @@ Bugs do get fixed: four defects were found and released inside a day in 1.3.x, t
 hang a pool. But that was a day off. This is one person with a full-time job, so read it as evidence
 that reports get acted on -- not as a response time. During a work week the same four fixes would
 have taken weeks, and a report may sit for a while before anyone looks at it. Nothing here is
-staffed. Hand-written context switching,
-lock-free Chase-Lev deques, a slab-allocated task system, frame DAGs with logic gates, and
-hybrid-core aware placement.
+staffed.
 
 Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 · BSD
 
