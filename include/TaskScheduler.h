@@ -209,6 +209,26 @@ namespace JLib {
 		// first-task latency. A frame with one wide fan-out gains close to nothing; a frame with
 		// many small dependent batches gains most of it. Measure before believing it helps.
 		//
+		// MEASURED IN A REAL GAME, AND IT DID NOTHING (2026-08-17). Recorded here rather than in a
+		// changelog nobody reads at the call site, because the honest expectation for this API is
+		// "probably no win". A 2D game, 5-node frame DAG, vsync off, 600 frames after 120 warm-up,
+		// two interleaved rounds, median frame time:
+		//
+		//     Sleep    383.3 / 374.1 us        <- shipped default
+		//     NoSleep  462.0 / 464.9 us        <- 23% WORSE
+		//     Scoped   374.8 / 377.5 us        <- indistinguishable from Sleep
+		//
+		// Consistent with the asymmetry above: entering the scope is lazy, so first-task latency is
+		// unchanged, and a 5-node mostly-main-affinity DAG has almost no inter-stage idle gaps for
+		// the guard to win back. It is kept because the case it was built for -- many small
+		// DEPENDENT batches per frame, or parking the pool across menus and loading screens -- is
+		// real and simply is not what that game does. Do not assume it helps; measure.
+		//
+		// The NoSleep row is the other lesson: the synthetic idle-pool benchmark predicted a ~3.5%
+		// tax and the real frame showed 23%. A game has the render thread, GPU driver threads and
+		// audio all competing, and spinning workers land on them at exactly the latency-sensitive
+		// moments. Treat the synthetic number as a LOWER BOUND.
+		//
 		// GLOBAL, not per-worker and not per-task. Drive it from ONE thread -- the frame thread.
 		// Overlapping guards on two threads are last-writer-wins, and the restore on scope exit
 		// will clobber whatever the other one set.
