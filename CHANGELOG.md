@@ -3,7 +3,94 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.3.7 - unreleased
+## 1.4.0 - unreleased
+
+**`ParallelFor` now dispatches by slice-stealing, and there is a new `ParallelRange`.**
+
+`ParallelFor`'s large-range path creates one task PER WORKER instead of one per chunk. Each pulls
+`[lo, lo+grain)` off a shared cursor until the range is consumed. The per-chunk paths it replaces
+cost ~80-140 ns each -- a slab slot, a push and an epoch retirement -- and that cost is precisely why
+chunk size had to be floored at 4 per worker. Measured against the fork-join path, 4M items, 31
+workers, medians of 4 runs: **1.7-1.9x on a uniform body, 1.2-1.3x when cost varies ~20x** across the
+range. No API or semantic change -- same callable, same blocking behaviour, same completion
+guarantee, so every existing caller gets it without doing anything.
+
+The crossover sweep moved with it. Against the same sweep before the change:
+
+| body | before | after |
+| --- | --- | --- |
+| trivial @ 200k | 0.68x -- never cleared 1.15x | **1.86x -- now has a crossover at all** |
+| light @ 200k | 1.92x | **4.76x** |
+| medium @ 4000 | 1.44x | **2.55x** |
+| heavy @ 200k | 16.60x | **20.86x** |
+
+Note what that implies about the ~75 µs gate: it was calibrated when dispatch was more expensive,
+and dispatch has now got cheaper twice (fork-join, then this). It is probably conservative. The
+sweep's granularity jumps 40,000 to 200,000, so it cannot say where the gate should sit -- that
+wants its own measurement before anyone moves it.
+
+**`ParallelRange(begin, end, grain, fn)`** is new, and exists for the one thing `ParallelFor` cannot
+do: skip the probe. `ParallelFor` runs a serial prefix and times it to decide serial-vs-parallel,
+which is the right default when you do not know the workload and pure serialization on the critical
+path when you do. On a 20,000-item job that prefix is ~312 items, roughly a third of the wall time.
+
+It also slices 16x finer -- up to 64 slices per worker against `ParallelFor`'s 4 -- which is only
+possible because the task count no longer varies with grain. **The two are not ranked; pick by the
+shape of your workload**, because each loses to the other on the wrong input:
+
+| body | `ParallelFor` | `ParallelRange` |
+| --- | --- | --- |
+| uniform cost per item | **0.09-0.11 ms** | 0.18-0.23 ms |
+| cost varies ~20x | 0.95-1.07 ms | **0.80-0.89 ms** |
+
+Finer slicing is **not free**. It buys load balancing with coordination, so it loses by ~2x when
+there is no imbalance to fix. Use `ParallelRange` for irregular work -- early-out branches,
+per-element data sizes, spatial queries whose depth varies -- and `ParallelFor` otherwise.
+
+Against enkiTS on the bulk row, measured with only one scheduler alive per run: **`ParallelRange`
+0.380-0.384 ms against enkiTS 0.375 ms -- a tie**, and enkiTS is far steadier (2% spread against our
+13%). `ParallelFor` on the same row is 0.444-0.468 ms; that gap is the probe.
+
+**A grain floor bug, caught by the new API and worth recording.** The first version floored grain at
+a flat 64, on the theory that a cursor makes grain a load-balancing knob only. It does not: the TASK
+count stops varying with grain, but the `fetch_add` count is `range/grain` on one contended line. A
+flat 64 measured **15x slower than `ParallelFor`** on a 4M range -- 65,536 atomics against ~124.
+`ParallelFor` had been hiding it by flooring grain to ~33,800 before the cursor ever saw it. The
+floor now scales to keep at most 64 slices per worker. Had the cursor only ever been reachable
+through `ParallelFor`, this would have shipped invisible.
+
+`ParallelForFJ` is no longer what `ParallelFor` selects, and stays public for callers who want the
+fork-join tree directly -- same reason `ParallelForNB` is public.
+
+**`PushArray` is not obsolete**, and the reason is structural. `ParallelFor` and `ParallelRange`
+BLOCK: their cursor, wait group and callable live on the caller's stack frame, which is the only
+thing making a zero-allocation slice-stealing loop possible. `PushArray` does not block -- it hands
+back a WaitGroup so you can submit range work and carry on, or never wait. A non-blocking cursor
+needs heap state and a refcount to outlive the caller's frame, which is a different design. It is
+also the only one of the three taking a per-ITEM callable.
+
+**The task slab is no longer memset at construction, and can optionally be lazy.**
+
+`std::vector<Block>(n)` value-initializes, so building the default 1M x 256-byte slab memset 256 MB
+that the free-list loop overwrote microseconds later. `new Block[n]` default-initializes a trivial
+type and writes nothing: **`Init()` drops from 57 ms to 35 ms with identical resident memory and
+identical semantics.** Pure waste removed, no decision required.
+
+`TaskScheduler::SetLazyTaskSlab(true)` before `Init` additionally defers linking slots into the free
+list until they are first needed, so resident memory tracks peak live tasks rather than capacity:
+
+    default            277 MB resident, Init() 35 ms
+    SetLazyTaskSlab     21 MB resident, Init() 5.5 ms
+
+**Default is OFF deliberately.** Eager faults every page in before the first task runs, so the steady
+state has no memory events at all -- that is the zero-allocation runtime this library advertises.
+Lazy keeps heap allocation out but moves first-touch page faults into the run, and a fault mid-frame
+is an unpredictable kernel transition on the critical path. Saving memory a desktop application does
+not care about is not worth weakening the guarantee it does. Turn it on for Android and iOS, where a
+whole app may have a few hundred MB. `PrefaultTaskSlots(n)` is the middle ground: lazy on, then
+prefault the ceiling you actually expect during load.
+
+### Also in this release (drafted as 1.3.7 before the 1.4 work landed)
 
 **Epoch reclamation can be handed to the application: `EpochManager::SetSelfReclaim(false)`, then
 call `Tick()` from your own idle point.** Default is unchanged.
