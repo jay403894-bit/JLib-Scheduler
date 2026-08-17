@@ -399,6 +399,28 @@ add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primit
 target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)
 target_compile_features(SchedulerPrimitivesTest PRIVATE cxx_std_17)
 
+# ABI harness for the Windows/ARM64 context switch -- the Windows counterpart of
+# tests/fibertest_aarch64.cpp, which the POSIX ABI job builds directly with `c++` and cannot be
+# reused here (see that file's header: MSVC has no inline assembly on ARM64 at all).
+#
+# It is a CMake TARGET rather than a hand-rolled compile line because it needs armasm64 for its
+# probe file, and the ASM_MARMASM language is already enabled for this configuration. Reproducing
+# that by hand in a CI step would mean re-deriving the assembler invocation.
+#
+# Links against Scheduler for ContextSwitch/FiberTrampoline only; it starts no pool and includes no
+# scheduler header, so a failure here is the assembly's fault and nothing else's -- which is the
+# entire value of it over inferring a bad switch from a primitives-suite crash.
+if(WIN32 AND JLIBSCHED_ARCH STREQUAL "aarch64")
+    add_executable(SchedulerFiberAbiTest
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fibertest_win_aarch64.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/win32/fibertest_probe_aarch64.asm")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/win32/fibertest_probe_aarch64.asm"
+        PROPERTIES LANGUAGE ASM_MARMASM)
+    target_link_libraries(SchedulerFiberAbiTest PRIVATE Scheduler)
+    target_compile_features(SchedulerFiberAbiTest PRIVATE cxx_std_17)
+endif()
+
 # ---- install (standalone only) ---------------------------------------------------------------
 # Inside the umbrella, JLib's own top-level file owns the export set and installs Scheduler as part
 # of it; duplicating that here would produce two packages describing the same target.

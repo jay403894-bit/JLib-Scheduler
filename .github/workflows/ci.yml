@@ -165,9 +165,9 @@ jobs:
   # real fiber suspend/resume round trips under contention, which is what actually exercises that.
   # A green build here proves almost nothing on its own.
   #
-  # NOT covered yet: tests/fibertest_aarch64.cpp, the isolated ABI harness, is POSIX-only (mmap, and
-  # a fork-based guard-page check). A Windows port of it would localise failures to the assembly
-  # instead of inferring them from a scheduler crash, and is the obvious follow-up.
+  # The isolated ABI harness IS covered, by SchedulerFiberAbiTest -- a Windows port of
+  # tests/fibertest_aarch64.cpp. It runs FIRST below, because it localises a bad switch to the
+  # specific register that moved instead of leaving it to be inferred from a scheduler crash.
   windows-arm64-bringup:
     name: Windows ARM64 (MSVC) -- bring-up, allowed to fail
     runs-on: windows-11-arm
@@ -190,6 +190,14 @@ jobs:
 
       - name: Build
         run: cmake --build build --config Release -j 2
+        shell: bash
+
+      # FIRST, because it is the only test whose failure needs no interpretation: it links against
+      # the context switch with no scheduler attached, drives one round trip, and reports a bitmask
+      # naming the exact registers that did not survive. Everything after this can only tell you
+      # that SOMETHING is wrong.
+      - name: Run ABI harness (context switch in isolation)
+        run: ./build/bin/Release/SchedulerFiberAbiTest.exe
         shell: bash
 
       # Ordered cheapest-signal-first. The event smoke test is the shortest thing that drives real
