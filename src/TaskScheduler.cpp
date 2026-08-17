@@ -1239,6 +1239,17 @@ TaskAllocator* TaskScheduler::GetAllocator() {
 size_t TaskScheduler::GetWorkerCount() const {
 	return workers.size();
 }
+// Forwarder; the slab lives on the allocator. See the header for the trade this exists to offer.
+void TaskScheduler::PrefaultTaskSlots(size_t slots) {
+	taskAllocator.Prefault(slots);
+}
+
+// Plain bool, init-only, for the same reason as EpochManager's selfReclaim: it is read exactly once,
+// while constructing the allocator, before any worker exists. Nothing races it, and making it atomic
+// would imply a runtime flip that is meaningless -- the slab is built by then.
+static bool g_lazyTaskSlab = false;
+void TaskScheduler::SetLazyTaskSlab(bool on) { g_lazyTaskSlab = on; }
+bool TaskScheduler::LazyTaskSlabEnabled()    { return g_lazyTaskSlab; }
 Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t noFiber, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;

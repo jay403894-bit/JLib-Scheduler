@@ -352,6 +352,45 @@ namespace JLib {
 		// and never resized while the pool is running.
 		size_t GetWorkerCount() const;
 
+		// Pay the task slab's page faults NOW rather than during the run.
+		//
+		// As of 1.4 the slab is LAZY: `Init()` touches almost nothing, and resident memory grows
+		// with peak live tasks instead of with capacity (measured 277 MB -> 21 MB, 57 ms -> 5.6 ms
+		// at 31 workers). The trade is that first-touching a page moves from startup into whenever
+		// that page is first needed, so a workload whose live-task count GROWS faults pages
+		// mid-run -- and a fault mid-frame is a latency spike.
+		//
+		// Call this during load if you would rather eat the cost up front. Prefaulting the full
+		// capacity reproduces the pre-1.4 behaviour exactly. Latency-sensitive applications with a
+		// known task ceiling probably want it; a phone, or anything that never approaches the
+		// default million slots, should leave it alone and keep the memory.
+		void PrefaultTaskSlots(size_t slots);
+
+		// Build the task slab LAZILY instead of up front. Set BEFORE Init(); the slab is constructed
+		// with the scheduler.
+		//
+		// DEFAULT IS OFF, and the reason is a property rather than a number. Eager construction
+		// faults every page in before the first task runs, so the steady state has no memory events
+		// at all -- allocation is a pointer pop off a free list. That is the zero-allocation runtime
+		// this library advertises. Lazy keeps heap allocation out too, but moves first-touch page
+		// faults INTO the run, and a fault mid-frame is an unpredictable kernel transition on the
+		// critical path -- the same class of problem as worker-side epoch reclamation, which was
+		// worth 3x on p99 to move off it.
+		//
+		// What lazy buys, measured at the default 1M slots x 256 bytes:
+		//
+		//     eager   277 MB resident, Init() 57 ms      lazy   21 MB resident, Init() 5.6 ms
+		//
+		// So: leave it off on desktop, where 256 MB is invisible and the guarantee is worth more.
+		// Turn it on for Android and iOS, where a whole app may have a few hundred MB and a quarter
+		// of a gigabyte of never-touched task slots is disqualifying. Resident cost then tracks peak
+		// live tasks rather than capacity.
+		//
+		// PrefaultTaskSlots() is the middle ground: lazy on, then prefault the ceiling you actually
+		// expect during load, and pay nothing for the rest.
+		static void SetLazyTaskSlab(bool on);
+		static bool LazyTaskSlabEnabled();
+
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
 		// "level_loaded", the handful of names your app knows at compile time. The registry is
@@ -576,7 +615,9 @@ namespace JLib {
 		// -----------------------------------------------
 
 		static TaskScheduler* instance;
-		TaskAllocator taskAllocator{ 1024 * 1024 }; // 1M tasks
+		// 1M tasks. Eager unless SetLazyTaskSlab(true) was called before Init -- see that setter for
+		// why the default is the expensive one.
+		TaskAllocator taskAllocator{ 1024 * 1024, LazyTaskSlabEnabled() };
 		std::unordered_map<std::string, std::unique_ptr<Event>> eventRegistry;
 		std::mutex registryMtx;
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
