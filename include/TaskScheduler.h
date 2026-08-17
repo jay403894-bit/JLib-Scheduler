@@ -745,12 +745,20 @@ namespace JLib {
 			;
 
 		// Defined in TaskScheduler.cpp, so it carries the value as the LIBRARY saw it.
-		uint64_t LibraryAbiSignature();
+		//
+		// NAMED THIS WAY ON PURPOSE. There are two distinct staleness failures and this covers both:
+		//   - The library predates the guard entirely (or was not rebuilt at all). Then this symbol
+		//     is MISSING and you get a LINK error -- and a linker cannot print an explanation, so
+		//     the only place to put one is the symbol name itself. "unresolved external symbol
+		//     LibraryAbiSignature" tells you nothing; this tells you what to do.
+		//   - The library was rebuilt but from different headers. Then it links, and the runtime
+		//     comparison below fires with a real message.
+		uint64_t JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration();
 
 		// Runs once per program, in every TU that includes this header. No caller action required --
 		// a guard you have to remember to invoke is a guard that is not there when it matters.
 		inline const bool g_abiChecked = [] {
-			const uint64_t lib = LibraryAbiSignature();
+			const uint64_t lib = JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration();
 			if (lib != kHeaderAbiSignature) {
 				std::fprintf(stderr,
 					"[JLib::Scheduler] FATAL: the Scheduler library was built against DIFFERENT headers "
