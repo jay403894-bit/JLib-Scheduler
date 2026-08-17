@@ -1650,6 +1650,25 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex) {
 		// 3. Release the outer engine mutex so other threads/fibers can work
 		mutex.Unlock();
 
+		// Why a SEMAPHORE and not a fiber queue, and why this is not the 1.3.5 bug.
+		//
+		// Between UnlockQueue() above and the Wait() below, this fiber is discoverable but not yet
+		// waiting -- the same shape as the lost wakeup fixed in SchedulerMutex::Lock in 1.3.5. It is
+		// safe here for a structural reason: a Notify landing in that window pops this semaphore and
+		// Signals it, Signal finds waitingFibers EMPTY and so takes the ++permits branch, and the
+		// Wait() below then sees permits > 0 and returns immediately. A COUNTING semaphore stores an
+		// early signal; the mutex's waiter queue could not, which is exactly why it deadlocked.
+		// (Verified by widening this window: 5/5 pass, where the same treatment on the mutex's old
+		// ordering gave 4/4 deadlocks.)
+		//
+		// LOAD-BEARING INVARIANT: waitingQueue holds a RAW POINTER into this fiber's STACK FRAME.
+		// That is sound only because a waiter cannot leave before it is signalled, and every
+		// signaller (Notify_One, Notify_All) removes the pointer from the queue BEFORE calling
+		// Signal on it. Break either half and this is a use-after-free on a live fiber stack.
+		// In particular, DO NOT add a timed/predicate Wait that can return unsignalled -- it would
+		// pop this frame while its address is still queued. A timeout here needs the wait handle to
+		// outlive the frame (pooled or refcounted), not just a deadline.
+		//
 		// 4. Suspend the fiber by waiting on our local semaphore.
 		// Your existing semaphore code handles fiber suspension seamlessly here!
 		localWaitSemaphore.Wait();
