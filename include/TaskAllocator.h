@@ -244,6 +244,24 @@ namespace JLib {
         }
 #endif
 
+        // Is `p` the start of a real slot in this allocator's slab?
+        //
+        // THE CANARY HAS A BLIND SPOT AND THIS COVERS IT. The canary lives in bytes [8,16) of a
+        // freed slot, but the intrusive free-list LINK is bytes [0,8). A stray write that lands only
+        // on the link leaves the canary intact, so Alloc() reports nothing -- and the first symptom
+        // is refill()'s walk dereferencing garbage, which is an access violation with no clue
+        // attached. That is not hypothetical: it is how it presented in Game01 (Debug), where
+        // `next()` returned 0x100000, a value that is neither null nor anywhere near the slab.
+        //
+        // Cheap enough to run on every link the walk touches and on every Free: two compares and a
+        // modulo against values already in registers. Debug/Development only, like the canary.
+        bool SlotInSlab(const void* p) const {
+            const std::byte* base = reinterpret_cast<const std::byte*>(mem.get());
+            const std::byte* q    = reinterpret_cast<const std::byte*>(p);
+            if (q < base || q >= base + (size_t)memSlots * SLOT) return false;
+            return ((size_t)(q - base) % SLOT) == 0;      // must be a slot START, not an interior byte
+        }
+
         void* Alloc() {                        // lock-Free unless the cache is empty
             Cache& c = local();
             if (!c.head) refill(c);
@@ -262,6 +280,21 @@ namespace JLib {
 
         void Free(void* slot) {                // lock-Free unless the cache overflows
             Cache& c = local();
+#ifdef JLIBSCHED_ALLOC_CANARY
+            // Catch a bad pointer AT THE FREE, which is far nearer the culprit than the refill()
+            // that eventually trips over it. Anything not a slot start -- a stack or heap address,
+            // an interior byte, a pointer mangled by a tag that was not masked off -- would be
+            // linked into the free list here and handed out as a Task later.
+            if (!SlotInSlab(slot)) {
+                char msg[192];
+                std::snprintf(msg, sizeof msg,
+                    "TaskAllocator: Free(%p) is not a slot in this slab -- refusing to link it into "
+                    "the free list. Freeing a non-slab pointer, or freeing twice through a mangled "
+                    "one.\n", slot);
+                JLIBSCHED_CANARY_REPORT(msg);
+                return;                        // do NOT corrupt the list with it
+            }
+#endif
             next(slot) = c.head;
 #ifdef JLIBSCHED_ALLOC_CANARY
             StampCanary(slot);
@@ -346,6 +379,21 @@ namespace JLib {
                     while (curr && moved < BATCH) {
                         batchTail = curr;
                         curr = next(curr);
+#ifdef JLIBSCHED_ALLOC_CANARY
+                        // Report a broken link HERE, naming both ends, instead of dereferencing it
+                        // on the next pass and dying with no context. See SlotInSlab.
+                        if (curr && !SlotInSlab(curr)) {
+                            char msg[256];
+                            std::snprintf(msg, sizeof msg,
+                                "TaskAllocator: free-list link corrupted -- slot %p points to %p, "
+                                "which is not a slot in the slab [%p, %p). Something wrote the first "
+                                "8 bytes of a FREED slot (the canary at [8,16) cannot see that).\n",
+                                batchTail, curr, (void*)mem.get(),
+                                (void*)(reinterpret_cast<std::byte*>(mem.get()) + (size_t)memSlots * SLOT));
+                            JLIBSCHED_CANARY_REPORT(msg);
+                            curr = nullptr;          // stop the walk rather than follow it
+                        }
+#endif
                         ++moved;
                     }
                     sharedHead = curr;              // detach [batchHead .. batchTail] in ONE store
