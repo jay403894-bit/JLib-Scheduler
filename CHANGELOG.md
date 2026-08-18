@@ -166,6 +166,42 @@ reproduce exactly: no errors and 174 complete executions on both the `acq_rel` a
 `seq_cst` steal CAS, and the permanent `-DNO_POP_FENCE` negative control still produces a safety
 violation. The TSan probe went from 4 reports to **0**.
 
+**[CRITICAL] The stale-library guard could not see this release's own ABI break, and a partial
+rebuild crashed at `0x0000000000100000`.** Anyone who upgrades to 1.4 without a *full* rebuild of
+every translation unit that includes `TaskScheduler.h` hits this, so it is a must-pull for
+downstream forks.
+
+1.4 added `nonWorkerLane` and `nonWorkerLaneClaimed` and made `consecutiveHiPriSteals`
+`thread_local`. Those moved `taskAllocator` from offset **304 to 312** -- while
+`sizeof(TaskScheduler)` stayed at exactly **1664**, because the new members landed in padding that
+already existed. `sizeof(Task)`, `sizeof(TaskAllocator)` and `sizeof(EpochManager)` did not move
+either, and those four sizes were the whole signature. The guard therefore *matched* across a real
+ABI break and reported success.
+
+What that produced was not a corrupt heap. It was a correctly-formed read of the wrong member:
+`CreateTask` is header-inline, so a TU compiled against the new headers reached +312 into an object
+laid out for +304, landed on `TaskAllocator::memSlots` instead of `mem`, and dereferenced its value.
+`memSlots` is `1024*1024`, so the access violation read address `0x0000000000100000` -- a number
+that reads like a wild pointer and is really a slot count. It surfaced inside the allocator, several
+subsystems away from anything that had changed, and free-list instrumentation found nothing because
+the bad pointer never went through the free list.
+
+Two fixes, and the second was a bug in the first attempt at the first:
+
+- The signature now includes **offsets**, not just sizes. `TaskScheduler::abiCanary` is a public
+  one-byte member sitting immediately after `taskAllocator`; its `offsetof` moves whenever anything
+  above it is added, removed, resized or reordered. Sizes remain for the types inline code allocates
+  or copies whole.
+- The signature and the check that consumes it now have **internal linkage**. They were written
+  first as an `inline` function and an `inline const bool`, which have *external* linkage -- so the
+  linker folds the library's copy and the application's copy into one, both sides evaluate the same
+  body, and the comparison is a value against itself. Measured: with the library built at offset 296
+  and the application at 312, the folded guard compared equal and let the program run into the
+  corruption. Per-TU copies are the mechanism, not an oversight.
+
+Verified both ways: a deliberately shifted header now aborts with the diagnostic, and a matched pair
+still runs clean. A guard that reports success is worse than no guard, which is what this was.
+
 **[CRITICAL] `~TaskMPSCQueue` corrupted the heap.** It ended with `::delete stub_`, but `init()`
 allocates `stub_` from the TaskAllocator slab -- and the `::` forces the *global* deallocation
 function, stepping past `Task`'s own. A slab slot went to the CRT heap: immediate
