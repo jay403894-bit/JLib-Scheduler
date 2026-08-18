@@ -199,7 +199,25 @@ Two fixes, and the second was a bug in the first attempt at the first:
   and the application at 312, the folded guard compared equal and let the program run into the
   corruption. Per-TU copies are the mechanism, not an oversight.
 
-Verified both ways: a deliberately shifted header now aborts with the diagnostic, and a matched pair
+The report also had to change, because the first version of it was useless in the place it fires.
+It printed two hashed 64-bit numbers to `stderr`, and a GUI-subsystem process has no console -- so
+the entire diagnostic was "Fatal program exit requested" at `__scrt_common_main_seh`. It now carries
+the components field by field and names the ones that disagree:
+
+```
+[JLib::Scheduler] FATAL: this translation unit was compiled against DIFFERENT
+Scheduler headers than the Scheduler library it is linked to.
+  Fields that disagree (library vs this TU):
+    offsetof(TaskScheduler,abiCanary)    408 vs 424
+```
+
+and it goes to `OutputDebugStringA` as well as `stderr`, so it lands in the debugger's Output
+window. The message says to rebuild **every** library that includes `TaskScheduler.h`, because that
+is the case that actually bit: `Sound`, `Renderer`, `Physics3D`, `Assets` and `PlatformerPhysics2D`
+each carry their own inlined copy of `CreateTask`, so a stale one of those reaches the wrong offset
+in a perfectly good scheduler object. Rebuilding only the Scheduler does not fix it.
+
+Verified both ways: a deliberately shifted header now aborts naming the field, and a matched pair
 still runs clean. A guard that reports success is worse than no guard, which is what this was.
 
 **[CRITICAL] `~TaskMPSCQueue` corrupted the heap.** It ended with `::delete stub_`, but `init()`

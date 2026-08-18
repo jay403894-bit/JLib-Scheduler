@@ -304,7 +304,7 @@ TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.l
 // the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
 // the including translation unit's view; a mismatch means somebody rebuilt one and not the other.
 namespace JLib { namespace detail {
-	uint64_t JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration() { return HeaderAbiSignature(); }
+	AbiComponents JLibScheduler_STALE_LIBRARY_rebuild_the_Scheduler_for_this_configuration() { return LocalAbiComponents(); }
 }}
 
 // Forwarders. The state lives on EpochManager (it is the thing that reclaims); these exist so the
@@ -356,7 +356,7 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 	{
 		const long long total = (long long)end - start;
 		const long long maxSlices = (long long)W * 64;
-		const int balanced = (int)((total + maxSlices - 1) / maxSlices);
+		const int balanced = (int)((total + maxSlices - 1) / maxSlices);        
 		grain = std::max({ grain, balanced, 64 });
 	}
 
