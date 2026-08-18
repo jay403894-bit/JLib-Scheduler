@@ -5,6 +5,133 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## 1.4.0 - unreleased
 
+**New `ParallelForLazy` -- demand-driven range splitting, with no probe and no calibrated constant.**
+
+`ParallelFor` decides serial-vs-parallel by PREDICTING: it runs a serial prefix, times it,
+extrapolates, and parallelizes if the estimate clears ~75 µs. That works on a uniform body and
+cannot work on a data-dependent one -- a prefix over items 0..311 says nothing about item 50,000
+when the early ones early-out and the later ones do full mesh collision. The prefix also warms the
+cache while the remainder streams from DRAM, so the extrapolation is biased low *systematically*
+rather than noisily, and on a hybrid part the probe runs on the caller's core class and the work
+runs on another.
+
+`ParallelForLazy` makes the structure splittable and lets STEALS decide instead. It publishes the
+right half of the range onto the calling thread's own deque and carries on with the left. If nobody
+took it, the splitter takes it straight back and runs it inline; if somebody did, the pool was
+hungry and the split was right. Idle pool → it parallelizes. Busy pool → it runs serially at near
+zero cost. Ragged body → a worker that finishes early steals, which is itself the signal to split
+more. Nothing to calibrate per machine.
+
+That is affordable because of what the speculative path actually costs, which had never been
+measured: **17.8 ns** for alloc → construct → `push_bottom` → `pop_bottom` → run → destroy → free.
+An unstolen split needs no notify (nobody has to be woken to run something you are about to run
+yourself) and no epoch retirement (winning the pop CAS proves no thief observed it). The
+"~85-105 ns per task" figure quoted elsewhere is the *cross-thread dispatch* path -- MPSC inbox,
+round-robin, notify -- which this one skips entirely; measured separately, that is 22.0 ns of the
+gap plus a 10.5 ns floor for the parked-notify branch.
+
+Medians of 15, 31 workers, default Sleep policy, against the same body each time:
+
+| body | ParallelFor | ParallelRange | **ParallelForLazy** |
+| --- | --- | --- | --- |
+| uniform, 1M | 5.7-6.9x | 7.7-8.1x | **8.4-9.6x** |
+| data-dependent 20x, 200k | 10.3-16.0x | 20.1-21.2x | **20.9-21.8x** |
+| back-loaded (all cost in the last 10%), 100k | 5.8-6.1x | 9.4-11.1x | **12.8-13.5x** |
+| cheap body, grain the body justifies | 1.00x | 0.19x | **1.01-1.03x** |
+
+**Grain is required, and is floored at 64 leaves per worker but otherwise honoured literally.** It
+means "the smallest subrange worth handing to anybody" -- the one thing the scheduler genuinely
+cannot infer. The floor is the same guard `ParallelFor` already applies to `chunkSize` (there, 4
+chunks per worker) and is legitimate for the same reason: it is a statement about the POOL, whose
+size is known exactly, not about the BODY, whose cost is unknowable. It exists because grain has a
+cliff on the low side that a caller who guesses too fine falls straight off -- measured at 31
+workers before the floor, **grain 1 gave 2.61x on a ragged body against 21.5x at grain 32-64**, and
+1.95x against 18.6x back-loaded. A split costs ~10.8 ns unstolen and a full dispatch when stolen,
+against a leaf holding one element. With the floor, grain 1 lands back inside the plateau.
+
+The floor does **not** rescue a grain that is too COARSE, and cannot: at grain 8192 the ragged body
+still measures 8.2x. Nor does it rescue a body too cheap to parallelize at all -- at grain 32 on a
+~0.4 ns/element body this measures 0.07x where `ParallelFor`'s probe correctly declines and stays at
+1.00x. That is the honest trade for removing the prediction, and it is why `ParallelFor` keeps its
+probe: use `ParallelFor` when you have no idea what the body costs, `ParallelForLazy` when you can
+name a sensible grain.
+
+**Callable from the main thread**, which is the normal case. `loPri`/`hiPri` gained one extra deque
+past the workers -- the non-worker lane -- claimed by one non-worker thread at a time and probed by
+every worker as an ordinary steal victim. Without it a main-thread caller had nowhere to publish and
+the tree would have had to fan out over a chain of steal hops. A second concurrent non-worker caller
+loses the claim and degrades to `ParallelRange` rather than blocking. The extra unconditional steal
+probe measured no regression on the benchmark suite (throughput, latency and frame DAG all within
+run-to-run variance).
+
+**`TaskAllocator::Alloc`+`Free` is 4.5x cheaper: 9.3 ns → 2.1 ns.**
+
+Profiling the split path turned up something that had nothing to do with splitting. `Alloc` and
+`Free` each did one `fetch_add`/`fetch_sub` on the sharded live-slot counter, and those two atomic
+read-modify-writes were **6.7 ns of the 9.3 ns round trip — 72%** — while the free-list work they
+surrounded was 1.5 ns. `memory_order_relaxed` does not make an RMW cheap: relaxed governs ordering,
+which is the free part, but the `lock xadd` still takes the cache line exclusively, ~3.3 ns each
+even completely uncontended. That was being paid twice per task for a number whose only readers are
+an error message in `TaskNode.h` and a diagnostic print in the benchmark.
+
+A shard is only ever *written* by the thread that owns it, so where ownership is exclusive the
+update can be a plain relaxed load + relaxed store with no lock prefix. **Exactness is not traded
+away.** The exclusivity premise fails above `kLiveSlots` (128) threads — and it fails on *cumulative*
+thread creations, not concurrent ones, since `s_liveNext` never decrements and an exiting thread
+never returns its slot, so a process that spawns transient threads gets there far sooner than its
+peak thread count suggests. Past that point two threads share a shard, and a non-atomic RMW would
+not merely blur the reading, it would lose updates permanently and drift further from the truth
+forever — precisely destroying the counter's one job, telling a real slab leak from normal churn.
+So the fast path is taken only where it is provably exclusive (the first 128 threads, which is every
+realistic case) and everything past it falls back to the original `fetch_add`. Verified exact under
+balanced churn on 16 threads, cross-thread alloc/free, 200 cumulative threads past the shard limit,
+and 24 concurrent threads sharing shards.
+
+Downstream effect: the speculative split path is **17.8 ns → 10.8 ns**, and the allocator drops from
+54% of it to 19% (the deque's last-item CAS is now the largest single item). On the benchmark suite
+the frame DAG went from 21.29-21.39 µs to 20.34-20.81 µs across four runs each — non-overlapping,
+~3.4% — with batch throughput and round-trip latency also improved.
+
+**`TaskDeque` now stores TAGGED pointers, so a thief never dereferences a task it has not claimed.**
+
+`steal_if` vets a candidate before claiming it, and it used to do that by passing the predicate the
+`Task*` and letting it read `corePref`/`noFiber`. That was safe in outcome -- CAS success proves
+`top_` never moved, so the vetted read was of the live task, and every other outcome discards it --
+but it was still a read through a pointer whose object lifetime could already have ended. The owner
+may pop that task, run it, free it and get the same slab slot straight back; because the free list
+is thread-local LIFO, that recycle is the **common** case, not a rare one. ThreadSanitizer reported
+it and was right to.
+
+Both vetting fields now ride in the spare low bits of the stored pointer -- `Task` is `alignas(16)`,
+so bits 0-3 are free, and a `static_assert` ties that to `alignof(Task)` so shrinking the alignment
+cannot break it silently. The predicate receives `StealBits` decoded from the tag, reading memory
+the deque owns rather than memory it does not. Sound only because both fields are written
+exclusively by `CreateTask` before the task is ever pushed, so a tag cannot go stale; a future
+mutator of either field must re-tag.
+
+Two things that sound like fixes and are not, recorded so they are not retried: making
+`Task::corePref`/`noFiber` **atomic** does nothing here, because the racing write is the
+*constructor* of the next task in that slot and initialization is not an atomic operation whatever
+the member's type is -- and the real problem is the ended lifetime, which no member type addresses.
+And "those fields never change, so the read is harmless" is a non-argument: by the time of the
+racing write they belong to a different object.
+
+**The protocol is unchanged** -- same indices, same atomics, same fences, same CAS; only the
+payload's spare bits are new. Re-verified with GenMC after the change and all three results
+reproduce exactly: no errors and 174 complete executions on both the `acq_rel` and the paper's
+`seq_cst` steal CAS, and the permanent `-DNO_POP_FENCE` negative control still produces a safety
+violation. The TSan probe went from 4 reports to **0**.
+
+**[CRITICAL] `~TaskMPSCQueue` corrupted the heap.** It ended with `::delete stub_`, but `init()`
+allocates `stub_` from the TaskAllocator slab -- and the `::` forces the *global* deallocation
+function, stepping past `Task`'s own. A slab slot went to the CRT heap: immediate
+`STATUS_HEAP_CORRUPTION` (0xC0000374) for anyone who destroyed one. It stayed hidden because nothing
+in the library destroys one (`Init()` does `instance = new TaskScheduler(...)` with no matching
+delete, so `~TaskScheduler` and the inbox vectors never run) -- but any harness or embedder that
+stack-allocates a `TaskMPSCQueue` hits it on the first run. The destructor now returns the stub to
+the arena it came from, and the default constructor zero-initializes `head_`/`tail_`/`stub_` instead
+of leaving them indeterminate.
+
 **`ParallelFor` now dispatches by slice-stealing, and there is a new `ParallelRange`.**
 
 `ParallelFor`'s large-range path creates one task PER WORKER instead of one per chunk. Each pulls

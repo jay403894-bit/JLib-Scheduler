@@ -21,6 +21,17 @@ CMakeFiles/
 CMakeUserPresets.json
 cmake_install.cmake
 
+# Measurement harnesses and one-off experiments. Real source, and worth keeping ON DISK -- several
+# of these are the only record of how a number was arrived at (scratchpad/taskcost.cpp is where the
+# 17.8 ns speculative-split figure comes from, scratchpad/lazytest.cpp holds the negative control
+# for the lazy splitter). They are ignored rather than committed because they are machine- and
+# question-specific: each one was written to settle one argument, they reference absolute paths and
+# a locally-built lib, and a public repo should not carry a graveyard of them.
+#
+# If a harness turns into something worth re-running on every change, it belongs in tests/ or
+# bench/ with a CMake target, not here.
+scratchpad/
+
 # MSBuild scratch. $(SolutionDir) resolves differently depending on whether this repo is built
 # standalone or as part of the JLib umbrella, so intermediates can land in either place.
 .vs/
