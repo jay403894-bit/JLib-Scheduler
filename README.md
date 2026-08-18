@@ -84,20 +84,31 @@ first and take the run twice.
 9.3 ns to 2.1 ns. Everything else reproduces 1.3.0 within noise except one row: 4-producer
 submission under `Sleep` reads 2.9 M/s where the 1.3.0 table said 9.8.
 
-**That was assumed to be a regression and it is not.** v1.3.0 was checked out, rebuilt and measured
-on this machine alongside 1.4.0: it reads **2.5-4.4 M/s**, against 1.4.0's 3.0-3.7 -- the same
-distribution. The two versions are indistinguishable on this metric, so nothing regressed between
-them, and there was nothing to bisect. Ruled out along the way: the affinity default (already
-`Ideal` at 1.3.0), the benchmark drifting (the entire `bench/bench.cpp` diff since 1.3.0 is an
-`#include`, a banner string and a change to the fork-join row), and section ordering within the run
-(`nosweep` and the full sweep read the same).
+**That was assumed to be a regression. It is not -- the row is BISTABLE, and neither number is
+wrong.** v1.3.0 was checked out, rebuilt and measured beside 1.4.0: it reads 2.5-4.4 M/s against
+1.4.0's 3.0-3.7, the same distribution, so nothing regressed between them. Sweeping pool size then
+showed what the row actually does:
 
-So the 9.8 belongs to conditions on this machine that no longer exist, and **what those were is
-unknown**. It is worth flagging that the rest of that session reproduces -- latency, the DAG,
-fork-join, burst, and the `NoSleep` half of this very row (12.5 against 12.7) all land within noise
--- so this is not a blanket shift in the machine, which makes a one-off measurement or a
-transcription error at least as likely as anything physical. **Treat the historical 9.8 as
-unreliable and this row's 2.9 as the number.** Published as measured rather than quietly dropped.
+| pool | 4 | 8 | 16 | 18 | 20 | 22 | 24 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| 4-producer M/s | 11.08 | 11.39 | 10.13 | 10.93 | 10.50 | **2.37** | 5.36 | 3.60 |
+
+A cliff at ~21 workers. Below it the four producers keep the pool saturated, so workers never park
+and a `Push` costs the ~1 ns of an awake-worker notify. Above it the consumers drain faster than the
+producers submit, workers run dry and park, and every `Push` buys a kernel wake instead. Those are
+two regimes, ~10-11 M/s and ~3 M/s, and this 31-worker machine sits just past the edge -- so the row
+lands in either depending on how the run settles.
+
+**This is the same failure mode the single-producer row is already documented for**, one crossover
+to the right: four producers feed more consumers than one, so the cliff moves from ~14 workers to
+~21. `bench.cpp` claimed the multi-producer case was flat across that sweep and served as the
+control for it. That claim was wrong and is now corrected -- fork-join and the frame DAG are the
+flat ones.
+
+So the 9.8 was a real reading from the saturated regime, and `best-of-5` on a bistable metric
+publishes whichever regime got lucky -- which is also why the row was recorded as 8.4 M/s and then
+9.8 M/s sixteen minutes later on identical code. **Read this row as a submission-rate measurement
+with a crossover, not a capacity number, and expect either regime.** Published as measured rather than quietly dropped.
 
 **Measure on your own hardware before relying on any of this.** These numbers come from one desktop
 with a large L3 and no competing load; a different cache hierarchy or a machine the application does

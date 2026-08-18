@@ -15,15 +15,34 @@
 //
 // 1a and 1b exist as a PAIR because measuring only the first one is actively misleading, and this
 // was learned the hard way. Sweeping pool size on 1a shows throughput collapsing from 3.4 M/s at 8
-// workers to 0.8 M/s at 14 and staying there, which reads as the scheduler failing to scale. It is
-// not: 1b, fork-join and the frame DAG are all flat across the same sweep on the same machine.
+// workers to 0.8 M/s at 14 and staying there, which reads as the scheduler failing to scale.
 //
 // What 1a actually measures past that point is a single producer being outrun. One thread creates
 // and pushes roughly 3.4 M tasks/sec; once the pool can drain faster than that, the surplus workers
 // find empty deques and spend their time steal-probing, and that traffic slows the producer down.
 // Hence a CLIFF at the crossover rather than a gradual slope. That is a real and useful number --
 // a main thread submitting a frame's work is a genuine pattern -- but it is a submission-rate
-// measurement, not a capacity one, and the label now says so.
+// measurement, not a capacity one, and the label says so.
+//
+// 1b HAS THE SAME CLIFF. This comment used to say "1b, fork-join and the frame DAG are all flat
+// across the same sweep", and for 1b that is FALSE -- corrected 2026-08-17 after the row was
+// mistaken for a regression and bisected. Measured, 31-worker machine, default Sleep:
+//
+//     pool     4      8     16     18     20  |    22     24     31
+//     mp   11.08  11.39  10.13  10.93  10.50  |  2.37   5.36   3.60
+//
+// Same shape as 1a, just further right: four producers can feed more consumers than one, so the
+// crossover lands at ~21 workers instead of ~14. Past it the consumers drain faster than the
+// producers submit, workers run dry and PARK, and every subsequent Push buys a kernel wake instead
+// of the ~1 ns an awake worker costs -- so the metric is bistable, ~10-11 M/s while the pool stays
+// saturated and ~3 M/s once it starts parking.
+//
+// TWO CONSEQUENCES, both bit us. First, `best-of-N` on a bistable metric publishes whichever regime
+// got lucky: this row was recorded as 8.4 M/s and then 9.8 M/s sixteen minutes later on identical
+// code, and reads ~3 M/s today, which was mistaken for a regression until v1.3.0 was rebuilt and
+// measured the same as HEAD. Second, the cliff means 1b is NOT the capacity control 1a needed --
+// it is a second submission-rate measurement with a higher crossover. fork-join and the frame DAG
+// are still the flat ones; lean on those.
 #define NOMINMAX
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
