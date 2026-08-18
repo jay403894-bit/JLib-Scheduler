@@ -13,9 +13,12 @@ namespace JLib {
     class alignas(platform::kCacheLine)TaskMPSCQueue {
         static_assert(std::is_pointer<Task*>::value, "MPSCQueue<T> expects a pointer type");
 
-        std::atomic<Task*> head_;   
-        Task*              tail_;   
-        Task*              stub_;    
+        std::atomic<Task*> head_;
+        Task*              tail_;
+        Task*              stub_;
+        // Remembered so the destructor can return `stub_` to the arena it actually came from.
+        // See the destructor for why that is not optional.
+        TaskAllocator*     alloc_;
 
         void append(Task* n) {
             n->next.store(nullptr, std::memory_order_relaxed);
@@ -24,13 +27,30 @@ namespace JLib {
         }
 
     public:
-        TaskMPSCQueue() {
-		
-        }
+        // Zero-initialized rather than left indeterminate. The default ctor used to leave head_,
+        // tail_ and stub_ as garbage, which has already cost one access violation (mainQ was
+        // constructed but never init()'d, so append() wrote through a garbage head_ -- see the
+        // mainQ.init() note in TaskScheduler::StartPool). A null stub_ is also what lets the
+        // destructor below tell an initialized queue from one that never was.
+        TaskMPSCQueue() : head_(nullptr), tail_(nullptr), stub_(nullptr), alloc_(nullptr) {}
 
+        // `stub_` COMES FROM THE SLAB, so it goes back to the slab.
+        //
+        // This was `::delete stub_;`, and the `::` is the whole bug: it forces the GLOBAL
+        // deallocation function, stepping past Task's own operator delete (which exists only to
+        // assert). So a TaskAllocator slot was handed to the CRT heap -- immediate
+        // STATUS_HEAP_CORRUPTION (0xC0000374) for anyone who ever destroyed one of these.
+        //
+        // It went unnoticed because nothing in the library destroys a TaskMPSCQueue: Init() does
+        // `instance = new TaskScheduler(...)` with no matching delete, so ~TaskScheduler -- and
+        // with it the inbox vectors -- never runs. A test harness that stack-allocates one hits it
+        // on the first run.
         ~TaskMPSCQueue() {
+            if (!stub_) return;          // constructed but never init()'d: nothing to unwind
             clear();
-            ::delete stub_;
+            stub_->~Task();
+            if (alloc_) alloc_->Free(stub_);
+            stub_ = nullptr;
         }
 
         void init(TaskAllocator* allocator) {
@@ -39,6 +59,7 @@ namespace JLib {
             stub_->next.store(nullptr, std::memory_order_relaxed);
             head_.store(stub_, std::memory_order_relaxed);
             tail_ = stub_;
+            alloc_ = allocator;
         }
         void push(Task* task) { append(task); }
 
