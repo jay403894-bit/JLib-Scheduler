@@ -469,13 +469,20 @@ Measured, 31 workers, medians of 15, speedup over the same body run serially:
 | cost varies ~20x across the range | 15.3x | 18.9x | **21.7x** |
 | all cost in the last 10% of the range | 11.3x | 11.3x | **14.8x** |
 | cheap body, 2M items | 11.3x | 11.8x | 11.6x |
-| cheap body, 20k items | 0.08x | 0.24x | 0.19x |
+| cheap body, 20k items, guessed grain | 0.08x | 0.24x | 0.19x |
+| cheap body, 20k items, **justified grain** | **1.03x** | 0.23x | 0.18x |
 
-Both are within reach of each other on real work; `ParallelRange` is currently ahead on these
-shapes and noticeably steadier run to run. Reach for `ParallelFor` when you want the recursive
-structure — nested parallelism, or a range whose subranges are themselves worth splitting — and for
-its near-zero cost when the pool is already saturated. Reach for `ParallelRange` when you want the
-flattest, most predictable division of a flat range, which is most of the time.
+`ParallelRange` leads on throughput for expensive bodies and is noticeably steadier run to run. But
+read the last row before concluding it is simply better: **`ParallelRange` is never free.** It
+dispatches one task per worker unconditionally, so it sits near 0.19x on cheap work whatever grain
+you hand it. `ParallelFor` degrades to a serial run at near-zero cost when there is nothing worth
+splitting — an unstolen split is taken straight back for ~11 ns — which is a property the shared
+cursor structurally cannot have.
+
+So: `ParallelFor` when the loop is sometimes-cheap, when the pool may already be saturated, or when
+you want the recursive structure (nested parallelism, subranges themselves worth splitting).
+`ParallelRange` when the range is reliably big enough to be worth parallelizing every time and you
+want the flattest, most predictable division of it.
 
 ### How do I pick a grain?
 
@@ -494,11 +501,28 @@ under-splitting an expensive body costs ~10%, while over-splitting a cheap one c
 
 **What none of this can do is decline.** Nothing probe-free can refuse to parallelize a body too
 cheap to be worth it — TBB's `simple_partitioner`, Rayon and Cilk all share this. 1.3.x could,
-because it probed; 1.4 removed the probe because it cannot work on a data-dependent body, which is
-what this library is for. A prefix over items 0-311 says nothing about item 50,000 when the early
-ones early-out at 2 ns and the later ones do full mesh collision, and the prefix also warms the
-cache while the remainder streams from DRAM, so the estimate is biased low *systematically* rather
-than noisily.
+because it probed. It was dropped anyway, for three reasons that are separate enough that fixing any
+one leaves the others standing:
+
+- **It does not travel.** The gate constant was ~2x *this machine's* dispatch cost — one CPU, one
+  memory system, one build. Deriving it at startup was built and reverted: that makes a broken
+  predictor portable rather than removing the prediction, and trades a reproducible wrong answer for
+  an irreproducible one.
+- **The estimate is biased, not noisy.** The prefix warms L1/L2 while the remainder streams from
+  DRAM, so it under-reads per-element cost *systematically*. Always the same direction, so it never
+  averages out and more sampling does not help.
+- **It looked deterministic while being wrong.** Same input, same answer, run after run — which
+  reads as a measurement rather than a guess, so nothing ever prompted anyone to check it. A noisy
+  predictor advertises its own unreliability; this one did not.
+
+And the structural one on top: a prefix over items 0–311 says nothing about item 50,000 when the
+early ones early-out at 2 ns and the later ones do full mesh collision.
+
+**This is not a novel position.** No mainstream work-stealing runtime gates parallelism on a timed
+serial prefix. Cilk-5 let spawn/steal decide; oneTBB's `auto_partitioner` uses a depth budget with
+steal feedback; Rayon resets a split budget on observed steals. All of them infer demand from
+**steals — something that actually happened** — rather than from a cost model. 1.4 converges with
+that rather than inventing against it.
 
 The 20k cheap-body row above is what that costs: 0.08x with a guessed grain, 0.24x with the default.
 If you need to know whether a loop should have been parallel at all, `SetParallelForSerial(true)`

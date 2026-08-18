@@ -256,6 +256,26 @@ namespace JLib {
 		// from DRAM, so the estimate is biased low SYSTEMATICALLY rather than noisily; and on a
 		// hybrid part the probe runs on the caller's core class and the work runs on another.
 		//
+		// THREE SEPARATE FAILURES, and it matters that they are separate -- fixing any one leaves the
+		// others:
+		//   1. IT DOES NOT TRAVEL. The gate constant was ~2x this machine's dispatch cost, which is
+		//      a property of one CPU, one memory system and one build. Calibrating it at startup was
+		//      built and reverted: it makes a broken predictor portable instead of removing the
+		//      prediction, and it trades a reproducible wrong answer for an irreproducible one.
+		//   2. THE ESTIMATE IS BIASED, NOT NOISY. The prefix warms L1/L2 and the remainder streams
+		//      from DRAM, so it under-reads per-element cost systematically -- always in the same
+		//      direction, so it never averages out and more samples do not help.
+		//   3. IT LOOKED DETERMINISTIC WHILE BEING WRONG. Same input, same answer, run after run --
+		//      which reads as a measurement rather than a guess and so never prompted anyone to
+		//      check it. A noisy predictor advertises its own unreliability; this one did not. That
+		//      is the "works on my machine" failure in its most durable form.
+		//
+		// NOT A NOVEL POSITION. No mainstream work-stealing runtime gates parallelism on a timed
+		// serial prefix: Cilk-5 let spawn/steal decide, oneTBB's auto_partitioner uses a depth
+		// budget with steal feedback, and Rayon resets a split budget on observed steals. All of
+		// them infer demand from STEALS -- something that actually happened -- rather than from a
+		// cost model. This is converging with that, not inventing against it.
+		//
 		// Instead the range is made splittable and STEALS DECIDE. This publishes the right half onto
 		// the calling thread's own deque and carries on with the left. Nobody took it -> the
 		// splitter takes it straight back and runs it inline for ~11 ns, no dispatch and no notify.
