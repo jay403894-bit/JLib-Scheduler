@@ -498,27 +498,31 @@ calling thread. Pass a `WaitGroup` if you need to wait later, `nullptr` if you n
 
 **`RunCursorRange` is public, and that is currently an accident of layering rather than a
 recommendation.** It is the shared core `ParallelFor` falls back to, and nothing selects it by size.
-That matters because the sweep below shows the cursor **winning at very large N** — 22.6x against
-the splitter's 18.5x at N=200,000 — so there is a real case for it that the library does not take
-automatically. If your ranges are consistently in the hundreds of thousands with a uniform body,
-calling it directly is measurably better; anywhere else the splitter wins by more.
+There used to be a claim here that it wins reliably at very large N — 22.6x against the splitter's
+18.5x at N=200,000 — and it does not hold up. That table is kept below as a record of what was
+claimed, not as guidance: it came from a scratchpad harness that was never committed, so nothing
+could re-run it until `SchedulerBench` gained a real splitter-vs-cursor sweep specifically to check
+it. Checking it is what broke it.
 
-**Those two mechanisms cross over, and the crossover is the reason `ParallelFor` uses the splitter.**
-Measured with the crossover sweep — 32 points over four body costs, medians of 3, non-overlapping
-distributions below N=200,000:
-
-| heavy body | N=1000 | N=2000 | N=4000 | N=10000 | N=200000 |
+| heavy body (original, unreproduced) | N=1000 | N=2000 | N=4000 | N=10000 | N=200000 |
 | --- | --- | --- | --- | --- | --- |
-| recursive splitter | **10.3x** | **12.6x** | **13.6x** | **13.9x** | 18.5x |
-| shared cursor | 6.6x | 7.8x | 9.4x | 9.3x | **22.6x** |
+| recursive splitter | 10.3x | 12.6x | 13.6x | 13.9x | 18.5x |
+| shared cursor | 6.6x | 7.8x | 9.4x | 9.3x | 22.6x |
 
-The splitter is 1.4–1.6x ahead across the whole mid-range — hundreds to thousands of items with real
-per-item work, which is the frame-graph shape this library is for — and gives up ~1.2x only at very
-large N.
+A first re-run on the original desktop looked like it confirmed this — heavy pulling ahead ~1.2x
+from around N=20,000. A second run on the exact same machine, same binary, same command, did not:
+heavy sat at 0.99–1.01x across the whole range, never clearing the win margin. Runs across two
+machines since then found no pattern that holds: a medium body won for the cursor at N=1,000 on
+one machine and lost to the splitter at that same N on the other; a heavy body won at N=400,000 on
+one and did not on the other. **Neither N, body cost, nor worker count predicts which one wins.**
 
-**A "tied" verdict was published briefly on the strength of three large-N samples**, which is the one
-region where the two agree. If you compare them again, use the sweep: three points chosen by hand
-missed a crossover that 32 points made obvious.
+That is a stronger claim than "the old number was wrong" — it means no replacement threshold
+belongs here either, worker-count-relative or otherwise. The original mistake was trusting a table
+nobody could re-run; the fix is not a better table, it is not trusting a table at all. If you need
+to know which mechanism wins for a specific workload, run `SchedulerBench`'s splitter-vs-cursor
+sweep against it yourself — it interleaves both arms with a same-vs-same control and marks any cell
+whose control moved more than 5% on its own, so a noisy reading says so instead of publishing a
+number.
 
 ### How do I pick a grain?
 

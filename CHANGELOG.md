@@ -26,10 +26,18 @@ re-runs the splitter a second time as the control; a cell whose control moved mo
 own is marked `?` rather than trusted, because the honest reading there is "the machine was not
 quiet enough for this cell," not "the cursor tied the splitter."
 
-A run on the original desktop reproduces the README's claim directionally: heavy bodies show the
-cursor pulling ahead by ~1.2-1.27x from around N=20,000, consistent with the README's implied
-22.6/18.5 ~ 1.22x. Cheaper bodies stay tied or favor the splitter across the whole range, which the
-README does not claim either way -- the original table only ever measured a heavy body.
+**Built specifically to check the README's claim, and checking it broke the claim.** A first run on
+the original desktop looked like it reproduced the old table -- heavy bodies pulling ahead ~1.2x
+from around N=20,000, close to the README's implied 22.6/18.5. A second run on the SAME machine,
+same code, same command, did not: heavy stayed at 0.99-1.01x across every size, never clearing the
+win margin. A borrowed laptop and repeated runs on both machines since then show no pattern that
+holds: a medium body won for the cursor at N=1,000 on one machine and lost to the splitter at that
+same N on the other; a heavy body won at N=400,000 on one machine and did not on the other. Neither
+N, body cost, nor worker count predicts it on their own.
+
+The honest conclusion is not "the crossover moved" -- it is that the original 32-point table was
+never a reproducible measurement in the first place. It survived as long as it did only because
+nothing could re-run it. See the corrected `README.md` section for what replaced the claim.
 
 ## 1.5.0 - 2026-08-18
 
