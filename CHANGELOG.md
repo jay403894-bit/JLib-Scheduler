@@ -3,6 +3,34 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## Unreleased
+
+**`SchedulerBench` gained a splitter-vs-cursor sweep, because the one that was already published
+could not be reproduced.** The README's crossover table -- the recursive splitter measured at
+10.3x-18.5x speedup over serial, the shared cursor (`RunCursorRange`, called directly) at
+6.6x-22.6x, crossing over above roughly N=200,000 on a uniform body -- came from a one-off
+scratchpad harness that was never committed. Nothing in this repository, on CI, or on a second
+machine could rerun that comparison; the table was frozen the moment the harness was deleted.
+
+`BenchSplitterVsCursorCrossover` is that comparison, built into the shipped bench this time. Six
+sizes from 1,000 to 400,000 (two points past the README's largest, so a crossover found there is
+confirmed by a following size rather than standing alone as the last, unconfirmed column), across
+the same four body-cost classes (`trivial`/`light`/`medium`/`heavy`) the ParallelFor sweep already
+uses. `nosweep` skips it along with the existing sweep, since three arms per rep makes it the
+slower of the two.
+
+**Interleaved with a same-vs-same control, and this is not decoration.** A block-measured
+comparison between two range APIs is exactly what produced a fictional 15-47% gap the first time
+this library compared `ParallelFor` against `ParallelRange` -- see that entry below. Every rep
+re-runs the splitter a second time as the control; a cell whose control moved more than 5% on its
+own is marked `?` rather than trusted, because the honest reading there is "the machine was not
+quiet enough for this cell," not "the cursor tied the splitter."
+
+A run on the original desktop reproduces the README's claim directionally: heavy bodies show the
+cursor pulling ahead by ~1.2-1.27x from around N=20,000, consistent with the README's implied
+22.6/18.5 ~ 1.22x. Cheaper bodies stay tied or favor the splitter across the whole range, which the
+README does not claim either way -- the original table only ever measured a heavy body.
+
 ## 1.5.0 - 2026-08-18
 
 **`ParallelForNB` is REMOVED.** It was the non-blocking range loop: fixed `chunkSize`, one task per

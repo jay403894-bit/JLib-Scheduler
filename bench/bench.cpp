@@ -49,6 +49,7 @@
 #include <Thread.h>    // StealStatsRead/Reset -- no-ops unless built with JLIBSCHED_STEAL_STATS
 #include <platform.h>  // SpinHintName -- stamped into the banner, see CpuRelax
 #include <chrono>
+#include <functional>  // RunCursorRange takes std::function<void(int,int)>&
 #include <cstdio>
 
 // Case-insensitive compare for the affinity-policy argument. The two platforms spell it
@@ -653,6 +654,120 @@ static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
     printf("  (sink %.1f -- printed only so the bodies can't be optimized away)\n", g_sink.load());
 }
 
+// ---------------- splitter vs cursor: the comparison the README's crossover table depended on ----
+// RunCursorRange is PUBLIC and is what ParallelFor falls back to when a second non-worker thread is
+// already splitting -- and the README documents it as measurably beating the recursive splitter
+// above roughly N=200,000 on a uniform body (22.6x vs 18.5x, one machine). That table came from a
+// one-off scratchpad harness that was never committed to this repo. Nothing -- not CI, not a second
+// machine, not a future session -- could reproduce it. This is that comparison, done properly, kept
+// where it can be rebuilt.
+//
+// INTERLEAVED WITH A CONTROL, on purpose, and this is not decoration: a BLOCK-MEASURED comparison
+// between two range APIs is exactly what produced a fictional 15-47% gap the first time this
+// library compared ParallelFor against ParallelRange (see the 1.4.0 CHANGELOG entry on it). Every
+// rep re-runs the splitter a second time as `ctl`; if ctl disagrees with the first splitter run by
+// more than the printed threshold, the cell is marked suspect rather than trusted. A `?` on a cell
+// means the machine was not quiet enough for THAT reading, not that the cursor tied the splitter.
+template <int kFlops>
+static void SweepSplitterVsCursor(JLib::TaskScheduler& sched, const char* label, const std::vector<int>& sizes) {
+    printf("  %-10s |", label);
+    std::vector<double> ratios;
+    ratios.reserve(sizes.size());
+
+    for (int n : sizes) {
+        constexpr int kReps = 7;   // matches SweepOne's kRuns; this has three arms per rep instead
+                                    // of two, so it is already the slower of the two sweeps.
+        const int workers = (int)std::max(1u, std::thread::hardware_concurrency() - 1u);
+        const int grain   = std::max(1, n / (workers * 4));
+
+        // Both arms run the IDENTICAL body -- same accumulation, same CAS-loop reduction -- so the
+        // only thing that can differ between them is the range mechanism itself.
+        auto runSplitter = [&]() -> double {
+            std::atomic<double> pacc{ 0.0 };
+            auto t0 = Clock::now();
+            sched.ParallelFor(0, n, grain, [&](int a, int b) {
+                double local = 0.0;
+                for (int i = a; i < b; ++i) local += BodyCost<kFlops>(i);
+                double cur = pacc.load(std::memory_order_relaxed);
+                while (!pacc.compare_exchange_weak(cur, cur + local, std::memory_order_relaxed)) {}
+                });
+            const double ms = MsBetween(t0, Clock::now());
+            SinkAdd(pacc.load());
+            return ms;
+        };
+        auto runCursor = [&]() -> double {
+            std::atomic<double> pacc{ 0.0 };
+            // Named lvalue, non-const -- RunCursorRange's signature does not accept a temporary.
+            std::function<void(int, int)> body = [&](int a, int b) {
+                double local = 0.0;
+                for (int i = a; i < b; ++i) local += BodyCost<kFlops>(i);
+                double cur = pacc.load(std::memory_order_relaxed);
+                while (!pacc.compare_exchange_weak(cur, cur + local, std::memory_order_relaxed)) {}
+                };
+            auto t0 = Clock::now();
+            sched.RunCursorRange(0, n, grain, body);
+            const double ms = MsBetween(t0, Clock::now());
+            SinkAdd(pacc.load());
+            return ms;
+        };
+
+        std::vector<double> splitMs, cursorMs, ctlMs;
+        splitMs.reserve(kReps); cursorMs.reserve(kReps); ctlMs.reserve(kReps);
+        for (int r = 0; r < kReps; ++r) {
+            splitMs.push_back(runSplitter());    // A
+            cursorMs.push_back(runCursor());     // B
+            ctlMs.push_back(runSplitter());      // A again -- isolates run-to-run noise from A vs B
+        }
+
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const double splitMed  = med(splitMs);
+        const double cursorMed = med(cursorMs);
+        const double ctlMed    = med(ctlMs);
+        // >1.00 means the cursor took LESS wall time than the splitter at this N -- the cursor wins.
+        const double cursorWins = splitMed / std::max(cursorMed, 1e-9);
+        const double noiseFloor = splitMed / std::max(ctlMed, 1e-9);
+        ratios.push_back(cursorWins);
+
+        const bool suspect = std::fabs(noiseFloor - 1.0) > 0.05;   // control moved >5% on its own
+        printf(" %5.2fx%s", cursorWins, suspect ? "?" : " ");
+    }
+
+    // Same persistence rule SweepOne uses: the first N where the cursor clears the margin AND is
+    // still ahead at the next size, so a lone spike is not reported as a real crossover.
+    int crossover = -1;
+    for (size_t i = 0; i < ratios.size(); ++i) {
+        if (ratios[i] < kWinMargin) continue;
+        if (i + 1 < ratios.size() && ratios[i + 1] < kWinMargin) continue;
+        crossover = sizes[i];
+        break;
+    }
+    if (crossover > 0) printf("   | cursor ahead from N=%d\n", crossover);
+    else               printf("   | splitter ahead (or tied) across this whole range\n");
+}
+
+static void BenchSplitterVsCursorCrossover(JLib::TaskScheduler& sched) {
+    // Extends past the README's largest point (200,000) with two further sizes, so a crossover
+    // found there gets the SAME confirmation-by-next-size discipline as everything else in this
+    // file, rather than standing alone as the last, unconfirmed column the way it did before.
+    const std::vector<int> sizes = { 1000, 4000, 20000, 100000, 200000, 400000 };
+
+    printf("\nSplitter vs cursor (RunCursorRange, direct) -- ratio = splitter_ms/cursor_ms; >1.00 means "
+           "the cursor wins\n");
+    printf("  '?' marks a cell whose same-vs-same control moved >5%% on its own -- distrust that cell,\n");
+    printf("  not the cursor. See the ParallelFor doc table in README.md for when to reach for this.\n");
+    printf("  %-10s |", "body");
+    for (int n : sizes) printf(" %6d", n);
+    printf("    |\n");
+    printf("  -----------+--------------------------------------------------------+------------------\n");
+
+    SweepSplitterVsCursor<1>   (sched, "trivial", sizes);
+    SweepSplitterVsCursor<8>   (sched, "light",   sizes);
+    SweepSplitterVsCursor<64>  (sched, "medium",  sizes);
+    SweepSplitterVsCursor<512>(sched, "heavy",   sizes);
+
+    printf("  (sink %.1f -- printed only so the bodies can't be optimized away)\n", g_sink.load());
+}
+
 int main(int argc, char** argv) {
     // Worker binding policy, chosen on the command line. It must be set BEFORE Init() (binding
     // happens at thread creation), and the scheduler is a process-wide singleton -- so one process
@@ -699,8 +814,9 @@ int main(int argc, char** argv) {
                    "            For sweeping pool size against latency and the frame DAG, which is\n"
                    "            a DIAGNOSTIC -- do not ship a small pool, it starves everything that\n"
                    "            is not a tiny graph.\n"
-                   "  nosweep   skip the ParallelFor crossover sweep (much the slowest section),\n"
-                   "            so a pool-size sweep is a few seconds per point instead of minutes.\n"
+                   "  nosweep   skip the ParallelFor crossover sweep AND the splitter-vs-cursor\n"
+                   "            sweep (the two slowest sections), so a pool-size sweep is a few\n"
+                   "            seconds per point instead of minutes.\n"
                    "\n"
                    "The scheduler is a process-wide singleton and both policy and pool size are\n"
                    "fixed at Init(), so one run measures ONE configuration -- run the exe once per\n"
@@ -812,6 +928,7 @@ int main(int argc, char** argv) {
     // pool has to go after everything it would otherwise contaminate.
     Section("burst");          BenchIdleBurst(sched);
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
+    if (runSweep) { Section("splitter vs cursor sweep");    BenchSplitterVsCursorCrossover(sched); }
 
     g_benchDone.store(true, std::memory_order_release);
     printf("----------------------------------------------------------------\n");
