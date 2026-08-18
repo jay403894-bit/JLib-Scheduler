@@ -21,6 +21,7 @@
 #include <thread>
 #include <chrono>
 #include <utility>   // std::pair -- the contention probe returns two counters
+#include <functional>   // RunCursorRange takes std::function<void(int,int)>&
 
 static int failures = 0;
 static void Check(bool ok, const char* what) {
@@ -439,6 +440,98 @@ static void TestRangeCoverage(JLib::TaskScheduler& sched) {
     }
 }
 
+// RunCursorRange is PUBLIC -- it is the shared-cursor mechanism ParallelFor falls back to when a
+// second non-worker thread is already splitting, and the README documents calling it directly for
+// very large uniform ranges (it measurably beats the recursive splitter above ~N=200,000). Despite
+// that it had ZERO test coverage until this: nothing caught a regression here except a human
+// running it by hand once, off to the side, to answer a question about whether it still worked
+// after ParallelRange was removed. It did, that time. This makes sure the next time is automatic.
+static void TestCursorRangeDirect(JLib::TaskScheduler& sched) {
+    std::printf("RunCursorRange (direct call) exactly-once coverage\n");
+
+    // Same shape of cases as TestRangeCoverage, so a reader who trusts one trusts the other:
+    // ragged division, a prime-ish size, a grain below the internal floor, and both range-API
+    // edge cases (single element, empty).
+    struct Case { int n; int grain; };
+    const Case cases[] = {
+        { 1000000, 64 },
+        {  999983, 97 },
+        {     100,  1 },
+        {       1, 64 },
+        {       0, 64 },
+    };
+
+    for (const Case& c : cases) {
+        std::vector<std::atomic<int>> visits(c.n > 0 ? c.n : 1);
+        for (auto& v : visits) v.store(0, std::memory_order_relaxed);
+
+        // BY REFERENCE, non-const, and a named lvalue -- RunCursorRange's signature does not accept
+        // a temporary. That is a real usability wart (see the header comment on the declaration)
+        // and this is also, incidentally, the test that would catch it changing silently.
+        std::function<void(int, int)> body = [&visits](int lo, int hi) {
+            for (int i = lo; i < hi; ++i)
+                visits[i].fetch_add(1, std::memory_order_relaxed);
+        };
+        sched.RunCursorRange(0, c.n, c.grain, body);
+
+        int missed = 0, doubled = 0;
+        for (int i = 0; i < c.n; ++i) {
+            const int v = visits[i].load(std::memory_order_relaxed);
+            if (v == 0) ++missed;
+            else if (v > 1) ++doubled;
+        }
+        char what[96];
+        std::snprintf(what, sizeof(what), "n=%d grain=%d: every element exactly once", c.n, c.grain);
+        Check(missed == 0 && doubled == 0, what);
+        if (missed || doubled)
+            std::printf("      missed %d, visited-twice %d\n", missed, doubled);
+    }
+
+    // Inverted range (end < start): TestRangeCoverage does not have this case because ParallelFor
+    // is documented to treat it as empty via `end - begin <= 0`. RunCursorRange takes the same
+    // contract but nothing had ever exercised the inverted direction specifically.
+    {
+        std::atomic<int> touched{ 0 };
+        std::function<void(int, int)> body = [&touched](int, int) { touched.fetch_add(1, std::memory_order_relaxed); };
+        sched.RunCursorRange(5, 3, 64, body);
+        Check(touched.load() == 0, "inverted range (end < start): calls nothing");
+    }
+}
+
+// The path production code actually takes: RunCursorRange is reached from ParallelFor only when a
+// SECOND non-worker thread loses the race for the single shared lane (see NonWorkerLaneClaim).
+// TestCursorRangeDirect proves the algorithm is correct in isolation; this proves it is correct
+// under the real contention that puts it on the path at all.
+static void TestCursorRangeFallback(JLib::TaskScheduler& sched) {
+    std::printf("RunCursorRange fallback under real non-worker contention\n");
+
+    const int n = 50000;
+    std::vector<std::atomic<int>> visits(n);
+    for (auto& v : visits) v.store(0, std::memory_order_relaxed);
+
+    auto work = [&] {
+        sched.ParallelFor(0, n, 64, [&visits](int lo, int hi) {
+            for (int i = lo; i < hi; ++i)
+                visits[i].fetch_add(1, std::memory_order_relaxed);
+        });
+    };
+    // Two bare threads calling ParallelFor at once: exactly one holds the non-worker lane and
+    // splits, the other is routed into RunCursorRange. Both must still cover their own full range.
+    std::thread a(work), b(work);
+    a.join();
+    b.join();
+
+    int missed = 0, wrong = 0;
+    for (int i = 0; i < n; ++i) {
+        const int v = visits[i].load(std::memory_order_relaxed);
+        if (v == 0) ++missed;
+        else if (v != 2) ++wrong;   // each of the two callers must touch every element once
+    }
+    Check(missed == 0 && wrong == 0, "two contending ParallelFor callers: every element touched by both, exactly once each");
+    if (missed || wrong)
+        std::printf("      missed %d, wrong-count %d\n", missed, wrong);
+}
+
 static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
     std::printf("IdlePolicy change on a live pool\n");
 
@@ -833,6 +926,8 @@ int main(int argc, char** argv) {
     }
 
     TestRangeCoverage(sched);
+    TestCursorRangeDirect(sched);
+    TestCursorRangeFallback(sched);
     TestIdlePolicySwitchUnderLoad(sched);
     TestMutexFiberContention(sched);
     TestMutexMixedContention(sched);
