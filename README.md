@@ -179,7 +179,7 @@ workers, Release, 1.3.0. `--` is not measured yet.
 | Round-trip submit→run→wait | 4.3 µs | 1.70 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
 | Independent tasks, per task | 67 ns | **65 ns** | 21.8 µs | 310 ns | 290 ns |
 | Range work, per item | 38 ns | 25 ns | **15 ns** | -- | -- |
-| Bulk parallel-for, 20k items | 0.38 ms | 0.17 ms | 0.375 ms | 0.49 ms | -- |
+| Bulk parallel-for, 20k items | 0.36 ms | 0.18 ms | 0.373 ms | 0.49 ms | -- |
 | 25% of tasks blocked 600 µs | **7.2 ms** | 10.2 ms | 15.4 ms | -- | 8.8 ms |
 
 **Our two columns were re-measured at 1.4.0; the other three were not.** enkiTS, Taskflow and marl
@@ -188,11 +188,11 @@ same harness, so the comparison still holds. The `NoSleep` round-trip cell is th
 it read 0.97 µs at 1.3.0 and 1.70 µs here with an **83% spread across repeats**, which is the
 harness being noisy on that row rather than a real move.
 
-**The bulk row was measured against `ParallelRange`**, the shared-cursor path, which is mechanism-
-matched to enkiTS — both hand workers slices off one cursor rather than creating a task per chunk —
-and at **0.38 ms against 0.375 ms it is a tie**, not a win; enkiTS is marginally ahead and far
-steadier (2% spread against our 13%). `ParallelFor` now uses recursive splitting instead, so this
-row needs re-measuring before it is quoted again. See [Parallel loops](#parallel-loops).
+**The bulk row was re-measured after `ParallelFor` moved to recursive splitting**, because the
+earlier figure was taken against the shared-cursor path that was mechanism-matched to enkiTS. It did
+not move: **0.355 ms against enkiTS 0.373 ms**, which is a tie either way — inside both harnesses'
+spreads (8% ours, 9% theirs). Read it as neither library having an edge on a uniform bulk range, not
+as a win. See [Parallel loops](#parallel-loops).
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a

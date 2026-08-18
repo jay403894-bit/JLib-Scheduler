@@ -274,8 +274,11 @@ static void BenchBulk(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
     constexpr int kItems = 20000;
     printf("  2. bulk parallel-for (%d items, native shape on both sides)\n", kItems);
 
-    std::vector<double> a, b, c;
+    std::vector<double> a, b;
   if (g_doJ) {
+    // ONE JLib row. There were two -- ParallelFor and ParallelRange -- from when those were separate
+    // entry points with different mechanisms. ParallelRange was folded into ParallelFor in 1.4, so
+    // the second row became the same call twice and reported a comparison it was not making.
     for (int r = 0; r < kRuns; ++r) {
         auto t0 = Clock::now();
         jl.ParallelFor(0, kItems, 256, [](int lo, int hi) {
@@ -284,22 +287,6 @@ static void BenchBulk(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
             g_sink.fetch_add(acc, std::memory_order_relaxed);
         });
         a.push_back(Ms(t0, Clock::now()));
-    }
-
-    // ParallelFor is the MECHANISM-MATCHED counterpart to enkiTS here: both hand workers slices
-    // off a shared cursor rather than materialising a task per chunk, and both take a range
-    // callable. ParallelFor stays in the table because it is what a caller who does not know their
-    // workload should reach for -- and on THIS body, which costs the same per item, it should win:
-    // finer slicing buys nothing when there is nothing to balance. The interesting comparison is
-    // ParallelFor against enkiTS, since that is like against like.
-    for (int r = 0; r < kRuns; ++r) {
-        auto t0 = Clock::now();
-        jl.ParallelFor(0, kItems, 256, [](int lo, int hi) {
-            uint64_t acc = 0;
-            for (int i = lo; i < hi; ++i) acc ^= Spin((uint64_t)i, kWorkIters);
-            g_sink.fetch_add(acc, std::memory_order_relaxed);
-        });
-        c.push_back(Ms(t0, Clock::now()));
     }
   }
 
@@ -316,7 +303,7 @@ static void BenchBulk(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
   }
 
     if (g_doJ) Report("JLib ParallelFor",   a);
-    if (g_doJ) Report("JLib ParallelFor", c);
+
     if (g_doE) Report("enkiTS",             b);
     printf("\n");
 }
