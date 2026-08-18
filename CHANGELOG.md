@@ -46,6 +46,29 @@ task constructions measured in a real application, fits in 96. That made it the 
 says not to bother: halving the stride to 128 was tested against a same-vs-same control and the
 entire effect fell inside run-to-run noise.
 
+**Three published figures were wrong and are corrected.** The 1.4.0 table was re-measured but the
+prose under it was not, so the same page quoted two numbers for the same benchmark: `PushBatch` read
+12.2 M/s where the table said **14.7**, and `PushArray` 1.0 ns/item where the table said **0.55**.
+Both follow from 1.4 cutting the allocator round trip 9.3 -> 2.1 ns.
+
+The third mattered more than a stale number usually does. "Submit from inside the pool where you
+can" recommended an architecture on the strength of **9.8 M/s** for four-producer submission -- which
+is the saturated regime of a row 1.4 documents as bistable with a cliff at ~21 workers, published by
+`best-of-5` picking whichever regime got lucky. The advice survives (four producers beat one in both
+regimes) but the margin on that machine is **2.4x, not 10x**, and the section now says so and points
+at the sweep. If you quoted 9.8 M/s from the 1.4 README, it was real and it was not representative.
+
+**The range APIs are now documented against each other** -- both `ParallelFor` overloads, `PushArray`
+and `RunCursorRange`, on the axes that decide between them: does it block, how does it divide, when
+do you want it. Two 1.4 leftovers went with it: `PushArray`'s comment still described `ParallelFor`
+as "which probes the work", and the README called the shared cursor an internal fallback when
+`RunCursorRange` is public.
+
+**`SchedulerBench` stopped printing a gate that no longer exists.** Its crossover sweep header
+advertised "probe a prefix, extrapolate, parallelize when est. work >= 75us" on every run. It now
+states there is no gate, and that cells below 1.00x are the known cost of being probe-free rather
+than a bug -- which is the question a sub-1.00x cell actually raises.
+
 ## 1.4.0 - 2026-08-18
 
 **`ParallelFor` NO LONGER PROBES. It is now demand-driven, and the probe is gone rather than
