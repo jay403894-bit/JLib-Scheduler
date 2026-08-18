@@ -289,25 +289,30 @@ namespace JLib {
 		// them infer demand from STEALS -- something that actually happened -- rather than from a
 		// cost model. This is converging with a settled answer, not inventing against it.
 		//
-		// WHAT REPLACED IT: SLICE-STEALING FROM A SHARED CURSOR. One task per worker (capped at the
-		// number of slices that exist), each pulling [lo, lo+grain) off one atomic until the range
-		// is consumed. The calling thread pulls too rather than blocking idle. So the number of
-		// scheduled entities is bounded by the pool no matter how fine the grain, load balancing is
-		// a consequence of the cursor rather than a policy, and a worker that draws a cheap region
-		// simply comes back for another. It is the mechanism enkiTS uses.
+		// WHAT REPLACED IT: RECURSIVE LAZY SPLITTING, and STEALS DECIDE. This publishes the right
+		// half of the range onto the calling thread's own deque and carries on with the left. Nobody
+		// took it -> the splitter takes it straight back and runs it inline for ~11 ns, no dispatch
+		// and no notify. Somebody took it -> the pool was hungry and the split was right.
 		//
 		// Everything it needs lives on THIS stack frame, which is sound only because ParallelFor
-		// BLOCKS: cursor, wait group and callable all outlive every task by construction. That is
-		// exactly why PushArray, which does NOT block, cannot use it.
+		// BLOCKS: the wait group and callable outlive every task by construction. That is exactly
+		// why PushArray, which does NOT block, cannot use it.
 		//
-		// 1.4 SHIPPED A RECURSIVE LAZY SPLITTER HERE FIRST -- publish the right half onto the
-		// caller's own deque, take it back if nobody steals it -- and it was replaced by this. NOT
-		// because it was slower. Measured with an interleaved A/B and a same-vs-same control:
-		// uniform 1M 0.673 vs 0.658 ms, ragged 200k 1.327 vs 1.326, back-loaded 1.327 vs 1.326 --
-		// tied within 2%. It went because at equal performance it needed a dedicated deque lane for
-		// non-worker threads, a wake heuristic with a per-thread round-robin cursor, a split tree
-		// and a bespoke wait loop, none of which the cursor needs. Simplicity was the tiebreak.
+		// A SHARED-CURSOR ALTERNATIVE EXISTS AND IS USED AS A FALLBACK (RunCursorRange): one task per
+		// worker, each pulling [lo, lo+grain) off one atomic. ParallelFor was switched to it for a
+		// single commit and switched back. The bench crossover sweep -- 32 points over four body
+		// costs, which is the instrument for this question -- shows the two CROSS OVER rather than
+		// tie, medians of 3 and non-overlapping below 200k:
 		//
+		//     heavy body   N=1000   2000    4000    10000   200000
+		//       splitter   10.3x   12.6x   13.6x   13.9x    18.5x
+		//       cursor      6.6x    7.8x    9.4x    9.3x    22.6x
+		//
+		// The splitter is 1.4-1.6x better across the whole mid-range -- hundreds to thousands of
+		// items with real per-item work, i.e. the frame-graph shape this library is for -- and gives
+		// up ~1.2x only at very large N. A "tied" verdict was published briefly on the strength of
+		// three samples that were all large-N, which is the one region where they agree. Do not
+		// re-run that comparison without the sweep.
 		// GRAIN (was `chunkSize`) is the smallest subrange worth handing to another thread. It is
 		// floored at 64 slices per worker with an absolute floor of 64 items -- a statement about
 		// the POOL, whose size is known exactly, never about the BODY.
@@ -329,17 +334,18 @@ namespace JLib {
 		// Requiring a number nobody has is how you get 32 passed in because it looked reasonable.
 		//
 		// So this derives one from the two things that ARE known exactly -- the range and the pool
-		// size -- and never consults the body. It defers entirely to the slicing floor: at most 64
-		// slices per worker, with an absolute floor of 64 items. One place decides how fine a range
-		// may be cut, and it is the same place for both overloads.
+		// size -- and never consults the body: `range / (workers * 8)`, the rule Cilk's `cilk_for`
+		// uses for its own default.
 		//
-		// IT USED TO COMPUTE ITS OWN COARSER DEFAULT (8 leaves per worker, Cilk's `cilk_for` rule)
-		// and that was correct for the recursive splitter it then fed: a tree pays per split and has
-		// a serial spine, so it wants fewer, larger leaves. The cursor has neither -- every lane is
-		// published at once and a slice costs one fetch_add -- so it wants the finer division. The
-		// old constant measured 6.23x against 16.55x at an explicit grain on a 64 MB memory-bound
-		// body once the algorithm underneath it changed. A tuning constant carried across a rewrite
-		// that invalidated it is how a library ends up slow for reasons nobody can find.
+		// A TUNING CONSTANT IS PART OF THE ALGORITHM IT WAS TUNED FOR, and this number has now been
+		// wrong in BOTH directions inside a single release. 8 per worker suits the recursive
+		// splitter, which pays per split and has a serial spine and so wants fewer, larger leaves.
+		// While ParallelFor was briefly pointed at the shared cursor -- which publishes every lane at
+		// once and pays one fetch_add per slice, so it wants the finer division -- keeping 8
+		// measured 6.23x against 16.55x at an explicit grain on a 64 MB memory-bound body. Changing
+		// it to defer to the cursor's floor then measured 4.36x against 11.33x once ParallelFor went
+		// back to splitting. If the algorithm underneath changes again, this is a measurement to
+		// redo, not a constant to carry across.
 		//
 		// PASS A GRAIN ONLY IF YOU HAVE MEASURED. The number that matters is wall-clock per leaf,
 		// not elements: aim for a few microseconds of work in each. If you have timed the loop

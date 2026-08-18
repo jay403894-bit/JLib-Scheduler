@@ -406,12 +406,20 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 }
 
 
-// ==================== RETAINED, UNREACHABLE: the recursive lazy splitter ====================
+// ==================== THE RECURSIVE LAZY SPLITTER: what ParallelFor uses ====================
 //
-// ParallelFor dispatched here until it moved to RunCursorRange. Kept for 1.4 and slated for removal
-// in 1.5 -- it measured TIED with the cursor (see ParallelFor's header), so nothing is lost by
-// deleting it, but nothing is gained by deleting it in a hurry either. No public entry point reaches
-// this code.
+// ParallelFor moved to RunCursorRange for one commit and was moved back. The bench crossover
+// sweep -- 32 points across four body costs, which is the instrument for this question and which
+// I had not run -- shows the two CROSS OVER rather than tie:
+//
+//     heavy body   N=1000   2000    4000    10000   200000
+//       splitter   10.3x   12.6x   13.6x   13.9x    18.5x
+//       cursor      6.6x    7.8x    9.4x    9.3x    22.6x
+//
+// (medians of 3, non-overlapping at every N below 200k.) The splitter is 1.4-1.6x better across the
+// whole mid-range -- hundreds to thousands of items with real per-item work, i.e. the frame-graph
+// shape this library exists for -- and gives up ~1.2x only at very large N. The earlier "tied"
+// verdict came from three samples that were ALL large-N, which is the one region where they agree.
 //
 // See ParallelFor's header comment for why this exists at all (short version: a predictive
 // probe cannot work on a data-dependent body, and data-dependent bodies are the target). What
@@ -588,18 +596,105 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 
 void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func) {
 	if (end - begin <= 0) return;
+	grain = std::max(1, grain);
 
-	// No pool, or the debugging kill switch: run the whole range inline on this thread.
-	// SetParallelForSerial is what replaced the removed threshold setter -- see the header.
+	// No pool (or a pool of one): there is nobody to steal, so splitting could only ever cost. Run
+	// it straight. Same answer RunCursorRange gives in the same situation. SetParallelForSerial
+	// joins it here -- one branch, and it answers "is ParallelFor responsible for this?" without a
+	// rebuild, which is the one job the removed threshold setter was actually good for.
 	if (g_parallelForSerial || !poolActive.load(std::memory_order_acquire) || workers.empty()) {
 		func(begin, end);
 		return;
 	}
 
-	// Slice-stealing, via the shared cursor. RunCursorRange owns the grain floor, so this does not
-	// pre-floor -- one place decides how fine a range may be cut, and it is the same place for both
-	// entry points.
-	RunCursorRange(begin, end, std::max(1, grain), func);
+	// GRAIN IS FLOORED SO THE TREE CANNOT PRODUCE MORE LEAVES THAN THE POOL CAN USE.
+	//
+	// This is the same guard the old chunked path applied to chunkSize (there, at most 4 chunks per
+	// worker), and it is legitimate for the same reason: it is a statement about the POOL, whose
+	// size is known exactly, and not about the BODY, whose cost is the thing that cannot be known.
+	// Nothing is predicted, so this does not smuggle the probe back in.
+	//
+	// It exists because grain has a CLIFF on the low side, and a caller who guesses too fine falls
+	// straight off it. Measured (scratchpad/grainsweep.cpp), 31 workers:
+	//
+	//     grain          1      2      8     32     64    256
+    //     ragged      2.61x  3.90x 14.14x 21.50x 21.45x 20.25x
+	//     back-loaded 1.95x  2.97x 10.86x 18.58x 18.61x 12.85x
+	//
+	// The optimum is a broad plateau and the penalty for being under it is severe -- 8x on ragged
+	// work at grain 1 -- because a split costs ~10.8 ns unstolen and a full dispatch when stolen,
+	// against a leaf holding one or two elements. 64 leaves per worker lands inside the plateau
+	// from any input (200k/31/64 -> ~101; 100k/31/64 -> ~51) and matches the cap ParallelRange
+	// already documents for its own grain.
+	//
+	// NOTE WHAT THIS DOES NOT FIX, and it is the cost of removing the probe: a grain too COARSE for
+	// the pool is clamped here, but a body too cheap to be worth parallelizing AT ALL is not, and
+	// cannot be. Nothing that refuses to measure the body can make that call. See the header.
+	{
+		const size_t maxLeaves = workers.size() * 64;
+		const int floorGrain = (int)(((size_t)(end - begin) + maxLeaves - 1) / maxLeaves);
+		grain = std::max(grain, floorGrain);
+	}
+
+	// A NON-WORKER needs the shared lane; a worker already has one. Losing the race means another
+	// app thread is mid-split, so fall back to the cursor path rather than serialising behind it --
+	// a perfectly good answer, just not this one.
+	const bool isWorker = (Thread::GetCurrent() != nullptr);
+	NonWorkerLaneClaim claim(nonWorkerLaneClaimed);
+	if (!isWorker && !claim.held()) {
+		RunCursorRange(begin, end, grain, func);
+		return;
+	}
+
+	WaitGroup wg;
+	LazyRangeState st{ &func, &wg, grain };
+	RunLazyRange(begin, end, &st);
+
+	// THE WAIT, and it is not WaitFor for a bare caller. Two different jobs are going on here.
+	//
+	// A FIBER caller parks and its worker goes back to its own loop, where pop_bottom picks up
+	// whatever this fiber published -- the right behaviour already, and it is why the from-a-worker
+	// case worked before any of this existed.
+	//
+	// A BARE caller (main, or a noFiber task) has nothing to park into, so WaitFor spin-helps via
+	// TryRunStolenNoFiberTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
+	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
+	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
+	// own lane where a 4.6 ns pop_bottom would have them. Measured, that scan was most of the cost
+	// of a cheap ParallelFor from main.
+	//
+	// So: drain our own lane LIFO first, and only fall back to general helping once it is empty
+	// (thieves took the rest, and the wait now genuinely has nothing local to do). LIFO is also the
+	// right order -- the most recently published split is the one whose data is still warm.
+	if (!OnBareThread()) {
+		WaitFor(wg);
+		return;
+	}
+
+	TaskDeque* myLane = LaneForCurrentThread();
+	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
+		if (myLane) {
+			if (auto opt = myLane->pop_bottom()) {
+				Task* t = *opt;
+				// The same completion bookkeeping Worker()'s noFiber fast path does, in the same
+				// order. Not factored out into a shared helper only because that path also handles
+				// immediate-core release and epoch ticking, neither of which applies here.
+				t->Execute();
+				if (t->waitGroup) {
+					int old = t->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+						t->waitGroup->WakeAll();
+				}
+				DestroyTask(t);
+				taskAllocator.Free(t);
+				continue;
+			}
+		}
+		// Our lane is empty: everything we published is out with thieves. Help the pool generally
+		// rather than spinning -- this is the same policy WaitFor's bare path takes.
+		if (!TryRunStolenNoFiberTask())
+			std::this_thread::yield();
+	}
 }
 
 void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
@@ -1884,18 +1979,24 @@ void SchedulerConditionVariable::Notify_All() {
 
 // Grain-free overload: derive it from the range and the pool, never from the body.
 //
-// Passes 1 and lets RunCursorRange's floor do the deriving -- at most 64 slices per worker, with an
-// absolute floor of 64 items.
+// EIGHT leaves per worker -- Cilk's `cilk_for` rule, derived from n and P alone and never from the
+// body.
 //
-// THIS USED TO COMPUTE ITS OWN, COARSER DEFAULT (8 leaves per worker, Cilk's `cilk_for` rule), and
-// that was right for the recursive splitter it then fed: a tree pays per split and has a serial
-// spine, so it prefers fewer, larger leaves. The cursor has neither -- it publishes every lane at
-// once and the per-slice cost is one fetch_add -- so it prefers the finer division, and the old
-// default measured 6.23x against 16.55x at an explicit grain on a 64 MB memory-bound body.
+// A TUNING CONSTANT IS PART OF THE ALGORITHM IT WAS TUNED FOR, and this line has now demonstrated
+// that in both directions within one release. It was 8/worker for the recursive splitter, which
+// pays per split and has a serial spine and therefore wants fewer, larger leaves. When ParallelFor
+// was briefly pointed at the shared cursor -- which publishes every lane at once and pays one
+// fetch_add per slice, so it wants the finer division -- keeping 8 measured 6.23x against 16.55x at
+// an explicit grain on a 64 MB memory-bound body. It was changed to defer to the cursor's floor.
+// When ParallelFor went BACK to the splitter, that new default was wrong the other way: 4.36x
+// against 11.33x on a 2M cheap range, and 0.05x against 1.01x on a small one.
 //
-// So the number moved because the algorithm underneath it did. Keeping the old constant would have
-// been carrying a tuning decision across a rewrite that invalidated it, which is the quiet way a
-// library ends up slow for reasons nobody can find.
+// So it is back to 8/worker, matching the algorithm that is actually underneath it. If that
+// algorithm changes again, this number is not a constant to preserve -- it is a measurement to redo.
 void TaskScheduler::ParallelFor(int begin, int end, std::function<void(int, int)> func) {
-	ParallelFor(begin, end, 1, std::move(func));
+	const int n = end - begin;
+	if (n <= 0) return;
+	const size_t leaves = std::max<size_t>(1, workers.size() * 8);
+	const int grain = (int)std::max<size_t>(1, ((size_t)n + leaves - 1) / leaves);
+	ParallelFor(begin, end, grain, std::move(func));
 }

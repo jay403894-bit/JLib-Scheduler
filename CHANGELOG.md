@@ -232,14 +232,19 @@ the crossover genuinely moves with core count and memory bandwidth. That is what
 `SetParallelForThresholdUs` exists for, and why the constant is exposed rather than baked in.
 
 **`ParallelRange(begin, end, grain, fn)`** was added here as the probe-free entry point, and then
-**REMOVED later in this same release, before it ever shipped.** Once `ParallelFor` lost its probe
-and moved to the same slice-stealing cursor, the two were literally the same function, and two names
-for one behaviour is worse than the problem either was solving. Use `ParallelFor`; the no-grain
-overload covers the case this was reached for.
+**REMOVED later in this same release, before it ever shipped.** Once `ParallelFor` lost its probe,
+the reason to have a second probe-free entry point went with it -- and briefly the two were literally
+the same function, while `ParallelFor` was pointed at the same cursor. Use `ParallelFor`; the
+no-grain overload covers the case this was reached for.
 
-What it contributed survives: the cursor itself, the grain floor below, and the finer slicing --
-up to 64 slices per worker, against the 4 per worker the old per-chunk path capped at -- are what
-`ParallelFor` does now.
+What it contributed survives. Its shared cursor is still `RunCursorRange`, used as the fallback when
+a second non-worker thread is already splitting, and its grain floor -- up to 64 slices per worker,
+against the 4 per worker the old per-chunk path capped at -- is what `ParallelFor` floors to now.
+
+`ParallelFor` itself ended on RECURSIVE SPLITTING rather than the cursor. It was switched to the
+cursor for one commit on the strength of three large-N samples that showed a tie, and switched back
+when the crossover sweep -- 32 points over four body costs -- showed the two cross over instead:
+the splitter is 1.4-1.6x ahead from N=1000 to N=10000 and gives up ~1.2x only at very large N.
 
 
 **A grain floor bug, caught by the new API and worth recording.** The first version floored grain at

@@ -4,7 +4,7 @@
 A hybrid runtime for C++17+ that gives you:
 
 - **Cilk-style work-stealing** for fast parallel loops (`ParallelFor`, `PushArray`)
-- **No cost model in the range APIs** -- `ParallelFor` has no probe and no calibrated constant; slice-stealing decides how work is divided
+- **No cost model in the range APIs** -- `ParallelFor` has no probe and no calibrated constant; steals decide how work is divided
 - **TaskFlow-style dependency graphs** (`TaskDAG`) with AND/OR gates
 - **Middleware-safe threads by default** -- no TLS surprises
 - **Fiber-based blocking only when you actually suspend**, so you never pay fiber overhead unless you need it
@@ -188,11 +188,11 @@ same harness, so the comparison still holds. The `NoSleep` round-trip cell is th
 it read 0.97 µs at 1.3.0 and 1.70 µs here with an **83% spread across repeats**, which is the
 harness being noisy on that row rather than a real move.
 
-**The bulk row is mechanism-matched to enkiTS** — both hand workers slices off a shared cursor
-rather than creating a task per chunk — and at **0.38 ms against 0.375 ms it is a tie**, not a win;
-enkiTS is marginally ahead and far steadier (2% spread against our 13%). It was two rows in an
-earlier draft, one of them a `ParallelFor` that still carried a serial probe; that probe is gone and
-both entry points are now the same code. See [Parallel loops](#parallel-loops).
+**The bulk row was measured against `ParallelRange`**, the shared-cursor path, which is mechanism-
+matched to enkiTS — both hand workers slices off one cursor rather than creating a task per chunk —
+and at **0.38 ms against 0.375 ms it is a tie**, not a win; enkiTS is marginally ahead and far
+steadier (2% spread against our 13%). `ParallelFor` now uses recursive splitting instead, so this
+row needs re-measuring before it is quoted again. See [Parallel loops](#parallel-loops).
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
@@ -442,44 +442,37 @@ one.
 ### Parallel loops
 
 `ParallelFor` takes a `(lo, hi)` callable, covers the range in disjoint subranges, and blocks until
-every one has run. It **slice-steals from a shared cursor**: every worker pulls `[lo, lo+grain)` off
-one atomic until the range is consumed, and the calling thread pulls too rather than idling. The
-number of scheduled entities is capped at the pool size (or the slice count, whichever is smaller)
-no matter how fine the grain, so load balancing falls out of the cursor rather than being a policy.
-It is the mechanism enkiTS uses. It predicts nothing.
+every one has run. It **splits recursively and lets steals decide**: it publishes the right half of
+the range onto the calling thread's own deque and carries on with the left. If nobody takes a split
+it takes it straight back and runs it inline for ~11 ns — no dispatch, no notify. If somebody does,
+the pool was hungry and the split was right. It predicts nothing.
 
 It is the only range entry point. `ParallelRange` was added earlier in 1.4 as the probe-free
-alternative and removed in the same release, before either shipped: once `ParallelFor` lost its
-probe and moved to the same cursor, the two were literally the same function.
+alternative and removed in the same release, before either shipped; its shared-cursor mechanism
+survives internally as the fallback when a second non-worker thread is already splitting.
 
-**1.4 shipped a recursive lazy splitter behind `ParallelFor` first, and it was replaced by this.**
-Not because it was slower — it was not. Measured with an interleaved A/B (one rep each, alternating,
-so neither pays the pool wake-up the other avoids) and an identical-code control to prove the method
-was fair:
+**Those two mechanisms cross over, and the crossover is the reason `ParallelFor` uses the splitter.**
+Measured with the crossover sweep — 32 points over four body costs, medians of 3, non-overlapping
+distributions below N=200,000:
 
-| body | recursive splitter | shared cursor |
-| --- | --- | --- |
-| uniform, 1M items | 0.673 ms | 0.658 ms |
-| cost varies ~20x across the range | 1.327 ms | 1.326 ms |
-| all cost in the last 10% of the range | 0.607 ms | 0.602 ms |
+| heavy body | N=1000 | N=2000 | N=4000 | N=10000 | N=200000 |
+| --- | --- | --- | --- | --- | --- |
+| recursive splitter | **10.3x** | **12.6x** | **13.6x** | **13.9x** | 18.5x |
+| shared cursor | 6.6x | 7.8x | 9.4x | 9.3x | **22.6x** |
 
-Within 2% everywhere. It was replaced because at equal performance it is a great deal more
-machinery: a dedicated deque lane for non-worker threads, a wake heuristic with a per-thread
-round-robin cursor, a split tree, and a bespoke wait loop, none of which the cursor needs.
+The splitter is 1.4–1.6x ahead across the whole mid-range — hundreds to thousands of items with real
+per-item work, which is the frame-graph shape this library is for — and gives up ~1.2x only at very
+large N.
 
-**A warning about how those numbers were obtained**, because it cost most of a day. Measuring the
-two in blocks — 15 reps of one, then 15 of the other — is not a comparison under the default `Sleep`
-policy: the pool parks between blocks, so whichever runs first pays the wake-up and reads 15-45%
-low. That artifact produced a confident, reproducible, entirely fictional performance gap. The
-control that caught it was making both rows call the same code and noticing they still disagreed by
-32%. If you benchmark anything in this library against anything else, interleave the reps and keep
-a same-vs-same row in the table.
+**A "tied" verdict was published briefly on the strength of three large-N samples**, which is the one
+region where the two agree. If you compare them again, use the sweep: three points chosen by hand
+missed a crossover that 32 points made obvious.
 
 ### How do I pick a grain?
 
 Mostly you don't. **`ParallelFor(begin, end, func)` derives one for you** from the two things known
-exactly — the range and the pool size — and never consults the body. It uses the same slicing floor
-an explicit grain gets: at most 64 slices per worker, with an absolute floor of 64 items.
+exactly — the range and the pool size — and never consults the body: `range / (workers * 8)`, the
+same rule Cilk's `cilk_for` uses for its default.
 
 Pass a grain only if you have measured. The number that matters is **wall-clock per slice, not
 elements**: aim for a few microseconds of work in each. If you have timed the loop serially once —
