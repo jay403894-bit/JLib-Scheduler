@@ -311,11 +311,31 @@ where memory-ordering bugs live.
 
 ## Build
 
-
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Development
 cmake --build build -j
 ```
+
+**On Windows this silently builds Debug, not Development, unless you say otherwise.** CMake's
+default generator there is Visual Studio, which is a MULTI-CONFIG generator: all three build types
+coexist in the same `build/` tree, chosen at BUILD time via `--config`, not at configure time --
+so `-DCMAKE_BUILD_TYPE=...` above does nothing on Windows and is silently accepted, not rejected,
+which is what makes this easy to miss. Left unspecified, `cmake --build` falls back to MSBuild's
+own default, Debug -- unoptimized, `_ITERATOR_DEBUG_LEVEL=2`, and consequently much slower than the
+CMAKE_BUILD_TYPE line looks like it asked for. `SchedulerBench`'s crossover sweeps are already the
+slowest sections in Development or Release; run one in an accidental Debug build and it can outlast
+the 180-second per-section watchdog before printing anything for the section you're waiting on.
+
+The portable form that works on both generator kinds:
+
+```
+cmake --build build --config Release -j
+```
+
+`Debug`/`Development`/`Release` all exist in the tree at once on Windows; this just tells the build
+step which one, and the binary lands at `build/Release/...` rather than `build/Debug/...`. On a
+single-config generator (Ninja, Makefiles -- the default on Linux/macOS) `--config` is accepted and
+ignored, since `CMAKE_BUILD_TYPE` already fixed the choice at configure time there.
 
 Or open `Scheduler.sln` in Visual Studio. Three build types: `Debug`, `Release`, and `Development`
 (optimized, with symbols and assertions live -- it deliberately does not define `NDEBUG`).
