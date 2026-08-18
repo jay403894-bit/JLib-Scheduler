@@ -581,7 +581,15 @@ namespace JLib {
 		// steady stream of hiPri work can't starve loPri tasks. (There used to also be age-based
 		// promotion -- boost old loPri tasks to hiPri -- but it's redundant now that stealing is
 		// single-item: a stolen task runs immediately, so the steal itself un-starves it.)
-		int consecutiveHiPriSteals = 0;
+		//
+		// PER THREAD, NOT PER SCHEDULER -- see the definition in TaskScheduler.cpp. This was a plain
+		// `int` member on the singleton, read-modify-written by GetTask() from every thread that
+		// spin-helps, which is a genuine data race and ThreadSanitizer says so (2026-08-17). It is
+		// also the wrong shape for what the counter means: the window is a property of ONE
+		// stealer's recent history, and sharing it made N concurrent helpers trip it N times faster
+		// than intended. Thread.cpp's `consecutiveMisses` backoff counter is thread_local for
+		// exactly these two reasons and this now matches it.
+		static thread_local int consecutiveHiPriSteals;
 		static constexpr int kStealFairnessWindow = 8; // after 8 hiPri steals, force a loPri scan
 		uint64_t GetCurrentTimeMs() const;
 		// ----

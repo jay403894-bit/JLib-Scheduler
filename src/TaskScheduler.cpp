@@ -80,6 +80,9 @@ static_assert(sizeof(Task) <= TaskAllocator::SLOT, "Task doesn't fit a slot");
 static_assert(alignof(Task) <= 16, "Task over-aligned for a slot");
 
 TaskScheduler* TaskScheduler::instance = nullptr;
+// See the declaration for why this is per-thread. Zero-initialized, so no guard variable and no
+// initialization check on the steal path.
+thread_local int TaskScheduler::consecutiveHiPriSteals = 0;
 GlobalFiberPool* TaskScheduler::globalPool = nullptr;
 
 TaskScheduler::TaskScheduler(size_t poolSize) {
