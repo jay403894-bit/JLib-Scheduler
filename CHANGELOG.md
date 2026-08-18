@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## Unreleased
+## 1.5.0 - 2026-08-18
 
 **`ParallelForNB` is REMOVED.** It was the non-blocking range loop: fixed `chunkSize`, one task per
 chunk, returns as soon as they are queued.
