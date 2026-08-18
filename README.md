@@ -81,19 +81,23 @@ first and take the run twice.
 
 **Rows that moved against the 1.3.0 version of this table.** `PushBatch` went 12.2 → 14.7 M/s and
 `PushArray` 1.0 → 0.55 ns/item; both follow from 1.4 cutting the task allocator's round trip from
-9.3 ns to 2.1 ns. Everything else reproduces 1.3.0 within noise -- **except one row, which is an
-open regression**: 4-producer submission under `Sleep` went 9.8 → 2.9 M/s.
+9.3 ns to 2.1 ns. Everything else reproduces 1.3.0 within noise except one row: 4-producer
+submission under `Sleep` reads 2.9 M/s where the 1.3.0 table said 9.8.
 
-That one is worth stating precisely, because everything about its shape is known except the cause.
-The **`NoSleep` half of the same row is fine** (12.5 M/s against 1.3.0's 12.7), so this is not the
-machine and not multi-producer submission in general -- it is specifically multi-producer submission
-**through the parking path**. It predates 1.4: the same 2.3-3.9 M/s is measured on the 1.3.6 tree
-with none of this release's changes applied. And it is not the benchmark drifting under it -- the
-entire diff to `bench/bench.cpp` since 1.3.0 is an `#include`, a banner string and a change to the
-fork-join row, so the multi-producer case is measuring exactly what it measured then.
+**That was assumed to be a regression and it is not.** v1.3.0 was checked out, rebuilt and measured
+on this machine alongside 1.4.0: it reads **2.5-4.4 M/s**, against 1.4.0's 3.0-3.7 -- the same
+distribution. The two versions are indistinguishable on this metric, so nothing regressed between
+them, and there was nothing to bisect. Ruled out along the way: the affinity default (already
+`Ideal` at 1.3.0), the benchmark drifting (the entire `bench/bench.cpp` diff since 1.3.0 is an
+`#include`, a banner string and a change to the fork-join row), and section ordering within the run
+(`nosweep` and the full sweep read the same).
 
-So: a real regression in the sleep/wake handshake, somewhere in the 66 commits between 1.3.0 and
-1.3.6, not yet bisected. Published as measured rather than quietly dropped.
+So the 9.8 belongs to conditions on this machine that no longer exist, and **what those were is
+unknown**. It is worth flagging that the rest of that session reproduces -- latency, the DAG,
+fork-join, burst, and the `NoSleep` half of this very row (12.5 against 12.7) all land within noise
+-- so this is not a blanket shift in the machine, which makes a one-off measurement or a
+transcription error at least as likely as anything physical. **Treat the historical 9.8 as
+unreliable and this row's 2.9 as the number.** Published as measured rather than quietly dropped.
 
 **Measure on your own hardware before relying on any of this.** These numbers come from one desktop
 with a large L3 and no competing load; a different cache hierarchy or a machine the application does
