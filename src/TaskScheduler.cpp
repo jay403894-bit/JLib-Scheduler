@@ -189,7 +189,10 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 	// per-task cost, measured) to answer a question the queues already know the answer to. Summing
 	// is O(workers) in a function that only runs when a watchdog has already given up.
 	size_t queued = 0;
-	for (size_t i = 0; i < workers.size(); ++i) queued += hiPri[i]->size() + loPri[i]->size();
+	// loPri/hiPri are one longer than `workers` -- the extra pair is the non-worker lane, summed
+	// here too. A watchdog that omitted it would report zero queued work while main's lane held a
+	// stranded lazy split, which is exactly the case this dump exists to make visible.
+	for (size_t i = 0; i < loPri.size(); ++i) queued += hiPri[i]->size() + loPri[i]->size();
 	printf("queuedTasks=%zu  paused=%d  poolActive=%d  workers=%zu\n",
 		queued,
 		(int)paused.load(std::memory_order_relaxed),
@@ -207,6 +210,11 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 			// The signature: parked, but holding work nobody else can take.
 			(s.workerState == 2 && (s.hasQueuedWork || !hiPriInboxes[i]->empty()
 				|| !loPriInboxes[i]->empty())) ? "   <-- SLEEPING WITH WORK" : "");
+	}
+	if (nonWorkerLane < loPri.size()) {
+		printf(" nw  %-14s   -      -    -   -     -/-           %zu/%zu%s\n",
+			nonWorkerLaneClaimed.load(std::memory_order_relaxed) ? "CLAIMED" : "free",
+			hiPri[nonWorkerLane]->size(), loPri[nonWorkerLane]->size(), "");
 	}
 	fflush(stdout);
 }
@@ -610,6 +618,261 @@ void TaskScheduler::ParallelRange(int begin, int end, int grain, std::function<v
 	RunCursorRange(begin, end, grain, func);
 }
 
+// ============================ DEMAND-DRIVEN (LAZY) RANGE SPLITTING ============================
+//
+// See ParallelForLazy's header comment for why this exists at all (short version: a predictive
+// probe cannot work on a data-dependent body, and data-dependent bodies are the target). What
+// follows is how it works.
+
+// Set on a NON-WORKER thread while it holds the non-worker lane. thread_local rather than a member
+// because the claim is a property of the calling thread, not of the scheduler, and a bare bool is
+// enough: the atomic in `nonWorkerLaneClaimed` is what makes the claim exclusive across threads;
+// this only records which side of it we are on. Workers never set it -- they have their own lane
+// by qIndex and never contend for this one.
+static thread_local bool t_ownsNonWorkerLane = false;
+
+// RAII claim on the non-worker lane. Failure is NOT an error and not something to wait on: it means
+// another non-worker thread is already splitting, and the caller degrades to the cursor path.
+namespace {
+	struct NonWorkerLaneClaim {
+		std::atomic<bool>* flag = nullptr;
+		explicit NonWorkerLaneClaim(std::atomic<bool>& f) {
+			if (!f.exchange(true, std::memory_order_acquire)) {
+				flag = &f;
+				t_ownsNonWorkerLane = true;
+			}
+		}
+		~NonWorkerLaneClaim() {
+			if (flag) {
+				t_ownsNonWorkerLane = false;
+				flag->store(false, std::memory_order_release);
+			}
+		}
+		bool held() const { return flag != nullptr; }
+		NonWorkerLaneClaim(const NonWorkerLaneClaim&) = delete;
+		NonWorkerLaneClaim& operator=(const NonWorkerLaneClaim&) = delete;
+	};
+}
+
+TaskDeque* TaskScheduler::LaneForCurrentThread() {
+	// A worker publishes onto its own deque -- it is the sole owner, and pushing to it from inside
+	// a task it is currently executing is already what Worker() does when it re-homes a task.
+	Thread* self = Thread::GetCurrent();
+	if (self) {
+		const int q = self->qIndex;
+		if (q >= 0 && (size_t)q < loPri.size()) return loPri[q].get();
+		return nullptr;
+	}
+	// A non-worker publishes onto the shared non-worker lane, but ONLY if it holds the claim.
+	// Without that check two app threads would push to one Chase-Lev deque, which has exactly one
+	// legal producer.
+	if (t_ownsNonWorkerLane && nonWorkerLane < loPri.size()) return loPri[nonWorkerLane].get();
+	return nullptr;
+}
+
+// Publish-right, recurse-left, down to grain.
+//
+// WHAT IS DEMAND-DRIVEN HERE, PRECISELY -- because it is easy to overclaim. The SERIAL-VS-PARALLEL
+// decision is: a split is published to this thread's own deque and, if nobody takes it, taken back
+// and run inline for 17.8 ns (scratchpad/taskcost.cpp). Nobody free, and the whole range collapses
+// to a serial run with a small constant per grain-chunk and no dispatch, no notify and no
+// retirement. Somebody free, and it parallelizes. That decision is made by steals, never predicted,
+// which is the entire point of replacing ParallelFor's probe.
+//
+// The GRANULARITY is not demand-driven, and deliberately so. It is the caller's `grain`, honoured
+// literally. A budget-and-refill scheme was built first -- ceil(log2(pool)) + 2 halvings, refilled
+// whenever a steal was observed -- and it measured WORSE, for a reason worth keeping: a budget that
+// decrements with depth starves the deepest parts of the tree, and on a back-loaded range the
+// deepest part is exactly where the work turned out to be. The diagnostic (scratchpad/lazydiag.cpp)
+// showed the hot tail left in 782-element leaves costing ~1.17 ms each against a 1.78 ms total --
+// one leaf WAS the critical path. That is the probe's mistake again, one level down: guessing where
+// the work is. Splitting to grain unconditionally makes no such guess, and it is affordable
+// precisely because the split got cheap: 17.8 ns * range/grain, which at grain 64 over 100k
+// elements is ~28 us against an 11 ms body.
+//
+// Measured on the back-loaded body after that change: 7.6x -> 14.6x, against the cursor path's
+// 10.9x and ParallelFor's 6.3x.
+void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
+	TaskDeque* myLane = LaneForCurrentThread();
+
+	while (myLane && (hi - lo) > st->grain) {
+		// The wake decision below needs to know whether our previous split is still sitting here.
+		// Sampled before the push, used after it.
+		const bool laneWasEmpty = (myLane->size() == 0);
+
+		const int mid = lo + (hi - lo) / 2;
+
+		Task* t = CreateTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); });
+		if (!t) break;                      // slab exhausted: run the remainder inline, no error
+		t->waitGroup = st->wg;
+
+		// Counted BEFORE publishing, for the same reason ParallelFor's flat path counts before
+		// PushBatch: the instant this is on the deque a thief can take it, finish it and decrement,
+		// and a count added afterwards races a wait that already saw zero. Nothing can drive the
+		// count to zero prematurely, because every task increments for its own children before its
+		// own decrement happens (which is after its body returns).
+		st->wg->n.fetch_add(1, std::memory_order_relaxed);
+
+		if (!myLane->push_bottom(t)) {
+			// Deque full. Unwind the count and the task, then fall through to running the whole
+			// remainder here -- the same graceful degradation the exhausted-slab case takes.
+			st->wg->n.fetch_sub(1, std::memory_order_relaxed);
+			DestroyTask(t);
+			taskAllocator.Free(t);
+			break;
+		}
+
+		// WAKE SOMEBODY -- but only when the evidence says nobody is coming.
+		//
+		// This is what the "an unstolen split is free" argument left out, and it took a round of
+		// measurement to find: a split published onto a deque is INVISIBLE to a PARKED worker. The
+		// sleep predicate covers only a worker's own inbox and hasQueuedWork, deliberately --
+		// stealable work on somebody else's deque is found by the steal phase that every AWAKE
+		// worker runs, and a sleeping worker runs nothing. So under the default Sleep policy, main
+		// published its splits to an audience of nobody and then ran every leaf itself: correct
+		// results, one thread, zero speedup.
+		//
+		// `laneWasEmpty` is the filter. If our previous split had already been carried off, thieves
+		// are awake and hungry and will be back on their own -- say nothing. If it is still sitting
+		// there, either nobody is awake or everybody is busy, and one notify is what distinguishes
+		// those. That keeps the steady state nearly free: NotifyWorker on an AWAKE worker is a
+		// seq_cst load and a return, measured at 1.17 ns, and here it is skipped outright.
+		//
+		// MarkQueuedWork is required alongside it, and is a mild stretch of that flag's meaning
+		// ("my own queue changed" vs "come and look around"). It is the safe direction: the worker
+		// clears the flag and re-searches at the top of every pass, so a spurious set costs one
+		// search and can never LOSE a wakeup, only ever add one.
+		//
+		// AFTER the push, never before: a worker woken while the deque is still empty can finish a
+		// whole search, find nothing and park again before the push lands, spending a kernel wake
+		// for nothing.
+		if (!laneWasEmpty && !workers.empty()) {
+			// THE CURSOR MUST START SOMEWHERE DIFFERENT ON EVERY THREAD, and this is the single
+			// highest-value line in the file. It began as a plain `= 0`, so every splitting thread
+			// walked workers 0,1,2,... from the same place: the low-numbered workers were woken
+			// over and over and the high-numbered ones were never woken at all. Measured on the
+			// back-loaded range, 13 of 32 threads ran a leaf and the other 19 stayed parked through
+			// the entire run with 2048 leaves available to steal. Seeding it per thread took that
+			// case from 7.6x to 14.6x on its own -- more than every other tuning here combined.
+			//
+			// Seeded once per THREAD from a shared counter, so the atomic is off the split path,
+			// with a stride coprime to any plausible pool size so two threads that start close
+			// together diverge immediately.
+			static std::atomic<size_t> s_wakeSeed{ 0 };
+			static thread_local size_t wakeCursor = s_wakeSeed.fetch_add(7919, std::memory_order_relaxed);
+			const size_t w = wakeCursor++ % workers.size();
+			workers[w]->MarkQueuedWork();
+			workers[w]->NotifyWorker();
+		}
+
+		hi = mid;
+	}
+	// The leaf. Everything not published above is ours.
+	(*st->func)(lo, hi);
+}
+
+void TaskScheduler::ParallelForLazy(int begin, int end, int grain, std::function<void(int, int)> func) {
+	if (end - begin <= 0) return;
+	grain = std::max(1, grain);
+
+	// No pool (or a pool of one): there is nobody to steal, so splitting could only ever cost. Run
+	// it straight. Same answer RunCursorRange gives in the same situation.
+	if (!poolActive.load(std::memory_order_acquire) || workers.empty()) {
+		func(begin, end);
+		return;
+	}
+
+	// A NON-WORKER needs the shared lane; a worker already has one. Losing the race means another
+	// app thread is mid-split, so fall back to the cursor path rather than serialising behind it --
+	// that is 1.4's behaviour, which is a perfectly good answer, just not this one.
+	// GRAIN IS FLOORED SO THE TREE CANNOT PRODUCE MORE LEAVES THAN THE POOL CAN USE.
+	//
+	// This is the same guard ParallelFor applies to chunkSize (there, at most 4 chunks per worker),
+	// and it is legitimate for the same reason: it is a statement about the POOL, whose size is
+	// known exactly, and not about the BODY, whose cost is the thing that cannot be known. Nothing
+	// is predicted, so this does not smuggle the probe back in.
+	//
+	// It exists because grain has a CLIFF on the low side, and a caller who guesses too fine falls
+	// straight off it. Measured (scratchpad/grainsweep.cpp), 31 workers:
+	//
+	//     grain          1      2      8     32     64    256
+    //     ragged      2.61x  3.90x 14.14x 21.50x 21.45x 20.25x
+	//     back-loaded 1.95x  2.97x 10.86x 18.58x 18.61x 12.85x
+	//
+	// The optimum is a broad plateau and the penalty for being under it is severe -- 8x on ragged
+	// work at grain 1 -- because a split costs ~10.8 ns unstolen and a full dispatch when stolen,
+	// against a leaf holding one or two elements. 64 leaves per worker lands inside the plateau
+	// from any input (200k/31/64 -> ~101; 100k/31/64 -> ~51) and matches the cap ParallelRange
+	// already documents for its own grain.
+	//
+	// NOTE WHAT THIS DOES NOT FIX: a grain that is too COARSE for the pool is clamped here, but a
+	// body too cheap to be worth parallelizing at all is not, and cannot be -- that is exactly the
+	// judgement only a probe can make, which is why ParallelFor keeps one. See this function's
+	// header comment.
+	{
+		const size_t maxLeaves = workers.size() * 64;
+		const int floorGrain = (int)(((size_t)(end - begin) + maxLeaves - 1) / maxLeaves);
+		grain = std::max(grain, floorGrain);
+	}
+
+	const bool isWorker = (Thread::GetCurrent() != nullptr);
+	NonWorkerLaneClaim claim(nonWorkerLaneClaimed);
+	if (!isWorker && !claim.held()) {
+		RunCursorRange(begin, end, grain, func);
+		return;
+	}
+
+	WaitGroup wg;
+	LazyRangeState st{ &func, &wg, grain };
+	RunLazyRange(begin, end, &st);
+
+	// THE WAIT, and it is not WaitFor for a bare caller. Two different jobs are going on here.
+	//
+	// A FIBER caller parks and its worker goes back to its own loop, where pop_bottom picks up
+	// whatever this fiber published -- the right behaviour already, and it is why the from-a-worker
+	// case worked before any of this existed.
+	//
+	// A BARE caller (main, or a noFiber task) has nothing to park into, so WaitFor spin-helps via
+	// TryRunStolenNoFiberTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
+	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
+	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
+	// own lane where a 4.6 ns pop_bottom would have them. Measured, that scan was most of the cost
+	// of a cheap ParallelForLazy from main.
+	//
+	// So: drain our own lane LIFO first, and only fall back to general helping once it is empty
+	// (thieves took the rest, and the wait now genuinely has nothing local to do). LIFO is also the
+	// right order -- the most recently published split is the one whose data is still warm.
+	if (!OnBareThread()) {
+		WaitFor(wg);
+		return;
+	}
+
+	TaskDeque* myLane = LaneForCurrentThread();
+	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
+		if (myLane) {
+			if (auto opt = myLane->pop_bottom()) {
+				Task* t = *opt;
+				// The same completion bookkeeping Worker()'s noFiber fast path does, in the same
+				// order. Not factored out into a shared helper only because that path also handles
+				// immediate-core release and epoch ticking, neither of which applies here.
+				t->Execute();
+				if (t->waitGroup) {
+					int old = t->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+						t->waitGroup->WakeAll();
+				}
+				DestroyTask(t);
+				taskAllocator.Free(t);
+				continue;
+			}
+		}
+		// Our lane is empty: everything we published is out with thieves. Help the pool generally
+		// rather than spinning -- this is the same policy WaitFor's bare path takes.
+		if (!TryRunStolenNoFiberTask())
+			std::this_thread::yield();
+	}
+}
+
 void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
 	chunkSize = std::max(1, chunkSize);
 	int totalItems = end - start;
@@ -880,8 +1143,11 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	hiPri.clear();
 	hiPriInboxes.clear();
 	workers.reserve(num_workers);
-	loPri.reserve(num_workers);
-	hiPri.reserve(num_workers);
+	// +1 for the NON-WORKER LANE (see nonWorkerLane's declaration). Only the deques get it --
+	// inboxes and immediateCoresInUse stay worker-indexed, because nothing ever pushes to a
+	// non-worker's inbox or pins a core to it.
+	loPri.reserve(num_workers + 1);
+	hiPri.reserve(num_workers + 1);
 	immediateCoresInUse.reserve(num_workers);
 	loPriInboxes.reserve(num_workers);
 	hiPriInboxes.reserve(num_workers);
@@ -903,6 +1169,16 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		loPriInboxes[i]->init(&taskAllocator);
 		hiPriInboxes[i]->init(&taskAllocator);
 	}
+	// THE NON-WORKER LANE. One extra deque pair past the workers, owned by whichever non-worker
+	// thread has claimed it (see nonWorkerLane / TryClaimNonWorkerLane). Built here rather than
+	// lazily so its index is fixed for the whole life of the pool: the steal loop reads it on
+	// every sweep and must never see a vector being grown underneath it -- the same race the
+	// two-pass worker construction below exists to avoid.
+	nonWorkerLane = num_workers;
+	loPri.push_back(std::make_unique<TaskDeque>());
+	hiPri.push_back(std::make_unique<TaskDeque>());
+	nonWorkerLaneClaimed.store(false, std::memory_order_relaxed);
+
 	// TWO PASSES, and the split is load-bearing. Creating a worker and STARTING it in the same
 	// iteration meant worker 0 was running -- and reading `workers` in its own startup path
 	// (Thread::StartWorker reads scheduler->workers.size()) -- while this loop was still

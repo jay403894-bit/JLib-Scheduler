@@ -293,6 +293,41 @@ namespace JLib {
 		// keeping chunk 0 for itself -- it is stuck here anyway, so leaving a whole lane idle would
 		// be waste.
 		void ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func);
+
+		// DEMAND-DRIVEN (lazy) range split -- the Cilk/oneTBB/Rayon model. Same shape and same
+		// guarantees as ParallelFor and ParallelRange: calls func(lo, hi) over disjoint subranges
+		// covering [begin, end), blocks until all of them are done, and the calling thread
+		// participates rather than sitting idle.
+		//
+		// WHAT IS DIFFERENT: IT NEVER PREDICTS. ParallelFor runs a serial prefix, times it,
+		// extrapolates to the rest, and parallelizes only if the estimate clears
+		// SetParallelForThresholdUs. That works on a uniform body and cannot work on a
+		// data-dependent one -- and data-dependent bodies are what this library is for. A probe
+		// over items 0..311 says nothing about item 50,000 when the early ones early-out at 2 ns
+		// and the later ones do full mesh collision at 4,000 ns. Worse, the prefix WARMS THE CACHE
+		// and the remainder streams from DRAM, so the extrapolation is biased low systematically
+		// rather than noisily; and on a hybrid or big.LITTLE part the probe runs on the caller's
+		// core class and the work runs on another.
+		//
+		// Instead, the structure is made splittable and STEALS DECIDE. This publishes the right
+		// half of the range onto the calling thread's own deque and carries on with the left half.
+		// If nobody took it, the splitter takes it straight back -- measured at 17.8 ns, because an
+		// unstolen split needs no notify (nobody has to be woken to run something you are about to
+		// run yourself) and no epoch retirement (winning the pop CAS proves no thief ever observed
+		// it). If somebody did take it, the pool was hungry and the split was exactly right.
+		// So: idle pool -> it parallelizes; busy pool -> it runs serially at near-zero cost;
+		// ragged body -> a worker that finishes early steals, which is itself the signal to split
+		// more. No constant to calibrate and nothing to get wrong per machine.
+		//
+		// GRAIN IS REQUIRED and is a hard floor -- the smallest subrange worth handing to anybody.
+		// It is the one thing the scheduler genuinely cannot infer, and asking for it is what lets
+		// everything else stop guessing. Same meaning as ParallelRange's.
+		//
+		// CALLABLE FROM MAIN, which is the normal case and the reason nonWorkerLane exists: main
+		// gets a real deque to publish onto, so every worker can steal from it in parallel from the
+		// first split rather than waiting out a log2(N) chain of steal hops. If a second non-worker
+		// thread is already splitting, this degrades to ParallelRange rather than blocking.
+		void ParallelForLazy(int begin, int end, int grain, std::function<void(int, int)> func);
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
@@ -571,6 +606,45 @@ namespace JLib {
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> loPri;
 		std::vector<std::unique_ptr<TaskDeque>> hiPri;
+
+		// ---------- the NON-WORKER LANE ----------
+		// loPri/hiPri carry ONE EXTRA deque pair past the workers, at index `nonWorkerLane`
+		// (== workers.size(), fixed by StartPool). Everything else -- inboxes,
+		// immediateCoresInUse, the P/E sets, PickNextWorker -- stays worker-indexed.
+		//
+		// WHY IT EXISTS. Demand-driven splitting (ParallelForLazy) works by publishing a split onto
+		// the SPLITTER'S OWN deque and taking it straight back if nobody stole it -- measured at
+		// 17.8 ns, versus ~85-105 ns for a real cross-thread dispatch. A worker has a deque to do
+		// that with. Main did not, so a ParallelFor called from the main thread -- which is the
+		// normal case -- had nowhere to publish, and the alternative was to hand the whole range to
+		// one worker and let the tree fan out over log2(N) STEAL HOPS before the pool filled up.
+		// One deque removes that ramp entirely: every worker can steal directly from main's lane,
+		// in parallel, starting from the first split.
+		//
+		// SINGLE OWNER, ENFORCED. A Chase-Lev deque has exactly one pusher/popper by construction,
+		// so two non-worker threads splitting at once would corrupt it. `nonWorkerLaneClaimed` is
+		// the claim; a caller that loses it falls back to the cursor path rather than waiting, so
+		// a second non-worker thread degrades to the 1.4 behaviour instead of blocking.
+		//
+		// Thieves treat it as one more victim and nothing else: it is probed after the topology
+		// phases (it has no cache locality to anybody) and before the global random fallback.
+		size_t nonWorkerLane = 0;
+		std::atomic<bool> nonWorkerLaneClaimed{ false };
+
+		// Everything a lazy split needs that does NOT change as the recursion descends. Held on the
+		// root caller's stack and passed down by pointer, which is sound for exactly the reason
+		// ParallelFor's cursor path is: ParallelForLazy BLOCKS, so the frame outlives every task
+		// spawned under it. A non-blocking variant would need this refcounted on the heap.
+		struct LazyRangeState {
+			std::function<void(int, int)>* func;
+			WaitGroup* wg;
+			int grain;
+		};
+		// The deque the CALLING thread may publish onto, or nullptr if it has none. Resolved per
+		// invocation and never cached across one: a split that gets stolen resumes on a different
+		// thread, and it must then publish onto THAT thread's deque, not the one it came from.
+		TaskDeque* LaneForCurrentThread();
+		void RunLazyRange(int lo, int hi, LazyRangeState* st);
 		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
 		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
 		static GlobalFiberPool* globalPool;
