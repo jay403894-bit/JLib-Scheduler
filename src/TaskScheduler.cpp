@@ -609,105 +609,18 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 
 void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func) {
 	if (end - begin <= 0) return;
-	grain = std::max(1, grain);
 
-	// No pool (or a pool of one): there is nobody to steal, so splitting could only ever cost. Run
-	// it straight. Same answer RunCursorRange gives in the same situation. SetParallelForSerial
-	// joins it here -- one branch, and it answers "is ParallelFor responsible for this?" without a
-	// rebuild, which is the one job the removed threshold setter was actually good for.
+	// No pool, or the debugging kill switch: run the whole range inline on this thread.
+	// SetParallelForSerial is what replaced the removed threshold setter -- see the header.
 	if (g_parallelForSerial || !poolActive.load(std::memory_order_acquire) || workers.empty()) {
 		func(begin, end);
 		return;
 	}
 
-	// GRAIN IS FLOORED SO THE TREE CANNOT PRODUCE MORE LEAVES THAN THE POOL CAN USE.
-	//
-	// This is the same guard the old chunked path applied to chunkSize (there, at most 4 chunks per
-	// worker), and it is legitimate for the same reason: it is a statement about the POOL, whose
-	// size is known exactly, and not about the BODY, whose cost is the thing that cannot be known.
-	// Nothing is predicted, so this does not smuggle the probe back in.
-	//
-	// It exists because grain has a CLIFF on the low side, and a caller who guesses too fine falls
-	// straight off it. Measured (scratchpad/grainsweep.cpp), 31 workers:
-	//
-	//     grain          1      2      8     32     64    256
-    //     ragged      2.61x  3.90x 14.14x 21.50x 21.45x 20.25x
-	//     back-loaded 1.95x  2.97x 10.86x 18.58x 18.61x 12.85x
-	//
-	// The optimum is a broad plateau and the penalty for being under it is severe -- 8x on ragged
-	// work at grain 1 -- because a split costs ~10.8 ns unstolen and a full dispatch when stolen,
-	// against a leaf holding one or two elements. 64 leaves per worker lands inside the plateau
-	// from any input (200k/31/64 -> ~101; 100k/31/64 -> ~51) and matches the cap ParallelRange
-	// already documents for its own grain.
-	//
-	// NOTE WHAT THIS DOES NOT FIX, and it is the cost of removing the probe: a grain too COARSE for
-	// the pool is clamped here, but a body too cheap to be worth parallelizing AT ALL is not, and
-	// cannot be. Nothing that refuses to measure the body can make that call. See the header.
-	{
-		const size_t maxLeaves = workers.size() * 64;
-		const int floorGrain = (int)(((size_t)(end - begin) + maxLeaves - 1) / maxLeaves);
-		grain = std::max(grain, floorGrain);
-	}
-
-	// A NON-WORKER needs the shared lane; a worker already has one. Losing the race means another
-	// app thread is mid-split, so fall back to the cursor path rather than serialising behind it --
-	// a perfectly good answer, just not this one.
-	const bool isWorker = (Thread::GetCurrent() != nullptr);
-	NonWorkerLaneClaim claim(nonWorkerLaneClaimed);
-	if (!isWorker && !claim.held()) {
-		RunCursorRange(begin, end, grain, func);
-		return;
-	}
-
-	WaitGroup wg;
-	LazyRangeState st{ &func, &wg, grain };
-	RunLazyRange(begin, end, &st);
-
-	// THE WAIT, and it is not WaitFor for a bare caller. Two different jobs are going on here.
-	//
-	// A FIBER caller parks and its worker goes back to its own loop, where pop_bottom picks up
-	// whatever this fiber published -- the right behaviour already, and it is why the from-a-worker
-	// case worked before any of this existed.
-	//
-	// A BARE caller (main, or a noFiber task) has nothing to park into, so WaitFor spin-helps via
-	// TryRunStolenNoFiberTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
-	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
-	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
-	// own lane where a 4.6 ns pop_bottom would have them. Measured, that scan was most of the cost
-	// of a cheap ParallelFor from main.
-	//
-	// So: drain our own lane LIFO first, and only fall back to general helping once it is empty
-	// (thieves took the rest, and the wait now genuinely has nothing local to do). LIFO is also the
-	// right order -- the most recently published split is the one whose data is still warm.
-	if (!OnBareThread()) {
-		WaitFor(wg);
-		return;
-	}
-
-	TaskDeque* myLane = LaneForCurrentThread();
-	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
-		if (myLane) {
-			if (auto opt = myLane->pop_bottom()) {
-				Task* t = *opt;
-				// The same completion bookkeeping Worker()'s noFiber fast path does, in the same
-				// order. Not factored out into a shared helper only because that path also handles
-				// immediate-core release and epoch ticking, neither of which applies here.
-				t->Execute();
-				if (t->waitGroup) {
-					int old = t->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-						t->waitGroup->WakeAll();
-				}
-				DestroyTask(t);
-				taskAllocator.Free(t);
-				continue;
-			}
-		}
-		// Our lane is empty: everything we published is out with thieves. Help the pool generally
-		// rather than spinning -- this is the same policy WaitFor's bare path takes.
-		if (!TryRunStolenNoFiberTask())
-			std::this_thread::yield();
-	}
+	// Slice-stealing, via the shared cursor. RunCursorRange owns the grain floor, so this does not
+	// pre-floor -- one place decides how fine a range may be cut, and it is the same place for both
+	// entry points.
+	RunCursorRange(begin, end, std::max(1, grain), func);
 }
 
 void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
@@ -1992,24 +1905,18 @@ void SchedulerConditionVariable::Notify_All() {
 
 // Grain-free overload: derive it from the range and the pool, never from the body.
 //
-// EIGHT leaves per worker, NOT the sixty-four the floor uses, and the difference is deliberate --
-// they are two different decisions that happen to be expressed in the same unit. The FLOOR exists
-// to stop an explicit grain being absurdly fine, where being aggressive costs nothing. The DEFAULT
-// is chosen with NO information at all, and there the errors are wildly asymmetric:
+// Passes 1 and lets RunCursorRange's floor do the deriving -- at most 64 slices per worker, with an
+// absolute floor of 64 items.
 //
-//   under-split an expensive body -> ~10% (200k ragged: ~19-21x against a 21.5-23x plateau)
-//   over-split a cheap body       -> ~20x (a 0.4 ns/element loop: 1.00x explicit against 0.05x)
+// THIS USED TO COMPUTE ITS OWN, COARSER DEFAULT (8 leaves per worker, Cilk's `cilk_for` rule), and
+// that was right for the recursive splitter it then fed: a tree pays per split and has a serial
+// spine, so it prefers fewer, larger leaves. The cursor has neither -- it publishes every lane at
+// once and the per-slice cost is one fetch_add -- so it prefers the finer division, and the old
+// default measured 6.23x against 16.55x at an explicit grain on a 64 MB memory-bound body.
 //
-// So an uninformed default must lean coarse. Passing grain=1 and letting the floor decide was the
-// first version and it measured exactly that 0.05x, because 64 leaves/worker is the right answer
-// only when the body is expensive -- which is the one thing this overload cannot know.
-//
-// Same rule Cilk's `cilk_for` uses for its own default, and for the same reason: n and P are known
-// exactly, the body is not.
+// So the number moved because the algorithm underneath it did. Keeping the old constant would have
+// been carrying a tuning decision across a rewrite that invalidated it, which is the quiet way a
+// library ends up slow for reasons nobody can find.
 void TaskScheduler::ParallelFor(int begin, int end, std::function<void(int, int)> func) {
-	const int n = end - begin;
-	if (n <= 0) return;
-	const size_t leaves = std::max<size_t>(1, workers.size() * 8);
-	const int grain = (int)std::max<size_t>(1, ((size_t)n + leaves - 1) / leaves);
-	ParallelFor(begin, end, grain, std::move(func));
+	ParallelFor(begin, end, 1, std::move(func));
 }

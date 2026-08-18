@@ -319,19 +319,17 @@ namespace JLib {
 		// Requiring a number nobody has is how you get 32 passed in because it looked reasonable.
 		//
 		// So this derives one from the two things that ARE known exactly -- the range and the pool
-		// size -- and never consults the body: `range / (workers * 8)`. Cilk's `cilk_for` picks its
-		// default the same way, from n and P alone.
+		// size -- and never consults the body. It defers entirely to the slicing floor: at most 64
+		// slices per worker, with an absolute floor of 64 items. One place decides how fine a range
+		// may be cut, and it is the same place for both overloads.
 		//
-		// EIGHT leaves per worker, not the SIXTY-FOUR the explicit overload floors at, and that gap
-		// is the point rather than an inconsistency. The floor stops an explicit grain being
-		// absurdly fine, where leaning aggressive costs nothing. A default is chosen with no
-		// information, and there the two errors are wildly asymmetric -- measured:
-		//
-		//     under-split an expensive body   ~10%   (200k ragged: ~19-21x vs a 21.5-23x plateau)
-		//     over-split a cheap body         ~20x   (0.4 ns/element: 1.00x explicit vs 0.05x)
-		//
-		// so an uninformed default has to lean coarse. Deriving it from the floor was the first
-		// version and it measured that 0.05x.
+		// IT USED TO COMPUTE ITS OWN COARSER DEFAULT (8 leaves per worker, Cilk's `cilk_for` rule)
+		// and that was correct for the recursive splitter it then fed: a tree pays per split and has
+		// a serial spine, so it wants fewer, larger leaves. The cursor has neither -- every lane is
+		// published at once and a slice costs one fetch_add -- so it wants the finer division. The
+		// old constant measured 6.23x against 16.55x at an explicit grain on a 64 MB memory-bound
+		// body once the algorithm underneath it changed. A tuning constant carried across a rewrite
+		// that invalidated it is how a library ends up slow for reasons nobody can find.
 		//
 		// PASS A GRAIN ONLY IF YOU HAVE MEASURED. The number that matters is wall-clock per leaf,
 		// not elements: aim for a few microseconds of work in each. If you have timed the loop
