@@ -519,8 +519,8 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched);
 // starts winning for each. One number cannot be right for all four rows; that is the finding.
 //
 // (This used to call the removed ParallelForFJ DIRECTLY, to dodge the fixed 10k gate it was
-// measuring -- going through ParallelFor would have reported serial-vs-serial below it. The gate
-// became probe-based, so the sweep calls ParallelFor normally now.)
+// measuring -- going through ParallelFor would have reported serial-vs-serial below it. There is no
+// gate at all now, so the sweep calls ParallelFor normally.)
 
 
 // Per-element bodies of increasing cost. volatile-ish accumulation so the optimizer can't delete them;
@@ -588,9 +588,10 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
             auto t1 = Clock::now();
             std::atomic<double> pacc{ 0.0 };
-            // ParallelFor, not the removed fork-join entry point: now that the gate is probe-based
-            // element count, this measures the DECISION as well as the dispatch. Every cell should
-            // read >= ~1.00x -- anything well below means the probe chose parallel when it shouldn't.
+            // ParallelFor, not the removed fork-join entry point. There is no gate to dodge any more:
+            // the range is split speculatively and steals decide, so this measures dispatch plus
+            // whatever the pool chose to take. Cells below ~1.00x mean the splitter parallelized a
+            // body too cheap to be worth it -- which nothing probe-free can refuse to do.
             sched.ParallelFor(0, n, grain, [&](int a, int b) {
                 double local = 0.0;
                 for (int i = a; i < b; ++i) local += BodyCost<kFlops>(i);
@@ -636,7 +637,9 @@ static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
     printf("\nParallelFor crossover sweep (speedup = serial/parallel; >1.00 means parallel wins)\n");
     printf("  a crossover is only reported at >=%.2fx confirmed by the next size -- below that is noise\n",
            kWinMargin);
-    printf("  gate: probe a prefix, extrapolate, parallelize when est. work >= 75us (was: N > 10000)\n");
+    printf("  no gate: the range is split speculatively and STEALS decide -- an untaken split is\n");
+    printf("           taken back and run inline (~11 ns). Nothing probe-free can decline a body\n");
+    printf("           too cheap to parallelize, so cells below 1.00x are that, not a bug.\n");
     printf("  %-10s |", "body");
     for (int n : sizes) printf(" %5d", n);
     printf("   |\n");
