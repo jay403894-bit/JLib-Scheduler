@@ -8,9 +8,20 @@ downstream users (forks/ports) should treat those as must-pull.
 **`ParallelForNB` is REMOVED.** It was the non-blocking range loop: fixed `chunkSize`, one task per
 chunk, returns as soon as they are queued.
 
-This is a **breaking change to a shipped public API** -- it was present in v1.3.6 and v1.4.0 -- so it
-belongs in a major bump under the versioning policy below, not a minor one. Recorded here rather
-than quietly dropped, because the honest reason is not that it was broken.
+This is a **breaking change to a shipped public API** -- it was present in v1.3.6 and v1.4.0 -- and
+it is shipping in a MINOR release as a deliberate, one-off exception to the versioning policy below.
+Saying so plainly is the point: the alternative was to carry a symbol nobody could use until a 2.0
+existed to justify deleting it.
+
+The reasoning, so it can be judged rather than taken on trust. It was never intentionally part of the
+supported surface -- it predates the range APIs that replaced it, was superseded long before it was
+removed, and survived on inertia rather than on a decision. It was undocumented, untested, and had
+no callers anywhere. And it could not be used correctly even in principle, because it offered no way
+to observe completion. An API that cannot tell you when it finished has no correct usage to break.
+
+**If you are affected, you will find out at COMPILE time, not at run time** -- the symbol is gone, so
+this surfaces as an unresolved name rather than as changed behaviour. The migration is mechanical and
+is shown below.
 
 **It worked.** It was tested before removal, not after: 10,000 elements over 40 chunks, every element
 covered exactly once, none skipped and none run twice. What it lacked was a reason to exist. It had

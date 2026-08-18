@@ -620,6 +620,12 @@ not break without a 2.0. Every header is installed because the supported ones ne
 but the rest are implementation detail and may change in any release. If you need something only
 reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
 
+That promise has been broken exactly once, deliberately, and it is listed here rather than only in
+the changelog: **`ParallelForNB` was removed in a minor release.** It offered no way to observe
+completion, so it had no correct usage to break; it was undocumented, untested and uncalled, and it
+predated the range APIs that superseded it. Use `PushArray`. If the count of exceptions in this
+paragraph ever reaches two, the policy is the thing that is wrong, not the releases.
+
 [CHANGELOG.md](CHANGELOG.md) has the release history and the negative results.
 
 ## License
