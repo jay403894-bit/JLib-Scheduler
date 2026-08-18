@@ -552,11 +552,18 @@ namespace JLib {
 		// common case); explicit P/E tasks are only stolen by a matching-class thief -- corePref is the
 		// sole placement authority, including across steals. degenerateTopology (non-hybrid CPU: one
 		// class set empty) disables class checks entirely so nothing is ever unstealable.
-		static bool StealClassCompatible(const Task* t, bool thiefIsP, bool degenerateTopology) {
-			const CorePref p = t->corePref;
+		// Takes the PREFERENCE, not the task. Steal vetting runs before the thief has claimed
+		// anything, so it must not dereference the candidate -- the value arrives in the deque's
+		// pointer tag instead (see TaskDeque's StealBits).
+		static bool StealClassCompatible(CorePref p, bool thiefIsP, bool degenerateTopology) {
 			if (p == CorePref::Default || p == CorePref::Wide) return true;   // Any aliases Wide
 			if (degenerateTopology) return true;
 			return (p == CorePref::P) ? thiefIsP : !thiefIsP;
+		}
+		// Convenience for callers that legitimately HOLD the task (owner-side placement checks),
+		// where dereferencing is fine. Steal paths must use the CorePref overload.
+		static bool StealClassCompatible(const Task* t, bool thiefIsP, bool degenerateTopology) {
+			return StealClassCompatible(t->corePref, thiefIsP, degenerateTopology);
 		}
 
 		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t noFiber = true, CorePref corePref = CorePref::Default);

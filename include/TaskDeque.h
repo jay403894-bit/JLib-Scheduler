@@ -24,18 +24,47 @@ namespace JLib {
     // correct needs either a lock (hot-path cost) or a block-based deque (complex + unverifiable
     // without race testing). Not worth it -- single-item stealing is standard and fast, so there is
     // no steal_batch: callers steal one task at a time via steal().
+    // The only fields a thief is allowed to vet BEFORE it has claimed a task, carried in the spare
+    // low bits of the stored pointer rather than read out of the Task itself.
+    //
+    // WHY THIS EXISTS. steal_if used to hand the predicate the Task* and let it dereference a task
+    // the thief had not claimed yet. That read was safe in OUTCOME -- see the argument above
+    // steal_if -- but it was a genuine read of memory whose object lifetime had ended: the owner
+    // can pop that task, run it, free it, and have the slab hand the very same slot straight back
+    // (the free list is thread-local LIFO, so that recycle is the COMMON case), all while the thief
+    // is still reading through its stale pointer. ThreadSanitizer reported it, correctly.
+    //
+    // Note what does NOT fix it: making Task::corePref/noFiber atomic. The racing write is the
+    // CONSTRUCTOR of the next task in that slot, and initialization is not an atomic operation
+    // whatever the member's type is -- and the underlying problem is the ended lifetime, which no
+    // member type addresses. The only real fix is to stop dereferencing an unclaimed task, which is
+    // what this does: the thief now reads bits it got from the DEQUE, published by the same
+    // release/acquire protocol that already publishes the pointer.
+    //
+    // Free, rather than a parallel array: a second array would add a cache line to every push and
+    // every steal. These bits ride in the pointer that is already being loaded.
+    //
+    // SAFE ONLY BECAUSE THE TAG CANNOT GO STALE: both fields are written exclusively by CreateTask,
+    // before the task is ever pushed. Nothing mutates them afterwards (checked). If that ever
+    // changes, a task's tag and its fields could disagree and stealing would vet against the wrong
+    // value -- so a new mutator of either field must re-tag or this scheme breaks quietly.
+    struct StealBits {
+        CorePref corePref;
+        bool     noFiber;
+    };
+
     class alignas(platform::kCacheLine) TaskDeque {
     public:
         explicit TaskDeque(size_t capacity = 32768)
             : capacity_(capacity),
             mask_(capacity - 1),
-            buffer_(new Task* [capacity])
+            buffer_(new uintptr_t[capacity])
         {
             if ((capacity & (capacity - 1)) != 0)
                 throw std::runtime_error("Capacity must be a power of 2");
 
             for (size_t i = 0; i < capacity; i++)
-                buffer_[i] = nullptr;
+                buffer_[i] = 0;
 
             top_.store(0, std::memory_order_relaxed);
             bottom_.store(0, std::memory_order_relaxed);
@@ -43,6 +72,25 @@ namespace JLib {
 
         ~TaskDeque() {
             delete[] buffer_;
+        }
+
+        // ---- tag encoding -------------------------------------------------------------------
+        // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bit 2: noFiber   bit 3: spare
+        static constexpr uintptr_t kTagMask = 0xF;
+        static_assert(alignof(Task) > kTagMask,
+            "TaskDeque packs steal-vetting bits into the low bits of a Task*; Task's alignment "
+            "must leave them free. Shrinking alignas(Task) breaks this silently.");
+
+        static uintptr_t tag(Task* item) {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(item);
+            return p | (static_cast<uintptr_t>(item->corePref) & 0x3)
+                     | (item->noFiber ? 0x4u : 0u);
+        }
+        static Task* untag(uintptr_t v) {
+            return reinterpret_cast<Task*>(v & ~kTagMask);
+        }
+        static StealBits bits(uintptr_t v) {
+            return StealBits{ static_cast<CorePref>(v & 0x3), (v & 0x4) != 0 };
         }
 
         // Owner-only push.
@@ -56,7 +104,7 @@ namespace JLib {
             if (b - t >= capacity_) {
                 return false;  // Full
             }
-            buffer_[b & mask_] = item;
+            buffer_[b & mask_] = tag(item);
             std::atomic_thread_fence(std::memory_order_release);
             bottom_.store(b + 1, std::memory_order_release);
             return true;
@@ -73,7 +121,7 @@ namespace JLib {
             }
 
             for (size_t i = 0; i < count; ++i) {
-                buffer_[(b + i) & mask_] = items[i];
+                buffer_[(b + i) & mask_] = tag(items[i]);
             }
 
             std::atomic_thread_fence(std::memory_order_release);
@@ -107,7 +155,7 @@ namespace JLib {
             t = top_.load(std::memory_order_acquire);
 
             if (t <= b) {
-                Task* item = buffer_[b & mask_];
+                Task* item = untag(buffer_[b & mask_]);
                 if (t == b) {
                     // Last item: race the stealer for it.
                     // seq_cst, matching Le/Pop/Cohen/Zappa Nardelli's verified Chase-Lev (PPoPP
@@ -159,7 +207,7 @@ namespace JLib {
             size_t b = bottom_.load(std::memory_order_acquire);
 
             if (t < b) {
-                Task* item = buffer_[t & mask_];
+                Task* item = untag(buffer_[t & mask_]);
                 if (top_.compare_exchange_strong(
                     t, t + 1,
                     std::memory_order_seq_cst,   // see pop_bottom: paper ordering, not GenMC's weaker acq_rel
@@ -180,13 +228,31 @@ namespace JLib {
         // WITHOUT CASing (task stays put for a compatible thief); pred true -> CAS claims exactly the
         // slot that was vetted.
         //
-        // SAFETY of the pre-CAS dereference (pred reads fields of a task we don't own yet): (1) Tasks
-        // live in TaskAllocator slab slots that are NEVER unmapped, so the loads can't fault -- worst
-        // case they read a recycled slot's bytes. (2) If the CAS then SUCCEEDS, top_ never moved, so
-        // no consumer claimed slot t in between (the owner only touches slot t when it's the LAST item,
-        // and resolves that via this same top_ CAS) -- i.e. CAS success PROVES the vetted read was of
-        // the live, still-queued task. (3) If pred declines or the CAS fails, no claim occurred and
-        // the (possibly stale) read influenced nothing but a skipped steal -- benign by construction.
+        // NO DEREFERENCE OF AN UNCLAIMED TASK. `pred` is handed StealBits decoded from the stored
+        // pointer's tag, never the Task itself, so nothing here reads memory the thief does not own.
+        //
+        // This replaced a version that passed pred the Task* and let it read corePref/noFiber
+        // directly. That was safe in OUTCOME and the argument was sound -- CAS success proves top_
+        // never moved, so the vetted read was of the live task; any other outcome discards it -- but
+        // it was still a read through a pointer whose object lifetime could already have ended. The
+        // owner may pop that task, run it, free it, and get the same slab slot straight back (the
+        // free list is thread-local LIFO, so the recycle is the COMMON case), all while a thief is
+        // mid-read. ThreadSanitizer reported it and was RIGHT to: the racing address was a slab
+        // slot, not one of this deque's atomics, so the atomic_thread_fence blind spot did not
+        // explain it away.
+        //
+        // Two dead ends worth recording, because both sound right:
+        //   * Making Task::corePref/noFiber ATOMIC does not fix it. The racing write is the
+        //     CONSTRUCTOR of the next task in that slot, and initialization is not an atomic
+        //     operation whatever the member's type is. The real problem is the ended lifetime,
+        //     which no member type addresses.
+        //   * "Those fields never change, so the read is harmless" is a non-argument. By the time
+        //     of the racing write they belong to a DIFFERENT object; their immutability on the old
+        //     one is irrelevant.
+        //
+        // THE PROTOCOL IS UNCHANGED by tagging -- same indices, same atomics, same fences, same CAS.
+        // Only the payload's spare low bits are new, so tests/verify/deque_model.c still describes
+        // this algorithm exactly.
         template <class Pred>
         std::optional<Task*> steal_if(Pred&& pred) {
             size_t t = top_.load(std::memory_order_acquire);
@@ -194,9 +260,12 @@ namespace JLib {
             size_t b = bottom_.load(std::memory_order_acquire);
 
             if (t < b) {
-                Task* item = buffer_[t & mask_];
-                if (!pred(item))
+                const uintptr_t slot = buffer_[t & mask_];
+                // Vetted from the TAG, never by dereferencing `slot` -- that is the entire point.
+                // Everything the predicate needs travels in bits the deque itself owns.
+                if (!pred(bits(slot)))
                     return std::nullopt;   // incompatible: leave it for a matching thief, NO claim
+                Task* item = untag(slot);
                 if (top_.compare_exchange_strong(
                     t, t + 1,
                     std::memory_order_seq_cst,   // see pop_bottom: paper ordering, not GenMC's acq_rel
@@ -223,7 +292,11 @@ namespace JLib {
             return t >= b;
         }
     private:
-        Task** buffer_;
+        // TAGGED POINTERS, not plain Task*. See StealBits above for what the low bits carry and
+        // why. Task is `alignas(16)`, so bits 0-3 of every Task* in here are guaranteed zero and
+        // free to use; kTagMask is asserted against alignof(Task) below so shrinking that alignment
+        // cannot silently start corrupting pointers.
+        uintptr_t* buffer_;
         const size_t capacity_;
         const size_t mask_;
 

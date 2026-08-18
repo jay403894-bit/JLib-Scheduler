@@ -1547,8 +1547,11 @@ Task* TaskScheduler::GetTask() {
 		? (isPCore[thief->qIndex] != 0)
 		: (thiefCpu < isPCpu.size() ? (isPCpu[thiefCpu] != 0) : true);
 	const bool degen = pWorkers.empty() || eWorkers.empty();
-	auto noFiberOnly = [&](Task* t) {
-		return t->noFiber != 0 && StealClassCompatible(t, thiefIsP, degen);
+	// Vets the deque's TAG, not the task -- see TaskDeque::StealBits. Both fields this needs
+	// (noFiber, corePref) ride in the stored pointer's spare low bits precisely so this predicate
+	// never has to dereference a candidate the thief has not claimed.
+	auto noFiberOnly = [&](StealBits sb) {
+		return sb.noFiber && StealClassCompatible(sb.corePref, thiefIsP, degen);
 	};
 
 	if (!forceLoPri) {

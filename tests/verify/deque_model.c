@@ -18,15 +18,29 @@
 //   and pop_bottom is actually STRONGER than the reference (release/acquire where they use relaxed,
 //   leaning on the fence). Is acq_rel sufficient here, given both sides carry a seq_cst FENCE?
 //
-//   Build both ways and compare:
+//   Build both ways and compare. NOTE THE FLAG POSITION -- the -D goes AFTER the `--`, because
+//   everything past it is handed to clang, not to genmc. The other order is what this comment used
+//   to say and it fails with "Unknown command line argument":
 //     genmc -- deque_model.c                          # as shipped (acq_rel)
-//     genmc -DSTEAL_CAS_SEQ_CST -- deque_model.c      # as the paper has it
+//     genmc -- -DSTEAL_CAS_SEQ_CST deque_model.c      # as the paper has it
+//     genmc -- -DNO_POP_FENCE deque_model.c           # the negative control; MUST fail
 //
 //   RESULT, GenMC v0.17.0 (LLVM 15), 2026-08-11, one owner + two thieves, 2 items:
 //
 //     acq_rel (as shipped)        no errors, 174 complete executions
 //     seq_cst (as the paper has)  no errors, 174 complete executions
 //     -DNO_POP_FENCE              SAFETY VIOLATION
+//
+//   RE-VERIFIED 2026-08-17 after TaskDeque switched to TAGGED POINTERS (steal-vetting bits packed
+//   into the spare low bits of the stored Task*, so steal_if no longer dereferences a task the
+//   thief has not claimed). All three results reproduced EXACTLY -- 174 complete executions on both
+//   orderings, safety violation at line 200 under -DNO_POP_FENCE.
+//
+//   That the model needed no change is the point, not an oversight: it already abstracts the
+//   payload as an opaque `int` in g_buffer, so packing bits into it changes what the payload MEANS
+//   and not what the protocol DOES. Same indices, same atomics, same fences, same CAS. steal_if is
+//   likewise still covered by steal's proof -- it adds only a branch on the already-read local
+//   payload and an early return that performs strictly FEWER shared operations than steal does.
 //
 //   So acq_rel IS sufficient. The two seq_cst FENCES carry the store-load ordering between
 //   pop_bottom and steal; the CAS's own strength is not what makes it work, and the reference's

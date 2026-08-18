@@ -723,8 +723,10 @@ void Thread::Worker() {
 				const bool iAmP  = scheduler->isPCore[qIndex] != 0;
 				const bool degen = scheduler->pWorkers.empty() || scheduler->eWorkers.empty();
 				bool sawDecline  = false;   // saw a task this sweep that exists but isn't ours (class mismatch)
-				auto classOK = [&](Task* t) {
-					if (TaskScheduler::StealClassCompatible(t, iAmP, degen)) return true;
+				// Takes the deque's tag bits rather than the Task*, so no candidate is
+				// dereferenced before it is claimed (see TaskDeque::StealBits).
+				auto classOK = [&](StealBits sb) {
+					if (TaskScheduler::StealClassCompatible(sb.corePref, iAmP, degen)) return true;
 					sawDecline = true;
 					return false;
 				};
