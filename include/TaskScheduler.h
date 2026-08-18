@@ -418,8 +418,9 @@ namespace JLib {
 		// exhaust the slab (measured: chunk 1 over 4M items exhausted a 1M-slot arena and fell back
 		// to running inline, at 32 ns/item against 0.06 at chunk 4096). Pick a chunk size.
 		//
-		// NOT A REPLACEMENT FOR ParallelFor, which probes the work, picks its own split, runs a
-		// chunk on the calling thread and blocks until done. PushArray is the fire-and-forget
+		// NOT A REPLACEMENT FOR ParallelFor, which picks its own split, runs a chunk on the calling
+		// thread and blocks until done. (It no longer probes -- 1.4 removed the gate; splits are
+		// published speculatively and steals decide.) PushArray is the fire-and-forget
 		// sibling: it returns as soon as the work is queued, so use it when the caller has other
 		// things to do, wants to submit several arrays before waiting on them together, or already
 		// knows its own chunk size. Pass a WaitGroup to be able to wait; pass nullptr not to.

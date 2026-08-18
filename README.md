@@ -457,9 +457,32 @@ the range onto the calling thread's own deque and carries on with the left. If n
 it takes it straight back and runs it inline for ~11 ns — no dispatch, no notify. If somebody does,
 the pool was hungry and the split was right. It predicts nothing.
 
-It is the only range entry point. `ParallelRange` was added earlier in 1.4 as the probe-free
-alternative and removed in the same release, before either shipped; its shared-cursor mechanism
-survives internally as the fallback when a second non-worker thread is already splitting.
+It is the range entry point you should reach for. `ParallelRange` was added earlier in 1.4 as the
+probe-free alternative and removed in the same release, before either shipped; its shared-cursor
+mechanism survives as `RunCursorRange`, which `ParallelFor` falls back to when a second non-worker
+thread is already splitting.
+
+**Which of the range APIs to use:**
+
+| | blocks? | how it divides | reach for it when |
+| --- | --- | --- | --- |
+| `ParallelFor(begin,end,func)` | yes | recursive split, steals decide; grain picked for you | **the default.** You have a range and want it done before the next line |
+| `ParallelFor(begin,end,grain,func)` | yes | same, your grain floored to ≥64 leaves/worker | you know the body's cost and want a coarser or finer split than the default |
+| `PushArray(begin,end,chunk,fn,wg)` | **no** | fixed `chunk`, one task per chunk, submitted up front | fire-and-forget: the caller has other work, or wants several arrays in flight before waiting on them together |
+| `RunCursorRange(begin,end,grain,func)` | yes | one task per worker sharing an atomic cursor | see the caveat below — normally you do not call this |
+| `ParallelForNB(begin,end,chunk,func)` | no | fixed `chunk` | legacy non-blocking form; `PushArray` is the better-specified sibling |
+
+`PushArray` is the one with a genuinely different contract: it **returns as soon as the work is
+queued**, so it is the only one of these you can use to overlap submission with other work on the
+calling thread. Pass a `WaitGroup` if you need to wait later, `nullptr` if you never will. It costs
+0.55 ns/item because it submits ceil(n/chunk) tasks rather than n.
+
+**`RunCursorRange` is public, and that is currently an accident of layering rather than a
+recommendation.** It is the shared core `ParallelFor` falls back to, and nothing selects it by size.
+That matters because the sweep below shows the cursor **winning at very large N** — 22.6x against
+the splitter's 18.5x at N=200,000 — so there is a real case for it that the library does not take
+automatically. If your ranges are consistently in the hundreds of thousands with a uniform body,
+calling it directly is measurably better; anywhere else the splitter wins by more.
 
 **Those two mechanisms cross over, and the crossover is the reason `ParallelFor` uses the splitter.**
 Measured with the crossover sweep — 32 points over four body costs, medians of 3, non-overlapping
