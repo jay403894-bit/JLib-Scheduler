@@ -382,11 +382,25 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 		grain = std::max({ grain, balanced, 64 });
 	}
 
+	// LANES ARE CAPPED AT THE NUMBER OF SLICES THAT ACTUALLY EXIST.
+	//
+	// This used to spawn exactly W tasks unconditionally, which is fine when the range has slices to
+	// spare and pure waste when it does not: a 20,000-element range at grain 8192 is THREE slices,
+	// and it was dispatching 31 tasks so that 28 of them could fetch_add past `end` and return
+	// having each paid a full dispatch. Measured, that is the whole reason this path read 0.18x on a
+	// body too cheap to parallelize -- it was not the cursor being unsuited to small work, it was
+	// paying for 31 lanes to do 3 slices' worth.
+	//
+	// A lane that cannot get a slice is not a smaller share of the work, it is a task whose entire
+	// life is one atomic and a return. The cap costs a division.
+	const long long sliceCount = (((long long)end - start) + grain - 1) / grain;
+	const int lanes = (int)std::min<long long>(W, std::max<long long>(1, sliceCount));
+
 	std::atomic<int> cursor{ start };
 	WaitGroup wg;
-	wg.n.store(W, std::memory_order_relaxed);
+	wg.n.store(lanes, std::memory_order_relaxed);
 
-	for (int w = 0; w < W; ++w) {
+	for (int w = 0; w < lanes; ++w) {
 		Task* t = CreateTask([cur = &cursor, f = &func, end, grain]() {
 			for (;;) {
 				const int lo = cur->fetch_add(grain, std::memory_order_relaxed);
