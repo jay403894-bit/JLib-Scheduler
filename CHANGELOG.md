@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 1.4.0 - 2026-08-17
+## 1.4.0 - 2026-08-18
 
 **`ParallelFor` NO LONGER PROBES. It is now demand-driven, and the probe is gone rather than
 demoted.** This is the headline change of 1.4 and it is a behaviour change to the primary API.
