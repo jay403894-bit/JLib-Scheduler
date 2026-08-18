@@ -103,7 +103,7 @@ int main() {
         printf("fiber tasks done  : counter=%d (expect 432)\n", g_counter.load());
     }
 
-    // 4. ParallelForLazy: the NON-WORKER LANE, the speculative publish/reclaim path, and the
+    // 4. ParallelFor (demand-driven since 1.4): the NON-WORKER LANE, the speculative publish/reclaim path, and the
     //    relaxed live-slot counter in TaskAllocator.
     //
     //    Worth being specific about what is being asked here, because two of the three are exactly
@@ -129,7 +129,7 @@ int main() {
         };
 
         // From MAIN: claims the non-worker lane.
-        for (int r = 0; r < 4; ++r) sched.ParallelForLazy(0, 20000, 32, body);
+        for (int r = 0; r < 4; ++r) sched.ParallelFor(0, 20000, 32, body);
 
         // From INSIDE a worker task: uses that worker's own deque instead. Fiber-backed, because it
         // blocks in WaitFor.
@@ -137,7 +137,7 @@ int main() {
             JLib::WaitGroup wg;
             wg.n.store(1, std::memory_order_relaxed);
             JLib::Task* t = sched.CreateTask([&] {
-                sched.ParallelForLazy(0, 20000, 32, body);
+                sched.ParallelFor(0, 20000, 32, body);
             }, /*hipri*/0, JLib::FiberSize::Standard, /*noFiber*/0);
             t->waitGroup = &wg;
             sched.Push(t);
@@ -146,9 +146,9 @@ int main() {
 
         // THREE non-worker threads at once: one wins the lane, the others must degrade cleanly.
         {
-            std::thread a([&]{ for (int r = 0; r < 3; ++r) sched.ParallelForLazy(0, 20000, 32, body); });
-            std::thread b([&]{ for (int r = 0; r < 3; ++r) sched.ParallelForLazy(0, 20000, 32, body); });
-            std::thread c([&]{ for (int r = 0; r < 3; ++r) sched.ParallelForLazy(0, 20000, 32, body); });
+            std::thread a([&]{ for (int r = 0; r < 3; ++r) sched.ParallelFor(0, 20000, 32, body); });
+            std::thread b([&]{ for (int r = 0; r < 3; ++r) sched.ParallelFor(0, 20000, 32, body); });
+            std::thread c([&]{ for (int r = 0; r < 3; ++r) sched.ParallelFor(0, 20000, 32, body); });
             a.join(); b.join(); c.join();
         }
 

@@ -5,55 +5,77 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## 1.4.0 - unreleased
 
-**New `ParallelForLazy` -- demand-driven range splitting, with no probe and no calibrated constant.**
+**`ParallelFor` NO LONGER PROBES. It is now demand-driven, and the probe is gone rather than
+demoted.** This is the headline change of 1.4 and it is a behaviour change to the primary API.
 
-`ParallelFor` decides serial-vs-parallel by PREDICTING: it runs a serial prefix, times it,
-extrapolates, and parallelizes if the estimate clears ~75 µs. That works on a uniform body and
-cannot work on a data-dependent one -- a prefix over items 0..311 says nothing about item 50,000
-when the early ones early-out and the later ones do full mesh collision. The prefix also warms the
-cache while the remainder streams from DRAM, so the extrapolation is biased low *systematically*
-rather than noisily, and on a hybrid part the probe runs on the caller's core class and the work
-runs on another.
+It used to decide serial-vs-parallel by PREDICTING: run a serial prefix, time it, extrapolate, and
+parallelize if the estimate clears ~75 µs. That works on a uniform body and cannot work on a
+data-dependent one -- a prefix over items 0..311 says nothing about item 50,000 when the early ones
+early-out and the later ones do full mesh collision. The prefix also warms the cache while the
+remainder streams from DRAM, so the estimate is biased low *systematically* rather than noisily, and
+on a hybrid part the probe runs on the caller's core class and the work runs on another.
 
-`ParallelForLazy` makes the structure splittable and lets STEALS decide instead. It publishes the
-right half of the range onto the calling thread's own deque and carries on with the left. If nobody
-took it, the splitter takes it straight back and runs it inline; if somebody did, the pool was
-hungry and the split was right. Idle pool → it parallelizes. Busy pool → it runs serially at near
-zero cost. Ragged body → a worker that finishes early steals, which is itself the signal to split
-more. Nothing to calibrate per machine.
+Now the range is made splittable and STEALS DECIDE. `ParallelFor` publishes the right half onto the
+calling thread's own deque and carries on with the left. Nobody took it → the splitter takes it
+straight back and runs it inline for ~11 ns, no dispatch and no notify. Somebody took it → the pool
+was hungry and the split was right. Idle pool parallelizes, busy pool runs serially at near zero
+cost, ragged body keeps getting stolen from -- which is itself the signal to subdivide where the
+work turned out to be. Nothing to calibrate per machine.
 
 That is affordable because of what the speculative path actually costs, which had never been
-measured: **17.8 ns** for alloc → construct → `push_bottom` → `pop_bottom` → run → destroy → free.
-An unstolen split needs no notify (nobody has to be woken to run something you are about to run
-yourself) and no epoch retirement (winning the pop CAS proves no thief observed it). The
-"~85-105 ns per task" figure quoted elsewhere is the *cross-thread dispatch* path -- MPSC inbox,
-round-robin, notify -- which this one skips entirely; measured separately, that is 22.0 ns of the
-gap plus a 10.5 ns floor for the parked-notify branch.
+measured: **17.8 ns** at the time, **10.8 ns** after the allocator fix below, for alloc → construct
+→ `push_bottom` → `pop_bottom` → run → destroy → free. An unstolen split needs no notify (nobody has
+to be woken to run something you are about to run yourself) and no epoch retirement (winning the pop
+CAS proves no thief observed it). The "~85-105 ns per task" figure quoted elsewhere is the
+*cross-thread dispatch* path -- MPSC inbox, round-robin, notify -- which this skips entirely.
 
-Medians of 15, 31 workers, default Sleep policy, against the same body each time:
+Medians of 15, 31 workers, default Sleep, speedup over the same body run serially:
 
-| body | ParallelFor | ParallelRange | **ParallelForLazy** |
+| body | 1.3.x `ParallelFor` | `ParallelRange` | **1.4 `ParallelFor`** |
 | --- | --- | --- | --- |
-| uniform, 1M | 5.7-6.9x | 7.7-8.1x | **8.4-9.6x** |
-| data-dependent 20x, 200k | 10.3-16.0x | 20.1-21.2x | **20.9-21.8x** |
-| back-loaded (all cost in the last 10%), 100k | 5.8-6.1x | 9.4-11.1x | **12.8-13.5x** |
-| cheap body, grain the body justifies | 1.00x | 0.19x | **1.01-1.03x** |
+| uniform, 1M | 5.7-6.9x | 7.7-8.1x | **8.4-9.8x** |
+| data-dependent 20x, 200k | 10.3-16.0x | 20.1-21.7x | **15.3-22.1x** |
+| back-loaded (all cost in the last 10%), 100k | 5.8-6.1x | 9.4-15.2x | **11.3-13.5x** |
 
-**Grain is required, and is floored at 64 leaves per worker but otherwise honoured literally.** It
-means "the smallest subrange worth handing to anybody" -- the one thing the scheduler genuinely
-cannot infer. The floor is the same guard `ParallelFor` already applies to `chunkSize` (there, 4
-chunks per worker) and is legitimate for the same reason: it is a statement about the POOL, whose
-size is known exactly, not about the BODY, whose cost is unknowable. It exists because grain has a
-cliff on the low side that a caller who guesses too fine falls straight off -- measured at 31
-workers before the floor, **grain 1 gave 2.61x on a ragged body against 21.5x at grain 32-64**, and
-1.95x against 18.6x back-loaded. A split costs ~10.8 ns unstolen and a full dispatch when stolen,
-against a leaf holding one element. With the floor, grain 1 lands back inside the plateau.
+**There is a new no-grain overload, and it is the one most callers want.** "How do I know what grain
+to pass?" is the fair objection, and for most callers the honest answer is that they cannot know --
+they know their body is "a collision check", not what it costs per element. `ParallelFor(begin, end,
+func)` derives a grain from the two things known exactly, the range and the pool size, and never
+consults the body: `range / (workers * 8)`, the same rule Cilk's `cilk_for` uses.
 
-The floor does **not** rescue a grain that is too COARSE, and cannot: at grain 8192 the ragged body
-still measures 8.2x. Nor does it rescue a body too cheap to parallelize at all -- at grain 32 on a
-~0.4 ns/element body this measures 0.07x where `ParallelFor`'s probe correctly declines and stays at
-1.00x. That is the honest trade for removing the prediction, and it is why `ParallelFor` keeps its
-probe: use `ParallelFor` when you have no idea what the body costs, `ParallelForLazy` when you can
+Eight leaves per worker, not the sixty-four the explicit overload *floors* at, and the gap is
+deliberate -- those are two different decisions. A floor stops an explicit grain being absurdly
+fine, where leaning aggressive costs nothing. A default is picked with no information, and there the
+errors are wildly asymmetric: under-splitting an expensive body costs ~10% (200k ragged: ~19-21x
+against a 21.5-23x plateau) while over-splitting a cheap one costs ~20x (0.4 ns/element: 1.00x with
+a justified grain against 0.05x). Deriving the default from the floor was the first version and it
+measured that 0.05x.
+
+**Explicit grain is floored at 64 leaves per worker.** Grain has a cliff on the low side that a
+caller guessing too fine falls straight off -- measured before the floor, **grain 1 gave 2.61x on a
+ragged body against 21.5x at grain 32-64**, and 1.95x against 18.6x back-loaded, because a split
+costs ~10.8 ns unstolen and a full dispatch when stolen, against a leaf holding one element. The
+floor is a statement about the POOL, whose size is known exactly, not about the BODY -- so it does
+not smuggle the probe back in.
+
+**WHAT YOU GIVE UP, stated plainly.** Nothing probe-free can decline to parallelize a body too cheap
+to be worth it, and the old probe could. Pass a grain smaller than the body justifies -- 32 elements
+of a ~0.4 ns/element loop -- and this faithfully splits that fine and measures ~0.08x against
+serial, where 1.3.x held 1.00x. The no-grain overload bounds the damage (0.24x on the same case, and
+11.8x rather than 4.6x on a large cheap range) but cannot remove it. TBB's `simple_partitioner`,
+Rayon and Cilk all share this property. If you do not know what an iteration costs, use the no-grain
+overload; if you need to know whether a loop should have been parallel at all, `SetParallelForSerial`
+answers it in one run.
+
+**REMOVED: `SetParallelForThresholdUs` / `GetParallelForThresholdUs`**, which tuned the gate that no
+longer exists. Their genuinely useful job was never tuning -- it was answering "is `ParallelFor`
+responsible for this?" without a rebuild, by being set enormous. **`SetParallelForSerial(bool)`**
+replaces that affordance and drops the pretence that the microsecond figure meant anything portable.
+
+**`ParallelForLazy` does not exist.** It was the working name while this was being built as a second
+entry point; shipping two names for one behaviour would have been worse than the probe. It never
+appeared in a release.
+
 name a sensible grain.
 
 **Callable from the main thread**, which is the normal case. `loPri`/`hiPri` gained one extra deque
@@ -98,10 +120,9 @@ The fork-join variant -- split in half, spawn the right half, recurse left. `Par
 dispatching to it when the slice-stealing cursor path replaced per-chunk tasks, which left it public
 with no caller anywhere in the tree.
 
-**`ParallelFor` is the drop-in**: same shape, same blocking behaviour, and it still decides
-serial-vs-parallel for you. Do not reach for `ParallelForLazy` as the migration target just because
-it is also a recursive splitter -- it requires a grain you can justify and will faithfully
-over-split if given a bad one, which is a decision a migrating caller never opted into.
+**`ParallelFor` is the drop-in**: same shape, same blocking behaviour -- and as of 1.4 it IS a
+recursive splitter, so a caller moving off the fork-join entry point gets the same structure it
+wanted. Use the no-grain overload if the old `grain` argument was a guess.
 
 This is a breaking change to shipped public API, taken in a minor release rather than deprecated
 through one, because the entry point had already been superseded internally for a release and had no
@@ -110,8 +131,8 @@ callers left to warn.
 Its measurement table survives in `RunLazyRange`'s comments rather than in git history, because it
 says something about the code that replaced it: the fork-join splitter carried a capitalised
 instruction NOT to spawn a child on the calling worker, backed by an A/B showing self-spawn
-saturating at ~8x where round-robin `Push` climbed past 17x. `ParallelForLazy` self-spawns and does
-not saturate -- the difference is that it wakes a thief per unstolen split. That wake, and the
+saturating at ~8x where round-robin `Push` climbed past 17x. The new `ParallelFor` self-spawns and
+does not saturate -- the difference is that it wakes a thief per unstolen split. That wake, and the
 per-thread seeding of its round-robin cursor, are load-bearing rather than optimisations: remove
 either and it becomes the 8x row.
 

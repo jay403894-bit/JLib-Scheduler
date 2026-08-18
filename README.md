@@ -4,7 +4,7 @@
 A hybrid runtime for C++17+ that gives you:
 
 - **Cilk-style work-stealing** for fast parallel loops (`PushArray`, `ParallelFor`, `ParallelRange`)
-- **Demand-driven range splitting** (`ParallelForLazy`) -- no probe, no calibrated constant: steals decide whether a loop parallelizes
+- **Demand-driven range splitting** -- `ParallelFor` has no probe and no calibrated constant: steals decide whether a loop parallelizes
 - **TaskFlow-style dependency graphs** (`TaskDAG`) with AND/OR gates
 - **Middleware-safe threads by default** -- no TLS surprises
 - **Fiber-based blocking only when you actually suspend**, so you never pay fiber overhead unless you need it
@@ -196,7 +196,7 @@ is marginally ahead and far steadier (2% spread against our 13%). The gap to `Pa
 second row is its **probe**: it runs ~312 of the 20,000 items serially to decide whether
 parallelising is worth it, which is a third of the wall time on a job this size. That probe is the
 right default when you don't know your workload and pure overhead when you do, which is exactly why
-both exist. See [Choosing a range API](#choosing-a-range-api-parallelfor-vs-parallelrange-vs-parallelforlazy).
+both exist. See [Choosing a range API](#choosing-a-range-api-parallelfor-vs-parallelrange).
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
@@ -443,70 +443,66 @@ blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need 
 each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
 one.
 
-### Choosing a range API: `ParallelFor` vs `ParallelRange` vs `ParallelForLazy`
+### Choosing a range API: `ParallelFor` vs `ParallelRange`
 
-Both take a `(lo, hi)` callable and block until the whole range has run. They differ in how the
-range is split, and **the right one depends on the shape of your workload, not on which is
-"faster"** — each loses to the other on the wrong input.
+Both take a `(lo, hi)` callable, cover the range in disjoint subranges, and block until every one
+has run. Neither predicts anything as of 1.4. They differ in **how the range is divided**, and the
+right one depends on the shape of your workload rather than on which is "faster".
 
-**`ParallelFor`** measures before it splits. It runs a small prefix serially, times it, and
-parallelizes only if the extrapolated work is worth it — then hands out coarse chunks, up to 4 per
-worker. Use it when iterations cost roughly the same, or when you don't know what they cost. Coarse
-chunks mean fewer scheduling entities and less coordination, which is what you want when there is
-nothing to balance.
+**`ParallelFor`** splits recursively and lets steals decide. It publishes the right half of the
+range onto the calling thread's own deque and carries on with the left. If nobody takes a split, it
+takes it straight back and runs it inline for ~11 ns — no dispatch, no notify. If somebody does, the
+pool was hungry and the split was right. So an idle pool parallelizes, a busy pool runs serially at
+near-zero cost, and a body whose cost explodes halfway through keeps getting stolen from, which is
+itself the signal to subdivide exactly where the work turned out to be.
 
-**`ParallelRange`** skips the probe and slices 16x finer, up to 64 slices per worker, handed out
-from a shared cursor. A worker that draws a cheap region comes straight back for more instead of
-idling while another grinds through the expensive end. Use it when iteration cost **varies** —
-early-out branches, per-element data sizes, spatial queries whose depth depends on position — or
-when you already know the range is big and don't want to pay for the probe.
-
-Measured, 4M items, 31 workers:
-
-| body | `ParallelFor` | `ParallelRange` |
-| --- | --- | --- |
-| uniform cost per item | **0.09–0.11 ms** | 0.18–0.23 ms |
-| cost varies ~20x across the range | 0.95–1.07 ms | **0.80–0.89 ms** |
-
-The uniform row is the important one to notice: finer slicing is **not free**. It buys load
-balancing at the price of more coordination, so it loses by ~2x when there is no imbalance to fix.
-Reach for `ParallelRange` because your work is irregular, not because it sounds better.
-
-**`ParallelForLazy`** (1.4) is the third option and the one to reach for when iteration cost is
-genuinely unpredictable. It never measures anything: it publishes the right half of the range onto
-the calling thread's own deque and carries on with the left, so **steals decide** whether the work
-gets parallelized. If nobody takes a split, the splitter takes it straight back and runs it inline
-for ~11 ns; if somebody does, the pool was hungry and the split was right. An idle pool parallelizes,
-a busy pool runs serially at near-zero cost, and a body whose cost explodes halfway through keeps
-getting stolen from — which is itself the signal to subdivide further.
-
-That matters because **a probe cannot work on a data-dependent body**, and no amount of tuning fixes
-it. A prefix over items 0-311 says nothing about item 50,000 when the early ones early-out at 2 ns
-and the later ones do full mesh collision. Worse, the prefix warms the cache while the remainder
-streams from DRAM, so the extrapolation is biased low *systematically* rather than noisily.
+**`ParallelRange`** hands slices out from a single shared cursor instead. Every worker pulls
+`[lo, lo+grain)` off one atomic until the range is consumed, so the number of scheduled entities is
+fixed at the pool size no matter how fine the grain. It has no tree to build and no fan-out to wait
+for, which makes it the steadier of the two, and it is the mechanism enkiTS uses.
 
 Measured, 31 workers, medians of 15, speedup over the same body run serially:
 
-| body | `ParallelFor` | `ParallelRange` | `ParallelForLazy` |
+| body | `ParallelFor(grain)` | `ParallelFor` (no grain) | `ParallelRange` |
 | --- | --- | --- | --- |
-| uniform, 1M items | 5.7-6.9x | 7.7-8.1x | **8.4-9.6x** |
-| cost varies ~20x across the range | 10.3-16.0x | 20.1-21.2x | **20.9-21.8x** |
-| all cost in the last 10% of the range | 5.8-6.1x | 9.4-11.1x | **12.8-13.5x** |
-| body too cheap to be worth parallelizing | **1.00x** | 0.19x | **1.01-1.03x** |
+| uniform, 1M items | 8.4x | 9.4x | **10.9x** |
+| cost varies ~20x across the range | 15.3x | 18.9x | **21.7x** |
+| all cost in the last 10% of the range | 11.3x | 11.3x | **14.8x** |
+| cheap body, 2M items | 11.3x | 11.8x | 11.6x |
+| cheap body, 20k items | 0.08x | 0.24x | 0.19x |
 
-**Grain is required, and it is the catch.** It means "the smallest subrange worth handing to
-anybody" — the one thing the scheduler genuinely cannot infer. Grain is floored so the tree cannot
-produce more than 64 leaves per worker, which protects against guessing too *fine*; nothing protects
-against guessing too *coarse*, and nothing can rescue a body too cheap to parallelize at all. On a
-~0.4 ns/element body at grain 32 this measures **0.07x** where `ParallelFor`'s probe correctly
-declines and stays at 1.00x. That is the honest cost of removing the prediction.
+Both are within reach of each other on real work; `ParallelRange` is currently ahead on these
+shapes and noticeably steadier run to run. Reach for `ParallelFor` when you want the recursive
+structure — nested parallelism, or a range whose subranges are themselves worth splitting — and for
+its near-zero cost when the pool is already saturated. Reach for `ParallelRange` when you want the
+flattest, most predictable division of a flat range, which is most of the time.
 
-So: **`ParallelFor` when you have no idea what an iteration costs** and want something safe;
-**`ParallelForLazy` when you can name a sensible grain** and the cost per iteration is irregular or
-unknown; **`ParallelRange` when you want the shared-cursor behaviour specifically.**
+### How do I pick a grain?
 
-If in doubt, use `ParallelFor` — the probe exists precisely so it can decline to parallelize work
-that isn't worth it, and a wrong guess there costs more than a wrong guess about grain.
+Mostly you don't. **`ParallelFor(begin, end, func)` derives one for you** from the two things known
+exactly — the range and the pool size — and never consults the body: `range / (workers * 8)`, the
+same rule Cilk's `cilk_for` uses for its default.
+
+Pass a grain only if you have measured. The number that matters is **wall-clock per leaf, not
+elements**: aim for a few microseconds of work in each. If you have timed the loop serially once —
+a two-line experiment in a dev build — then `grain = range * (target_leaf_time / total_serial_time)`
+gets you there without knowing anything per-element.
+
+An explicit grain is floored at 64 leaves per worker, which protects against guessing too *fine*.
+The default is deliberately coarser than that floor, because the two errors are not symmetric:
+under-splitting an expensive body costs ~10%, while over-splitting a cheap one costs ~20x.
+
+**What none of this can do is decline.** Nothing probe-free can refuse to parallelize a body too
+cheap to be worth it — TBB's `simple_partitioner`, Rayon and Cilk all share this. 1.3.x could,
+because it probed; 1.4 removed the probe because it cannot work on a data-dependent body, which is
+what this library is for. A prefix over items 0-311 says nothing about item 50,000 when the early
+ones early-out at 2 ns and the later ones do full mesh collision, and the prefix also warms the
+cache while the remainder streams from DRAM, so the estimate is biased low *systematically* rather
+than noisily.
+
+The 20k cheap-body row above is what that costs: 0.08x with a guessed grain, 0.24x with the default.
+If you need to know whether a loop should have been parallel at all, `SetParallelForSerial(true)`
+answers it in one run without a rebuild.
 
 ### You can take garbage collection off the workers
 

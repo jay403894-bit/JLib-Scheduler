@@ -234,19 +234,91 @@ namespace JLib {
 		static void SetSelfReclaim(bool on);
 		static bool SelfReclaimEnabled();
 
-		static void   SetParallelForThresholdUs(double us);
-		static double GetParallelForThresholdUs();
+		// Force every ParallelFor to run its whole range inline, on the calling thread.
+		//
+		// Replaces `SetParallelForThresholdUs`, which was removed in 1.4 along with the probe it
+		// tuned. That setter's genuinely useful job was not tuning: it was answering "is ParallelFor
+		// responsible for this?" in one run, without a rebuild, by being set enormous. This keeps
+		// that affordance and drops the pretence that the number meant anything portable.
+		static void SetParallelForSerial(bool on);
+		static bool ParallelForSerial();
 
-		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
+		// Parallel range loop. Calls func(lo, hi) over disjoint subranges covering [begin, end),
+		// blocks until every one has run, and the calling thread participates rather than idling.
+		//
+		// IT NEVER PREDICTS -- this is the 1.4 change, and it replaced the probe outright.
+		//
+		// Until 1.4 this ran a serial prefix, timed it, extrapolated, and parallelized only if the
+		// estimate cleared a ~75us gate. That works on a uniform body and CANNOT work on a
+		// data-dependent one, which is what this library is for. A prefix over items 0..311 says
+		// nothing about item 50,000 when the early ones early-out at 2 ns and the later ones do full
+		// mesh collision at 4,000 ns. Worse, the prefix WARMS THE CACHE while the remainder streams
+		// from DRAM, so the estimate is biased low SYSTEMATICALLY rather than noisily; and on a
+		// hybrid part the probe runs on the caller's core class and the work runs on another.
+		//
+		// Instead the range is made splittable and STEALS DECIDE. This publishes the right half onto
+		// the calling thread's own deque and carries on with the left. Nobody took it -> the
+		// splitter takes it straight back and runs it inline for ~11 ns, no dispatch and no notify.
+		// Somebody took it -> the pool was hungry and the split was right. Idle pool parallelizes,
+		// busy pool runs serially at near-zero cost, and a ragged body keeps getting stolen from,
+		// which is itself the signal to subdivide where the work turned out to be.
+		//
+		// GRAIN (was `chunkSize`) is the smallest subrange worth handing to another thread, and it
+		// is now load-bearing rather than advisory, because it is the only thing left that the
+		// scheduler cannot infer. It is floored at 64 leaves per worker, which protects against a
+		// grain too FINE for the pool.
+		//
+		// WHAT YOU GIVE UP, stated plainly: nothing here can decline to parallelize a body that is
+		// too cheap to be worth it. The probe could, and did. Pass a grain smaller than the body
+		// justifies -- 32 elements of a ~0.4 ns/element loop -- and this will faithfully split that
+		// fine and measure ~0.07x against serial, where the old probe held 1.00x. If you do not know
+		// what an iteration costs, pick a grain you can defend on wall-clock grounds (a few
+		// microseconds of work per leaf is a safe target), or call SetParallelForSerial(true) and
+		// measure. That is the trade the probe's removal buys, and it buys correctness on every
+		// body whose cost is not uniform.
+		void ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func);
+
+		// The same thing WITHOUT having to name a grain, and this is the one most callers want.
+		//
+		// "How do I know what grain to pass?" is the fair objection to the overload above, and for
+		// most callers the honest answer is that they cannot know: they know their body is "a
+		// collision check" or "a matrix multiply", not what it costs in nanoseconds per element.
+		// Requiring a number nobody has is how you get 32 passed in because it looked reasonable.
+		//
+		// So this derives one from the two things that ARE known exactly -- the range and the pool
+		// size -- and never consults the body: `range / (workers * 8)`. Cilk's `cilk_for` picks its
+		// default the same way, from n and P alone.
+		//
+		// EIGHT leaves per worker, not the SIXTY-FOUR the explicit overload floors at, and that gap
+		// is the point rather than an inconsistency. The floor stops an explicit grain being
+		// absurdly fine, where leaning aggressive costs nothing. A default is chosen with no
+		// information, and there the two errors are wildly asymmetric -- measured:
+		//
+		//     under-split an expensive body   ~10%   (200k ragged: ~19-21x vs a 21.5-23x plateau)
+		//     over-split a cheap body         ~20x   (0.4 ns/element: 1.00x explicit vs 0.05x)
+		//
+		// so an uninformed default has to lean coarse. Deriving it from the floor was the first
+		// version and it measured that 0.05x.
+		//
+		// PASS A GRAIN ONLY IF YOU HAVE MEASURED. The number that matters is wall-clock per leaf,
+		// not elements: aim for a few microseconds of work in each. If you have timed the loop
+		// serially once -- which is a two-line experiment in a dev build -- then
+		// `grain = range * (target_leaf_time / total_serial_time)` gets you there without knowing
+		// anything per-element.
+		//
+		// This does NOT rescue a body too cheap to parallelize; nothing probe-free can, and the
+		// explicit overload's comment says why. What it does is bound the damage: leaves are capped
+		// at `workers * 64`, so the worst case is that many dispatches rather than one per element.
+		void ParallelFor(int begin, int end, std::function<void(int, int)> func);
 		// `ParallelForFJ` was REMOVED in 1.4. It was the fork-join variant: split in half, spawn the
 		// right half, recurse left. ParallelFor stopped dispatching to it when the slice-stealing
 		// cursor path replaced per-chunk tasks, which left it public with no caller anywhere.
 		//
 		// USE `ParallelFor`. It is the drop-in -- same shape, same blocking behaviour -- and it still
-		// decides serial-vs-parallel for you. Do NOT reach for ParallelForLazy as the migration
-		// target just because it is also a recursive splitter: it requires a grain you can actually
-		// justify and will faithfully over-split if given a bad one, which is a decision the caller
-		// being migrated never opted into.
+		// decides serial-vs-parallel for you.
+
+
+
 		// Shared slice-stealing core behind ParallelFor's large-range path and ParallelRange. Takes func
 		// by REFERENCE: both callers block, so the object outlives every task, and copying a
 		// std::function per worker would reintroduce an allocation this exists to remove.
@@ -291,40 +363,6 @@ namespace JLib {
 		// be waste.
 		void ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func);
 
-		// DEMAND-DRIVEN (lazy) range split -- the Cilk/oneTBB/Rayon model. Same shape and same
-		// guarantees as ParallelFor and ParallelRange: calls func(lo, hi) over disjoint subranges
-		// covering [begin, end), blocks until all of them are done, and the calling thread
-		// participates rather than sitting idle.
-		//
-		// WHAT IS DIFFERENT: IT NEVER PREDICTS. ParallelFor runs a serial prefix, times it,
-		// extrapolates to the rest, and parallelizes only if the estimate clears
-		// SetParallelForThresholdUs. That works on a uniform body and cannot work on a
-		// data-dependent one -- and data-dependent bodies are what this library is for. A probe
-		// over items 0..311 says nothing about item 50,000 when the early ones early-out at 2 ns
-		// and the later ones do full mesh collision at 4,000 ns. Worse, the prefix WARMS THE CACHE
-		// and the remainder streams from DRAM, so the extrapolation is biased low systematically
-		// rather than noisily; and on a hybrid or big.LITTLE part the probe runs on the caller's
-		// core class and the work runs on another.
-		//
-		// Instead, the structure is made splittable and STEALS DECIDE. This publishes the right
-		// half of the range onto the calling thread's own deque and carries on with the left half.
-		// If nobody took it, the splitter takes it straight back -- measured at 17.8 ns, because an
-		// unstolen split needs no notify (nobody has to be woken to run something you are about to
-		// run yourself) and no epoch retirement (winning the pop CAS proves no thief ever observed
-		// it). If somebody did take it, the pool was hungry and the split was exactly right.
-		// So: idle pool -> it parallelizes; busy pool -> it runs serially at near-zero cost;
-		// ragged body -> a worker that finishes early steals, which is itself the signal to split
-		// more. No constant to calibrate and nothing to get wrong per machine.
-		//
-		// GRAIN IS REQUIRED and is a hard floor -- the smallest subrange worth handing to anybody.
-		// It is the one thing the scheduler genuinely cannot infer, and asking for it is what lets
-		// everything else stop guessing. Same meaning as ParallelRange's.
-		//
-		// CALLABLE FROM MAIN, which is the normal case and the reason nonWorkerLane exists: main
-		// gets a real deque to publish onto, so every worker can steal from it in parallel from the
-		// first split rather than waiting out a log2(N) chain of steal hops. If a second non-worker
-		// thread is already splitting, this degrades to ParallelRange rather than blocking.
-		void ParallelForLazy(int begin, int end, int grain, std::function<void(int, int)> func);
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 		bool Push(uint8_t cpu_affinity, Task* task);
@@ -616,7 +654,7 @@ namespace JLib {
 		// (== workers.size(), fixed by StartPool). Everything else -- inboxes,
 		// immediateCoresInUse, the P/E sets, PickNextWorker -- stays worker-indexed.
 		//
-		// WHY IT EXISTS. Demand-driven splitting (ParallelForLazy) works by publishing a split onto
+		// WHY IT EXISTS. Demand-driven splitting (ParallelFor since 1.4) works by publishing a split onto
 		// the SPLITTER'S OWN deque and taking it straight back if nobody stole it -- measured at
 		// 17.8 ns, versus ~85-105 ns for a real cross-thread dispatch. A worker has a deque to do
 		// that with. Main did not, so a ParallelFor called from the main thread -- which is the
@@ -637,7 +675,7 @@ namespace JLib {
 
 		// Everything a lazy split needs that does NOT change as the recursion descends. Held on the
 		// root caller's stack and passed down by pointer, which is sound for exactly the reason
-		// ParallelFor's cursor path is: ParallelForLazy BLOCKS, so the frame outlives every task
+		// the cursor path is: ParallelFor BLOCKS, so the frame outlives every task
 		// spawned under it. A non-blocking variant would need this refcounted on the heap.
 		struct LazyRangeState {
 			std::function<void(int, int)>* func;

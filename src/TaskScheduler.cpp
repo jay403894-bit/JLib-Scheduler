@@ -334,161 +334,13 @@ namespace JLib { namespace detail {
 void TaskScheduler::SetSelfReclaim(bool on) { EpochManager::Instance().SetSelfReclaim(on); }
 bool TaskScheduler::SelfReclaimEnabled()    { return EpochManager::Instance().SelfReclaimEnabled(); }
 
-static double g_parallelWorthwhileUs = kDefaultParallelWorthwhileUs;
-void TaskScheduler::SetParallelForThresholdUs(double us) { g_parallelWorthwhileUs = us; }
-double TaskScheduler::GetParallelForThresholdUs() { return g_parallelWorthwhileUs; }
+// The debugging kill switch that outlived the gate. Plain bool, not atomic, for the same reason
+// the idle and affinity policies are: it is set once at startup (or from a debugger) and read on a
+// hot path, and making it atomic would tax every ParallelFor to synchronise a value nothing races.
+static bool g_parallelForSerial = false;
+void TaskScheduler::SetParallelForSerial(bool on) { g_parallelForSerial = on; }
+bool TaskScheduler::ParallelForSerial()           { return g_parallelForSerial; }
 
-void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func) {
-	chunkSize = std::max(1, chunkSize);
-	int totalItems = end - start;
-	if (totalItems <= 0) return;
-
-	// PROBE: the scheduler cannot know what an element costs, and the caller usually cannot say in a
-	// portable way either -- so measure it. Run a small prefix serially, time it, and extrapolate to
-	// the rest. The probe is not overhead: it is loop work that had to happen regardless, just done
-	// here instead of in a chunk. Sized as a fraction of the range so an expensive body cannot burn
-	// the whole budget deciding (32 heavy elements is ~19us, well under the threshold it is testing).
-	const int probeCount = std::min(totalItems, std::max(32, std::min(1024, totalItems / 64)));
-	const auto probeT0 = std::chrono::steady_clock::now();
-	func(start, start + probeCount);
-	const double probeUs =
-		std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - probeT0).count();
-
-	start += probeCount;
-	totalItems -= probeCount;
-	if (totalItems <= 0) return;   // the probe was the whole range
-
-	// Floor the chunk size so the range can't be shattered into more pieces than the pool can use.
-	// A caller passing a small chunkSize is expressing "split this finely", but past ~4 chunks per
-	// worker extra pieces buy no more load balancing and cost a task each -- 256 elements at
-	// chunkSize 2 builds 128 tasks to do ~250us of work, and measured 0.49x (i.e. 2x SLOWER) purely
-	// on tree overhead. 4 per worker keeps enough pieces to even out a ragged body.
-	{
-		const int maxUsefulTasks = (int)std::max<size_t>(1, workers.size() * 4);
-		chunkSize = std::max(chunkSize, (totalItems + maxUsefulTasks - 1) / maxUsefulTasks);
-	}
-
-	const double estRemainingUs = probeUs * ((double)totalItems / (double)probeCount);
-	if (estRemainingUs >= g_parallelWorthwhileUs) {
-		int numTasks = (totalItems + chunkSize - 1) / chunkSize;
-
-		// HYBRID dispatch (same spirit as the scheduler's other hybrids -- fiberless-vs-fiber,
-		// main-spin-help, locality-then-random steal): the FLAT path below has the CALLER spawn every
-		// chunk serially -- fine and ~14% faster when there are few tasks, but its O(#tasks) serial
-		// CreateTask+Push+NotifyWorker on ONE thread blows up at fine grain (benchmarked ~8x slower at
-		// ~15k tasks; each notify also takes the worker mutex from the lost-wakeup fix). Fork-join
-		// distributes the spawn across the whole pool and wins decisively past a few dozen tasks. Cross
-		// over at ~2 tasks/worker (below that flat wins/ties; above, FJ pulled ahead). That fork-join
-		// entry point (ParallelForFJ) was REMOVED in 1.4 -- the cursor path below superseded it.
-		// CURSOR PATH. Past this point the range wants more pieces than the pool has lanes, and both
-		// alternatives pay a TASK PER CHUNK -- flat spawns them serially on the caller, FJ
-		// distributes the spawning but still creates them. Measured, that task is ~80-140 ns
-		// (slab slot + push + epoch retirement), which is why chunkSize had to be floored at 4 per
-		// worker above: finer pieces balance better but cost a task each.
-		//
-		// The cursor removes the trade. One task PER WORKER, each pulling [lo, lo+grain) off a
-		// shared atomic until the range is consumed -- so the number of scheduled entities is fixed
-		// at the pool size no matter how fine the grain, and load balancing becomes free. It is what
-		// enkiTS's ITaskSet does, and the reason its range numbers do not degrade at small
-		// partitions.
-		//
-		// Everything it needs lives on THIS stack frame, which is sound only because ParallelFor
-		// BLOCKS: cursor, wg and func all outlive every task by construction. ParallelForNB cannot
-		// use this without heap state and a refcount, which is why it is not wired up there.
-		// Past ~2 tasks per worker, slice-stealing beats both per-chunk strategies -- see
-		// RunCursorRange, which also handles the no-pool case by running inline. This is where
-		// ParallelForFJ used to be called. It stayed public for a release after ParallelFor stopped
-		// choosing it, which left it with no caller anywhere, and it was removed in 1.4. The flat
-		// path below still wins at small task counts and is unchanged.
-		if ((size_t)numTasks > 2 * workers.size()) {
-			RunCursorRange(start, end, chunkSize, func);
-			return;
-		}
-
-		// Chunk 0 is MAIN'S OWN LANE: the calling thread computes it as a plain inline call
-		// (NOT a scheduled task), so it can never suspend/resume and never touches a fiber or
-		// task slab. Chunks 1..numTasks-1 go to workers. This keeps all hw lanes busy without
-		// making the caller a task-runner -- the caller stays a pure waiter for scheduled work.
-		// See WaitFor for why the caller must not run scheduled tasks.
-		const int mainChunkStart = start;
-		const int mainChunkEnd = std::min(start + chunkSize, end);
-
-		// Capturing `&func` (a by-value parameter) is safe ONLY because WaitFor(wg) below
-		// blocks until every task tied to `wg` has completed -- the tasks never outlive this
-		// frame. The completion decrement is done exclusively by the worker's waitGroup path
-		// (Thread::Worker / TryRunStolenNoFiberTask); the task body must NOT also decrement, or
-		// each task counts down twice and the wait wakes early on half-finished work.
-		WaitGroup wg;
-		// Collected and submitted in ONE PushBatch instead of numTasks-1 individual Push() calls.
-		// Each Push does its own MarkQueuedWork + NotifyWorker, and a notify takes the target
-		// worker's mutex (the lost-wakeup fix); batching cuts that to one notify per SEGMENT.
-		//
-		// minPerSegment=1 below, NOT the default 64. This path only runs at <= 2 tasks per worker
-		// (above that ParallelFor dispatches to the cursor path), so a 64-task floor would collapse
-		// the whole batch onto ONE worker -- strictly worse than the per-task Push it replaces,
-		// which at least round-robined. The default exists for big fire-and-forget batches where
-		// the alternative is a single push; here the alternative is N pushes, so any segmenting
-		// wins and the finest available spread is the right one.
-		//
-		// Stack buffer, no allocation: numTasks is bounded by 2*workers+1 on this path, so the
-		// heap fallback is unreachable in practice and exists only so a huge pool cannot overrun.
-		// ParallelFor runs per-frame in a game loop; a malloc here would be a poor trade.
-		Task* stackBuf[256];
-		std::vector<Task*> heapBuf;
-		Task** pending = stackBuf;
-		if (numTasks - 1 > (int)(sizeof(stackBuf) / sizeof(stackBuf[0]))) {
-			heapBuf.resize((size_t)numTasks - 1);
-			pending = heapBuf.data();
-		}
-		int pendingCount = 0;
-
-		for (int i = 1; i < numTasks; ++i) {
-			int chunkStart = start + i * chunkSize;
-			int chunkEnd = std::min(chunkStart + chunkSize, end);
-
-			Task* t = CreateTask([&func, chunkStart, chunkEnd]() {
-				func(chunkStart, chunkEnd);
-				});
-			if (!t) {
-				func(chunkStart, chunkEnd); // arena exhausted: graceful degradation, run it here
-				continue;
-			}
-			t->waitGroup = &wg;
-			// MUST route through Push()/PushLocal or PushBatch, NOT a blind
-			// `loPriInboxes[i % n]->push()` round-robin: both of those consult immediateCoresInUse
-			// and skip any core PINNED by a persistent PushImmediate task (e.g. the audio
-			// subsystem's forever-running mixer). A pinned worker never returns to its loop to
-			// drain its inbox, and inboxes are owner-drain-only (never stealable, so
-			// TryRunStolenNoFiberTask can't rescue them) -- so a chunk shoved into a pinned
-			// worker's inbox is stranded forever and WaitFor(wg) spins until the heat death of the
-			// app. This was the particle-demo deadlock: it only bit once the sound thread was
-			// pinned. PushBatch keeps that check per segment, and also handles the
-			// MarkQueuedWork/NotifyWorker that Push() did per task.
-			pending[pendingCount++] = t;
-		}
-
-		// Counted BEFORE publishing: the instant PushBatch hands these over a worker can finish one
-		// and decrement, and adding to n afterwards races a WaitFor that already saw zero.
-		if (pendingCount > 0) {
-			wg.n.fetch_add(pendingCount, std::memory_order_relaxed);
-			PushBatch(pending, (size_t)pendingCount, 0, /*minPerSegment*/1);
-		}
-
-		// Main computes its own lane while the workers churn -- no wasted thread.
-		func(mainChunkStart, mainChunkEnd);
-
-		// Block until every dispatched chunk is done (fiber callers park; non-fiber callers
-		// spin-and-help via TryRunStolenNoFiberTask inside WaitFor).
-		WaitFor(wg);
-	}
-	else
-	{
-		// Not enough work left to pay for dispatch -- finish the remainder inline. One whole-range
-		// call is equivalent to the old per-item func(i, i+1) loop for a range-processing func,
-		// and cheaper.
-		func(start, end);
-	}
-}
 
 // THE SLICE-STEALING CORE, shared by ParallelFor's large-range path and by ParallelRange.
 //
@@ -568,7 +420,7 @@ void TaskScheduler::ParallelRange(int begin, int end, int grain, std::function<v
 
 // ============================ DEMAND-DRIVEN (LAZY) RANGE SPLITTING ============================
 //
-// See ParallelForLazy's header comment for why this exists at all (short version: a predictive
+// See ParallelFor's header comment for why this exists at all (short version: a predictive
 // probe cannot work on a data-dependent body, and data-dependent bodies are the target). What
 // follows is how it works.
 
@@ -741,26 +593,25 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 	(*st->func)(lo, hi);
 }
 
-void TaskScheduler::ParallelForLazy(int begin, int end, int grain, std::function<void(int, int)> func) {
+void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func) {
 	if (end - begin <= 0) return;
 	grain = std::max(1, grain);
 
 	// No pool (or a pool of one): there is nobody to steal, so splitting could only ever cost. Run
-	// it straight. Same answer RunCursorRange gives in the same situation.
-	if (!poolActive.load(std::memory_order_acquire) || workers.empty()) {
+	// it straight. Same answer RunCursorRange gives in the same situation. SetParallelForSerial
+	// joins it here -- one branch, and it answers "is ParallelFor responsible for this?" without a
+	// rebuild, which is the one job the removed threshold setter was actually good for.
+	if (g_parallelForSerial || !poolActive.load(std::memory_order_acquire) || workers.empty()) {
 		func(begin, end);
 		return;
 	}
 
-	// A NON-WORKER needs the shared lane; a worker already has one. Losing the race means another
-	// app thread is mid-split, so fall back to the cursor path rather than serialising behind it --
-	// that is 1.4's behaviour, which is a perfectly good answer, just not this one.
 	// GRAIN IS FLOORED SO THE TREE CANNOT PRODUCE MORE LEAVES THAN THE POOL CAN USE.
 	//
-	// This is the same guard ParallelFor applies to chunkSize (there, at most 4 chunks per worker),
-	// and it is legitimate for the same reason: it is a statement about the POOL, whose size is
-	// known exactly, and not about the BODY, whose cost is the thing that cannot be known. Nothing
-	// is predicted, so this does not smuggle the probe back in.
+	// This is the same guard the old chunked path applied to chunkSize (there, at most 4 chunks per
+	// worker), and it is legitimate for the same reason: it is a statement about the POOL, whose
+	// size is known exactly, and not about the BODY, whose cost is the thing that cannot be known.
+	// Nothing is predicted, so this does not smuggle the probe back in.
 	//
 	// It exists because grain has a CLIFF on the low side, and a caller who guesses too fine falls
 	// straight off it. Measured (scratchpad/grainsweep.cpp), 31 workers:
@@ -775,16 +626,18 @@ void TaskScheduler::ParallelForLazy(int begin, int end, int grain, std::function
 	// from any input (200k/31/64 -> ~101; 100k/31/64 -> ~51) and matches the cap ParallelRange
 	// already documents for its own grain.
 	//
-	// NOTE WHAT THIS DOES NOT FIX: a grain that is too COARSE for the pool is clamped here, but a
-	// body too cheap to be worth parallelizing at all is not, and cannot be -- that is exactly the
-	// judgement only a probe can make, which is why ParallelFor keeps one. See this function's
-	// header comment.
+	// NOTE WHAT THIS DOES NOT FIX, and it is the cost of removing the probe: a grain too COARSE for
+	// the pool is clamped here, but a body too cheap to be worth parallelizing AT ALL is not, and
+	// cannot be. Nothing that refuses to measure the body can make that call. See the header.
 	{
 		const size_t maxLeaves = workers.size() * 64;
 		const int floorGrain = (int)(((size_t)(end - begin) + maxLeaves - 1) / maxLeaves);
 		grain = std::max(grain, floorGrain);
 	}
 
+	// A NON-WORKER needs the shared lane; a worker already has one. Losing the race means another
+	// app thread is mid-split, so fall back to the cursor path rather than serialising behind it --
+	// a perfectly good answer, just not this one.
 	const bool isWorker = (Thread::GetCurrent() != nullptr);
 	NonWorkerLaneClaim claim(nonWorkerLaneClaimed);
 	if (!isWorker && !claim.held()) {
@@ -807,7 +660,7 @@ void TaskScheduler::ParallelForLazy(int begin, int end, int grain, std::function
 	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
 	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
 	// own lane where a 4.6 ns pop_bottom would have them. Measured, that scan was most of the cost
-	// of a cheap ParallelForLazy from main.
+	// of a cheap ParallelFor from main.
 	//
 	// So: drain our own lane LIFO first, and only fall back to general helping once it is empty
 	// (thieves took the rest, and the wait now genuinely has nothing local to do). LIFO is also the
@@ -2121,4 +1974,28 @@ void SchedulerConditionVariable::Notify_All() {
 		localQueue.pop();
 		sem->Signal();
 	}
+}
+
+// Grain-free overload: derive it from the range and the pool, never from the body.
+//
+// EIGHT leaves per worker, NOT the sixty-four the floor uses, and the difference is deliberate --
+// they are two different decisions that happen to be expressed in the same unit. The FLOOR exists
+// to stop an explicit grain being absurdly fine, where being aggressive costs nothing. The DEFAULT
+// is chosen with NO information at all, and there the errors are wildly asymmetric:
+//
+//   under-split an expensive body -> ~10% (200k ragged: ~19-21x against a 21.5-23x plateau)
+//   over-split a cheap body       -> ~20x (a 0.4 ns/element loop: 1.00x explicit against 0.05x)
+//
+// So an uninformed default must lean coarse. Passing grain=1 and letting the floor decide was the
+// first version and it measured exactly that 0.05x, because 64 leaves/worker is the right answer
+// only when the body is expensive -- which is the one thing this overload cannot know.
+//
+// Same rule Cilk's `cilk_for` uses for its own default, and for the same reason: n and P are known
+// exactly, the body is not.
+void TaskScheduler::ParallelFor(int begin, int end, std::function<void(int, int)> func) {
+	const int n = end - begin;
+	if (n <= 0) return;
+	const size_t leaves = std::max<size_t>(1, workers.size() * 8);
+	const int grain = (int)std::max<size_t>(1, ((size_t)n + leaves - 1) / leaves);
+	ParallelFor(begin, end, grain, std::move(func));
 }
