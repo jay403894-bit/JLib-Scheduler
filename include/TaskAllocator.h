@@ -102,15 +102,71 @@ namespace JLib {
         // sharing into an array instead of removing it. The slots are static, so a thread that
         // exits leaves its final value behind rather than a dangling pointer -- which is also the
         // right answer, since slots stranded in a dead thread's cache genuinely are out of
-        // circulation. Above kLiveSlots threads the modulo makes two threads share a counter; it
-        // stays correct because the update is still atomic, just mildly contended again.
+        // circulation. Above kLiveSlots threads the modulo makes two threads share a counter, and
+        // what keeps that correct is described directly below.
+        //
+        // THE UPDATE IS NOT AN RMW WHEN IT DOES NOT HAVE TO BE, and that is worth 72% of this
+        // allocator's cost. Profiled 2026-08-17 (scratchpad/alloccost.cpp, which models Alloc+Free
+        // mechanism by mechanism and lands within 0.03 ns of the real thing):
+        //
+        //     free-list pop+push, the actual work            1.50 ns
+        //     + the thread_local plumbing                    2.57 ns
+        //     + two relaxed atomic RMWs (this counter)       9.29 ns    <- +6.72 ns
+        //     same counter as non-atomic inc/dec             2.70 ns
+        //
+        // `memory_order_relaxed` does NOT make a read-modify-write cheap. Relaxed governs ORDERING,
+        // which is the free part; the `lock xadd` still has to take the line exclusively, and that
+        // is ~3.3 ns each even completely uncontended. Two of them per task, for a number whose
+        // only readers are an error message in TaskNode.h and a diagnostic print in the benchmark.
+        //
+        // WHY A PLAIN LOAD+STORE IS SAFE HERE -- and it is conditional, which is the whole point of
+        // the `exclusive` flag below. A shard is only ever WRITTEN by the thread that owns it
+        // (readers just sum), so as long as no two threads share a shard, load+store loses nothing:
+        // there is no other writer to race, and the object stays std::atomic so the reader is still
+        // race-free rather than UB.
+        //
+        // That premise breaks above kLiveSlots, and it breaks on CUMULATIVE thread creations rather
+        // than concurrent ones -- s_liveNext never decrements and an exiting thread never returns
+        // its slot, so a process that spawns transient threads reaches 128 far sooner than its peak
+        // thread count suggests. Past that the modulo makes two threads share a shard, and a
+        // non-atomic RMW there does not merely blur the reading: it LOSES updates permanently, so
+        // the total drifts further from the truth forever. For a counter whose job is telling a
+        // real slab leak from normal churn, that is the difference between imprecise and useless.
+        //
+        // So the fast path is taken only where it is provably exclusive -- the first kLiveSlots
+        // threads, which is every realistic case (this pool is hw-1) -- and anything past that
+        // falls back to the fetch_add it always used. The branch is on a thread_local bool decided
+        // once per thread and is perfectly predicted. Exactness is never traded away; only the
+        // cases that can afford the shortcut take it.
         using LiveCounter = detail::LiveCounter;
         static constexpr size_t kLiveSlots = 128;
+    public:
+        // The shard count, exposed so a test can push PAST it and verify the fallback keeps the
+        // total exact. Not otherwise useful to a caller.
+        static constexpr size_t kLiveSlotsForTest = kLiveSlots;
+    private:
         inline static LiveCounter    s_live[kLiveSlots];
         inline static std::atomic<size_t> s_liveNext{ 0 };
-        static LiveCounter& liveSlot() {
-            static thread_local size_t s = s_liveNext.fetch_add(1, std::memory_order_relaxed) % kLiveSlots;
-            return s_live[s];
+
+        struct LiveRef { LiveCounter* c; bool exclusive; };
+        static const LiveRef& liveSlot() {
+            static thread_local LiveRef r = [] {
+                const size_t n = s_liveNext.fetch_add(1, std::memory_order_relaxed);
+                // n < kLiveSlots  =>  n % kLiveSlots == n, and no earlier or later thread was or
+                // will be handed the same index. That is the exclusivity the fast path needs.
+                return LiveRef{ &s_live[n % kLiveSlots], n < kLiveSlots };
+            }();
+            return r;
+        }
+        static void liveAdd(long long d) {
+            const LiveRef& r = liveSlot();
+            if (r.exclusive) {
+                // Sole writer: read it, adjust it, put it back. No lock prefix, no line handoff.
+                r.c->v.store(r.c->v.load(std::memory_order_relaxed) + d, std::memory_order_relaxed);
+            }
+            else {
+                r.c->v.fetch_add(d, std::memory_order_relaxed);
+            }
         }
 
         // ---- per-thread cache (the lock-Free hot path) ----
@@ -198,9 +254,9 @@ namespace JLib {
 #endif
             c.head = next(slot);
             c.count--;
-            // Uncontended: this thread owns the line, so the RMW costs its latency and no coherence
-            // traffic. That is the entire difference from the shared counter this replaced.
-            liveSlot().v.fetch_add(1, std::memory_order_relaxed);
+            // Owning the line is necessary but was never sufficient -- an uncontended `lock xadd`
+            // still cost ~3.3 ns of pure latency here. See liveAdd for what replaced it and when.
+            liveAdd(+1);
             return slot;
         }
 
@@ -212,7 +268,7 @@ namespace JLib {
 #endif
             c.head = slot;
             c.count++;
-            liveSlot().v.fetch_sub(1, std::memory_order_relaxed);
+            liveAdd(-1);
             if (c.count > 2 * BATCH) flush(c);
         }
 
