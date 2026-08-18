@@ -15,7 +15,11 @@
 
 param(
     [string]$Message = "",
-    [switch]$WhatIf
+    [switch]$WhatIf,
+    # Release anyway when the section is below the threshold. A genuine hotfix is allowed to be
+    # three lines; this switch exists so that is a DECISION rather than something nobody noticed.
+    [switch]$Small,
+    [int]$MinChangelogLines = 20
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,6 +50,30 @@ if ($when -match '(?i)unreleased') {
     Fail "CHANGELOG.md still reads '## $version - unreleased'. Date it (today is $(Get-Date -Format 'yyyy-MM-dd'))."
 }
 Step "changelog : $version - $when"
+
+# ---- 2b. the section must actually say something ----------------------------------------------
+# Not a style rule. Every correction in 1.5.0 -- three wrong published figures, a bench header
+# advertising a gate that had been removed a release earlier -- was found by USING 1.4, after 1.4
+# had shipped. That is the normal discovery path, so fixes will always straggle in behind a tag.
+# The failure mode is tagging each straggler on its own until the version number stops carrying
+# information.
+#
+# The threshold is calibrated, not invented. Measured across every section in this file: the
+# smallest release ever shipped was 1.2.1 at 12 non-blank lines, and everything from 1.2.2 onward
+# is 28 or more. So 20 clears the entire recent history and only trips a genuinely thin release.
+$clLines   = Get-Content 'CHANGELOG.md'
+$bodyLines = 0
+for ($i = $h.LineNumber; $i -lt $clLines.Count; $i++) {
+    if ($clLines[$i] -match '^## ') { break }
+    if ($clLines[$i].Trim().Length -gt 0) { $bodyLines++ }
+}
+Step "section   : $bodyLines non-blank lines"
+if ($bodyLines -lt $MinChangelogLines -and -not $Small) {
+    Fail "the $version section is only $bodyLines non-blank lines (threshold $MinChangelogLines).
+  Either this release is thinner than it should be -- let main accumulate, the '## Unreleased'
+  heading exists for exactly that and nothing forces a tag -- or it is a deliberate hotfix, in
+  which case re-run with -Small. Raise the bar for one run with -MinChangelogLines <n>."
+}
 
 # ---- 3. the tag must not already exist, locally or on the remote -------------------------------
 if (git tag -l $tag) { Fail "$tag already exists locally. Bump the version, or delete it if it was never pushed." }
