@@ -356,7 +356,7 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 	{
 		const long long total = (long long)end - start;
 		const long long maxSlices = (long long)W * 64;
-		const int balanced = (int)((total + maxSlices - 1) / maxSlices);        
+		const int balanced = (int)((total + maxSlices - 1) / maxSlices);
 		grain = std::max({ grain, balanced, 64 });
 	}
 
