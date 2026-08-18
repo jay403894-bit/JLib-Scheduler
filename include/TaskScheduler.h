@@ -256,25 +256,38 @@ namespace JLib {
 		// from DRAM, so the estimate is biased low SYSTEMATICALLY rather than noisily; and on a
 		// hybrid part the probe runs on the caller's core class and the work runs on another.
 		//
-		// THREE SEPARATE FAILURES, and it matters that they are separate -- fixing any one leaves the
-		// others:
-		//   1. IT DOES NOT TRAVEL. The gate constant was ~2x this machine's dispatch cost, which is
-		//      a property of one CPU, one memory system and one build. Calibrating it at startup was
-		//      built and reverted: it makes a broken predictor portable instead of removing the
-		//      prediction, and it trades a reproducible wrong answer for an irreproducible one.
-		//   2. THE ESTIMATE IS BIASED, NOT NOISY. The prefix warms L1/L2 and the remainder streams
-		//      from DRAM, so it under-reads per-element cost systematically -- always in the same
-		//      direction, so it never averages out and more samples do not help.
-		//   3. IT LOOKED DETERMINISTIC WHILE BEING WRONG. Same input, same answer, run after run --
-		//      which reads as a measurement rather than a guess and so never prompted anyone to
-		//      check it. A noisy predictor advertises its own unreliability; this one did not. That
-		//      is the "works on my machine" failure in its most durable form.
+		// THE ROOT OF IT: ITERATION COUNT IS A USELESS PROXY FOR EXECUTION TIME. Everything below is
+		// a consequence of trying to recover time from a number that does not carry it.
+		//
+		// Static probing hits four walls. They are independent -- fixing one leaves the rest:
+		//
+		//   1. PROBE OVERHEAD. A timer read is 15-30 ns plus pipeline serialisation, against a
+		//      ~69 ns task overhead, so a probe fine-grained enough to see divergence costs more
+		//      than the thing it is deciding about.
+		//      *** THIS ONE DID NOT BITE US, and the distinction is worth keeping: our probe called
+		//      the clock exactly TWICE per ParallelFor, outside the loop, so ~30-60 ns amortised
+		//      over the whole range. Do not cite it as a reason ours failed. It matters the other
+		//      way -- ours was the CHEAPEST POSSIBLE probe and the other three walls still took it.
+		//   2. CACHE PERTURBATION. The prefix warms L1/L2; the remaining 99% streams from DRAM. The
+		//      estimate is therefore biased LOW systematically rather than noisily -- always the
+		//      same direction, so it never averages out and more sampling cannot help.
+		//   3. DATA-DEPENDENT WORK. In the workloads this library targets -- frustum culling, ray
+		//      tracing, narrow-phase -- iteration 1 early-outs at 2 ns and iteration 50 does full
+		//      mesh collision at 4,000 ns. No sample predicts divergence.
+		//   4. ASYMMETRIC TOPOLOGY. Measuring on a P-core describes an execution profile that means
+		//      nothing once an E-core steals the remainder. The normal case on the Android/ARM
+		//      targets, not an edge case.
+		//
+		// And a fifth that is about people rather than hardware: the gate LOOKED DETERMINISTIC while
+		// being wrong. Same input, same answer, every run -- so it read as a measurement rather than
+		// a guess, and nothing ever prompted a check. A noisy predictor advertises its own
+		// unreliability; this one did not.
 		//
 		// NOT A NOVEL POSITION. No mainstream work-stealing runtime gates parallelism on a timed
 		// serial prefix: Cilk-5 let spawn/steal decide, oneTBB's auto_partitioner uses a depth
 		// budget with steal feedback, and Rayon resets a split budget on observed steals. All of
 		// them infer demand from STEALS -- something that actually happened -- rather than from a
-		// cost model. This is converging with that, not inventing against it.
+		// cost model. This is converging with a settled answer, not inventing against it.
 		//
 		// Instead the range is made splittable and STEALS DECIDE. This publishes the right half onto
 		// the calling thread's own deque and carries on with the left. Nobody took it -> the

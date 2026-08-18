@@ -501,22 +501,32 @@ under-splitting an expensive body costs ~10%, while over-splitting a cheap one c
 
 **What none of this can do is decline.** Nothing probe-free can refuse to parallelize a body too
 cheap to be worth it — TBB's `simple_partitioner`, Rayon and Cilk all share this. 1.3.x could,
-because it probed. It was dropped anyway, for three reasons that are separate enough that fixing any
-one leaves the others standing:
+because it probed. It was dropped anyway, and the root of it is that **iteration count is a useless
+proxy for execution time**. Everything else follows from trying to recover time from a number that
+does not carry it.
 
-- **It does not travel.** The gate constant was ~2x *this machine's* dispatch cost — one CPU, one
-  memory system, one build. Deriving it at startup was built and reverted: that makes a broken
-  predictor portable rather than removing the prediction, and trades a reproducible wrong answer for
-  an irreproducible one.
-- **The estimate is biased, not noisy.** The prefix warms L1/L2 while the remainder streams from
-  DRAM, so it under-reads per-element cost *systematically*. Always the same direction, so it never
-  averages out and more sampling does not help.
-- **It looked deterministic while being wrong.** Same input, same answer, run after run — which
-  reads as a measurement rather than a guess, so nothing ever prompted anyone to check it. A noisy
-  predictor advertises its own unreliability; this one did not.
+Static probing hits four walls, and they are independent — fixing one leaves the rest:
 
-And the structural one on top: a prefix over items 0–311 says nothing about item 50,000 when the
-early ones early-out at 2 ns and the later ones do full mesh collision.
+- **Probe overhead.** A timer read is 15–30 ns plus pipeline serialisation, against a ~69 ns task
+  overhead. A probe fine-grained enough to see divergence costs more than the decision is worth.
+- **Cache perturbation.** The prefix warms L1/L2 while the remaining 99% streams from DRAM, so the
+  estimate is biased *low systematically* rather than noisily — always the same direction, so it
+  never averages out and more sampling cannot help.
+- **Data-dependent work.** In frustum culling, ray tracing and narrow-phase — what this library is
+  for — iteration 1 early-outs at 2 ns and iteration 50 does full mesh collision at 4,000 ns. No
+  sample predicts divergence.
+- **Asymmetric topology.** Measuring on a P-core describes a profile that means nothing once an
+  E-core steals the remainder. That is the normal case on the ARM targets, not an edge case.
+
+Only the first of those did *not* apply here: our probe called the clock twice per `ParallelFor`,
+outside the loop, so ~30–60 ns amortised over the whole range. That is worth stating because it cuts
+the other way — this was the cheapest possible probe, calibrated to within measurement error of the
+right constant on the machine it was tuned on, and the other three walls took it anyway.
+
+There was also a fifth failure that is about people rather than hardware: the gate **looked
+deterministic while being wrong**. Same input, same answer, every run — so it read as a measurement
+rather than a guess, and nothing ever prompted a check. A noisy predictor advertises its own
+unreliability. This one did not.
 
 **This is not a novel position.** No mainstream work-stealing runtime gates parallelism on a timed
 serial prefix. Cilk-5 let spawn/steal decide; oneTBB's `auto_partitioner` uses a depth budget with
