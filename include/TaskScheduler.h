@@ -289,26 +289,36 @@ namespace JLib {
 		// them infer demand from STEALS -- something that actually happened -- rather than from a
 		// cost model. This is converging with a settled answer, not inventing against it.
 		//
-		// Instead the range is made splittable and STEALS DECIDE. This publishes the right half onto
-		// the calling thread's own deque and carries on with the left. Nobody took it -> the
-		// splitter takes it straight back and runs it inline for ~11 ns, no dispatch and no notify.
-		// Somebody took it -> the pool was hungry and the split was right. Idle pool parallelizes,
-		// busy pool runs serially at near-zero cost, and a ragged body keeps getting stolen from,
-		// which is itself the signal to subdivide where the work turned out to be.
+		// WHAT REPLACED IT: SLICE-STEALING FROM A SHARED CURSOR. One task per worker (capped at the
+		// number of slices that exist), each pulling [lo, lo+grain) off one atomic until the range
+		// is consumed. The calling thread pulls too rather than blocking idle. So the number of
+		// scheduled entities is bounded by the pool no matter how fine the grain, load balancing is
+		// a consequence of the cursor rather than a policy, and a worker that draws a cheap region
+		// simply comes back for another. It is the mechanism enkiTS uses.
 		//
-		// GRAIN (was `chunkSize`) is the smallest subrange worth handing to another thread, and it
-		// is now load-bearing rather than advisory, because it is the only thing left that the
-		// scheduler cannot infer. It is floored at 64 leaves per worker, which protects against a
-		// grain too FINE for the pool.
+		// Everything it needs lives on THIS stack frame, which is sound only because ParallelFor
+		// BLOCKS: cursor, wait group and callable all outlive every task by construction. That is
+		// exactly why PushArray, which does NOT block, cannot use it.
 		//
-		// WHAT YOU GIVE UP, stated plainly: nothing here can decline to parallelize a body that is
-		// too cheap to be worth it. The probe could, and did. Pass a grain smaller than the body
-		// justifies -- 32 elements of a ~0.4 ns/element loop -- and this will faithfully split that
-		// fine and measure ~0.07x against serial, where the old probe held 1.00x. If you do not know
-		// what an iteration costs, pick a grain you can defend on wall-clock grounds (a few
-		// microseconds of work per leaf is a safe target), or call SetParallelForSerial(true) and
-		// measure. That is the trade the probe's removal buys, and it buys correctness on every
-		// body whose cost is not uniform.
+		// 1.4 SHIPPED A RECURSIVE LAZY SPLITTER HERE FIRST -- publish the right half onto the
+		// caller's own deque, take it back if nobody steals it -- and it was replaced by this. NOT
+		// because it was slower. Measured with an interleaved A/B and a same-vs-same control:
+		// uniform 1M 0.673 vs 0.658 ms, ragged 200k 1.327 vs 1.326, back-loaded 1.327 vs 1.326 --
+		// tied within 2%. It went because at equal performance it needed a dedicated deque lane for
+		// non-worker threads, a wake heuristic with a per-thread round-robin cursor, a split tree
+		// and a bespoke wait loop, none of which the cursor needs. Simplicity was the tiebreak.
+		//
+		// GRAIN (was `chunkSize`) is the smallest subrange worth handing to another thread. It is
+		// floored at 64 slices per worker with an absolute floor of 64 items -- a statement about
+		// the POOL, whose size is known exactly, never about the BODY.
+		//
+		// WHAT YOU GIVE UP with the probe gone, stated plainly: nothing here can decline to
+		// parallelize a body too cheap to be worth it. Pass a grain far smaller than the body
+		// justifies and it will faithfully slice that fine and lose to a serial loop -- ~0.19x on a
+		// 20k range of a ~0.4 ns/element body, where the old probe held 1.00x. Give it a grain worth
+		// a few microseconds of work and the same case is ~1.00x. If you cannot say, use the
+		// overload below; if you need to know whether a loop should be parallel at all,
+		// SetParallelForSerial(true) answers it in one run without a rebuild.
 		void ParallelFor(int begin, int end, int grain, std::function<void(int, int)> func);
 
 		// The same thing WITHOUT having to name a grain, and this is the one most callers want.
@@ -350,49 +360,17 @@ namespace JLib {
 
 
 
-		// Shared slice-stealing core behind ParallelFor's large-range path and ParallelRange. Takes func
+		// Shared slice-stealing core behind ParallelFor. Takes func
 		// by REFERENCE: both callers block, so the object outlives every task, and copying a
 		// std::function per worker would reintroduce an allocation this exists to remove.
 		void RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func);
 		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 
 		// Blocking range loop with ATOMIC SLICE-STEALING, and no probe.
-		//
-		// Same shape and same guarantees as ParallelFor -- calls func(lo, hi) over disjoint
-		// sub-ranges covering [begin, end) exactly once each, and returns when all of them have run.
-		// Two differences, both deliberate:
-		//
-		//   NO PROBE. ParallelFor cannot know what an element costs, so it runs a prefix SERIALLY,
-		//   times it, and decides serial-vs-parallel from that. That is the right default, but it is
-		//   serialization on the critical path before any parallelism starts, and it is pure waste
-		//   for a caller who already knows the range is large. This skips it and goes straight to
-		//   work. Use ParallelFor when you do not know; use this when you do.
-		//
-		//   FINER SLICING BY DEFAULT. Workers do not get a task per chunk: one task per worker is
-		//   created, and each pulls [lo, lo+grain) off a shared atomic until the range is consumed.
-		//   Because the task count no longer varies with grain, this can afford up to 64 slices per
-		//   worker where ParallelFor's per-chunk paths cap out at 4.
-		//
-		// USE ParallelRange WHEN COST VARIES ACROSS THE RANGE, and ParallelFor otherwise. That is not
-		// a preference, it is what the numbers say -- 4M items, 31 workers, medians of 3 runs:
-		//
-		//     uniform body   ParallelFor 0.09-0.11 ms   ParallelRange 0.18-0.23 ms   (ParallelFor ~2x)
-		//     ragged  body   ParallelFor 0.95-1.07 ms   ParallelRange 0.80-0.89 ms   (this ~1.2x)
-		//
-		// Finer slicing is pure overhead when every item costs the same -- more atomics, nothing to
-		// balance. It pays when it lets a worker that drew a cheap region come back for more instead
-		// of idling while another grinds through the expensive end.
-		//
-		// GRAIN IS A FLOOR, NOT A PROMISE, and it is raised to keep at most 64 slices per worker.
-		// The cursor makes the TASK count independent of grain but not the fetch_add count, which is
-		// range/grain on one contended line. A flat floor of 64 measured 15x SLOWER than ParallelFor
-		// on a 4M range -- 65,536 atomics against ~124. Fine grain is cheaper here than with
-		// per-chunk tasks; it is not free.
-		//
-		// The calling thread PARTICIPATES rather than blocking idle, same as ParallelFor's flat path
-		// keeping chunk 0 for itself -- it is stuck here anyway, so leaving a whole lane idle would
-		// be waste.
-		void ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func);
+		// `ParallelRange` was REMOVED in 1.4, before it ever shipped. It was added earlier in the
+		// same release as the probe-free entry point, and once ParallelFor lost its probe and moved
+		// to the same slice-stealing cursor the two were literally the same function. Two names for
+		// one behaviour is worse than the problem either was solving. Use ParallelFor.
 
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
@@ -417,8 +395,8 @@ namespace JLib {
 		// chunkSize -- at 32 it is ~3 ns/item -- which is the same amortisation a range-based API
 		// gets, without giving up a per-item callable.
 		//
-		// NOT MADE OBSOLETE BY ParallelRange (1.4), and the reason is structural rather than a
-		// performance argument. ParallelFor and ParallelRange BLOCK: their cursor, wait group and
+		// NOT MADE OBSOLETE BY ParallelFor, and the reason is structural rather than a
+		// performance argument. ParallelFor BLOCKS: its cursor, wait group and
 		// callable all live on the caller's stack frame, which is the only thing that makes a
 		// zero-allocation slice-stealing loop possible. PushArray does not block -- it hands you a
 		// WaitGroup and returns, so you can submit range work and go do something else, or never

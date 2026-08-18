@@ -396,7 +396,7 @@ static const int kFiberContentionIters = FiberContentionIters();
 // outside without instrumentation that would perturb the thing being measured. What is asserted is
 // the property that matters -- every task completes across every transition -- plus that the scoped
 // guard restores exactly, including nested.
-// ParallelRange: EXACTLY-ONCE coverage, which is the only property slice-stealing can plausibly get
+// ParallelFor: EXACTLY-ONCE coverage, which is the only property slice-stealing can plausibly get
 // wrong. A cursor hands out [lo, lo+grain) to whichever worker asks next, so the failure modes are
 // an element visited twice (two workers got overlapping slices) or never (the tail was dropped by
 // an off-by-one). Both are silent in a benchmark -- a loop that skips 3 of 4 million elements just
@@ -404,8 +404,8 @@ static const int kFiberContentionIters = FiberContentionIters();
 //
 // Sizes are chosen so the last slice does NOT divide evenly, because that ragged tail is exactly
 // where an off-by-one lives. A range that divides cleanly would pass with a broken clamp.
-static void TestParallelRangeCoverage(JLib::TaskScheduler& sched) {
-    std::printf("ParallelRange exactly-once coverage\n");
+static void TestRangeCoverage(JLib::TaskScheduler& sched) {
+    std::printf("ParallelFor exactly-once coverage\n");
 
     struct Case { int n; int grain; };
     const Case cases[] = {
@@ -420,7 +420,7 @@ static void TestParallelRangeCoverage(JLib::TaskScheduler& sched) {
         std::vector<std::atomic<int>> visits(c.n > 0 ? c.n : 1);
         for (auto& v : visits) v.store(0, std::memory_order_relaxed);
 
-        sched.ParallelRange(0, c.n, c.grain, [&visits](int lo, int hi) {
+        sched.ParallelFor(0, c.n, c.grain, [&visits](int lo, int hi) {
             for (int i = lo; i < hi; ++i)
                 visits[i].fetch_add(1, std::memory_order_relaxed);
             });
@@ -832,7 +832,7 @@ int main(int argc, char** argv) {
         Check(em.RetiredCount() == 0, "manual Tick did not underflow the counter");
     }
 
-    TestParallelRangeCoverage(sched);
+    TestRangeCoverage(sched);
     TestIdlePolicySwitchUnderLoad(sched);
     TestMutexFiberContention(sched);
     TestMutexMixedContention(sched);

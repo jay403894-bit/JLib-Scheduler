@@ -31,7 +31,7 @@ CAS proves no thief observed it). The "~85-105 ns per task" figure quoted elsewh
 
 Medians of 15, 31 workers, default Sleep, speedup over the same body run serially:
 
-| body | 1.3.x `ParallelFor` | `ParallelRange` | **1.4 `ParallelFor`** |
+| body | 1.3.x `ParallelFor` (probe) | recursive splitter | **1.4 `ParallelFor`** |
 | --- | --- | --- | --- |
 | uniform, 1M | 5.7-6.9x | 7.7-8.1x | **8.4-9.8x** |
 | data-dependent 20x, 200k | 10.3-16.0x | 20.1-21.7x | **15.3-22.1x** |
@@ -82,7 +82,7 @@ name a sensible grain.
 past the workers -- the non-worker lane -- claimed by one non-worker thread at a time and probed by
 every worker as an ordinary steal victim. Without it a main-thread caller had nowhere to publish and
 the tree would have had to fan out over a chain of steal hops. A second concurrent non-worker caller
-loses the claim and degrades to `ParallelRange` rather than blocking. The extra unconditional steal
+loses the claim and degrades to the cursor path rather than blocking. The extra unconditional steal
 probe measured no regression on the benchmark suite (throughput, latency and frame DAG all within
 run-to-run variance).
 
@@ -176,7 +176,7 @@ stack-allocates a `TaskMPSCQueue` hits it on the first run. The destructor now r
 the arena it came from, and the default constructor zero-initializes `head_`/`tail_`/`stub_` instead
 of leaving them indeterminate.
 
-**`ParallelFor` now dispatches by slice-stealing, and there is a new `ParallelRange`.**
+**`ParallelFor` now dispatches by slice-stealing.**
 
 `ParallelFor`'s large-range path creates one task PER WORKER instead of one per chunk. Each pulls
 `[lo, lo+grain)` off a shared cursor until the range is consumed. The per-chunk paths it replaces
@@ -197,7 +197,7 @@ The crossover sweep moved with it. Against the same sweep before the change:
 
 **The ~75 µs gate was then measured, and it stays.** The reasonable-sounding prediction was that it
 must be conservative: it was calibrated before fork-join existed, and dispatch has since got cheaper
-twice. Measured directly -- raw serial loop against `ParallelRange` (no probe to contaminate the
+twice. Measured directly -- raw serial loop against the cursor path (no probe to contaminate the
 timing), sweeping element counts so total serial work spans ~0.1 µs to ~9 ms, three body costs,
 medians of 15, stable across three runs:
 
@@ -231,27 +231,16 @@ bench row already records 0.75x on a Ryzen laptop APU and 1.09x on an M1 Air aga
 the crossover genuinely moves with core count and memory bandwidth. That is what
 `SetParallelForThresholdUs` exists for, and why the constant is exposed rather than baked in.
 
-**`ParallelRange(begin, end, grain, fn)`** is new, and exists for the one thing `ParallelFor` cannot
-do: skip the probe. `ParallelFor` runs a serial prefix and times it to decide serial-vs-parallel,
-which is the right default when you do not know the workload and pure serialization on the critical
-path when you do. On a 20,000-item job that prefix is ~312 items, roughly a third of the wall time.
+**`ParallelRange(begin, end, grain, fn)`** was added here as the probe-free entry point, and then
+**REMOVED later in this same release, before it ever shipped.** Once `ParallelFor` lost its probe
+and moved to the same slice-stealing cursor, the two were literally the same function, and two names
+for one behaviour is worse than the problem either was solving. Use `ParallelFor`; the no-grain
+overload covers the case this was reached for.
 
-It also slices 16x finer -- up to 64 slices per worker against `ParallelFor`'s 4 -- which is only
-possible because the task count no longer varies with grain. **The two are not ranked; pick by the
-shape of your workload**, because each loses to the other on the wrong input:
+What it contributed survives: the cursor itself, the grain floor below, and the finer slicing --
+up to 64 slices per worker, against the 4 per worker the old per-chunk path capped at -- are what
+`ParallelFor` does now.
 
-| body | `ParallelFor` | `ParallelRange` |
-| --- | --- | --- |
-| uniform cost per item | **0.09-0.11 ms** | 0.18-0.23 ms |
-| cost varies ~20x | 0.95-1.07 ms | **0.80-0.89 ms** |
-
-Finer slicing is **not free**. It buys load balancing with coordination, so it loses by ~2x when
-there is no imbalance to fix. Use `ParallelRange` for irregular work -- early-out branches,
-per-element data sizes, spatial queries whose depth varies -- and `ParallelFor` otherwise.
-
-Against enkiTS on the bulk row, measured with only one scheduler alive per run: **`ParallelRange`
-0.380-0.384 ms against enkiTS 0.375 ms -- a tie**, and enkiTS is far steadier (2% spread against our
-13%). `ParallelFor` on the same row is 0.444-0.468 ms; that gap is the probe.
 
 **A grain floor bug, caught by the new API and worth recording.** The first version floored grain at
 a flat 64, on the theory that a cursor makes grain a load-balancing knob only. It does not: the TASK
@@ -264,8 +253,8 @@ through `ParallelFor`, this would have shipped invisible.
 `ParallelForFJ` is no longer what `ParallelFor` selects, and stays public for callers who want the
 fork-join tree directly -- same reason `ParallelForNB` is public.
 
-**`PushArray` is not obsolete**, and the reason is structural. `ParallelFor` and `ParallelRange`
-BLOCK: their cursor, wait group and callable live on the caller's stack frame, which is the only
+**`PushArray` is not obsolete**, and the reason is structural. `ParallelFor`
+BLOCKS: its cursor, wait group and callable live on the caller's stack frame, which is the only
 thing making a zero-allocation slice-stealing loop possible. `PushArray` does not block -- it hands
 back a WaitGroup so you can submit range work and carry on, or never wait. A non-blocking cursor
 needs heap state and a refcount to outlive the caller's frame, which is a different design. It is

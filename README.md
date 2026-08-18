@@ -3,7 +3,7 @@
 
 A hybrid runtime for C++17+ that gives you:
 
-- **Cilk-style work-stealing** for fast parallel loops (`PushArray`, `ParallelFor`, `ParallelRange`)
+- **Cilk-style work-stealing** for fast parallel loops (`ParallelFor`, `PushArray`)
 - **No cost model in the range APIs** -- `ParallelFor` has no probe and no calibrated constant; slice-stealing decides how work is divided
 - **TaskFlow-style dependency graphs** (`TaskDAG`) with AND/OR gates
 - **Middleware-safe threads by default** -- no TLS surprises
@@ -179,8 +179,7 @@ workers, Release, 1.3.0. `--` is not measured yet.
 | Round-trip submit→run→wait | 4.3 µs | 1.70 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
 | Independent tasks, per task | 67 ns | **65 ns** | 21.8 µs | 310 ns | 290 ns |
 | Range work, per item | 38 ns | 25 ns | **15 ns** | -- | -- |
-| Bulk parallel-for, 20k items (`ParallelRange`, 1.4) | 0.38 ms | 0.17 ms | 0.375 ms | 0.49 ms | -- |
-| &nbsp;&nbsp;same row via `ParallelFor` | 0.46 ms | 0.24 ms | 0.375 ms | -- | -- |
+| Bulk parallel-for, 20k items | 0.38 ms | 0.17 ms | 0.375 ms | 0.49 ms | -- |
 | 25% of tasks blocked 600 µs | **7.2 ms** | 10.2 ms | 15.4 ms | -- | 8.8 ms |
 
 **Our two columns were re-measured at 1.4.0; the other three were not.** enkiTS, Taskflow and marl
@@ -189,14 +188,11 @@ same harness, so the comparison still holds. The `NoSleep` round-trip cell is th
 it read 0.97 µs at 1.3.0 and 1.70 µs here with an **83% spread across repeats**, which is the
 harness being noisy on that row rather than a real move.
 
-**The two bulk rows are the same work through two of our APIs**, added in 1.4. `ParallelRange` is
-the mechanism-matched counterpart to enkiTS — both hand workers slices off a shared cursor rather
-than creating a task per chunk — and at **0.38 ms against 0.375 ms it is a tie**, not a win; enkiTS
-is marginally ahead and far steadier (2% spread against our 13%). The gap to `ParallelFor` on the
-second row is its **probe**: it runs ~312 of the 20,000 items serially to decide whether
-parallelising is worth it, which is a third of the wall time on a job this size. That probe is the
-right default when you don't know your workload and pure overhead when you do, which is exactly why
-both exist. See [`ParallelFor` and `ParallelRange`](#parallelfor-and-parallelrange).
+**The bulk row is mechanism-matched to enkiTS** — both hand workers slices off a shared cursor
+rather than creating a task per chunk — and at **0.38 ms against 0.375 ms it is a tie**, not a win;
+enkiTS is marginally ahead and far steadier (2% spread against our 13%). It was two rows in an
+earlier draft, one of them a `ParallelFor` that still carried a serial probe; that probe is gone and
+both entry points are now the same code. See [Parallel loops](#parallel-loops).
 
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
@@ -443,16 +439,18 @@ blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need 
 each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
 one.
 
-### `ParallelFor` and `ParallelRange`
+### Parallel loops
 
-Both take a `(lo, hi)` callable, cover the range in disjoint subranges, and block until every one
-has run. As of 1.4 **they are the same algorithm** — slice-stealing from a shared cursor. Every
-worker pulls `[lo, lo+grain)` off one atomic until the range is consumed, so the number of scheduled
-entities is capped at the pool size (or the slice count, whichever is smaller) no matter how fine
-the grain. It is the mechanism enkiTS uses. Neither predicts anything.
+`ParallelFor` takes a `(lo, hi)` callable, covers the range in disjoint subranges, and blocks until
+every one has run. It **slice-steals from a shared cursor**: every worker pulls `[lo, lo+grain)` off
+one atomic until the range is consumed, and the calling thread pulls too rather than idling. The
+number of scheduled entities is capped at the pool size (or the slice count, whichever is smaller)
+no matter how fine the grain, so load balancing falls out of the cursor rather than being a policy.
+It is the mechanism enkiTS uses. It predicts nothing.
 
-`ParallelFor` is the one to call: it is the name most code already uses, and it has the no-grain
-overload. `ParallelRange` is the same call with grain required.
+It is the only range entry point. `ParallelRange` was added earlier in 1.4 as the probe-free
+alternative and removed in the same release, before either shipped: once `ParallelFor` lost its
+probe and moved to the same cursor, the two were literally the same function.
 
 **1.4 shipped a recursive lazy splitter behind `ParallelFor` first, and it was replaced by this.**
 Not because it was slower — it was not. Measured with an interleaved A/B (one rep each, alternating,

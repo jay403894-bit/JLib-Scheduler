@@ -236,7 +236,7 @@ void TaskScheduler::NotifyAll() {
 //
 // RE-MEASURED 2026-08-17, AFTER slice-stealing replaced fork-join here. The prediction was that this
 // must now be too conservative, since the constant is a dispatch cost and dispatch had got cheaper
-// twice. It is not. Raw serial loop against ParallelRange (no probe, so nothing contaminates the
+// twice. It is not. Raw serial loop against the cursor path (no probe, so nothing contaminates the
 // timing), sweeping element counts so serial work spans 0.1us to 9ms, medians of 15, stable over
 // three runs: heavy body breaks even at 69us, medium at 88us. 75 sits between them, unchanged.
 //
@@ -342,7 +342,7 @@ void TaskScheduler::SetParallelForSerial(bool on) { g_parallelForSerial = on; }
 bool TaskScheduler::ParallelForSerial()           { return g_parallelForSerial; }
 
 
-// THE SLICE-STEALING CORE, shared by ParallelFor's large-range path and by ParallelRange.
+// THE SLICE-STEALING CORE behind ParallelFor.
 //
 // One task PER WORKER rather than per chunk. Each pulls [lo, lo+grain) off a shared atomic until the
 // range is consumed, so the number of scheduled entities is the pool size no matter how fine the
@@ -427,12 +427,13 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 	WaitFor(wg);
 }
 
-// No probe, straight to slice-stealing. See the header for when to prefer this over ParallelFor.
-void TaskScheduler::ParallelRange(int begin, int end, int grain, std::function<void(int, int)> func) {
-	RunCursorRange(begin, end, grain, func);
-}
 
-// ============================ DEMAND-DRIVEN (LAZY) RANGE SPLITTING ============================
+// ==================== RETAINED, UNREACHABLE: the recursive lazy splitter ====================
+//
+// ParallelFor dispatched here until it moved to RunCursorRange. Kept for 1.4 and slated for removal
+// in 1.5 -- it measured TIED with the cursor (see ParallelFor's header), so nothing is lost by
+// deleting it, but nothing is gained by deleting it in a hurry either. No public entry point reaches
+// this code.
 //
 // See ParallelFor's header comment for why this exists at all (short version: a predictive
 // probe cannot work on a data-dependent body, and data-dependent bodies are the target). What
