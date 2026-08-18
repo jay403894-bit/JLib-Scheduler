@@ -223,56 +223,34 @@ void TaskScheduler::NotifyAll() {
 	for (auto& w : workers)
 		w->NotifyWorker();
 }
-// How much SERIAL WORK a loop must represent before splitting it pays for itself. Measured, not
-// guessed (bench.exe, BenchParallelForCrossover): sweeping per-element cost over four orders of
-// magnitude, the crossover ELEMENT COUNT moves 400x (200,000 for a trivial body down to ~400 for an
-// expensive one) while the crossover WORK stays pinned at 70-92us. That constant is the fork-join
-// dispatch+join overhead, and it is the only thing that generalizes -- which is why the old
-// `totalItems > 10000` gate was wrong in BOTH directions: it let a trivial body parallelize at 10k
-// where it ran 11x SLOWER, and forced an expensive body serial at 4k where parallel was 12x faster.
-// 75us sits in the measured cluster. The error is asymmetric -- being slightly too eager can cost
-// multiples, being slightly too cautious costs a few percent near the boundary -- so when in doubt
-// this leans serial.
+// ---- THE REMOVED GATE, and two findings from it worth keeping -------------------------------
 //
-// RE-MEASURED 2026-08-17, AFTER slice-stealing replaced fork-join here. The prediction was that this
-// must now be too conservative, since the constant is a dispatch cost and dispatch had got cheaper
-// twice. It is not. Raw serial loop against the cursor path (no probe, so nothing contaminates the
-// timing), sweeping element counts so serial work spans 0.1us to 9ms, medians of 15, stable over
-// three runs: heavy body breaks even at 69us, medium at 88us. 75 sits between them, unchanged.
+// ParallelFor used to refuse to parallelize below ~75 us of estimated serial work. The threshold,
+// its runtime setter, and the probe that fed it are all gone in 1.4 (see ParallelFor's header for
+// the four walls static probing hits). Two measurements from that era survive the mechanism,
+// because both bear on anything that might tempt someone to add a gate back:
 //
-// The cheap body never broke even in that range -- 0.52x at 64us -- which looks like an indictment
-// and is not: 64us is BELOW this threshold, so ParallelFor declines there and that number is what
-// you would get if it did not. Checked the other side too, memory-bound loop over a buffer far past
-// L3, forced-serial vs the default gate: 1.00x at 4MB (the boundary), then 3.62x at 16MB, 2.95x at
-// 64MB, 1.96x at 256MB. It declines below the threshold and pays off above it.
+// 1. AN ELEMENT COUNT IS NOT A GATE. Sweeping per-element cost over four orders of magnitude, the
+//    crossover ELEMENT COUNT moved 400x -- 200,000 for a trivial body down to ~400 for an expensive
+//    one -- while the crossover WORK stayed pinned at 70-92 us. That is why the `totalItems > 10000`
+//    rule this predates was wrong in BOTH directions: it parallelized a trivial body at 10k where it
+//    ran 11x SLOWER, and serialized an expensive one at 4k where parallel was 12x faster. Any future
+//    gate expressed in ELEMENTS is this bug again.
 //
-// WHAT IS STILL A REAL LIMITATION: this is one number measured on ONE machine. The crossover moves
-// with core count and memory bandwidth -- the memory-bound bench row records 0.75x on a Ryzen
-// laptop APU and 1.09x on an M1 Air against ~3.3x here. A static default cannot be right
-// everywhere, which is why SetParallelForThresholdUs is public. An adaptive gate would need the
-// PARALLEL rate, and the probe can only measure the serial one without speculating.
-// Keyed on OPTIMIZATION, not on NDEBUG alone. A "Development"/RelWithDebInfo build is optimized but
-// deliberately keeps assertions live, so it does NOT define NDEBUG -- testing NDEBUG by itself would
-// hand an optimized build the unoptimized threshold and serialize work that should be parallel.
-#if defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
-static constexpr double kDefaultParallelWorthwhileUs = 75.0;
-#else
-// DEBUG BUILDS PAY A MUCH HIGHER DISPATCH COST and the 75us figure was measured in RELEASE. Unoptimized
-// std::function indirection, _ITERATOR_DEBUG_LEVEL on the containers, and un-inlined task allocation
-// make building a fork-join tree roughly an order of magnitude more expensive, while the constant is
-// *only* a measure of that overhead. Leaving it at 75 made Game01's physics loop -- hundreds of
-// elements, previously always serial under the old >10000 gate -- start parallelizing in Debug and
-// drop the game to 2 FPS, while Release stayed in the hundreds. Same threshold, wrong build.
-// Not a guess at a ratio: it is deliberately conservative, because in a Debug build being slightly too
-// serial costs nothing anyone measures, and being too eager costs an unusable frame rate.
-static constexpr double kDefaultParallelWorthwhileUs = 750.0;
-#endif
+// 2. DISPATCH COSTS ~10x MORE IN A DEBUG BUILD, and that is a live hazard now rather than history.
+//    The 75 us figure was measured in Release; unoptimized std::function indirection,
+//    _ITERATOR_DEBUG_LEVEL on the containers and un-inlined task allocation make dispatch roughly an
+//    order of magnitude dearer. Leaving Release's threshold in place for Debug made Game01's physics
+//    loop -- a few hundred elements -- start parallelizing and dropped the game to 2 FPS while
+//    Release stayed in the hundreds. The fix then was a separate 750 us Debug threshold.
+//
+//    THERE IS NO THRESHOLD NOW, in any build. What replaced that protection is the slice cap: a few
+//    hundred elements floors to grain 64 and caps at min(workers, slices), so such a loop dispatches
+//    ~5 tasks rather than the ~124 the old per-chunk path built. That should keep it out of the 2 FPS
+//    regime, but it is REASONING, not a measurement -- nobody has run Game01 in Debug against 1.4.
+//    If a Debug build regresses on frame time, this is the first thing to suspect, and
+//    SetParallelForSerial(true) tells you in one run whether ParallelFor is responsible.
 
-// Runtime-settable so this can be BISECTED without a rebuild: set it absurdly high and every
-// ParallelFor runs serial, which answers "is ParallelFor responsible for this?" in one run instead of
-// a recompile per guess. Also legitimately useful beyond debugging -- the right value is a property of
-// the machine and the build, and an app that has profiled its own workload knows better than a
-// hard-coded constant. Plain double, written once at startup and only read afterwards.
 // Worker binding policy. Read once per worker at thread creation (Thread.cpp), so it must be set
 // before Init(); a plain global is correct here -- no cross-thread mutation after startup.
 // DEFAULT = Ideal, changed from Hard 2026-08-05 on measurement (bench.exe hard|physical|ideal|none,
