@@ -378,7 +378,8 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// CreateTask+Push+NotifyWorker on ONE thread blows up at fine grain (benchmarked ~8x slower at
 		// ~15k tasks; each notify also takes the worker mutex from the lost-wakeup fix). Fork-join
 		// distributes the spawn across the whole pool and wins decisively past a few dozen tasks. Cross
-		// over at ~2 tasks/worker (below that flat wins/ties; above, FJ pulls ahead). See ParallelForFJ.
+		// over at ~2 tasks/worker (below that flat wins/ties; above, FJ pulled ahead). That fork-join
+		// entry point (ParallelForFJ) was REMOVED in 1.4 -- the cursor path below superseded it.
 		// CURSOR PATH. Past this point the range wants more pieces than the pool has lanes, and both
 		// alternatives pay a TASK PER CHUNK -- flat spawns them serially on the caller, FJ
 		// distributes the spawning but still creates them. Measured, that task is ~80-140 ns
@@ -396,9 +397,9 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// use this without heap state and a refcount, which is why it is not wired up there.
 		// Past ~2 tasks per worker, slice-stealing beats both per-chunk strategies -- see
 		// RunCursorRange, which also handles the no-pool case by running inline. This is where
-		// ParallelForFJ used to be called; it stays PUBLIC for callers who want the fork-join tree
-		// directly (same reason ParallelForNB is public), it is simply no longer what ParallelFor
-		// picks. The flat path below still wins at small task counts and is unchanged.
+		// ParallelForFJ used to be called. It stayed public for a release after ParallelFor stopped
+		// choosing it, which left it with no caller anywhere, and it was removed in 1.4. The flat
+		// path below still wins at small task counts and is unchanged.
 		if ((size_t)numTasks > 2 * workers.size()) {
 			RunCursorRange(start, end, chunkSize, func);
 			return;
@@ -423,7 +424,7 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// worker's mutex (the lost-wakeup fix); batching cuts that to one notify per SEGMENT.
 		//
 		// minPerSegment=1 below, NOT the default 64. This path only runs at <= 2 tasks per worker
-		// (above that ParallelFor dispatches to ParallelForFJ), so a 64-task floor would collapse
+		// (above that ParallelFor dispatches to the cursor path), so a 64-task floor would collapse
 		// the whole batch onto ONE worker -- strictly worse than the per-task Push it replaces,
 		// which at least round-robined. The default exists for big fire-and-forget batches where
 		// the alternative is a single push; here the alternative is N pushes, so any segmenting
@@ -487,59 +488,6 @@ void TaskScheduler::ParallelFor(int start, int end, int chunkSize, std::function
 		// and cheaper.
 		func(start, end);
 	}
-}
-void TaskScheduler::ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func) {
-	grain = std::max(1, grain);
-	if (end - start <= 0) return;
-	if (end - start <= grain) { func(start, end); return; }   // too small to bother splitting
-
-	WaitGroup wg;
-	// Recursive splitter. Runs on the CALLER inline (it does the leftmost spine of leaves) and on
-	// WORKERS (each spawned task runs it on its own sub-range). Discipline: spawn the RIGHT half as
-	// a task and continue on the LEFT inline. Each spawned task increments wg once (before Push) and
-	// is decremented once when it completes -- by the worker's waitGroup path (Thread::Worker /
-	// TryRunStolenNoFiberTask), NOT here. The caller's own inline work is not a task and never touches wg.
-	// wg can't hit 0 prematurely: a task increments for all its children (inside rec) BEFORE it
-	// returns (and gets decremented), so pending descendants are always counted.
-	// Round-robin Push, and do NOT "improve" this by spawning the child on the calling worker. That
-	// was tried and measured on 2026-08-14, and it is where the removed PushFork died:
-	//
-	//   heavy body, speedup vs serial   N=256   512   1000   2000   10000   40000   200000
-	//     round-robin Push               1.09  3.57   6.33   9.50   12.04   14.20    17.80
-	//     self-spawn                     2.33  4.14   5.65   7.00    7.40    8.00     8.70
-	//
-	// Self-spawn SATURATES at ~8x on a 31-worker pool where Push climbs past 17x -- the signature of
-	// the tree never reaching most of the pool, because putting it all on one deque leaves
-	// single-item stealing as the only way it can spread. The frame DAG and both throughput rows
-	// were flat across the same A/B, so this is placement and nothing else.
-	//
-	// The apparent 2.1x win at N=256 above is an ARTIFACT of that run, which had to bypass a
-	// fiber-only guard to make the splitter self-spawn at all. Swept in the configuration that guard
-	// allowed (fiber parent, fiber children), self-spawn is slower at EVERY leaf count from 2 to 512
-	// and worst at the small end -- 4.6x at 8 leaves.
-	//
-	// There is also a SAFETY reason it could never have been used here: these children are noFiber
-	// (the CreateTask default, and correct -- the splitter never suspends), and a noFiber task
-	// cannot park in WaitFor, so it must never be the sole owner of the queue its children sit in.
-	// See the nested-ParallelFor hazard.
-	std::function<void(int, int)> rec = [&](int a, int b) {
-		while (b - a > grain) {
-			int mid = a + (b - a) / 2;
-			Task* t = CreateTask([&rec, mid, b]() { rec(mid, b); });
-			if (!t) {
-				func(mid, b);          // arena exhausted: do the right half inline, no task/no wg
-			} else {
-				t->waitGroup = &wg;
-				wg.n.fetch_add(1, std::memory_order_relaxed);   // count BEFORE it can run+decrement
-				Push(t);
-			}
-			b = mid;                   // keep splitting the left half on THIS thread
-		}
-		func(a, b);                    // base case: do the leaf
-	};
-
-	rec(start, end);   // caller does the leftmost spine + spawns the rest of the tree
-	WaitFor(wg);
 }
 
 // THE SLICE-STEALING CORE, shared by ParallelFor's large-range path and by ParallelRange.
@@ -671,6 +619,28 @@ TaskDeque* TaskScheduler::LaneForCurrentThread() {
 }
 
 // Publish-right, recurse-left, down to grain.
+//
+// THIS SELF-SPAWNS, AND THE OLD FORK-JOIN SPLITTER MEASURED THAT AS A DISASTER. Worth stating up
+// front, because `ParallelForFJ` (removed in 1.4) carried the opposite instruction in capital
+// letters -- "do NOT spawn the child on the calling worker" -- backed by a real A/B from
+// 2026-08-14, a 31-worker pool, heavy body, speedup vs serial:
+//
+//     N                 256    512   1000   2000   10000   40000   200000
+//     round-robin Push  1.09   3.57   6.33   9.50   12.04   14.20    17.80
+//     self-spawn        2.33   4.14   5.65   7.00    7.40    8.00     8.70
+//
+// Self-spawn SATURATED at ~8x where Push climbed past 17x, and that is the signature of the tree
+// never reaching most of the pool: everything lands on one deque and single-item stealing is the
+// only way it can spread. That measurement is what retired PushFork.
+//
+// This splitter puts its work on the caller's own deque too, and does NOT saturate -- 9-13x on the
+// same class of body, better than ParallelFor on all three shapes. **The difference is the wake.**
+// The old splitter published to a deque and told nobody, so it depended entirely on thieves noticing
+// on their own; a parked worker never notices, because the sleep predicate does not cover other
+// people's deques. This one notifies a worker per split whose predecessor was not taken, and that
+// notify -- plus seeding the round-robin cursor PER THREAD, which on its own took a back-loaded
+// range from 7.6x to 14.6x -- is what turns self-spawn from an 8x ceiling into the fastest of the
+// three. Neither is an optimisation to trim later: remove either and this becomes the 8x row above.
 //
 // WHAT IS DEMAND-DRIVEN HERE, PRECISELY -- because it is easy to overclaim. The SERIAL-VS-PARALLEL
 // decision is: a split is published to this thread's own deque and, if nobody takes it, taken back

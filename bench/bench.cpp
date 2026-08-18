@@ -518,10 +518,10 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched);
 // between callers. So this sweeps both axes -- N and per-element cost -- and reports where parallel
 // starts winning for each. One number cannot be right for all four rows; that is the finding.
 //
-// (This used to call ParallelForFJ DIRECTLY, to dodge the fixed 10k gate it was measuring -- going
-// through ParallelFor would have reported serial-vs-serial below that threshold. The gate became
-// probe-based, so the sweep calls ParallelFor normally now and this file has no ParallelForFJ
-// caller left; see the note where the call actually happens.)
+// (This used to call the removed ParallelForFJ DIRECTLY, to dodge the fixed 10k gate it was
+// measuring -- going through ParallelFor would have reported serial-vs-serial below it. The gate
+// became probe-based, so the sweep calls ParallelFor normally now.)
+
 
 // Per-element bodies of increasing cost. volatile-ish accumulation so the optimizer can't delete them;
 // the results are summed into a global that gets printed.
@@ -588,7 +588,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
             auto t1 = Clock::now();
             std::atomic<double> pacc{ 0.0 };
-            // ParallelFor, not ParallelForFJ: now that the gate is probe-based rather than a fixed
+            // ParallelFor, not the removed fork-join entry point: now that the gate is probe-based
             // element count, this measures the DECISION as well as the dispatch. Every cell should
             // read >= ~1.00x -- anything well below means the probe chose parallel when it shouldn't.
             sched.ParallelFor(0, n, grain, [&](int a, int b) {

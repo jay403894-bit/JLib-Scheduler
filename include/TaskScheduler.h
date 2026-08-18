@@ -238,18 +238,15 @@ namespace JLib {
 		static double GetParallelForThresholdUs();
 
 		void ParallelFor(int start, int end, int chunkSize, std::function<void(int, int)> func);
-		// Fork-join (recursive-split) variant of ParallelFor. Splits the range in half, spawns the
-		// right half as a task and recurses on the left inline; `grain` is the base-case size. It
-		// parallelizes task CREATION -- the tree is built by the whole pool -- instead of the caller
-		// spawning every chunk serially.
+		// `ParallelForFJ` was REMOVED in 1.4. It was the fork-join variant: split in half, spawn the
+		// right half, recurse left. ParallelFor stopped dispatching to it when the slice-stealing
+		// cursor path replaced per-chunk tasks, which left it public with no caller anywhere.
 		//
-		// NOT experimental, and usually not the one to call: ParallelFor DISPATCHES HERE AUTOMATICALLY
-		// once a range needs more than ~2 tasks per worker, which is where the measurements put the
-		// crossover. Below that the flat path is ~14% faster (no tree to build); above it, flat's
-		// O(#tasks) serial CreateTask+Push+NotifyWorker on one thread collapses -- ~8x slower at
-		// ~15k tasks. Call this directly only to bypass ParallelFor's serial-vs-parallel probe, which
-		// is what the crossover benchmark does deliberately.
-		void ParallelForFJ(int start, int end, int grain, std::function<void(int, int)> func);
+		// USE `ParallelFor`. It is the drop-in -- same shape, same blocking behaviour -- and it still
+		// decides serial-vs-parallel for you. Do NOT reach for ParallelForLazy as the migration
+		// target just because it is also a recursive splitter: it requires a grain you can actually
+		// justify and will faithfully over-split if given a bad one, which is a decision the caller
+		// being migrated never opted into.
 		// Shared slice-stealing core behind ParallelFor's large-range path and ParallelRange. Takes func
 		// by REFERENCE: both callers block, so the object outlives every task, and copying a
 		// std::function per worker would reintroduce an allocation this exists to remove.

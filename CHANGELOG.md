@@ -92,6 +92,29 @@ Downstream effect: the speculative split path is **17.8 ns → 10.8 ns**, and th
 the frame DAG went from 21.29-21.39 µs to 20.34-20.81 µs across four runs each — non-overlapping,
 ~3.4% — with batch throughput and round-trip latency also improved.
 
+**REMOVED: `ParallelForFJ`. Use `ParallelFor`.**
+
+The fork-join variant -- split in half, spawn the right half, recurse left. `ParallelFor` stopped
+dispatching to it when the slice-stealing cursor path replaced per-chunk tasks, which left it public
+with no caller anywhere in the tree.
+
+**`ParallelFor` is the drop-in**: same shape, same blocking behaviour, and it still decides
+serial-vs-parallel for you. Do not reach for `ParallelForLazy` as the migration target just because
+it is also a recursive splitter -- it requires a grain you can justify and will faithfully
+over-split if given a bad one, which is a decision a migrating caller never opted into.
+
+This is a breaking change to shipped public API, taken in a minor release rather than deprecated
+through one, because the entry point had already been superseded internally for a release and had no
+callers left to warn.
+
+Its measurement table survives in `RunLazyRange`'s comments rather than in git history, because it
+says something about the code that replaced it: the fork-join splitter carried a capitalised
+instruction NOT to spawn a child on the calling worker, backed by an A/B showing self-spawn
+saturating at ~8x where round-robin `Push` climbed past 17x. `ParallelForLazy` self-spawns and does
+not saturate -- the difference is that it wakes a thief per unstolen split. That wake, and the
+per-thread seeding of its round-robin cursor, are load-bearing rather than optimisations: remove
+either and it becomes the 8x row.
+
 **`TaskDeque` now stores TAGGED pointers, so a thief never dereferences a task it has not claimed.**
 
 `steal_if` vets a candidate before claiming it, and it used to do that by passing the predicate the
