@@ -470,7 +470,6 @@ thread is already splitting.
 | `ParallelFor(begin,end,grain,func)` | yes | same, your grain floored to ≥64 leaves/worker | you know the body's cost and want a coarser or finer split than the default |
 | `PushArray(begin,end,chunk,fn,wg)` | **no** | fixed `chunk`, one task per chunk, submitted up front | fire-and-forget: the caller has other work, or wants several arrays in flight before waiting on them together |
 | `RunCursorRange(begin,end,grain,func)` | yes | one task per worker sharing an atomic cursor | see the caveat below — normally you do not call this |
-| `ParallelForNB(begin,end,chunk,func)` | no | fixed `chunk` | legacy non-blocking form; `PushArray` is the better-specified sibling |
 
 `PushArray` is the one with a genuinely different contract: it **returns as soon as the work is
 queued**, so it is the only one of these you can use to overlap submission with other work on the

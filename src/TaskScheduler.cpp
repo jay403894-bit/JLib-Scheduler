@@ -334,7 +334,8 @@ bool TaskScheduler::ParallelForSerial()           { return g_parallelForSerial; 
 //
 // EVERYTHING LIVES ON THE CALLER'S STACK, which is sound only because both entry points BLOCK:
 // cursor, wg and func all outlive every task by construction. A non-blocking version would need
-// heap state and a refcount, which is why ParallelForNB is not wired through here.
+// heap state and a refcount, which is why `PushArray` -- the non-blocking range API -- allocates a
+// task per chunk instead of sharing this cursor.
 void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func) {
 	if (end <= start) return;
 	if (workers.empty()) { func(start, end); return; }   // no pool: just run it
@@ -697,18 +698,6 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	}
 }
 
-void TaskScheduler::ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func) {
-	chunkSize = std::max(1, chunkSize);
-	int totalItems = end - start;
-	if (totalItems <= 0) return;
-
-	int numTasks = (totalItems + chunkSize - 1) / chunkSize;
-	for (int i = 0; i < numTasks; ++i) {
-		int chunkStart = start + i * chunkSize;
-		int chunkEnd = std::min(chunkStart + chunkSize, end);
-		Push([=]() { func(chunkStart, chunkEnd); });
-	}
-}
 // Fills siblingQIndex/clusterMates from REAL hardware topology -- NOT from the sequential affinity
 // scheme assumption (worker qIndex i is pinned to logical CPU i+1, main sits on 0). That mapping
 // tells you what you ASKED the OS for, not what the hardware actually looks like (adjacent logical

@@ -370,7 +370,6 @@ namespace JLib {
 		// by REFERENCE: both callers block, so the object outlives every task, and copying a
 		// std::function per worker would reintroduce an allocation this exists to remove.
 		void RunCursorRange(int start, int end, int grain, std::function<void(int, int)>& func);
-		void ParallelForNB(int start, int end, int chunkSize, std::function<void(int, int)> func);
 
 		// Blocking range loop with ATOMIC SLICE-STEALING, and no probe.
 		// `ParallelRange` was REMOVED in 1.4, before it ever shipped. It was added earlier in the

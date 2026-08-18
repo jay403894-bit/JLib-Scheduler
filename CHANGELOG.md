@@ -3,6 +3,38 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## Unreleased
+
+**`ParallelForNB` is REMOVED.** It was the non-blocking range loop: fixed `chunkSize`, one task per
+chunk, returns as soon as they are queued.
+
+This is a **breaking change to a shipped public API** -- it was present in v1.3.6 and v1.4.0 -- so it
+belongs in a major bump under the versioning policy below, not a minor one. Recorded here rather
+than quietly dropped, because the honest reason is not that it was broken.
+
+**It worked.** It was tested before removal, not after: 10,000 elements over 40 chunks, every element
+covered exactly once, none skipped and none run twice. What it lacked was a reason to exist. It had
+**zero callers** in this repository, in any other JLib component, or in the application that drives
+this library, and **zero tests** -- a public API nothing exercised, which is the combination most
+likely to rot unnoticed.
+
+`PushArray` is the replacement and is strictly better specified: it returns the number of chunks
+submitted, takes an optional `WaitGroup` so the caller can wait later, is a template rather than a
+`std::function` (so it does not allocate to hold the callable), and degrades gracefully by running
+the remainder inline when the arena is exhausted.
+
+    // before
+    sched.ParallelForNB(0, n, 256, [&](int lo, int hi) { work(lo, hi); });
+    // after
+    sched.PushArray(0, n, 256, [&](size_t lo, size_t hi) { work((int)lo, (int)hi); });
+
+One thing it took with it: its lambda captured **144 bytes**, which made it the single construct in
+the entire codebase that could not fit a 128-byte slab slot -- everything else, including 216,323
+task constructions measured in a real application, fits in 96. That made it the sole reason
+`TaskAllocator::SLOT` had to stay at 256. Removing it unblocks a smaller slot, though measurement
+says not to bother: halving the stride to 128 was tested against a same-vs-same control and the
+entire effect fell inside run-to-run noise.
+
 ## 1.4.0 - 2026-08-18
 
 **`ParallelFor` NO LONGER PROBES. It is now demand-driven, and the probe is gone rather than
