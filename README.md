@@ -169,7 +169,9 @@ same one the library does.
 
 Same machine, same harness, same worker count, both libraries expressed the way their authors
 intended. i9-13900K at Intel spec power limits (see the caveat under [Measured](#measured)), 31
-workers, Release, 1.3.0. `--` is not measured yet.
+workers, Release. **Our two columns are 1.4.0; the other three were last measured at 1.3.0** and are
+carried over unchanged -- see the note under the table for why that is still a fair comparison.
+`--` is not measured yet.
 
 **Every column below was measured with only that scheduler running.** The harness takes `--only=jlib`
 / `--only=enki` and starts nothing else, so no library's threads are alive while another is timed.
@@ -397,10 +399,18 @@ int main() {
 
 ### Submit from inside the pool where you can
 
-Pushing 200,000 tasks from one thread runs at **1.0 M/s**; submitting the same work from four tasks
-already on the pool runs at **9.8 M/s** -- and single-producer submission gets *worse* as workers are
-added. The cost is all in submission, not in finishing: drain-after-submit is 0.00 ms at every pool
-size, so the pool is done before the loop stops pushing.
+Pushing 200,000 tasks from one thread runs at **1.2 M/s**; submitting the same work from four tasks
+already on the pool runs at **2.9 M/s** on this 31-worker machine, and **10-11 M/s** on a pool below
+~21 workers -- and single-producer submission gets *worse* as workers are added. The cost is all in
+submission, not in finishing: drain-after-submit is 0.00 ms at every pool size, so the pool is done
+before the loop stops pushing.
+
+The two four-producer figures are not a contradiction and neither is the headline: that row is
+**bistable with a crossover at ~21 workers**, and this section used to quote 9.8 M/s, which was a
+real reading from the saturated regime published by `best-of-5` on a metric that has two of them.
+See [the table notes](#measured) for the sweep. The advice survives the correction -- four producers
+beat one in *both* regimes -- but the margin is 2.4x here, not 10x, so treat "submit from inside the
+pool" as worth doing rather than as the difference between working and not.
 
 The reason is not a privileged path for workers -- `Push` routes every task through `PickNextWorker`
 into some worker's inbox regardless of who called it, so a task spawning a task pays the same
@@ -416,9 +426,9 @@ what makes the work cheap to *consume*, not cheap to submit.
 One submitter is still a normal shape -- a main thread queueing a frame's work is fine. It just means
 that if adding workers stops helping, the loop is the thing to look at. Two ways to fix it in bulk:
 
-- **`PushBatch`** -- 12.2 M/s, flat across pool sizes. Links the tasks and hands them over in
+- **`PushBatch`** -- 14.7 M/s, flat across pool sizes. Links the tasks and hands them over in
   segments, instead of paying a worker selection, a queue push and a condition-variable signal each.
-- **`PushArray`** -- 1.0 ns per item, because it submits ceil(n/chunk) tasks rather than n.
+- **`PushArray`** -- 0.55 ns per item, because it submits ceil(n/chunk) tasks rather than n.
 
 `SchedulerBench` reports the two cases as `throughput/1p` and `throughput/mp`.
 
