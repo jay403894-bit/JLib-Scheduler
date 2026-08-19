@@ -364,10 +364,11 @@ Fiber* Thread::AcquireFiber(Task* task) {
 		if (!warned.exchange(true, std::memory_order_relaxed)) {
 			std::cerr << "[JLib::Scheduler] fiber pool exhausted. A SUSPENDED task holds its fiber, "
 			             "so the number of tasks that may be blocked AT ONCE is capped at the pool "
-			             "size (64 per core). Past that, workers re-queue and retry instead of "
-			             "running, which looks like a stall rather than an error. Either block fewer "
-			             "tasks concurrently, or raise standardFiberCount in TaskScheduler::StartPool. "
-			             "This warning prints once.\n";
+			             "size (64 per core by default). Past that, workers re-queue and retry "
+			             "instead of running, which looks like a stall rather than an error. Either "
+			             "block fewer tasks concurrently, or call "
+			             "TaskScheduler::SetFiberBudget(standardPerWorker, heavyPerWorker) BEFORE "
+			             "Init() to raise it. This warning prints once.\n";
 		}
 	}
 	return f;

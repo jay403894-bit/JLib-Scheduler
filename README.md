@@ -465,9 +465,11 @@ for as long as it stays suspended, so concurrent suspensions are bounded by the 
 that, workers re-queue the tasks they cannot start and retry: it still makes progress, but it looks
 like a stall rather than an error, so one warning is printed and then the pool grinds. Tasks that
 never suspend are unaffected, and so is the total number in flight -- it is specifically the number
-blocked *simultaneously*. Raise `standardFiberCount` in `StartPool` if you need more, remembering
-each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an arbitrary
-one.
+blocked *simultaneously*. Call `TaskScheduler::SetFiberBudget(standardPerWorker, heavyPerWorker)`
+**before** `Init()` if you need more -- it cannot be changed after, since each fiber registers a
+permanent slot with the epoch manager and the stack arena is one fixed allocation made at startup.
+Remember each standard fiber carries a 64 KB stack, so the cap is a memory decision rather than an
+arbitrary one.
 
 ### Parallel loops
 

@@ -30,24 +30,28 @@ jobs:
             smoke: build/bin/Release/SchedulerEventSmoke.exe
             topo: build/bin/Release/SchedulerTopologyTest.exe
             prims: build/bin/Release/SchedulerPrimitivesTest.exe
+            fiberbudget: build/bin/Release/SchedulerFiberBudgetTest.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
             topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
+            fiberbudget: build/bin/SchedulerFiberBudgetTest
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
             topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
+            fiberbudget: build/bin/SchedulerFiberBudgetTest
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
             smoke: build/bin/SchedulerEventSmoke
             topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
+            fiberbudget: build/bin/SchedulerFiberBudgetTest
 
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +119,14 @@ jobs:
       # on the first manual Tick(). Neither has any other coverage.
       - name: Run primitives test with self-reclaim disabled
         run: ./${{ matrix.prims }} noreclaim
+        shell: bash
+
+      # SetFiberBudget: does StartPool actually consume the configured per-worker fiber counts, not
+      # just the setter storing them. Verified as a real check before this was added -- reverting
+      # the StartPool wiring back to the old hardcoded 64/8 makes this fail with the wrong pool size
+      # rather than passing regardless.
+      - name: Run fiber budget test (SetFiberBudget wiring)
+        run: ./${{ matrix.fiberbudget }}
         shell: bash
 
       # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
@@ -235,6 +247,10 @@ jobs:
 
       - name: Run primitives test with self-reclaim disabled
         run: ./build/bin/Release/SchedulerPrimitivesTest.exe noreclaim
+        shell: bash
+
+      - name: Run fiber budget test (SetFiberBudget wiring)
+        run: ./build/bin/Release/SchedulerFiberBudgetTest.exe
         shell: bash
 
       - name: Run benchmark (smoke test)

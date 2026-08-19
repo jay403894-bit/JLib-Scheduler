@@ -935,18 +935,17 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// Still fully automatic: for the default Init() (poolSize 0 -> hw-1) this is the same number it
 	// always was. It only changes what an EXPLICIT smaller pool costs.
 	//
-	// 64 standard + 8 heavy per worker is the count of tasks that may be SUSPENDED AT ONCE per
-	// worker, since a suspended task holds its fiber -- not the number of tasks in flight. See the
-	// README's rules section. Each standard fiber carries a 64 KB stack and each heavy one 512 KB,
-	// so this is ~8 MB of commit per worker; the pages are reserved and only materialise on touch.
+	// 64 standard + 8 heavy per worker (the defaults; see SetFiberBudget to change them) is the
+	// count of tasks that may be SUSPENDED AT ONCE per worker, since a suspended task holds its
+	// fiber -- not the number of tasks in flight. See the README's rules section. Each standard
+	// fiber carries a 64 KB stack and each heavy one 512 KB, so the default is ~8 MB of commit per
+	// worker; the pages are reserved and only materialise on touch.
 	unsigned int coreCount = num_workers;
 	if (coreCount == 0) coreCount = 4; // Fallback
 
-	size_t standardFiberCount = coreCount * 64;
-	size_t heavyFiberCount = coreCount * 8;
+	size_t standardFiberCount = coreCount * StandardFibersPerWorker();
+	size_t heavyFiberCount = coreCount * HeavyFibersPerWorker();
 
-	// 3. Ensure a minimum to avoid "thrashing"
-	
 	// GlobalFiberPool now owns all fibers and stack allocation
 	globalPool = GlobalFiberPool::Create(standardFiberCount, heavyFiberCount);
 	workers.clear();
@@ -1459,6 +1458,19 @@ void TaskScheduler::PrefaultTaskSlots(size_t slots) {
 static bool g_lazyTaskSlab = false;
 void TaskScheduler::SetLazyTaskSlab(bool on) { g_lazyTaskSlab = on; }
 bool TaskScheduler::LazyTaskSlabEnabled()    { return g_lazyTaskSlab; }
+
+// Defaults match what StartPool always computed inline (coreCount * 64, coreCount * 8) before this
+// existed. Not validated against zero or anything else -- same trust-the-caller stance every other
+// setter here takes; a caller who sets 0 has asked for a pool that always reports exhausted, and
+// that is theirs to have asked for.
+static size_t g_standardFibersPerWorker = 64;
+static size_t g_heavyFibersPerWorker    = 8;
+void TaskScheduler::SetFiberBudget(size_t standardPerWorker, size_t heavyPerWorker) {
+	g_standardFibersPerWorker = standardPerWorker;
+	g_heavyFibersPerWorker    = heavyPerWorker;
+}
+size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWorker; }
+size_t TaskScheduler::HeavyFibersPerWorker()    { return g_heavyFibersPerWorker; }
 Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t noFiber, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;

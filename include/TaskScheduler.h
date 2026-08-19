@@ -535,6 +535,25 @@ namespace JLib {
 		static void SetLazyTaskSlab(bool on);
 		static bool LazyTaskSlabEnabled();
 
+		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
+		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +
+		// 8 heavy per worker, same as always; call this before Init() to change the multiplier.
+		// Total capacity is this times the pool's actual worker count, so a multiplier is what gets
+		// configured here rather than an absolute total the caller would have to keep in sync with
+		// an "auto" pool size it may not know yet.
+		//
+		// PRE-INIT ONLY, same contract as SetLazyTaskSlab and SetParallelForSerial above. Not
+		// resizable after Init(): each fiber registers a permanent slot with the epoch manager and
+		// the stack arena is one fixed allocation made at StartPool, so there is no live pool to
+		// grow into even if this were called later -- it would just be ignored.
+		//
+		// This is the actual lever the exhaustion warning in Thread.cpp means when it says "raise
+		// standardFiberCount" -- that used to name a local variable inside StartPool with no way to
+		// reach it from outside the library. Call this before Init() instead.
+		static void SetFiberBudget(size_t standardPerWorker, size_t heavyPerWorker);
+		static size_t StandardFibersPerWorker();
+		static size_t HeavyFibersPerWorker();
+
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
 		// "level_loaded", the handful of names your app knows at compile time. The registry is

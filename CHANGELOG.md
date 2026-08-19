@@ -5,6 +5,30 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## Unreleased
 
+**Fiber pool capacity is now configurable: `TaskScheduler::SetFiberBudget(standardPerWorker,
+heavyPerWorker)`, called before `Init()`.** Defaults stay 64/8, unchanged. This closes a gap the
+library's own exhaustion warning had been pointing at since before this API existed: it says,
+verbatim, "raise `standardFiberCount` in `TaskScheduler::StartPool`" -- naming a local variable
+inside a function body that nothing outside the library could reach. Anyone who hit the warning in
+production and went looking for the lever it described would not have found one. `SetFiberBudget`
+is that lever, following the same pre-Init-only contract `SetLazyTaskSlab` and
+`SetParallelForSerial` already use -- it cannot be changed after `Init()`, since each fiber
+registers a permanent slot with the epoch manager and the stack arena is one fixed allocation made
+at startup.
+
+A stale comment sitting next to the old computation (`// 3. Ensure a minimum to avoid "thrashing"`)
+had no code under it and is removed rather than kept as a second unfulfilled promise.
+
+Verified with a dedicated test (`SchedulerFiberBudgetTest`, new in CI on all four platforms plus
+the Windows ARM64 job) rather than trusting the getters alone: it checks that `StartPool` actually
+*consumes* the configured counts by reading `GlobalFiberPool::AvailableCount()` after `Init()`, not
+just that the setter stores what it was given. Confirmed as a real check, not a vacuous one, by
+reverting the `StartPool` wiring back to the old hardcoded 64/8 and watching the test correctly
+fail with the wrong pool size (288 instead of the configured 80) rather than passing regardless.
+Not folded into the existing primitives suite: `TestFiberCapOversubscribed` there hardcodes
+`4 * 64 = 256` directly into its own logic, so changing the process-wide default anywhere in that
+shared binary would have silently invalidated it.
+
 **`SchedulerBench` gained a splitter-vs-cursor sweep, because the one that was already published
 could not be reproduced.** The README's crossover table -- the recursive splitter measured at
 10.3x-18.5x speedup over serial, the shared cursor (`RunCursorRange`, called directly) at

@@ -385,6 +385,14 @@ add_executable(SchedulerEventSmoke "${CMAKE_CURRENT_SOURCE_DIR}/tests/event_smok
 target_link_libraries(SchedulerEventSmoke PRIVATE Scheduler)
 target_compile_features(SchedulerEventSmoke PRIVATE cxx_std_17)
 
+# SetFiberBudget: does StartPool actually consume the configured per-worker counts, not just the
+# setter storing them. A standalone binary, not a case in primitives_test.cpp, because
+# TestFiberCapOversubscribed there hardcodes 4*64=256 into its own logic -- changing the
+# process-wide default anywhere in that shared binary would silently invalidate it.
+add_executable(SchedulerFiberBudgetTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_budget_test.cpp")
+target_link_libraries(SchedulerFiberBudgetTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberBudgetTest PRIVATE cxx_std_17)
+
 # Pure-logic tests for the >64-CPU path: mask math, the flat-id split, and the worker-to-CPU
 # assignment on unevenly sized processor groups. Runs anywhere, which is the point -- it is the only
 # check on the wide path that does not require hardware nobody here has.
