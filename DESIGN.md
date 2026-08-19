@@ -325,11 +325,13 @@ The context switch is hand-written assembly per ABI: MASM for Win64, GAS for Sys
 AAPCS64. A new *architecture* therefore needs a new `ContextSwitch` and a matching `Fiber::Init`,
 not a compiler flag.
 
-Verified in CI on every push: Windows x64 (MSVC), Linux x86-64 (GCC), Linux AArch64 (GCC), macOS
-arm64 (AppleClang). AArch64 on Android/Termux (Clang) is verified by hand. The benchmark suite
-passes on all of them, fibers suspending and resuming through the switch under the real scheduler,
-and the AAPCS64 switch has a standalone ABI harness (`tests/fibertest_aarch64.cpp`) run at `-O0` and
-`-O2` on both ARM64 platforms.
+Verified in CI on every push: Windows x64 (MSVC), Windows ARM64 (MSVC), Linux x86-64 (GCC), Linux
+AArch64 (GCC), macOS arm64 (AppleClang). AArch64 on Android/Termux (Clang) is verified by hand. The
+benchmark suite passes on all of them, fibers suspending and resuming through the switch under the
+real scheduler, and the AAPCS64 switch has a standalone ABI harness (`tests/fibertest_aarch64.cpp`)
+run at `-O0` and `-O2` on both POSIX ARM64 platforms; Windows ARM64 has its own isolated harness,
+`tests/fibertest_win_aarch64.cpp`, run before the scheduler suite so a bad switch localises to the
+exact register that failed instead of surfacing as an unexplained scheduler crash.
 
 The ARM64 results agreeing across three toolchains, three libcs and two object formats
 (GCC/glibc/ELF, Clang/bionic/ELF, AppleClang/libc++/Mach-O) is what makes the ABI claim worth
@@ -341,10 +343,25 @@ ABI layer under `src/posix/<arch>/` is shared by every POSIX target, because the
 belongs to the instruction set and not to the kernel. `include/platform.h` is the only place that
 tests OS and architecture.
 
-Windows on ARM64 is refused explicitly rather than attempted. MSVC's ARM64 assembler is `armasm64`,
-whose syntax is unrelated to the GAS syntax the AArch64 switch is written in, and a Windows fiber
-switch must also update the TEB's stack bounds -- the fixup the x64 MASM does and the Linux/macOS
-switch deliberately omits.
+Windows on ARM64 is supported, not refused -- verified on a real `windows-11-arm` GitHub Actions
+runner, a required leg (not allowed-to-fail) since five consecutive green runs of the isolated ABI
+harness plus the full scheduler suite. It needed a third hand-written context switch,
+`src/win32/aarch64/ContextSwitch.asm`, because MSVC's ARM64 assembler is `armasm64`, whose syntax is
+unrelated to the GAS syntax the POSIX AArch64 switch is written in -- this is the one place the
+"OS axis is orthogonal to the arch axis" claim above does not fully hold, since a calling convention
+belongs to the (OS, ARCH) pair, and Windows needed its own assembler even though the ABI underneath
+is close to identical.
+
+Two things that sound like they should be true here are not. There is no TEB fixup: an earlier
+version of this document claimed a Windows fiber switch must update the TEB's stack bounds "the way
+the x64 MASM does" -- there is no such fixup anywhere in `src/win32/`, on x64 or ARM64, and the claim
+was wrong on both platforms it was made about. And `Fiber::Init` did not need a Windows-ARM64-specific
+version: `src/posix/aarch64/FiberInit.cpp` is reused verbatim, because Windows ARM64 and AAPCS64 agree
+on the callee-saved register set and frame layout closely enough that only the assembler syntax and
+unwind format differ, not the ABI contract itself. `x18` is never touched by the switch, and that is
+load-bearing rather than incidental: it is the TEB pointer on Windows, and fibers here migrate between
+worker threads, so saving it into a fiber frame and restoring it after a migration would install a
+stale TEB on whichever thread resumed that fiber next.
 
 ### ucontext is not used, and that is a measurement
 
