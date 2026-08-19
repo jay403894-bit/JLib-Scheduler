@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## Unreleased
+## 1.6.0 - 2026-08-18
 
 **Fiber pool capacity is now configurable: `TaskScheduler::SetFiberBudget(standardPerWorker,
 heavyPerWorker)`, called before `Init()`.** Defaults stay 64/8, unchanged. This closes a gap the
