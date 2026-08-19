@@ -31,6 +31,7 @@ jobs:
             topo: build/bin/Release/SchedulerTopologyTest.exe
             prims: build/bin/Release/SchedulerPrimitivesTest.exe
             fiberbudget: build/bin/Release/SchedulerFiberBudgetTest.exe
+            slabsize: build/bin/Release/SchedulerTaskSlabSizeTest.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
@@ -38,6 +39,7 @@ jobs:
             topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
             fiberbudget: build/bin/SchedulerFiberBudgetTest
+            slabsize: build/bin/SchedulerTaskSlabSizeTest
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
@@ -45,6 +47,7 @@ jobs:
             topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
             fiberbudget: build/bin/SchedulerFiberBudgetTest
+            slabsize: build/bin/SchedulerTaskSlabSizeTest
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
@@ -52,6 +55,7 @@ jobs:
             topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
             fiberbudget: build/bin/SchedulerFiberBudgetTest
+            slabsize: build/bin/SchedulerTaskSlabSizeTest
 
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +131,15 @@ jobs:
       # rather than passing regardless.
       - name: Run fiber budget test (SetFiberBudget wiring)
         run: ./${{ matrix.fiberbudget }}
+        shell: bash
+
+      # SetTaskSlabSize: same shape of check as the fiber budget one -- does construction actually
+      # consume the configured slot count, and does the allocator genuinely exhaust at it. Verified
+      # as real before this was added: reverting the wiring back to the hardcoded 1024*1024 made
+      # both checks fail (reported capacity 1048576 instead of the configured value, and none of
+      # 137 allocation attempts against a slab meant to hold 37 ever returned nullptr).
+      - name: Run task slab size test (SetTaskSlabSize wiring)
+        run: ./${{ matrix.slabsize }}
         shell: bash
 
       # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
@@ -251,6 +264,10 @@ jobs:
 
       - name: Run fiber budget test (SetFiberBudget wiring)
         run: ./build/bin/Release/SchedulerFiberBudgetTest.exe
+        shell: bash
+
+      - name: Run task slab size test (SetTaskSlabSize wiring)
+        run: ./build/bin/Release/SchedulerTaskSlabSizeTest.exe
         shell: bash
 
       - name: Run benchmark (smoke test)

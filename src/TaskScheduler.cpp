@@ -1459,6 +1459,10 @@ static bool g_lazyTaskSlab = false;
 void TaskScheduler::SetLazyTaskSlab(bool on) { g_lazyTaskSlab = on; }
 bool TaskScheduler::LazyTaskSlabEnabled()    { return g_lazyTaskSlab; }
 
+static size_t g_taskSlabSize = 1024 * 1024;
+void TaskScheduler::SetTaskSlabSize(size_t slots) { g_taskSlabSize = slots; }
+size_t TaskScheduler::TaskSlabSize()              { return g_taskSlabSize; }
+
 // Defaults match what StartPool always computed inline (coreCount * 64, coreCount * 8) before this
 // existed. Not validated against zero or anything else -- same trust-the-caller stance every other
 // setter here takes; a caller who sets 0 has asked for a pool that always reports exhausted, and

@@ -535,6 +535,25 @@ namespace JLib {
 		static void SetLazyTaskSlab(bool on);
 		static bool LazyTaskSlabEnabled();
 
+		// Total task slab capacity. Defaults to 1024*1024 (1M), same as always; call this before
+		// Init() to change it. No structural reason it was fixed -- not a power of two anything else
+		// depends on, not coupled to the ABI guard, which hashes type layout rather than a runtime
+		// count -- it just went unexposed until something wanted it. Combine with SetLazyTaskSlab to
+		// size AND choose the commit strategy: a small eager slab for a memory budget you want to
+		// hold for certain, or a large lazy one for a ceiling you do not expect to reach.
+		//
+		// PRE-INIT ONLY, same contract as the setters above: taskAllocator is a member of
+		// TaskScheduler, constructed once when Init() calls `new TaskScheduler(...)`, so this has to
+		// land before that to be read by it.
+		//
+		// Exhaustion past whatever this is set to is not an error on its own -- CreateTask returns
+		// nullptr and every caller in this codebase already falls back to running inline (see
+		// RunLazyRange and ParallelFor's grain-floor comment) -- but a slab too small for a real
+		// workload turns that fallback from an occasional safety net into the common case, which
+		// costs the dispatch benefit this scheduler exists for. Measure before shrinking it.
+		static void SetTaskSlabSize(size_t slots);
+		static size_t TaskSlabSize();
+
 		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
 		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +
 		// 8 heavy per worker, same as always; call this before Init() to change the multiplier.
@@ -833,9 +852,9 @@ namespace JLib {
 		// -----------------------------------------------
 
 		static TaskScheduler* instance;
-		// 1M tasks. Eager unless SetLazyTaskSlab(true) was called before Init -- see that setter for
-		// why the default is the expensive one.
-		TaskAllocator taskAllocator{ 1024 * 1024, LazyTaskSlabEnabled() };
+		// 1M tasks by default; see SetTaskSlabSize to change it. Eager unless SetLazyTaskSlab(true)
+		// was called before Init -- see that setter for why the default is the expensive one.
+		TaskAllocator taskAllocator{ TaskSlabSize(), LazyTaskSlabEnabled() };
 
 	public:
 		// ABI LAYOUT CANARY. Not used by anything at runtime; its OFFSET is the payload.

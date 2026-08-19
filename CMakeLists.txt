@@ -393,6 +393,14 @@ add_executable(SchedulerFiberBudgetTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber
 target_link_libraries(SchedulerFiberBudgetTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberBudgetTest PRIVATE cxx_std_17)
 
+# SetTaskSlabSize: does construction actually consume the configured slot count, and does the
+# allocator genuinely exhaust at it rather than the number being cosmetic. Standalone for the same
+# reason as SchedulerFiberBudgetTest -- primitives_test.cpp creates tasks liberally and was never
+# written expecting a slab of a few dozen slots.
+add_executable(SchedulerTaskSlabSizeTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/task_slab_size_test.cpp")
+target_link_libraries(SchedulerTaskSlabSizeTest PRIVATE Scheduler)
+target_compile_features(SchedulerTaskSlabSizeTest PRIVATE cxx_std_17)
+
 # Pure-logic tests for the >64-CPU path: mask math, the flat-id split, and the worker-to-CPU
 # assignment on unevenly sized processor groups. Runs anywhere, which is the point -- it is the only
 # check on the wide path that does not require hardware nobody here has.

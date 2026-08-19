@@ -3,6 +3,29 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## Unreleased
+
+**`TaskScheduler::SetTaskSlabSize(slots)`, called before `Init()`.** Total task slab capacity,
+defaulting to 1024*1024 as always. Combine with `SetLazyTaskSlab` to control both the ceiling and
+the commit strategy -- a small eager slab for a memory budget you want to hold for certain, or a
+large lazy one for a ceiling you do not expect to reach.
+
+There was no structural reason the size was fixed: not a power of two anything else depends on
+(checked), not coupled to the ABI guard, which hashes type layout rather than a runtime count. It
+just went unexposed, the same shape of gap `SetFiberBudget` closed last release, found this time
+because there was an actual reason to want it -- experimenting with memory profile -- rather than
+inferred from a warning message.
+
+Verified the same way: a dedicated test (`SchedulerTaskSlabSizeTest`) checks not just that
+`TaskSlabSize()` reflects the configured value but that `TaskAllocator::Capacity()` after `Init()`
+matches it, and that `CreateTask` actually exhausts near that count rather than the number being
+cosmetic. Confirmed as a real check by reverting the wiring to the old hardcoded `1024 * 1024` and
+watching both fail -- reported capacity 1048576 instead of the configured 37, and none of 137
+allocation attempts against that 37-slot slab ever returned `nullptr`. Standalone binary, wired
+into CI on all four platforms plus Windows ARM64, for the same reason `SchedulerFiberBudgetTest`
+is one: `primitives_test.cpp` creates tasks liberally and was never written expecting a slab this
+small.
+
 ## 1.6.0 - 2026-08-18
 
 **Fiber pool capacity is now configurable: `TaskScheduler::SetFiberBudget(standardPerWorker,
