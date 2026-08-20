@@ -3,6 +3,23 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.1.0 - 2026-08-20
+
+**`TaskScheduler::TryRunStolenNoFiberTask()` is renamed `TryRunStolenNativeTask()`.** A leftover
+from the `TaskType` rename in 2.0.0: that pass covered `noFiber`/`Task::type` and every comment
+that named them, but this one public method's name itself still spelled out the old `NoFiber`
+vocabulary it was supposed to retire, plus one stale abbreviation (`TRSFJ`, from `TryRunStolenFastJob`,
+the name before that) in an adjacent comment that never got updated either. Same category of
+change as 2.0.0 -- a public rename, technically source-breaking -- but treated as closing a gap in
+that sweep rather than a new breaking decision, so it ships as a minor rather than a second major
+bump days after the first.
+
+Renamed at every call site: `TaskScheduler.h`'s declaration and two comments, `TaskScheduler.cpp`'s
+definition, three call sites, and two comments (including the stale `TRSFJ` abbreviation), and the
+two comment-only mentions in `bench/compare/compare_taskflow.cpp` and `compare_marl.cpp`. Historical
+CHANGELOG entries that describe what this method was named at past releases are left untouched --
+they are an accurate record of history, not documentation of the current API.
+
 ## 2.0.0 - 2026-08-20
 
 **[BREAKING] `Task::noFiber` and `CreateTask`'s matching parameter are replaced by `TaskType`, an

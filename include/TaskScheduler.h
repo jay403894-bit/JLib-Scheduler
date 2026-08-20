@@ -633,7 +633,7 @@ namespace JLib {
 		// the slab stays correct; skipping either of these leaks a slab slot.
 		// Returns true if it ran a task, false if nothing stealable -- callers should yield()
 		// on false to avoid a hot spin.
-		bool TryRunStolenNoFiberTask();
+		bool TryRunStolenNativeTask();
 
 		// Steal-time class compatibility (used with TaskDeque::steal_if -- vet BEFORE claiming, never
 		// steal-then-Requeue, which is pure deque contention + worker thrash). Placement policy at steal
@@ -843,7 +843,7 @@ namespace JLib {
 		// HARD-PINNED (Thread::StartWorker SetThreadAffinityMask), so the OS can't place work P/E for us.
 		std::vector<char> isPCore;
 		// isPCpu[logical CPU] -- P/E class of every logical processor, same EfficiencyClass
-		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenNoFiberTask's
+		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenNativeTask's
 		// callers include NON-worker, possibly UNPINNED threads (main, or any app thread hitting a
 		// SchedulerMutex/SchedulerConditionVariable spin): their class can't be assumed -- it's looked
 		// up via GetCurrentProcessorNumber() at steal time ("this Native task would run HERE, right now").
@@ -910,7 +910,7 @@ namespace JLib {
 		// Callable from EITHER context, and the two behave differently on contention:
 		//   on a fiber      -- the fiber is queued and SUSPENDED, freeing the worker for other work.
 		//   on a bare thread -- there is no fiber to suspend, so it spins, running one stolen
-		//                       Native task per iteration (TryRunStolenNoFiberTask) instead of
+		//                       Native task per iteration (TryRunStolenNativeTask) instead of
 		//                       burning the cycles.
 		//
 		// That second path is why this is NOT the right lock everywhere, and the reason is stronger

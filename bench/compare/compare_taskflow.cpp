@@ -16,7 +16,7 @@
 // WORKER ACCOUNTING, checked in the source rather than assumed, because all three libraries count
 // differently and getting this wrong silently hands someone an extra core:
 //   JLib     -- Init(N) spawns N workers; main is not a worker but DOES help while waiting, via
-//               TryRunStolenNoFiberTask (Native tasks only).
+//               TryRunStolenNativeTask (Native tasks only).
 //   enkiTS   -- Initialize(N) spawns N-1 and uses the CALLER as thread 0, a full worker.
 //   Taskflow -- Executor(N) spawns N; the caller does NOT participate. corun_until is documented as
 //               callable only "from a worker of the calling executor", so run(tf).wait() blocks.

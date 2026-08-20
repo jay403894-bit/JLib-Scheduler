@@ -53,7 +53,7 @@ namespace {
 	inline void ContendedSpinStep() {
 		if (t_spinHelpDepth == 0 && t_heldMutexes == 0 && TaskScheduler::IsInitialized()) {
 			++t_spinHelpDepth;
-			const bool ranSomething = TaskScheduler::Instance().TryRunStolenNoFiberTask();
+			const bool ranSomething = TaskScheduler::Instance().TryRunStolenNativeTask();
 			--t_spinHelpDepth;
 			if (ranSomething) { t_idleSpins = 0; return; }   // progress: not an idle pass
 		}
@@ -658,7 +658,7 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	// case worked before any of this existed.
 	//
 	// A BARE caller (main, or a Native task) has nothing to park into, so WaitFor spin-helps via
-	// TryRunStolenNoFiberTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
+	// TryRunStolenNativeTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
 	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
 	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
 	// own lane where a 4.6 ns pop_bottom would have them. Measured, that scan was most of the cost
@@ -693,7 +693,7 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		}
 		// Our lane is empty: everything we published is out with thieves. Help the pool generally
 		// rather than spinning -- this is the same policy WaitFor's bare path takes.
-		if (!TryRunStolenNoFiberTask())
+		if (!TryRunStolenNativeTask())
 			std::this_thread::yield();
 	}
 }
@@ -1125,7 +1125,7 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 			bool ranSomething = false;
 			if (t_heldMutexes == 0) {
 				++t_spinHelpDepth;
-				ranSomething = TryRunStolenNoFiberTask();
+				ranSomething = TryRunStolenNativeTask();
 				--t_spinHelpDepth;
 			}
 			if (!ranSomething)
@@ -1333,11 +1333,11 @@ void TaskScheduler::Stop(Task* worker_task) {
 Task* TaskScheduler::GetTask() {
 	bool forceLoPri = (consecutiveHiPriSteals >= kStealFairnessWindow);
 
-	// NOFIBER- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenNoFiberTask,
+	// NATIVE- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenNativeTask,
 	// whose fiberless caller can't run anything that might suspend. Previously this stole blind and
 	// Requeued fiber-backed tasks -- a claim-CAS + full re-push + notify to move a task nowhere (deque
 	// contention + thrash). Now a fiber-backed task is never claimed at all: it stays put for a real worker,
-	// and the scan just moves to the next victim. Class matters too because TRSFJ's callers vary: the
+	// and the scan just moves to the next victim. Class matters too because TryRunStolenNativeTask's callers vary: the
 	// SchedulerMutex spin path invokes it FROM WORKERS (thief class = that worker's), while main/WaitFor
 	// helpers are non-workers pinned to CPU 0 -- a P-core -- so they vet as P. corePref is the sole
 	// placement authority EVERYWHERE, including helper steals.
@@ -1391,7 +1391,7 @@ Task* TaskScheduler::GetTask() {
 	return nullptr;
 }
 
-bool TaskScheduler::TryRunStolenNoFiberTask() {
+bool TaskScheduler::TryRunStolenNativeTask() {
 	// Steal ONE Native and run it to completion right here with the full completion bookkeeping
 	// Worker()'s fast path does. GetTask vets the Native flag AT THE DEQUE (steal_if) -- a fiber-backed task
 	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue

@@ -16,7 +16,7 @@
 //
 // WORKER ACCOUNTING, checked in each library's source rather than assumed:
 //   JLib     -- Init(N) spawns N workers; main is not a worker but helps while waiting, via
-//               TryRunStolenNoFiberTask (Native tasks only).
+//               TryRunStolenNativeTask (Native tasks only).
 //   marl     -- Scheduler::Config::setWorkerThreadCount(N) spawns N; the BOUND thread runs tasks
 //               too when it blocks on a WaitGroup, so main participates much as it does here.
 // Both therefore get N = hw-1 spawned plus a participating main.
