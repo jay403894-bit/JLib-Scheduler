@@ -8,8 +8,8 @@
 //   ./smoke ; echo "exit $?"
 //
 // WHY THIS EXISTS: every other section of the bench uses CreateTask(+[](void*){}, nullptr), the
-// function-pointer overload, which defaults to fastJob=true and never touches a fiber. Only
-// fork-join passes fastJob=false, so it is the FIRST code in the whole bench to exercise
+// function-pointer overload, which defaults to TaskType::Native and never touches a fiber. Only
+// fork-join passes TaskType::Fiber, so it is the FIRST code in the whole bench to exercise
 // Fiber::Init, the switch-in, FiberEntryWrapper, and the suspend path -- all of which are new on
 // AArch64. The bench conflates all four; this separates them into two stages.
 //
@@ -95,7 +95,7 @@ int main() {
         JLib::WaitGroup wg;
         JLib::Task* t = sched.CreateTask([] {
             printf("  [stage 1: fiber task body ran]\n"); fflush(stdout);
-        }, false, JLib::FiberSize::Standard, false);   // hipri=false, Standard, fastJob=FALSE
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
         if (!t) { printf("STAGE 1 FAIL: CreateTask returned null\n"); return 1; }
 
         t->waitGroup = &wg;
@@ -116,7 +116,7 @@ int main() {
             JLib::WaitGroup inner;
             JLib::Task* child = sched.CreateTask([] {
                 printf("    [stage 2: child ran]\n"); fflush(stdout);
-            }, false, JLib::FiberSize::Standard, false);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
             if (!child) { printf("STAGE 2 FAIL: child CreateTask null\n"); return; }
 
             child->waitGroup = &inner;
@@ -125,7 +125,7 @@ int main() {
             printf("  [stage 2: outer suspending in WaitFor]\n"); fflush(stdout);
             sched.WaitFor(inner);                 // <-- suspends THIS fiber
             printf("  [stage 2: outer resumed]\n"); fflush(stdout);
-        }, false, JLib::FiberSize::Standard, false);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
         if (!t) { printf("STAGE 2 FAIL: CreateTask returned null\n"); return 1; }
 
         t->waitGroup = &outer;

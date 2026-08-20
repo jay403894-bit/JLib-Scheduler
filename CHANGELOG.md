@@ -5,6 +5,45 @@ downstream users (forks/ports) should treat those as must-pull.
 
 ## Unreleased
 
+**[BREAKING] `Task::noFiber` and `CreateTask`'s matching parameter are replaced by `TaskType`, an
+enum with values `Native` and `Fiber`.** This is the reason for the major version: requesting the
+capability most calls actually want -- a task that may suspend -- meant writing `noFiber = false`,
+a double negative repeated at every call site that needed it, each one requiring its own comment to
+stay readable. `TaskType::Fiber` is the identical request spelled as a direct, positive statement.
+
+The reason this is an enum and not a renamed bool: a bool rename is not safe here. `noFiber` was a
+positional parameter, and every existing call site passed it as a bare `true`/`false`/`0`/`1`
+literal. Flipping the polarity of a same-shaped bool (`fiber = true`) would have let every one of
+those call sites keep compiling while silently meaning the opposite of what they used to -- no
+error, no warning, just inverted behaviour. An enum can't accept a bare literal positionally, so the
+compiler refuses every call site until it names `TaskType::Native` or `TaskType::Fiber` explicitly.
+Same breaking change, but it fails at compile time instead of at runtime.
+
+`Native` is the default, unchanged from `noFiber`'s effective default -- nothing about ordinary
+`CreateTask` calls that don't touch this parameter needs to change. One related bug fixed for free:
+`Task::noFiber`'s own member default was `0`/false (fiber-capable), while `CreateTask`'s parameter
+defaulted to `true` (native) -- a mismatch that only mattered for a `Task` constructed directly
+rather than through `CreateTask`, and is gone now that both read `TaskType::Native`.
+
+Every internal call site (41+ across this repository) was updated, along with `TaskDeque::StealBits`
+(the internal steal-vetting tag, which mirrors this field but was never itself public), and every
+mention in the README and DESIGN.md, including code examples that would otherwise no longer compile
+against the API they were documenting.
+
+Verified before committing: a full clean rebuild of every target with zero errors; the complete
+`primitives_test` suite green under default/`nosleep`/`noreclaim`, which specifically exercises the
+fiber suspend/resume path under real contention rather than merely compiling against it; the
+fork-join section of `SchedulerBench`, the one path that specifically needs `TaskType::Fiber`; and a
+re-disassembly of the `Worker()` dispatch check this touches, confirming identical codegen to before
+the change -- one byte compare and one conditional jump, `Native` still the fall-through case.
+
+```cpp
+// before
+Task* t = sched.CreateTask(fn, data, hipri, size, /*noFiber*/ false, corePref);
+// after
+Task* t = sched.CreateTask(fn, data, hipri, size, TaskType::Fiber, corePref);
+```
+
 **`TaskScheduler::SetTaskSlabSize(slots)`, called before `Init()`.** Total task slab capacity,
 defaulting to 1024*1024 as always. Combine with `SetLazyTaskSlab` to control both the ceiling and
 the commit strategy -- a small eager slab for a memory budget you want to hold for certain, or a

@@ -379,7 +379,7 @@ static void BenchLatency(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
 // measurement does not show a taper at both ends, the harness is wrong, not the theory.
 //
 // A FAIRNESS DEBT, stated rather than hidden: JLib submits 256 individual tasks per batch while
-// enkiTS submits one ranged set, because JLib's blocking tasks need noFiber=0 individually. From
+// enkiTS submits one ranged set, because JLib's blocking tasks need TaskType::Fiber individually. From
 // benchmark 1 that is ~1.2 us/task of submission overhead JLib pays and enkiTS does not, worth
 // ~300 us per batch -- comparable to D itself. The D=0 row measures exactly that gap, so read the
 // DELTA COLUMNS (each library against its own D=0 baseline), which cancel it. The absolute columns
@@ -459,8 +459,8 @@ static void BenchBlocking(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
                     // the baseline should charge. enkiTS's EnkiBlock always did this; JLib's side
                     // did not, so JLib's baseline was inflated by 33% more work than enkiTS's.
                     const bool blocks = (i % kBlockEvery) == 0;
-                    // Blocking tasks MUST be fiber-backed (noFiber=0): WaitOnEvent needs a fiber to
-                    // suspend. Non-blocking tasks keep the default noFiber=1, so the fiber cost is
+                    // Blocking tasks MUST be fiber-backed (TaskType::Fiber): WaitOnEvent needs a fiber to
+                    // suspend. Non-blocking tasks keep the default TaskType::Native, so the fiber cost is
                     // paid only where it buys something -- the whole point of the hybrid, and the
                     // reason the D=0 row is a fair baseline rather than a rigged one.
                     JLib::Task* t = blocks
@@ -476,7 +476,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
                                       s.GetEvent("compare_io").SignalAll();
                               });
                               g_blockersLeft.fetch_sub(1, std::memory_order_acq_rel);
-                          }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0)
+                          }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber)
                         : jl.CreateTask(+[](void* p) {
                               g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                std::memory_order_relaxed);

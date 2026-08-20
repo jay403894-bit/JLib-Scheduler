@@ -17,6 +17,21 @@ namespace JLib {
 
     enum class FiberSize : uint8_t { Standard, Heavy };
 
+    // Whether a task runs on a bare OS thread with no fiber underneath (Native) or gets a fiber so
+    // it may suspend (Fiber). Replaces the `noFiber` bool in 2.0: requesting suspend capability used
+    // to mean writing `noFiber = false`, a double negative repeated at every call site that needed
+    // it, each requiring its own explanatory comment to stay readable. `TaskType::Fiber` is the same
+    // request spelled as a direct, positive statement, and -- unlike a renamed bool -- the compiler
+    // refuses any call site still passing a bare `true`/`false` literal instead of naming a value,
+    // so a change here cannot silently invert what an existing call site meant.
+    //
+    // Native is the default, unchanged: the overwhelmingly common short task needs no fiber, no
+    // context switch, no 64KB stack, and MUST NOT suspend -- no WaitFor, no WaitOnEvent, no CoYield.
+    // There is no context to switch away from, so suspending throws inside a noexcept Execute() and
+    // fail-fasts (STATUS_STACK_BUFFER_OVERRUN on Windows) with no message. Ask for TaskType::Fiber
+    // explicitly for anything that waits on something.
+    enum class TaskType : uint8_t { Native, Fiber };
+
     // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). FULLY ORTHOGONAL to hiPri by
     // design: hiPri is QUEUE ORDER (drained/stolen first) and NOTHING ELSE; placement is governed SOLELY
     // by this field -- priority never implies a core class (a loPri P-core task and a hiPri E-core task
@@ -59,17 +74,12 @@ namespace JLib {
         WaitGroup* waitGroup = nullptr;
         uint8_t hiPri = false;
         FiberSize requiredSize = FiberSize::Standard;
-        // Run directly on the worker with NO fiber underneath: no fiber acquired, no context switch,
-        // no 64KB stack. Cheaper, and the right default for the overwhelmingly common short task.
-        //
-        // THE CONSTRAINT: such a task MUST NOT SUSPEND -- no WaitFor, no WaitOnEvent, no CoYield.
-        // There is no context to switch away from, so suspending throws inside a noexcept Execute()
-        // and fail-fasts (STATUS_STACK_BUFFER_OVERRUN on Windows) with no message. CreateTask
-        // defaults this to TRUE, so any task that waits on anything must opt out explicitly.
-        //
-        // (Named fastJob until 1.0. "noFiber" states what is checkable -- whether a fiber exists --
-        // rather than advertising a benefit, and it puts the constraint in view at the call site.)
-        uint8_t noFiber = 0;
+        // See TaskType above for the contract. Defaults to Native here too -- previously this field
+        // (noFiber) defaulted to 0/false (fiber-capable) while CreateTask's own parameter defaulted
+        // to true (native), a mismatch that only mattered for a bare Task constructed directly
+        // rather than through CreateTask. Fixed as part of the same change rather than carried
+        // forward silently.
+        TaskType type = TaskType::Native;
         uint8_t priorityBoost = 0;  // Original priority before boost (0 = no boost, otherwise original hiPri)
         // P/E-core placement hint (see CorePref above). Lives in what was tail PADDING -- FiberSize is
         // uint8_t, so the byte block ends at offset 53 with 11 spare bytes under the 64-byte assert.

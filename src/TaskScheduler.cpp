@@ -14,7 +14,7 @@ using namespace JLib;
 
 // ================= CONTENDED-WAIT HELPER, shared by SchedulerMutex and SchedulerSemaphore =======
 // A bare thread that blocks on one of these cannot suspend, so instead of burning the core it runs
-// a stolen noFiber task per iteration. That is work-conserving and it is also the single most
+// a stolen Native task per iteration. That is work-conserving and it is also the single most
 // dangerous thing in this file, because it makes acquiring a lock REENTRANT: user code runs inside
 // the acquisition loop, and it can do anything, including taking locks.
 //
@@ -32,7 +32,7 @@ using namespace JLib;
 //     stops executing other people's tasks entirely.
 //
 //  3. POINTLESS CPU BURN when the holder is a SUSPENDED FIBER. Helping cannot resume it -- only
-//     noFiber tasks are stolen here, so if the resumer is a fiber task this thread structurally
+//     Native tasks are stolen here, so if the resumer is a fiber task this thread structurally
 //     cannot make that progress. Yielding gives the OS a chance to run a worker that can.
 //
 // The idle count deliberately measures UNPRODUCTIVE passes, not iterations. Each pass may run a
@@ -387,7 +387,7 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 				const int hi = (lo + grain > end) ? end : lo + grain;
 				(*f)(lo, hi);
 			}
-			}, false, FiberSize::Standard, /*noFiber*/1);
+			}, false, FiberSize::Standard, TaskType::Native);
 		// Arena exhausted: drop this lane rather than the work. The cursor is self-balancing, so the
 		// remaining workers simply take what this one would have.
 		if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
@@ -657,7 +657,7 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	// whatever this fiber published -- the right behaviour already, and it is why the from-a-worker
 	// case worked before any of this existed.
 	//
-	// A BARE caller (main, or a noFiber task) has nothing to park into, so WaitFor spin-helps via
+	// A BARE caller (main, or a Native task) has nothing to park into, so WaitFor spin-helps via
 	// TryRunStolenNoFiberTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
 	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
 	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
@@ -677,7 +677,7 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		if (myLane) {
 			if (auto opt = myLane->pop_bottom()) {
 				Task* t = *opt;
-				// The same completion bookkeeping Worker()'s noFiber fast path does, in the same
+				// The same completion bookkeeping Worker()'s Native fast path does, in the same
 				// order. Not factored out into a shared helper only because that path also handles
 				// immediate-core release and epoch ticking, neither of which applies here.
 				t->Execute();
@@ -1053,10 +1053,10 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 	Task* myTask = thread->currentRunningTask;
 	Fiber* myFiber = myTask->assignedFiber;
 	if (!myFiber) {
-		// A noFiber task (see Task::noFiber) runs with no fiber underneath it -- there's
+		// A Native task (see Task::type) runs with no fiber underneath it -- there's
 		// nothing to switch away to. This is a contract violation, not a transient failure.
 		throw std::runtime_error("WaitOnEvent called from a task with no assigned fiber -- "
-			"noFiber tasks must never suspend.");
+			"Native tasks must never suspend.");
 	}
 
 	// Order matters. Become parkable (WANTS_SUSPEND) BEFORE registering, so any signal
@@ -1226,7 +1226,7 @@ void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& 
 	Fiber* myFiber = myTask->assignedFiber;
 	if (!myFiber) {
 		throw std::runtime_error("WaitOnEventArmed called from a task with no assigned fiber -- "
-			"noFiber tasks must never suspend.");
+			"Native tasks must never suspend.");
 	}
 
 	// Same ordering as WaitOnEvent: become parkable, then register as a waiter, so a signal
@@ -1254,7 +1254,7 @@ void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*
 	Fiber* myFiber = myTask->assignedFiber;
 	if (!myFiber) {
 		throw std::runtime_error("WaitOnEventDirectArmed called from a task with no assigned "
-			"fiber -- noFiber tasks must never suspend.");
+			"fiber -- Native tasks must never suspend.");
 	}
 
 	DirectEvent* e = eventPool.Acquire();   // pool sized for max concurrent waits (never null in practice)
@@ -1279,9 +1279,9 @@ void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*
 
 bool TaskScheduler::IsOnFiber() {
 	auto* t = Thread::GetCurrent();
-	// currentRunningTask alone isn't enough -- a noFiber task sets it too (see Worker()'s fast
+	// currentRunningTask alone isn't enough -- a Native task sets it too (see Worker()'s fast
 	// path) but deliberately never gets a fiber. Callers use this to decide whether
-	// WaitOnEvent*-style suspension is safe, so it must be false for a noFiber task.
+	// WaitOnEvent*-style suspension is safe, so it must be false for a Native task.
 	return t != nullptr && t->currentRunningTask != nullptr && t->currentFiber != nullptr;
 }
 
@@ -1325,7 +1325,7 @@ void TaskScheduler::Stop(Task* worker_task) {
 }
 
 
-// Steals ONE task for a NON-worker helper (e.g. main spinning in WaitFor, or a noFiber spinning
+// Steals ONE task for a NON-worker helper (e.g. main spinning in WaitFor, or a Native task spinning
 // on a SchedulerMutex). Random-start, hiPri-then-loPri scan with fairness: after
 // kStealFairnessWindow consecutive hiPri steals it forces a loPri scan so loPri work can't starve
 // behind a stream of hiPri steals. Single-item steal() is the only correct steal in the lock-free
@@ -1341,10 +1341,10 @@ Task* TaskScheduler::GetTask() {
 	// SchedulerMutex spin path invokes it FROM WORKERS (thief class = that worker's), while main/WaitFor
 	// helpers are non-workers pinned to CPU 0 -- a P-core -- so they vet as P. corePref is the sole
 	// placement authority EVERYWHERE, including helper steals.
-	// Thief class, NOT assumed: a worker (SchedulerMutex/CV spin inside a noFiber lands here from
+	// Thief class, NOT assumed: a worker (SchedulerMutex/CV spin inside a Native task lands here from
 	// workers too) uses its pinned class; any NON-worker thread (main, or an arbitrary app thread
 	// hitting a scheduler primitive -- possibly unpinned and floating) asks the OS where it is RIGHT
-	// NOW via GetCurrentProcessorNumber + the per-CPU class table. "Would this noFiber run on a P or
+	// NOW via GetCurrentProcessorNumber + the per-CPU class table. "Would this Native task run on a P or
 	// E core?" is answered by where the caller is actually standing.
 	Thread* thief = Thread::GetCurrent();
 	// Bounds-check against the ACTUAL table size, not `& 63`. That mask was the old 64-CPU
@@ -1360,10 +1360,10 @@ Task* TaskScheduler::GetTask() {
 		: (thiefCpu < isPCpu.size() ? (isPCpu[thiefCpu] != 0) : true);
 	const bool degen = pWorkers.empty() || eWorkers.empty();
 	// Vets the deque's TAG, not the task -- see TaskDeque::StealBits. Both fields this needs
-	// (noFiber, corePref) ride in the stored pointer's spare low bits precisely so this predicate
+	// (type, corePref) ride in the stored pointer's spare low bits precisely so this predicate
 	// never has to dereference a candidate the thief has not claimed.
-	auto noFiberOnly = [&](StealBits sb) {
-		return sb.noFiber && StealClassCompatible(sb.corePref, thiefIsP, degen);
+	auto nativeOnly = [&](StealBits sb) {
+		return sb.type == TaskType::Native && StealClassCompatible(sb.corePref, thiefIsP, degen);
 	};
 
 	if (!forceLoPri) {
@@ -1371,7 +1371,7 @@ Task* TaskScheduler::GetTask() {
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
 			size_t target = (start + i) % numThreads;
-			if (auto s = hiPri[target]->steal_if(noFiberOnly)) {
+			if (auto s = hiPri[target]->steal_if(nativeOnly)) {
 				consecutiveHiPriSteals++;
 				return *s;
 			}
@@ -1384,7 +1384,7 @@ Task* TaskScheduler::GetTask() {
 	size_t start = rand() % numThreads;
 	for (size_t i = 0; i < numThreads; ++i) {
 		size_t target = (start + i) % numThreads;
-		if (auto s = loPri[target]->steal_if(noFiberOnly))
+		if (auto s = loPri[target]->steal_if(nativeOnly))
 			return *s;
 	}
 
@@ -1392,18 +1392,18 @@ Task* TaskScheduler::GetTask() {
 }
 
 bool TaskScheduler::TryRunStolenNoFiberTask() {
-	// Steal ONE noFiber and run it to completion right here with the full completion bookkeeping
-	// Worker()'s fast path does. GetTask vets the noFiber flag AT THE DEQUE (steal_if) -- a fiber-backed task
+	// Steal ONE Native and run it to completion right here with the full completion bookkeeping
+	// Worker()'s fast path does. GetTask vets the Native flag AT THE DEQUE (steal_if) -- a fiber-backed task
 	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue
 	// relocation path (claim CAS + re-push + notify = contention/thrash) no longer exists.
 	Task* task = GetTask();
 	if (!task) {
 		// Nothing stealable anywhere -- but "anywhere" only covers DEQUES, and if this caller is a
-		// WORKER it is here because it is blocked inside a task (a noFiber task spinning in
+		// WORKER it is here because it is blocked inside a task (a Native task spinning in
 		// WaitFor / SchedulerMutex / SchedulerConditionVariable). It will not return to Worker()'s
 		// loop while it spins, and inboxes are owner-drain-only, so anything in ITS OWN inbox is
 		// unreachable by the entire pool -- including, possibly, the task it is waiting for. That
-		// is a real deadlock, not a slow path: a noFiber task calling ParallelFor from a worker
+		// is a real deadlock, not a slow path: a Native task calling ParallelFor from a worker
 		// hangs deterministically, because PushLocal round-robins chunks over every worker
 		// INCLUDING the calling one, and the chunk that lands at home is then stranded.
 		//
@@ -1475,11 +1475,11 @@ void TaskScheduler::SetFiberBudget(size_t standardPerWorker, size_t heavyPerWork
 }
 size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWorker; }
 size_t TaskScheduler::HeavyFibersPerWorker()    { return g_heavyFibersPerWorker; }
-Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, uint8_t noFiber, CorePref corePref) {
+Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, TaskType type, CorePref corePref) {
 	void* mem = taskAllocator.Alloc();
 	if (!mem) return nullptr;
 	Task* t = ::new (mem) Task(fn, data, hipri, size);
-	t->noFiber = noFiber;
+	t->type = type;
 	t->corePref = corePref;
 	// Concrete type is exactly Task, whose destructor is empty -- the completion path can skip the
 	// virtual call entirely. See Task::trivialDtor.
@@ -1548,7 +1548,7 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	if (immediateCoresInUse[idx]->load(std::memory_order_acquire)) return false;
 
 	// Marks this core busy-with-a-fork until Thread::Worker() clears it on completion (see
-	// the is_handling_fork cleanup in both the noFiber and fiber-DEAD paths). If the forked
+	// the is_handling_fork cleanup in both the Native and fiber-DEAD paths). If the forked
 	// task never returns (a long-running subsystem pinned here for the program's lifetime),
 	// this correctly STAYS true forever -- which is what makes PickNextWorker()'s existing
 	// skip-if-busy check actually mean something: without setting this, a never-returning fork
@@ -1728,7 +1728,7 @@ void SchedulerMutex::Lock() {
 		}
 	}
 	else {
-		// Bare thread: cannot suspend, so help with stolen noFiber work while waiting. See the
+		// Bare thread: cannot suspend, so help with stolen Native work while waiting. See the
 		// block comment above ContendedSpinStep for what that costs and what guards it.
 		while (!Try_Lock()) ContendedSpinStep();
 		// Ownership is counted inside Try_Lock, which is the single place a bare thread takes this

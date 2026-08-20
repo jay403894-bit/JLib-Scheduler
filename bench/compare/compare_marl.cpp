@@ -16,7 +16,7 @@
 //
 // WORKER ACCOUNTING, checked in each library's source rather than assumed:
 //   JLib     -- Init(N) spawns N workers; main is not a worker but helps while waiting, via
-//               TryRunStolenNoFiberTask (noFiber tasks only).
+//               TryRunStolenNoFiberTask (Native tasks only).
 //   marl     -- Scheduler::Config::setWorkerThreadCount(N) spawns N; the BOUND thread runs tasks
 //               too when it blocks on a WaitGroup, so main participates much as it does here.
 // Both therefore get N = hw-1 spawned plus a participating main.
@@ -80,7 +80,7 @@ static constexpr int kWorkIters = 200;
 // marl::schedule + WaitGroup is a direct structural match for JLib's CreateTask/Push + WaitGroup --
 // closer than either of the other two libraries gets. The difference measured here is therefore
 // close to a like-for-like cost of the two implementations of the same idea, except that every marl
-// task lands on a fiber while JLib's default noFiber tasks do not.
+// task lands on a fiber while JLib's default Native tasks do not.
 static void BenchThroughput(JLib::TaskScheduler& jl) {
     printf("  independent-task throughput -- ns per task, lower is better\n\n");
     printf("     %8s %11s %11s %12s %11s\n",
@@ -208,7 +208,7 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
 //      steady state, so there is no basis to predict either is faster.
 //
 //   2. MIXED WORKLOAD: THIS SHOULD WIN, by roughly the fraction of tasks that never touch a fiber.
-//      marl fiber-backs EVERY task; here only noFiber=0 tasks do, and this benchmark is 25%
+//      marl fiber-backs EVERY task; here only TaskType::Fiber tasks do, and this benchmark is 25%
 //      blocking, so 75% of its tasks skip the pool round-trip entirely. That -- not a faster fiber
 //      -- is the hybrid's actual claim, and it is what this row exists to test.
 //
@@ -318,7 +318,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                                       if (g_released.load(std::memory_order_acquire))
                                           g_ioEvent->SignalAll();
                                   });
-                              }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0)
+                              }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber)
                             : jl.CreateTask(+[](void* p) {
                                   g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                    std::memory_order_relaxed);
@@ -379,12 +379,12 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
 // that fiber tuning). So measure the stages instead of arguing about them.
 //
 // Three variants, each differing from the previous by exactly ONE stage:
-//   A  noFiber=1, empty body   -- baseline: create, place, claim, run, destroy. No fiber at all.
-//   B  noFiber=0, empty body   -- adds fiber acquire from the pool, ContextSwitch in, ContextSwitch
-//                                 out, fiber release. The task never suspends.
-//   C  noFiber=0, waits on an ALREADY-SIGNALLED event -- adds AddWaiter, SignalAll, the
-//                                 SUSPENDED->READY CAS, the re-queue, a second trip through
-//                                 placement/inbox/deque, and a second ContextSwitch pair.
+//   A  TaskType::Native, empty body -- baseline: create, place, claim, run, destroy. No fiber at all.
+//   B  TaskType::Fiber, empty body  -- adds fiber acquire from the pool, ContextSwitch in,
+//                                      ContextSwitch out, fiber release. The task never suspends.
+//   C  TaskType::Fiber, waits on an ALREADY-SIGNALLED event -- adds AddWaiter, SignalAll, the
+//                                      SUSPENDED->READY CAS, the re-queue, a second trip through
+//                                      placement/inbox/deque, and a second ContextSwitch pair.
 //
 // So B-A is what a fiber costs to attach and run on, and C-B is what a full suspend/resume round
 // trip through the scheduler costs. Together they should account for the 5 us; if they do not, the
@@ -416,7 +416,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
             auto t0 = Clock::now();
             for (int i = 0; i < N; ++i) {
                 JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr,
-                                              false, JLib::FiberSize::Standard, /*noFiber*/0);
+                                              false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
                 t->waitGroup = &wg; jl.Push(t);
             }
             jl.WaitFor(wg);
@@ -430,7 +430,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
                 JLib::Task* t = jl.CreateTask(+[](void*) {
                     JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
                     s.WaitOnEventArmed(*g_ioEvent, [] { g_ioEvent->SignalAll(); });
-                }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0);
+                }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
                 t->waitGroup = &wg; jl.Push(t);
             }
             jl.WaitFor(wg);

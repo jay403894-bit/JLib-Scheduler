@@ -100,7 +100,7 @@ namespace JLib {
         // moved. Only ever called on the calling thread's own Thread object -- both queues are
         // owner-only on the drain side, and this is that owner.
         //
-        // Exists for one situation: a worker BLOCKED INSIDE A TASK (a noFiber task spinning in
+        // Exists for one situation: a worker BLOCKED INSIDE A TASK (a Native task spinning in
         // WaitFor/SchedulerMutex/SchedulerConditionVariable). It will not return to Worker()'s loop
         // while it spins, and nothing else may drain its inboxes, so anything sitting there is
         // invisible to the ENTIRE pool -- including, potentially, the very task it is waiting for.

@@ -433,13 +433,13 @@ void Thread::Worker() {
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
-			// or ContextSwitch paid at all. Only safe because noFiber tasks are a CONTRACT --
+			// or ContextSwitch paid at all. Only safe because Native tasks are a CONTRACT --
 			// they must never call WaitOnEvent*/anything that suspends (there's no fiber here
 			// to switch away to). assignedFiber is deliberately left nullptr for these tasks,
-			// which is exactly what WaitOnEvent*'s guards check for -- a mismarked noFiber
+			// which is exactly what WaitOnEvent*'s guards check for -- a mismarked Native
 			// task that tries to suspend anyway fails loudly there instead of corrupting the
 			// worker's real call stack.
-			if (task_to_run->noFiber) {
+			if (task_to_run->type == TaskType::Native) {
 				currentRunningTask = task_to_run;
 				busy.store(true, std::memory_order_relaxed);
 				task_to_run->Execute();
@@ -602,7 +602,7 @@ void Thread::Worker() {
 				// Finish this worker's own queued inbox work FIRST, rather than dumping it for
 				// others to steal -- forking isn't urgent, and relying on a peer happening to
 				// steal it loses efficiency and risks unbounded latency if the pool is busy
-				// elsewhere. noFiber tasks (the common case, defaulted true) are GUARANTEED to
+				// elsewhere. Native tasks (the common case, and the default) are GUARANTEED to
 				// never suspend, so they're executed to completion right here, no fiber needed
 				// -- genuinely finished, not just relocated. A fiber-backed task COULD
 				// legitimately suspend on an external event; forcing it to finish inline isn't

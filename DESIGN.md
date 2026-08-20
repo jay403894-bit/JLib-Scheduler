@@ -57,7 +57,7 @@ enum class CorePref : uint8_t {
     Any = Wide // alias: "genuinely don't care" -- same mechanism, honest name
 };
 
-sched.CreateTask(fn, data, /*hiPri*/ false, FiberSize::Standard, /*noFiber*/ true, CorePref::E);
+sched.CreateTask(fn, data, /*hiPri*/ false, FiberSize::Standard, TaskType::Native, CorePref::E);
 ```
 
 The rules:
@@ -107,12 +107,12 @@ the real anti-starvation mechanism. It stays out until a profile says otherwise.
 Two execution paths. Choosing the wrong one deadlocks or corrupts queue state, so this is the one
 table worth memorising.
 
-| Mode | `noFiber` | Stack | Model | Use for |
+| Mode | `TaskType` | Stack | Model | Use for |
 |---|---|---|---|---|
-| Standard | `true` (default) | worker's own stack | run to completion, never suspends | bulk math, raycasts, data sweeps, physics jobs |
-| Fiber | `false` | pooled fiber stack | cooperative, may suspend | fork-join, anything that waits |
+| Native | `Native` (default) | worker's own stack | run to completion, never suspends | bulk math, raycasts, data sweeps, physics jobs |
+| Fiber | `Fiber` | pooled fiber stack | cooperative, may suspend | fork-join, anything that waits |
 
-`noFiber` tasks skip fiber acquisition and the context switch entirely, which is why per-job
+`Native` tasks skip fiber acquisition and the context switch entirely, which is why per-job
 overhead stays small enough to run an entire physics engine's job graph through the pool.
 
 ---
@@ -121,9 +121,9 @@ overhead stays small enough to run an entire physics engine's job graph through 
 
 ### Fork-join requires a fiber
 
-A task that will call `WaitFor` must be created with `noFiber = false`.
+A task that will call `WaitFor` must be created with `TaskType::Fiber`.
 
-If it is `true`, the scheduler runs it directly on a worker thread. When it then calls `WaitFor`,
+If it is `Native`, the scheduler runs it directly on a worker thread. When it then calls `WaitFor`,
 suspension is attempted on a thread with no fiber under it -- that throws inside a `noexcept`
 `Execute()` and fail-fasts immediately, with no message (`STATUS_STACK_BUFFER_OVERRUN` on Windows).
 
@@ -131,8 +131,8 @@ suspension is attempted on a thread with no fiber under it -- that throws inside
 
 `PushImmediate(cpu_affinity, task)` removes a worker from the general pool, offloads its queue to
 its neighbours, and locks it to one task's loop. Service tasks launched this way -- audio mixers,
-network listeners -- must be `noFiber = true`. Immediate-mode tasks sit outside the fiber pool, so a
-suspend/resume from one corrupts worker-queue boundary tracking.
+network listeners -- must be `TaskType::Native`. Immediate-mode tasks sit outside the fiber pool, so
+a suspend/resume from one corrupts worker-queue boundary tracking.
 
 ### Suspending never blocks a thread
 
@@ -143,7 +143,7 @@ compute without stalling cores, and it is the reason fibers exist here at all.
 ### From a bare thread, hold nothing across a blocking call into the scheduler
 
 A bare thread cannot suspend, so when it blocks on a `SchedulerMutex`, a `SchedulerSemaphore`, a
-condition variable or `WaitFor`, it runs stolen noFiber tasks instead of burning the core. That is
+condition variable or `WaitFor`, it runs stolen Native tasks instead of burning the core. That is
 work-conserving and it has a consequence worth stating plainly: **acquiring a lock executes user
 code**. Whatever the caller holds can be demanded by the task it runs, and the interleaving is
 chosen by the scheduler, so lock-ordering discipline in the caller's own code cannot prevent it.
@@ -195,24 +195,24 @@ so the window does not exist.
 ```cpp
 JLib::WaitGroup wg;
 
-// noFiber MUST be false: this task suspends while waiting on children
-Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, /*noFiber*/ false);
+// MUST be TaskType::Fiber: this task suspends while waiting on children
+Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, TaskType::Fiber);
 parent->waitGroup = &wg;
 wg.n.fetch_add(1, std::memory_order_release);   // count BEFORE push -- workers decrement on completion
 sched.Push(parent);
 
-sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing noFiber tasks
+sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing Native tasks
 ```
 
 ### Pinned service
 
 ```cpp
-// Runs raw on the pinned thread, so noFiber MUST be true
+// Runs raw on the pinned thread, so it MUST be TaskType::Native
 Task* audioService = sched.CreateTask([](void*) {
     while (engineRunning) {
         UpdateAudioBuffers();   // OS waits or atomics -- never a fiber yield
     }
-}, nullptr, /*hiPri*/ 1, FiberSize::Standard, /*noFiber*/ true);
+}, nullptr, /*hiPri*/ 1, FiberSize::Standard, TaskType::Native);
 
 sched.PushImmediate(/*coreID*/ 2, audioService);   // evicts core 2's queue, locks the loop to it
 ```
@@ -250,7 +250,7 @@ high-priority task waits -- it carries the priority inheritance described above.
 locks and locks used within a single priority level do not need it.
 
 While spinning on a contended `SchedulerMutex` or `SchedulerConditionVariable`, the spinner helps
-drain the pool by stealing `noFiber` tasks (class-vetted against the core it is actually standing on)
+drain the pool by stealing `Native` tasks (class-vetted against the core it is actually standing on)
 rather than burning cycles.
 
 You never call `delete` on a task. On completion the scheduler returns the slot to the slab, guarded
@@ -496,7 +496,7 @@ why this scheduler is a hybrid rather than fibers-everywhere.
 
 ### The hybrid is a correctness boundary, not a performance dial
 
-A `noFiber` task runs on one OS thread from start to finish and cannot migrate, because it has no
+A `Native` task runs on one OS thread from start to finish and cannot migrate, because it has no
 suspension point to migrate across. Everything thread-affine is therefore correct inside it:
 `thread_local` stays consistent, `std::this_thread::get_id()` is stable, thread-bound OS resources
 (COM apartments, GL contexts, per-thread allocator arenas) behave, and a plain `std::mutex` can be
@@ -510,18 +510,19 @@ suspend.
 
 The payoff is that middleware written for an ordinary thread pool drops straight in. JLib's Physics3D
 drives Jolt Physics through a `JPH::JobSystem` adapter over this scheduler, with every Jolt job
-submitted as `noFiber`. Jolt is pure compute, never suspends, and keeps per-thread temp allocators,
+submitted as `TaskType::Native`. Jolt is pure compute, never suspends, and keeps per-thread temp allocators,
 so it needs exactly the guarantee the default path gives -- it runs as if it were on enkiTS and never
 learns fibers exist. Under a fiber-everything scheduler that integration is a hazard instead.
 
 That generalises to three shapes, which cover most of what an engine links:
 
 - Libraries with a pluggable dispatcher -- Jolt's `JobSystem`, PhysX's `PxCpuDispatcher`, Bullet's
-  `btITaskScheduler`, Box2D v3's task callbacks. A thin adapter submitting `noFiber` tasks is enough.
+  `btITaskScheduler`, Box2D v3's task callbacks. A thin adapter submitting `TaskType::Native` tasks
+  is enough.
 - Poll-driven libraries -- an ASIO `io_context::poll()`, an `enet_host_service` with a zero timeout.
-  Pump it from one `noFiber` task per frame.
+  Pump it from one `TaskType::Native` task per frame.
 - Blocking service loops -- a network listener or audio mixer that wants to own a thread. Use
-  `PushImmediate` with `noFiber`, which reserves a worker for it.
+  `PushImmediate` with `TaskType::Native`, which reserves a worker for it.
 
 So you are not cut off from the ecosystem in exchange for having fibers, which is the trade a fiber
 scheduler usually asks you to make. This is also where the design departs from marl and

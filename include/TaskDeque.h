@@ -34,7 +34,7 @@ namespace JLib {
     // (the free list is thread-local LIFO, so that recycle is the COMMON case), all while the thief
     // is still reading through its stale pointer. ThreadSanitizer reported it, correctly.
     //
-    // Note what does NOT fix it: making Task::corePref/noFiber atomic. The racing write is the
+    // Note what does NOT fix it: making Task::corePref/type atomic. The racing write is the
     // CONSTRUCTOR of the next task in that slot, and initialization is not an atomic operation
     // whatever the member's type is -- and the underlying problem is the ended lifetime, which no
     // member type addresses. The only real fix is to stop dereferencing an unclaimed task, which is
@@ -50,7 +50,7 @@ namespace JLib {
     // value -- so a new mutator of either field must re-tag or this scheme breaks quietly.
     struct StealBits {
         CorePref corePref;
-        bool     noFiber;
+        TaskType type;
     };
 
     class alignas(platform::kCacheLine) TaskDeque {
@@ -75,7 +75,7 @@ namespace JLib {
         }
 
         // ---- tag encoding -------------------------------------------------------------------
-        // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bit 2: noFiber   bit 3: spare
+        // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bit 2: type == Native   bit 3: spare
         static constexpr uintptr_t kTagMask = 0xF;
         static_assert(alignof(Task) > kTagMask,
             "TaskDeque packs steal-vetting bits into the low bits of a Task*; Task's alignment "
@@ -84,13 +84,14 @@ namespace JLib {
         static uintptr_t tag(Task* item) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(item);
             return p | (static_cast<uintptr_t>(item->corePref) & 0x3)
-                     | (item->noFiber ? 0x4u : 0u);
+                     | (item->type == TaskType::Native ? 0x4u : 0u);
         }
         static Task* untag(uintptr_t v) {
             return reinterpret_cast<Task*>(v & ~kTagMask);
         }
         static StealBits bits(uintptr_t v) {
-            return StealBits{ static_cast<CorePref>(v & 0x3), (v & 0x4) != 0 };
+            return StealBits{ static_cast<CorePref>(v & 0x3),
+                              (v & 0x4) != 0 ? TaskType::Native : TaskType::Fiber };
         }
 
         // Owner-only push.
@@ -231,7 +232,7 @@ namespace JLib {
         // NO DEREFERENCE OF AN UNCLAIMED TASK. `pred` is handed StealBits decoded from the stored
         // pointer's tag, never the Task itself, so nothing here reads memory the thief does not own.
         //
-        // This replaced a version that passed pred the Task* and let it read corePref/noFiber
+        // This replaced a version that passed pred the Task* and let it read corePref/type
         // directly. That was safe in OUTCOME and the argument was sound -- CAS success proves top_
         // never moved, so the vetted read was of the live task; any other outcome discards it -- but
         // it was still a read through a pointer whose object lifetime could already have ended. The
@@ -242,7 +243,7 @@ namespace JLib {
         // explain it away.
         //
         // Two dead ends worth recording, because both sound right:
-        //   * Making Task::corePref/noFiber ATOMIC does not fix it. The racing write is the
+        //   * Making Task::corePref/type ATOMIC does not fix it. The racing write is the
         //     CONSTRUCTOR of the next task in that slot, and initialization is not an atomic
         //     operation whatever the member's type is. The real problem is the ended lifetime,
         //     which no member type addresses.

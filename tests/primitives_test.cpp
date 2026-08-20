@@ -152,7 +152,7 @@ static void TestScopedPermit(JLib::TaskScheduler& sched) {
 //
 // This is the bug 1.2.3 fixed, and the reason this file exists. It FAILS on 1.2.2.
 //
-// A bare thread that blocks on a SchedulerMutex runs stolen noFiber tasks while it waits. So:
+// A bare thread that blocks on a SchedulerMutex runs stolen Native tasks while it waits. So:
 // hold A, queue tasks that want A, then contend on B. The waiting thread helps, runs a task that
 // asks for A, and A is held by that same thread -- which is stuck inside the task. Nothing can
 // release it. No fiber involved, and no lock-ordering discipline in the caller prevents it, because
@@ -330,7 +330,7 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
                 if (released.load(std::memory_order_acquire)) evp->SignalAll();
             });
             finished.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::FiberSize::Standard, /*noFiber*/0);
+        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null under fiber pressure"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -552,7 +552,7 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
         wg.n.store(kPerRound, std::memory_order_relaxed);
         for (int i = 0; i < kPerRound; ++i) {
             JLib::Task* t = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); },
-                                             false, JLib::FiberSize::Standard, /*noFiber*/1);
+                                             false, JLib::FiberSize::Standard, JLib::TaskType::Native);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -625,7 +625,7 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                     inside.fetch_sub(1, std::memory_order_acq_rel);
                     if (useLock) m->Unlock();
                 }
-                }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+                }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
             if (!task) return std::pair<int, int>{ -1, -1 };
             task->waitGroup = &wg;
             sched.Push(task);
@@ -689,7 +689,7 @@ static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
     wg.n.store(1, std::memory_order_relaxed);
     // `body` passed directly, as an lvalue. This did not compile until LambdaTask gained a const&
     // constructor -- see TestCreateTaskAcceptsNamedCallable below, which guards it.
-    JLib::Task* t = sched.CreateTask(body, false, JLib::FiberSize::Standard, /*noFiber*/0);
+    JLib::Task* t = sched.CreateTask(body, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
     if (!t) { Check(false, "CreateTask returned null"); return; }
     t->waitGroup = &wg;
     sched.Push(t);
@@ -730,7 +730,7 @@ static void TestConditionVariableFiber(JLib::TaskScheduler& sched) {
         heldAfterWake.store(!m.Try_Lock(), std::memory_order_release);
         m.Unlock();
         finished.store(true, std::memory_order_release);
-        }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
     if (!waiter) { Check(false, "CreateTask returned null"); return; }
     waiter->waitGroup = &wg;
     sched.Push(waiter);
@@ -771,7 +771,7 @@ static void TestConditionVariableNotifyAll(JLib::TaskScheduler& sched) {
             while (!ready) cv.Wait(m);
             m.Unlock();
             woke.fetch_add(1, std::memory_order_release);
-            }, false, JLib::FiberSize::Standard, /*noFiber*/0);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);

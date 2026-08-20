@@ -66,12 +66,12 @@ int main(int argc, char** argv) {
         JLib::WaitGroup wg;
         wg.n.fetch_add(kWaitersArg, std::memory_order_relaxed);
         for (int i = 0; i < kWaitersArg; ++i) {
-            // noFiber=false: these suspend, so they need a fiber under them.
+            // These suspend, so they need a fiber under them.
             JLib::Task* t = sched.CreateTask([&sched, name] {
                 g_entered.fetch_add(1, std::memory_order_relaxed);
                 sched.WaitOnEvent(name);
                 g_resumed.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::FiberSize::Standard, false);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
             if (!t) { printf("FAIL: CreateTask returned null (round %d)\n", round); return 1; }
             t->waitGroup = &wg;
             sched.Push(t);

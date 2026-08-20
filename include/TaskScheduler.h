@@ -623,8 +623,8 @@ namespace JLib {
 		// question a caller can ask meaningfully once more than one system shares the pool.
 
 		// Lets a non-worker caller (e.g. main, while spinning on a WaitGroup/counter) safely
-		// help drain the pool instead of pure-spinning. Steals ONE noFiber task via GetTask(), which
-		// vets the noFiber flag AT THE DEQUE (TaskDeque::steal_if) -- a fiber-backed task is never claimed
+		// help drain the pool instead of pure-spinning. Steals ONE Native task via GetTask(), which
+		// vets the task's TaskType AT THE DEQUE (TaskDeque::steal_if) -- a fiber-backed task is never claimed
 		// by this fiberless caller at all (it could suspend, and there's no fiber to switch away
 		// to), so it stays queued for a real worker. This replaced the old steal-then-Requeue
 		// relocation, which was pure contention churn (claim CAS + re-push + notify, task moved
@@ -655,10 +655,10 @@ namespace JLib {
 			return StealClassCompatible(t->corePref, thiefIsP, degenerateTopology);
 		}
 
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t noFiber = true, CorePref corePref = CorePref::Default);
+		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default);
 
 		template<typename F>
-		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, uint8_t noFiber = true, CorePref corePref = CorePref::Default) {
+		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			static_assert(sizeof(L) <= TaskAllocator::SLOT, "lambda too big for a slot");
 			static_assert(alignof(L) <= 16, "lambda over-aligned for the slot");
@@ -667,7 +667,7 @@ namespace JLib {
 			L* t = ::new (mem) L(std::forward<F>(f));
  			t->hiPri = hipri;
 			t->requiredSize = size;
-			t->noFiber = noFiber;
+			t->type = type;
 			t->corePref = corePref;
 			// ~LambdaTask is empty and its only member is the functor, so the destructor has work
 			// to do only when the CAPTURES do. Non-capturing lambdas and captures of scalars or
@@ -846,7 +846,7 @@ namespace JLib {
 		// derivation as isPCore but indexed by CPU, not worker. Needed because TryRunStolenNoFiberTask's
 		// callers include NON-worker, possibly UNPINNED threads (main, or any app thread hitting a
 		// SchedulerMutex/SchedulerConditionVariable spin): their class can't be assumed -- it's looked
-		// up via GetCurrentProcessorNumber() at steal time ("this noFiber task would run HERE, right now").
+		// up via GetCurrentProcessorNumber() at steal time ("this Native task would run HERE, right now").
 		// Workers keep the cheaper static isPCore[qIndex] lookup (hard-pinned, class never changes).
 		std::vector<char> isPCpu;
 		// -----------------------------------------------
@@ -910,7 +910,7 @@ namespace JLib {
 		// Callable from EITHER context, and the two behave differently on contention:
 		//   on a fiber      -- the fiber is queued and SUSPENDED, freeing the worker for other work.
 		//   on a bare thread -- there is no fiber to suspend, so it spins, running one stolen
-		//                       noFiber task per iteration (TryRunStolenNoFiberTask) instead of
+		//                       Native task per iteration (TryRunStolenNoFiberTask) instead of
 		//                       burning the cycles.
 		//
 		// That second path is why this is NOT the right lock everywhere, and the reason is stronger
@@ -1003,7 +1003,7 @@ namespace JLib {
 		SchedulerConditionVariable() = default;
 		~SchedulerConditionVariable() = default;
 
-		// Fibers suspend here; noFiber tasks spin and steal work
+		// Fibers suspend here; Native tasks spin and steal work
 		void Wait(SchedulerMutex& mutex);
 
 		// Unblocks one waiting fiber context
