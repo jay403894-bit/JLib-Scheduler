@@ -768,6 +768,92 @@ static void BenchSplitterVsCursorCrossover(JLib::TaskScheduler& sched) {
     printf("  (sink %.1f -- printed only so the bodies can't be optimized away)\n", g_sink.load());
 }
 
+// ------------------------------------------------- inbox-drain dispatch: Requeue loop vs PushBatch
+// Worker()'s immediate/fork inbox drain (Thread.cpp, "2. Immediate task execution") empties a
+// worker's own inbox one task at a time via Requeue() before that worker pins to a persistent
+// service task -- each call pays its own PickNextWorker + spin-check + single-item push +
+// NotifyWorker (a mutex lock). PushBatch exists specifically to amortize that per-task notify cost
+// across a segmented, spread submission, and the drained tasks already sit in a contiguous array at
+// the point Requeue is called today, so swapping the loop for one PushBatch call costs nothing to
+// wire up IF it is actually faster at the sizes that drain sees (a round is capped at BATCH_SIZE=64).
+//
+// This isolates exactly the two production functions being compared (Requeue, PushBatch), not a
+// reimplementation of either, so the numbers here transfer directly to the real drainInbox change.
+// Same interleaved-with-control discipline as SweepSplitterVsCursor above, for the same reason: a
+// block-measured A-then-B comparison is exactly what produced a fictional splitter-vs-cursor gap
+// once already (1.4.0 CHANGELOG). Timing covers DISPATCH only (the loop/call itself) -- completion
+// is waited for outside the timed region so a rep can't contaminate the next one, but is not part of
+// the cost being compared: the pinning worker only cares how fast it clears its hands of the batch.
+static void SweepRequeueVsPushBatch(JLib::TaskScheduler& sched, const std::vector<int>& sizes) {
+    constexpr int kReps = 9;
+
+    for (int n : sizes) {
+        auto runRequeue = [&]() -> double {
+            JLib::WaitGroup wg;
+            wg.n.store(n, std::memory_order_relaxed);
+            std::vector<JLib::Task*> tasks((size_t)n);
+            for (int i = 0; i < n; ++i) {
+                tasks[i] = sched.CreateTask(+[](void*) {}, nullptr);
+                tasks[i]->waitGroup = &wg;
+            }
+            auto t0 = Clock::now();
+            for (int i = 0; i < n; ++i) sched.Requeue(tasks[i]);
+            const double us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+            sched.WaitFor(wg);   // drain before the next arm reuses the pool -- excluded from the timing
+            return us;
+        };
+        auto runPushBatch = [&]() -> double {
+            JLib::WaitGroup wg;
+            wg.n.store(n, std::memory_order_relaxed);
+            std::vector<JLib::Task*> tasks((size_t)n);
+            for (int i = 0; i < n; ++i) {
+                tasks[i] = sched.CreateTask(+[](void*) {}, nullptr);
+                tasks[i]->waitGroup = &wg;
+            }
+            // minPerSegment=8: sized for THIS caller's batch sizes (<=256), not inherited from
+            // ParallelFor's default -- PushBatch's own header warns that splitting a small batch too
+            // finely pays more notifies than the parallelism is worth.
+            auto t0 = Clock::now();
+            sched.PushBatch(tasks.data(), (size_t)n, /*cpuaffinity*/0, /*minPerSegment*/8, /*hiPri*/false);
+            const double us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+            sched.WaitFor(wg);
+            return us;
+        };
+
+        std::vector<double> reqUs, pbUs, ctlUs;
+        reqUs.reserve(kReps); pbUs.reserve(kReps); ctlUs.reserve(kReps);
+        for (int r = 0; r < kReps; ++r) {
+            reqUs.push_back(runRequeue());     // A
+            pbUs.push_back(runPushBatch());    // B
+            ctlUs.push_back(runRequeue());     // A again -- isolates run-to-run noise from A vs B
+        }
+
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const double reqMed = med(reqUs);
+        const double pbMed  = med(pbUs);
+        const double ctlMed = med(ctlUs);
+        // >1.00 means PushBatch took LESS wall time than the Requeue loop at this N -- PushBatch wins.
+        const double pbWins     = reqMed / std::max(pbMed, 1e-9);
+        const double noiseFloor = reqMed / std::max(ctlMed, 1e-9);
+        const bool   suspect    = std::fabs(noiseFloor - 1.0) > 0.05;   // control moved >5% on its own
+
+        printf("  N=%-4d  %6.2fx%s   (requeue=%7.2f us, pushbatch=%7.2f us)\n",
+            n, pbWins, suspect ? "?" : " ", reqMed, pbMed);
+    }
+}
+
+static void BenchRequeueVsPushBatch(JLib::TaskScheduler& sched) {
+    // 64 is the real BATCH_SIZE a single drain round processes; 256 stands in for a busier inbox
+    // (multiple rounds) the header comment on the real drain loop says it has to handle.
+    const std::vector<int> sizes = { 8, 32, 64, 128, 256 };
+
+    printf("\nInbox-drain dispatch (Worker()'s immediate/fork drain): per-task Requeue() loop vs one\n");
+    printf("PushBatch() call -- ratio = requeue_us/pushbatch_us; >1.00 means PushBatch wins.\n");
+    printf("  '?' marks a cell whose same-vs-same control moved >5%% on its own -- distrust that cell.\n");
+
+    SweepRequeueVsPushBatch(sched, sizes);
+}
+
 int main(int argc, char** argv) {
     // Worker binding policy, chosen on the command line. It must be set BEFORE Init() (binding
     // happens at thread creation), and the scheduler is a process-wide singleton -- so one process
@@ -929,6 +1015,7 @@ int main(int argc, char** argv) {
     Section("burst");          BenchIdleBurst(sched);
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
     if (runSweep) { Section("splitter vs cursor sweep");    BenchSplitterVsCursorCrossover(sched); }
+    if (runSweep) { Section("requeue vs pushbatch");        BenchRequeueVsPushBatch(sched); }
 
     g_benchDone.store(true, std::memory_order_release);
     printf("----------------------------------------------------------------\n");

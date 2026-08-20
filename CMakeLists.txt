@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.1.0")
+set(JLIBSCHED_VERSION "2.2.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -400,6 +400,14 @@ target_compile_features(SchedulerFiberBudgetTest PRIVATE cxx_std_17)
 add_executable(SchedulerTaskSlabSizeTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/task_slab_size_test.cpp")
 target_link_libraries(SchedulerTaskSlabSizeTest PRIVATE Scheduler)
 target_compile_features(SchedulerTaskSlabSizeTest PRIVATE cxx_std_17)
+
+# Worker()'s immediate/fork inbox drain moved from a per-task Requeue() loop to a single
+# PushBatch() call in 2.2.0. PushImmediate() had zero test coverage before this -- standalone for
+# the same isolation reason as the two tests above, and because it needs an exact 2-worker pool to
+# make the drain deterministic, which a shared-binary test can't assume.
+add_executable(SchedulerImmediateDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/immediate_drain_test.cpp")
+target_link_libraries(SchedulerImmediateDrainTest PRIVATE Scheduler)
+target_compile_features(SchedulerImmediateDrainTest PRIVATE cxx_std_17)
 
 # Pure-logic tests for the >64-CPU path: mask math, the flat-id split, and the worker-to-CPU
 # assignment on unevenly sized processor groups. Runs anywhere, which is the point -- it is the only

@@ -621,29 +621,47 @@ void Thread::Worker() {
 				// never ends and those tasks are stranded for the life of the process. That is the
 				// particle-demo deadlock again, needing >64 queued instead of >0.
 				//
-				// TERMINATION rests on an invariant, since this no longer has a count bound: Requeue
-				// routes through PickNextWorker, which SKIPS any core whose immediateCoresInUse is
-				// set -- and PushToCore stores that flag BEFORE SetImmediateTask, so by the time this
-				// worker observes immediateTask its own core is already marked. Requeue therefore
-				// cannot hand a task back to the inbox being drained. The one exception is every
-				// worker being pinned at once, where Requeue already spins on its own
-				// while(immediateCoresInUse) loop regardless of this drain -- a pre-existing hazard,
-				// not one introduced here. Do NOT "fix" this loop by re-adding a cap: the cap is what
-				// stranded the overflow in the first place.
-				auto drainInbox = [&](TaskMPSCQueue* inbox, TaskDeque* deque) {
+				// TERMINATION rests on an invariant, since this no longer has a count bound: PushBatch's
+				// segment loop routes through PickNextWorker, which SKIPS any core whose
+				// immediateCoresInUse is set -- and PushToCore stores that flag BEFORE SetImmediateTask,
+				// so by the time this worker observes immediateTask its own core is already marked.
+				// PushBatch therefore cannot hand a task back to the inbox being drained. The one
+				// exception is every worker being pinned at once, where PushBatch's segment loop already
+				// spins on its own while(immediateCoresInUse) loop regardless of this drain -- a
+				// pre-existing hazard, not one introduced here. Do NOT "fix" this loop by re-adding a
+				// cap: the cap is what stranded the overflow in the first place.
+				//
+				// ONE PushBatch CALL PER ROUND, not a per-task Requeue loop (that was this function
+				// until 2.2.0). Each Requeue call pays its own PickNextWorker + spin-check + single-item
+				// push + NotifyWorker (a mutex lock); PushBatch amortizes that cost across a segmented,
+				// spread submission -- measured 7.5-8.2x faster at these sizes (SchedulerBench's
+				// "requeue vs pushbatch" sweep, interleaved with a same-vs-same control; BATCH_SIZE=64 is
+				// the size a single round actually sees). minPerSegment=8 is sized for a round this
+				// small -- ParallelFor's default would over-segment it and pay more notifies than the
+				// spread is worth (see PushBatch's own header on that regression).
+				//
+				// PushBatch places every task at CorePref::Default regardless of its individual
+				// corePref, unlike the old per-task Requeue which honored it. Currently behavior-
+				// identical: no shipped caller sets CorePref::P/E (class routing is opt-in and dormant).
+				// Revisit if a future P/E-routed caller ever gets PushImmediate-pinned.
+				//
+				// batch[] can hold null entries (see the pop loops in section 5 below, which guard the
+				// same way) -- PushBatch links tasks[i]->next contiguously and cannot tolerate a hole,
+				// so nulls are compacted out before the call, unlike the old loop's per-task `if (!t)`.
+				auto drainInbox = [&](TaskMPSCQueue* inbox, bool inboxIsHiPri) {
 					for (;;) {
 						size_t count = 0;
 						while (count < BATCH_SIZE && inbox->pop(batch[count])) count++;
 						if (count == 0) break;
-						for (size_t i = 0; i < count; ++i) {
-							Task* t = batch[i];
-							if (!t) continue;
-							scheduler->Requeue(t);
-						}
+						size_t live = 0;
+						for (size_t i = 0; i < count; ++i)
+							if (batch[i]) batch[live++] = batch[i];
+						if (live == 0) continue;
+						scheduler->PushBatch(batch, live, /*cpuaffinity*/0, /*minPerSegment*/8, inboxIsHiPri);
 					}
 				};
-				drainInbox(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
-				drainInbox(scheduler->loPriInboxes[qIndex].get(), scheduler->loPri[qIndex].get());
+				drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
+				drainInbox(scheduler->loPriInboxes[qIndex].get(), /*inboxIsHiPri*/false);
 
 				if (EpochManager::Instance().ShouldSelfReclaim()) {
 					EpochManager::Instance().Tick();

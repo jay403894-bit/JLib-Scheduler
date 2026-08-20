@@ -3,6 +3,44 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.2.0 - 2026-08-20
+
+**Worker()'s immediate/fork inbox drain now dispatches via one `PushBatch()` call per round
+instead of a per-task `Requeue()` loop.** When a worker is about to pin to a persistent
+`PushImmediate` task (an audio mixer, a network poll loop), it must first empty its own inbox --
+nothing else can steal from an inbox, only its owner can drain it, and once pinned it never will.
+That drain used to call `Requeue()` once per task, and each call pays its own `PickNextWorker` +
+spin-check + single-item push + `NotifyWorker` (a mutex lock) -- the exact per-task notify cost
+`PushBatch` was built to amortize for every OTHER large submission path in this library, just never
+wired into this one.
+
+Measured with a new `SchedulerBench` sweep ("requeue vs pushbatch"), interleaved with a same-vs-same
+control (every same-vs-same cell came back clean, no `?` flags): **PushBatch dispatches 7.5-8.2x
+faster than the Requeue loop at every size tested (N=8 to N=256)**, including N=64 -- the actual
+`BATCH_SIZE` a single drain round processes -- and N=256, standing in for the multi-round backlog
+case the drain's own header comment already worried about. `minPerSegment=8` is tuned for this call
+site's small batch sizes specifically; reusing `ParallelFor`'s default would over-segment a 64-task
+drain and pay more notifies than the spread is worth (see `PushBatch`'s own header on that
+regression).
+
+One behavior change, currently inert: `PushBatch` places every task at `CorePref::Default`
+regardless of its individual `corePref`, where the old per-task `Requeue` honored it. Harmless today
+-- no shipped caller sets `CorePref::P`/`E` (class routing is opt-in and dormant) -- but worth
+revisiting if a future P/E-routed caller is ever `PushImmediate`-pinned. `Requeue()` itself is
+untouched and still the right tool at its four remaining call sites (`Fiber.cpp`, two single-task
+retry/race paths in `Thread.cpp`, and the rare deque-full overflow fallback) -- all single-task
+contexts where `PushBatch`'s segment-building overhead would have nothing to amortize against.
+
+New test: `SchedulerImmediateDrainTest` (`immediate_drain_test.cpp`), since `PushImmediate()` had
+zero test coverage of any kind before this. Pins a 2-worker pool's worker 0 after seeding a
+150-task backlog (>`BATCH_SIZE`, forcing the drain through multiple `PushBatch` rounds) and checks
+every backlogged task ran exactly once -- verifying the null-compaction this change needed
+(`PushBatch` links `tasks[i]->next` contiguously and cannot tolerate a hole the old per-task loop's
+`if (!t) continue` could) neither drops nor duplicates a task -- and that the immediate task itself
+still runs afterward. Passed 8/8 local runs before landing; wired into CI on all 5 targets. Full
+existing suite (primitives under all three modes, event smoke, fiber budget, task slab, topology)
+verified green with no regressions.
+
 ## 2.1.0 - 2026-08-20
 
 **`TaskScheduler::TryRunStolenNoFiberTask()` is renamed `TryRunStolenNativeTask()`.** A leftover
