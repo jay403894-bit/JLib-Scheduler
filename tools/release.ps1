@@ -112,6 +112,34 @@ if ($LASTEXITCODE -ne 0) { Fail "push failed -- the tag exists locally but nothi
 git push origin $tag
 if ($LASTEXITCODE -ne 0) { Fail "tag push failed -- the commit IS pushed, so just re-run: git push origin $tag" }
 
+# ---- 6. the GitHub Release itself, not just the tag --------------------------------------------
+# This step was MISSING for three releases in a row (2.1.0, 2.2.0, 2.3.0) before anyone noticed --
+# the tag existed, CI ran green against it, but the Releases page still said 2.0.0 was "Latest".
+# `git push origin $tag` publishes the tag; it does not create a Release. The two are different
+# GitHub objects and only one of them is what a reader (or `gh release list`) actually sees as
+# "the last release". Same $Message used for the tag's own annotation, since it is already written
+# as a one-line description -- see this script's header for the intended shape of that parameter.
+# Notes body is the CHANGELOG's own section for $version, extracted the same way the size-guard
+# above already parses it, so the two can never say different things about the same release.
+$notesLines = @()
+for ($i = $h.LineNumber; $i -lt $clLines.Count; $i++) {
+    if ($clLines[$i] -match '^## ') { break }
+    $notesLines += $clLines[$i]
+}
+$notesFile = New-TemporaryFile
+Set-Content -Path $notesFile -Value ($notesLines -join "`n") -Encoding utf8
+try {
+    gh release create $tag --title $Message --notes-file $notesFile
+    if ($LASTEXITCODE -ne 0) { throw "gh release create exited $LASTEXITCODE" }
+}
+catch {
+    Write-Host "WARNING: tag $tag is pushed and CI will run, but the GitHub Release was NOT created: $_" -ForegroundColor Yellow
+    Write-Host "  Fix by hand: gh release create $tag --title `"$Message`" --notes-file $notesFile" -ForegroundColor Yellow
+}
+finally {
+    Remove-Item $notesFile -ErrorAction SilentlyContinue
+}
+
 Write-Host ""
 Write-Host "released $tag" -ForegroundColor Green
 Write-Host "CI: gh run list --limit 3" -ForegroundColor DarkGray
