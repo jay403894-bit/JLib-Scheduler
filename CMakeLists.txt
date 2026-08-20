@@ -31,13 +31,19 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.2.0")
+set(JLIBSCHED_VERSION "2.3.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
 # they exist to measure. Turn on only for an experiment, and do not compare its numbers against a
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
+
+# Latency breakdown: where a push->run->wait round trip actually spends its time -- OS wake vs
+# Worker()'s own loop order (local deque + steal scan run before the inbox a cold wake was FOR).
+# Same OFF-by-default rule as JLIBSCHED_STEAL_STATS and for the same reason: a clock read on every
+# wake is not free, and this is instrumenting a ~us-scale measurement.
+option(JLIBSCHED_LATENCY_STATS "Record wake/preSteal/found timestamps (diagnostic; perturbs latency)" OFF)
 
 # AArch64 spin hint. Default is isb, which is NOT the architectural analogue of x86 PAUSE -- that is
 # YIELD, and YIELD retires as a NOP on non-SMT cores, which is nearly all of them, so it gives a spin
@@ -332,6 +338,11 @@ add_library(JLib::Scheduler ALIAS Scheduler)
 if(JLIBSCHED_STEAL_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STEAL_STATS=1)
     message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+
+if(JLIBSCHED_LATENCY_STATS)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_LATENCY_STATS=1)
+    message(STATUS "JLib::Scheduler: latency breakdown instrumentation ON (diagnostic build, not for perf numbers)")
 endif()
 
 # PUBLIC because CpuRelax() is inline in a header -- every translation unit that spins must agree,

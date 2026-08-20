@@ -3,6 +3,36 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.3.0 - 2026-08-20
+
+**New diagnostic: `JLIBSCHED_LATENCY_STATS`, built to answer where the README's 4.3 µs Sleep
+round-trip actually goes** -- the OS kernel wake, or `Worker()`'s own loop order (it checks the
+local deque and runs a full steal scan before ever looking at the inbox a cold wake was actually
+for; see 2.2.0's `PushBatch` change to the same drain). Same convention as `JLIBSCHED_STEAL_STATS`:
+off by default, three global timestamp marks (Wake, PreSteal, Found) compiled to nothing unless
+built with `-DJLIBSCHED_LATENCY_STATS=ON`, and `BenchLatency` prints a breakdown only when it's on.
+
+**The answer: the loop order costs a real but small ~0.30 µs (~6% of the round trip); the OS wake
+is ~85% of it (4.00 µs of 4.89 µs measured in an instrumented build).** Confirmed on a strict
+monotonicity check across the marks (reject any sample where Wake/PreSteal/Found don't strictly
+increase in order) -- 2,245 of 20,000 samples passed, which is itself the interesting finding: most
+round-robin iterations DON'T reach a clean cold-wake-to-found sequence at all, because round-robin
+spreads submissions across every worker, and any one worker is idle for the other (workers-1)
+iterations -- long enough to fully park every time.
+
+**Pinning the same round trip to one worker instead of round-robin dropped it 5.9x, from 4.89 µs to
+0.83 µs**, with the clean-sample rate jumping from 11% to 50%. That worker is usually still
+mid-backoff, not yet parked, when the next task lands, so most hits skip the kernel wake entirely.
+Neither number is wrong; they measure different things -- 4.3 µs is a genuinely idle pool's wake
+cost, 0.83 µs is a worker still warm from the last task. README footnoted with both, so the
+headline figure isn't read as a hard floor on submission when it's specifically the cold-park cost.
+
+No production code changed. `Worker()` gained four `JLIBSCHED_LATENCY_MARK` call sites (the macro
+expands to `((void)0)` when the flag is off, so a normal build costs nothing) at the two park-exit
+points, the start of the steal scan, and the two inbox-found points.
+Wired into CI the same way `JLIBSCHED_STEAL_STATS` is: one build-and-run on the cheapest runner, so
+the diagnostic can't silently bit-rot between the rare times someone actually needs it.
+
 ## 2.2.0 - 2026-08-20
 
 **Worker()'s immediate/fork inbox drain now dispatches via one `PushBatch()` call per round

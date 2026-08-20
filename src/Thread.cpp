@@ -706,6 +706,7 @@ void Thread::Worker() {
 		{
 			// --- 4. Work stealing ---
 			if (!task_to_run) {
+				JLIBSCHED_LATENCY_MARK(PreSteal);
 				// Non-blocking backoff: a per-worker (thread_local, no shared/contended state --
 				// can't itself become a new source of contention) count of consecutive whole-
 				// steal-block misses. Above the threshold, shrink how many clusterMates get
@@ -841,6 +842,7 @@ void Thread::Worker() {
 					auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 					if (opt) {
 						task_to_run = *opt;
+						JLIBSCHED_LATENCY_MARK(Found);
 						continue;
 					}
 				}
@@ -869,6 +871,7 @@ void Thread::Worker() {
 						auto opt = scheduler->loPri[qIndex]->pop_bottom();
 						if (opt) {
 							task_to_run = *opt;
+							JLIBSCHED_LATENCY_MARK(Found);
 							continue;
 						}
 					}
@@ -955,6 +958,7 @@ void Thread::Worker() {
 						|| !scheduler->hiPriInboxes[qIndex]->empty()
 						|| !scheduler->loPriInboxes[qIndex]->empty()))) {
 				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+				JLIBSCHED_LATENCY_MARK(Wake);
 				if (!running.load(std::memory_order_acquire)) break;
 				continue;   // work landed while deciding: go search for it instead of parking
 			}
@@ -980,6 +984,7 @@ void Thread::Worker() {
 
 			// Back to AWAKE before releasing the mutex, so the very next push skips the signal.
 			workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+			JLIBSCHED_LATENCY_MARK(Wake);
 
 			if (!running.load(std::memory_order_acquire)) break;
 		}

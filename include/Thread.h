@@ -3,6 +3,8 @@
 
 #pragma once
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <condition_variable>
 #include <random>
@@ -57,6 +59,48 @@ namespace JLib {
     inline void StealStatsReset() {}
     inline void StealStatsRead(long long& probes, long long& hits) { probes = 0; hits = 0; }
     inline constexpr bool kStealStatsEnabled = false;
+#endif
+
+    // ============================== LATENCY BREAKDOWN INSTRUMENTATION (opt-in) ===================
+    // Built to answer one question: where does the 4.3 us push->run->wait round-trip (README's
+    // Sleep-mode figure) actually go -- the OS kernel wake, or Worker()'s own loop order? A parked
+    // worker wakes because a Push() landed in ITS INBOX, but the loop checks its local deque (3)
+    // and runs a full steal scan (4) BEFORE it ever looks at that inbox (5) -- so a cold wake pays
+    // for a steal sweep across an otherwise-idle pool that is guaranteed to fail, before it finds
+    // the very task that woke it. Three global timestamps (not per-worker: this is a SERIAL,
+    // one-task-in-flight investigation, same setup as BenchLatency, so there is only ever one
+    // worker actually doing anything to record) mark the three transitions that split that gap:
+    // Wake (cv.wait returns / the recheck-abort escape, whichever fires), PreSteal (right before
+    // section 4 begins), and Found (section 5 actually retrieves the task).
+    //
+    // OFF unless JLIBSCHED_LATENCY_STATS is defined, for the same reason as JLIBSCHED_STEAL_STATS:
+    // a clock read on every wake is not free, and instrumentation that perturbs a ~us-scale
+    // measurement is worse than none. Turn on only for this experiment; do not compare its numbers
+    // against a normal build's.
+    //
+    // Enable with -DJLIBSCHED_LATENCY_STATS=ON at configure time.
+#ifdef JLIBSCHED_LATENCY_STATS
+    inline std::atomic<int64_t> g_lastWakeNs{ 0 };
+    inline std::atomic<int64_t> g_lastPreStealNs{ 0 };
+    inline std::atomic<int64_t> g_lastFoundNs{ 0 };
+    inline int64_t LatencyNowNs() {
+        using namespace std::chrono;
+        return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+    #define JLIBSCHED_LATENCY_MARK(which) \
+        (::JLib::g_last##which##Ns.store(::JLib::LatencyNowNs(), std::memory_order_relaxed))
+    inline void LatencyStatsRead(int64_t& wakeNs, int64_t& preStealNs, int64_t& foundNs) {
+        wakeNs     = g_lastWakeNs.load(std::memory_order_relaxed);
+        preStealNs = g_lastPreStealNs.load(std::memory_order_relaxed);
+        foundNs    = g_lastFoundNs.load(std::memory_order_relaxed);
+    }
+    inline constexpr bool kLatencyStatsEnabled = true;
+#else
+    #define JLIBSCHED_LATENCY_MARK(which) ((void)0)
+    inline void LatencyStatsRead(int64_t& wakeNs, int64_t& preStealNs, int64_t& foundNs) {
+        wakeNs = preStealNs = foundNs = 0;
+    }
+    inline constexpr bool kLatencyStatsEnabled = false;
 #endif
 
     struct WaitHandle {

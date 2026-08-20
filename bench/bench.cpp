@@ -383,18 +383,56 @@ static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
 // ---------------------------------------------------------------- 2. latency
 static void BenchLatency(JLib::TaskScheduler& sched) {
     constexpr int kIters = 20'000;
+
+    // Only populated (and only costs anything) when built with -DJLIBSCHED_LATENCY_STATS=ON --
+    // see Thread.h. Serial, one task in flight at a time, same setup as the round trip itself, so
+    // a global "most recent" timestamp per transition is unambiguous: nothing else touches these
+    // between one iteration's Push and its WaitFor returning.
+    std::vector<double> wakeUs, loopEntryUs, stealScanUs;
+    if (JLib::kLatencyStatsEnabled) {
+        wakeUs.reserve(kIters); loopEntryUs.reserve(kIters); stealScanUs.reserve(kIters);
+    }
+
     auto t0 = Clock::now();
     for (int i = 0; i < kIters; ++i) {
         JLib::WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
         JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
         t->waitGroup = &wg;
+        const int64_t pushNs = JLib::kLatencyStatsEnabled
+            ? std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()
+            : 0;
         sched.Push(t);
         sched.WaitFor(wg);
+        if (JLib::kLatencyStatsEnabled) {
+            int64_t wakeNs = 0, preStealNs = 0, foundNs = 0;
+            JLib::LatencyStatsRead(wakeNs, preStealNs, foundNs);
+            // Skip a sample where a mark didn't fire this iteration (shouldn't happen in the
+            // serial/idle-pool steady state, but a control that can't go negative is worth more
+            // than one that silently accepts garbage).
+            if (wakeNs > pushNs && preStealNs >= wakeNs && foundNs >= preStealNs) {
+                wakeUs.push_back((double)(wakeNs - pushNs) / 1000.0);
+                loopEntryUs.push_back((double)(preStealNs - wakeNs) / 1000.0);
+                stealScanUs.push_back((double)(foundNs - preStealNs) / 1000.0);
+            }
+        }
     }
     double totalMs = MsBetween(t0, Clock::now());
     printf("latency      : %d serial round-trips in %.2f ms  ->  %.2f us per push->run->wait\n",
         kIters, totalMs, totalMs * 1000.0 / kIters);
+
+    if (!JLib::kLatencyStatsEnabled) return;
+    auto med = [](std::vector<double> v) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+        };
+    printf("  breakdown (median of %zu clean samples): OS wake %.2f us, loop entry (sections 1-3)"
+        " %.2f us, steal scan (section 4) %.2f us\n",
+        wakeUs.size(), med(wakeUs), med(loopEntryUs), med(stealScanUs));
+    printf("  (loop entry + steal scan = the cost paid between waking and finding the task that woke\n"
+           "   you, which sits in the INBOX, checked only in section 5 -- after the local deque and\n"
+           "   the full steal scan both fail against an otherwise-idle pool)\n");
 }
 
 // ---------------------------------------------------------------- 3. ParallelFor

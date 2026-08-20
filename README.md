@@ -196,6 +196,21 @@ not move: **0.355 ms against enkiTS 0.373 ms**, which is a tie either way — in
 spreads (8% ours, 9% theirs). Read it as neither library having an edge on a uniform bulk range, not
 as a win. See [Parallel loops](#parallel-loops).
 
+**The 4.3 µs Sleep round-trip is specifically the cost of waking a FULLY PARKED worker, not a fixed
+floor on submission.** `BenchLatency` round-robins across every worker, so any given one only gets
+touched roughly once every pool-size iterations -- long enough to fully park every time, paying a
+real OS kernel wake on every hit. A breakdown built to answer where that time goes (build with
+`-DJLIBSCHED_LATENCY_STATS=ON`) found the OS wake itself is ~85% of it (4.00 µs of 4.89 µs in an
+instrumented build), with `Worker()`'s own loop order -- it checks the local deque and runs a full
+steal scan before ever looking at the inbox a cold wake was actually for -- contributing a real but
+small ~0.30 µs. Pin the same round trip to one worker instead (`Push(1, task)` every time) and it
+drops to **0.83 µs**, a 5.9x difference, because that worker is usually still mid-backoff, not yet
+parked, when the next task lands. Neither number is "wrong" -- they measure different things: 4.3 µs
+is what a genuinely idle pool costs to wake (e.g. a game at a frame boundary), 0.83 µs is what a
+worker that's still warm from the last task costs. `JLIBSCHED_LATENCY_STATS` is a permanent,
+off-by-default diagnostic (same convention as `JLIBSCHED_STEAL_STATS`) for measuring this split on
+your own hardware.
+
 Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
 (**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
 recommendation).
