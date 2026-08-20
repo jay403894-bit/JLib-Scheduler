@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## Unreleased
+## 2.0.0 - 2026-08-20
 
 **[BREAKING] `Task::noFiber` and `CreateTask`'s matching parameter are replaced by `TaskType`, an
 enum with values `Native` and `Fiber`.** This is the reason for the major version: requesting the
