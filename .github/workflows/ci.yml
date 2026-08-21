@@ -246,16 +246,26 @@ jobs:
         run: |
           docker pull genmc/genmc:v0.17.0
 
+          # NOT plain `genmc` -- checked the image directly (registry API, no local Docker
+          # available at the time): the installed binary sits at /usr/local/bin/genmc/genmc, a
+          # directory named genmc containing the executable one level deeper, not a file directly
+          # on PATH. Plain `genmc` resolves to nothing and fails with "executable file not found".
+          # `genmc [OPTIONS] -- [COMPILER_FLAGS] <file>` -- -unroll is a GenMC OPTION (cli.md lists
+          # it alongside -sc/-rc11/etc), so it belongs BEFORE the --, not after. The -D defines and
+          # the source file are COMPILER_FLAGS and belong after it. Getting this backwards either
+          # silently no-ops the bound or hard-errors depending on how clang treats the unknown flag
+          # -- checked the docs directly rather than guess after the PATH fix above already needed
+          # one correction.
           run_genmc() {
             docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
-              genmc -- -unroll=8 "$@"
+              /usr/local/bin/genmc/genmc -unroll=8 -- "$@"
           }
           run_positive() {
-            echo "=== genmc -- -unroll=8 $* (expect: no errors) ==="
+            echo "=== genmc -unroll=8 -- $* (expect: no errors) ==="
             run_genmc "$@"
           }
           run_negative() {
-            echo "=== genmc -- -unroll=8 $* (expect: FAILS -- this is the negative control) ==="
+            echo "=== genmc -unroll=8 -- $* (expect: FAILS -- this is the negative control) ==="
             if run_genmc "$@"; then
               echo "NEGATIVE CONTROL DID NOT FAIL: $* -- the check has gone vacuous"
               exit 1
