@@ -222,11 +222,12 @@ jobs:
 
       # GenMC models: tests/verify/*.c, checking the four primitives this scheduler's history
       # actually broke (1.2.0's lost wakeup, 1.3.4's mutex deadlock) exhaustively rather than
-      # hoping a normal test run happens to hit the bad interleaving. No prebuilt GenMC binaries
-      # exist (checked before adding this) -- built from source against LLVM, pinned to the exact
-      # tag (v0.17.0) every model's own RESULTS section was recorded against, so a CI pass means
-      # the same thing those hand-recorded numbers already meant. Cached by that tag so only the
-      # first run after a version bump pays the from-source build cost.
+      # hoping a normal test run happens to hit the bad interleaving. Runs via the genmc/genmc
+      # Docker Hub image (verified to exist and carry a v0.17.0 tag before relying on it -- an
+      # earlier guess at a ghcr.io package for this did NOT exist, confirmed by a direct anonymous
+      # registry pull attempt, so this one was checked rather than assumed by analogy) pinned to
+      # that exact tag, the same version every model's own RESULTS section was recorded against.
+      # No from-source LLVM build, no cache management -- just a docker pull.
       #
       # -unroll=8 on every invocation, even though none of these four harnesses actually contain
       # an unbounded loop (traced by hand: deque/event are NITEMS- or thread-count-bounded,
@@ -234,28 +235,7 @@ jobs:
       # defense in depth per GenMC's own manual ("for infinite loops with side effects, use
       # -unroll=N"), so a future model that DOES add an unbounded loop fails fast/deterministically
       # in seconds instead of a CI job silently running to the full job timeout.
-      - name: Cache GenMC v0.17.0
-        if: matrix.os == 'ubuntu-latest'
-        id: genmc-cache
-        uses: actions/cache@v4
-        with:
-          path: genmc-install
-          key: genmc-v0.17.0-${{ runner.os }}
-
-      - name: Build GenMC v0.17.0
-        if: matrix.os == 'ubuntu-latest' && steps.genmc-cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev libffi-dev zlib1g-dev libedit-dev bc
-          git clone --branch v0.17.0 --depth 1 https://github.com/MPI-SWS/genmc.git genmc-src
-          # RelWithDebInfo, matching GenMC's own documented/tested build ("Installing" section of
-          # their README) -- not Release, to avoid hitting an untested NDEBUG-only configuration.
-          cmake -S genmc-src -B genmc-src/build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/genmc-install"
-          cmake --build genmc-src/build -j 2
-          cmake --install genmc-src/build
-        shell: bash
-
+      #
       # Every model runs twice: as shipped (must report no errors) and under its documented
       # negative control (must report an error). The second half is the part that makes the first
       # half mean anything -- a model whose negative control silently stopped failing has quietly
@@ -264,15 +244,19 @@ jobs:
       - name: Run GenMC models (exhaustive, not lucky)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          export PATH="${GITHUB_WORKSPACE}/genmc-install/bin:$PATH"
+          docker pull genmc/genmc:v0.17.0
 
+          run_genmc() {
+            docker run --rm -v "$PWD":/workspace -w /workspace genmc/genmc:v0.17.0 \
+              genmc -- -unroll=8 "$@"
+          }
           run_positive() {
             echo "=== genmc -- -unroll=8 $* (expect: no errors) ==="
-            genmc -- -unroll=8 "$@"
+            run_genmc "$@"
           }
           run_negative() {
             echo "=== genmc -- -unroll=8 $* (expect: FAILS -- this is the negative control) ==="
-            if genmc -- -unroll=8 "$@"; then
+            if run_genmc "$@"; then
               echo "NEGATIVE CONTROL DID NOT FAIL: $* -- the check has gone vacuous"
               exit 1
             fi
