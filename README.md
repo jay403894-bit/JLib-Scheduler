@@ -42,11 +42,19 @@ I needed tasks that could wait on a gpu fence without parking a worker thread, e
 | Suspend/resume inside a task | no | no | yes | yes |
 | Dependency DAG with AND/OR gates | partial | yes | no | yes |
 | Cache/SMT topology-aware stealing | no | no | no | yes |
+| Model-checked concurrency (not just tested) | no | no | no | yes |
 | Maintained | yes | yes | archived Apr 2026 | yes |
 
 marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so middleware written
 for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
 and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
+
+**"Model-checked" checked, not assumed**: enkiTS has no dedicated test suite at all (two ad hoc files
+sitting in its `example/` directory); Taskflow's 39-file `unittests/` suite is the most extensive of
+the three by far; marl has a real 14-file suite matched by benchmarks for most of them. None of the
+three have anything resembling exhaustive concurrency verification -- it's unit tests only, at every
+point on that spectrum. See [Model checked](#model-checked) for what GenMC and TLA+/TLC actually
+cover here and, as importantly, what they don't.
 
 ## Measured
 
