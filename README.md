@@ -681,12 +681,25 @@ which take the processor group as data -- `SetThreadAffinityMask` takes it from 
 and so cannot name a CPU in a second group. Handled up to 256 CPUs, but **untested above 64**; if you
 have such a machine, that is the most useful thing you could report.
 
+**`CorePref::P`/`::E`'s reliability is quietly coupled to `AffinityPolicy`, not just to whether the
+CPU is hybrid.** `isPCore` is a label assigned ONCE per worker at pool startup, from real topology.
+Under `Hard` that label stays true for the process's whole life -- a worker never leaves its
+assigned core. Under `Ideal`, **the shipped default**, the OS is only given a preference and may
+migrate the thread under contention or thermal pressure, so the label can go stale mid-run: a
+`P`-preferring task can land on a worker that used to be on a P-core and no longer is. In other
+words, the mode where the hint is maximally trustworthy (`Hard`) is the one already measured and
+rejected as the default for its own cost (see [Worker binding](DESIGN.md#worker-binding) -- ~45%
+worse wake latency, ~2x on the frame DAG). `Ideal` migration is the exception rather than the rule
+in practice, which is why it is still treated as "meaningful" rather than as `None`, but this is a
+real gap between "hint" and "guarantee," not just boilerplate hedging -- know it before building a
+design that assumes a `P` task always lands on a P-core.
+
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.
 
 ## Versioning
 
-2.0.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
+2.5.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
 not break without a 2.0. Every header is installed because the supported ones need them to compile,
 but the rest are implementation detail and may change in any release. If you need something only
 reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
