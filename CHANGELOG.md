@@ -3,6 +3,25 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.6.0 - 2026-08-21
+
+**README: `CorePref::P`/`::E`'s reliability is now documented as coupled to `AffinityPolicy`, not
+just to whether the CPU is hybrid.** `isPCore` is a label assigned once per worker at pool startup;
+under `Hard` it stays true for the process's life, but under `Ideal` (the shipped default) the OS
+may migrate the thread and the label can go stale mid-run. The mode where the hint is maximally
+trustworthy is the one already measured and rejected as the default for its own cost (~45% wake
+latency, ~2x frame DAG -- see `DESIGN.md#worker-binding`). A real gap between hint and guarantee,
+not boilerplate hedging, and now written down where the other `CorePref` caveats already live.
+
+**Also fixes `## Versioning`**, which had been silently stuck at "2.0.0" through five real releases
+since (2.1.0 through 2.5.0) -- found while touching the section next to it.
+
+No code changed. Closes out this stretch of work: the `TryRunStolenNoFiberTask` rename gap (2.1.0),
+the measured `PushBatch` immediate-drain win (2.2.0), the latency-breakdown diagnostic that found
+the cold-park-vs-warm-worker distinction (2.3.0), the `fiberresume_model.tla` verification (2.4.0),
+and `PushBatch` finally preserving `corePref` (2.5.0) are all shipped, green, and documented
+accurately as of this release.
+
 ## 2.5.0 - 2026-08-21
 
 **`PushBatch` now takes an explicit `CorePref pref = CorePref::Default` parameter**, closing the
