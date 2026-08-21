@@ -305,8 +305,8 @@ here, and before writing a comparison of your own.
 
 ## Model checked
 
-The two lock-free structures are model checked with [GenMC](https://plv.mpi-sws.org/genmc/), not
-only tested. A test runs whichever interleaving the CPU happens to produce; a model checker
+The lock-free/lock-based hot paths are model checked with [GenMC](https://plv.mpi-sws.org/genmc/),
+not only tested. A test runs whichever interleaving the CPU happens to produce; a model checker
 enumerates every execution the C11 memory model permits, so for a bounded harness the result is
 exhaustive rather than lucky. Models live in `tests/verify/`.
 
@@ -316,13 +316,35 @@ exhaustive rather than lucky. Models live in `tests/verify/`.
   fences are what carry the ordering.
 - **Event waiter stack** (`event_model.c`) - two pushers, one drainer, 24 executions, no errors. No
   waiter lost, none woken twice, no race on the plain `nextWaiter` field.
+- **Worker sleep/wake predicate** (`sleepwake_model.c`) - the `workerState`/`hasQueuedWork`/
+  `immediate` protocol that lets a push skip the mutex+notify when the target is already awake.
+  32 executions clean as shipped. Its own history is the cautionary tale for this whole section: an
+  earlier, single-flag version of this same model passed clean, the protocol was built from it, and
+  1.2.0 shipped a lost wakeup that hung macOS arm64 in CI about one run in three -- the model was not
+  wrong about what it modelled, it just modelled a decision with two fewer inputs than the real one.
+- **Fiber wait/resume handshake** (`fiberwait_model.c`) - `SchedulerMutex`/`Semaphore`/`CondVar`'s
+  queue-then-mark-parkable ordering. This is the exact handshake that shipped broken in 1.3.4: publish
+  to the waiter queue before marking the fiber parkable, and an `Unlock()`/`Signal()` landing in that
+  window pops the fiber and discards the wake, since `ResumeQueueless` doesn't treat `RUNNING` as
+  resumable -- a mutex locked forever with no holder. `-DOLD_ORDERING` reproduces it as a genuine
+  safety violation; the shipped 1.3.5 ordering and `-DSEQ_CST` both check clean, confirming this was
+  an ordering defect, not a missing memory barrier.
+- **Fiber resume CAS race** (`fiberresume_model.tla`) - a DIFFERENT tool, TLA+/PlusCal checked with
+  TLC rather than GenMC: `Fiber::ResumeQueueless()`'s own CAS race (`WANTS_SUSPEND` racing between the
+  worker's own CAS to `SUSPENDED` and any other thread's CAS to `SUSPEND_SIGNALED`), independent of
+  whichever queue/ordering discipline sits on top of it in the four models above. Read this one as
+  design-level evidence, not GenMC-grade proof -- it's a hand-written abstraction checked by explicit-
+  state search over a small bound (828 distinct states at `MaxFibers=3`, clean again at 5), not a
+  check of the compiled C++ itself. See the file's own header for the full caveat and how to
+  reproduce it.
 
-Each model ships a negative control, which is the part that makes a clean run mean anything. Build
-the deque model with `-DNO_POP_FENCE` and it produces a double-claim in under a second: two threads
-taking the same task, the use-after-free class. That fence had been called redundant more than once.
+Each GenMC model ships a negative control, which is the part that makes a clean run mean anything.
+Build the deque model with `-DNO_POP_FENCE` and it produces a double-claim in under a second: two
+threads taking the same task, the use-after-free class. That fence had been called redundant more
+than once.
 
-This is not a proof of the whole scheduler. It covers two data structures at small bounds, which is
-where memory-ordering bugs live.
+This is not a proof of the whole scheduler. It covers the handful of places memory-ordering and
+wakeup-race bugs have actually shipped, at small bounds, not the scheduler as a whole.
 
 ## Build
 
