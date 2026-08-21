@@ -1,4 +1,4 @@
----------------------------- MODULE FiberStateMachine ----------------------------
+---------------------------- MODULE fiberresume_model ----------------------------
 (* SPDX-License-Identifier: BSD-3-Clause                                            *)
 (* Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repo root.  *)
 (*                                                                                    *)

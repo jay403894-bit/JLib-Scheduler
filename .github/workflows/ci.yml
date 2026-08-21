@@ -205,6 +205,93 @@ jobs:
           ./build-latency-stats/bin/SchedulerBench none 4 nosweep
         shell: bash
 
+      # tests/verify/fiberresume_model.tla, added 2.4.0 -- see the README's "Model checked" section
+      # for what this does and does not prove. Java is preinstalled on GitHub-hosted Ubuntu runners;
+      # tla2tools.jar needs no build step at all, unlike GenMC below. Translating BEFORE checking
+      # catches a stale/hand-edited PlusCal->TLA+ translation as a real CI failure, not just a local
+      # "trust the committed output" assumption. Same bounds already verified by hand and recorded
+      # in the .tla file's own header (828 distinct states, MaxFibers=3) -- a CI pass means the same
+      # thing that verification already meant, just re-run automatically instead of by memory.
+      - name: Model-check fiberresume_model.tla (TLA+/TLC)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          java -cp /tmp/tla2tools.jar pcal.trans tests/verify/fiberresume_model.tla
+          java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto tests/verify/fiberresume_model.tla
+        shell: bash
+
+      # GenMC models: tests/verify/*.c, checking the four primitives this scheduler's history
+      # actually broke (1.2.0's lost wakeup, 1.3.4's mutex deadlock) exhaustively rather than
+      # hoping a normal test run happens to hit the bad interleaving. No prebuilt GenMC binaries
+      # exist (checked before adding this) -- built from source against LLVM, pinned to the exact
+      # tag (v0.17.0) every model's own RESULTS section was recorded against, so a CI pass means
+      # the same thing those hand-recorded numbers already meant. Cached by that tag so only the
+      # first run after a version bump pays the from-source build cost.
+      #
+      # -unroll=8 on every invocation, even though none of these four harnesses actually contain
+      # an unbounded loop (traced by hand: deque/event are NITEMS- or thread-count-bounded,
+      # sleepwake has no loop at all, fiberwait's for(;;) provably exits within 2 iterations) --
+      # defense in depth per GenMC's own manual ("for infinite loops with side effects, use
+      # -unroll=N"), so a future model that DOES add an unbounded loop fails fast/deterministically
+      # in seconds instead of a CI job silently running to the full job timeout.
+      - name: Cache GenMC v0.17.0
+        if: matrix.os == 'ubuntu-latest'
+        id: genmc-cache
+        uses: actions/cache@v4
+        with:
+          path: genmc-install
+          key: genmc-v0.17.0-${{ runner.os }}
+
+      - name: Build GenMC v0.17.0
+        if: matrix.os == 'ubuntu-latest' && steps.genmc-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-dev libffi-dev zlib1g-dev libedit-dev bc
+          git clone --branch v0.17.0 --depth 1 https://github.com/MPI-SWS/genmc.git genmc-src
+          # RelWithDebInfo, matching GenMC's own documented/tested build ("Installing" section of
+          # their README) -- not Release, to avoid hitting an untested NDEBUG-only configuration.
+          cmake -S genmc-src -B genmc-src/build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/genmc-install"
+          cmake --build genmc-src/build -j 2
+          cmake --install genmc-src/build
+        shell: bash
+
+      # Every model runs twice: as shipped (must report no errors) and under its documented
+      # negative control (must report an error). The second half is the part that makes the first
+      # half mean anything -- a model whose negative control silently stopped failing has quietly
+      # become a vacuous check, exactly the trap the primitives test suite was bitten by once
+      # already (passed 1-in-3 runs with the mutex physically removed).
+      - name: Run GenMC models (exhaustive, not lucky)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/genmc-install/bin:$PATH"
+
+          run_positive() {
+            echo "=== genmc -- -unroll=8 $* (expect: no errors) ==="
+            genmc -- -unroll=8 "$@"
+          }
+          run_negative() {
+            echo "=== genmc -- -unroll=8 $* (expect: FAILS -- this is the negative control) ==="
+            if genmc -- -unroll=8 "$@"; then
+              echo "NEGATIVE CONTROL DID NOT FAIL: $* -- the check has gone vacuous"
+              exit 1
+            fi
+            echo "  (correctly failed)"
+          }
+
+          run_positive tests/verify/deque_model.c
+          run_negative -DNO_POP_FENCE tests/verify/deque_model.c
+
+          run_positive tests/verify/event_model.c
+          run_negative -DNO_RELEASE tests/verify/event_model.c
+
+          run_positive tests/verify/sleepwake_model.c
+          run_negative -DIMMEDIATE_ONLY -DWEAK_IMMEDIATE tests/verify/sleepwake_model.c
+
+          run_positive tests/verify/fiberwait_model.c
+          run_negative -DOLD_ORDERING tests/verify/fiberwait_model.c
+        shell: bash
+
   # ---------------------------------------------------------------------------------------------
   # Windows on ARM64 -- REQUIRED as of 1.3.6.
   #
