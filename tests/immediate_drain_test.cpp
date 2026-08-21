@@ -23,6 +23,16 @@
 // (hiPriInboxes vs loPriInboxes) is already exercised elsewhere (e.g. ParallelFor's hiPri
 // batches), so the residual risk from that asymmetry is low but not zero -- noted rather than
 // silently assumed away.
+//
+// The backlog deliberately MIXES CorePref::Default/P/E (cycled every 3rd task), since 2.5.0 added
+// an in-place 3-way partition to drainInbox specifically so a mixed-class inbox gets split into
+// homogeneous PushBatch calls instead of every task silently landing at Default (PushBatch itself
+// assumes one class per call -- see its own corePref note). What this test CAN verify portably:
+// every task still runs exactly once regardless of the mix, on any hardware. What it can NOT
+// verify without a real hybrid CPU: that a P task actually lands on a P-class worker -- on a
+// non-hybrid machine (most CI runners, most dev boxes) every worker reports as class P and the
+// distinction is unobservable from outside, so asserting on WHICH worker ran a task would be
+// vacuous there. The completion-count check is the honest, hardware-independent one.
 
 #define NOMINMAX
 #include <TaskScheduler.h>
@@ -54,10 +64,12 @@ int main() {
     // 150 > BATCH_SIZE (64): forces drainInbox's for(;;) loop through more than one round, so
     // PushBatch is called more than once for this single backlog, not just the trivial case.
     constexpr int kBacklog = 150;
+    static const CorePref kCycle[3] = { CorePref::Default, CorePref::P, CorePref::E };
     WaitGroup wg;
     wg.n.store(kBacklog, std::memory_order_relaxed);
     for (int i = 0; i < kBacklog; ++i) {
-        Task* t = sched.CreateTask(+[](void*) { completed.fetch_add(1, std::memory_order_relaxed); }, nullptr);
+        Task* t = sched.CreateTask(+[](void*) { completed.fetch_add(1, std::memory_order_relaxed); },
+            nullptr, /*hipri*/false, FiberSize::Standard, TaskType::Native, kCycle[i % 3]);
         t->waitGroup = &wg;
         sched.Push(1, t);   // explicit cpu_affinity=1 (1-indexed) -> worker 0's loPriInbox, deterministically
     }
@@ -83,7 +95,8 @@ int main() {
     sched.WaitFor(immWg);
 
     Check(completed.load(std::memory_order_acquire) == kBacklog,
-          "every backlogged task ran exactly once (no drop/duplicate from PushBatch compaction)");
+          "every backlogged task ran exactly once, Default/P/E mixed (no drop/duplicate from the "
+          "compaction or the corePref partition)");
     Check(immediateRan.load(std::memory_order_relaxed), "immediate task itself ran after the drain");
 
     sched.Join();

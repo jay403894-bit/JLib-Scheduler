@@ -1134,15 +1134,15 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 	}
 }
 void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment,
-	bool hiPri)
+	bool hiPri, CorePref pref)
 {
 	if (!tasks || count == 0) return;
 
-	// NOTE (corePref): a batch is placed at CorePref::Default (full-pool round-robin) regardless of
-	// its members' individual corePrefs -- a batch is assumed homogeneous/Default. Class-pinned
-	// tasks should go through Push() individually; once batched here, a receiving OWNER runs them
-	// unvetted (see the enforcement-scope note in Task.h), though class-aware STEALING still applies
-	// to whatever other workers try to take from that deque.
+	// NOTE (corePref): `pref` places the WHOLE batch as one class -- still assumed homogeneous, but
+	// now the caller states which class explicitly (CorePref::Default unless told otherwise) instead
+	// of it being silently hardcoded to Default regardless of what was asked for. A receiving OWNER
+	// still runs its tasks unvetted once claimed (see the enforcement-scope note in Task.h), but
+	// class-aware STEALING and PLACEMENT now both agree, where before only stealing did.
 	//
 	// A links-and-pushes helper, because the segment loop below and the explicit-affinity path want
 	// the same three steps. push_batch null-terminates the tail itself, so segments never bleed into
@@ -1161,11 +1161,13 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	};
 
 	if (cpuaffinity != 0) {
-		// Explicit affinity is an explicit request: honour it and do not spread.
+		// Explicit affinity is an explicit request: honour it and do not spread. Falls back to
+		// PickNextWorker(pref), not the unpinned target, if that exact core is stuck -- pre-existing
+		// behaviour, now at least routed toward the right class instead of always Default.
 		int chosen = cpuaffinity - 1;
 		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			std::this_thread::yield();
-			chosen = PickNextWorker();
+			chosen = PickNextWorker(pref);
 		}
 		submitRun(0, count, chosen);
 		return;
@@ -1201,10 +1203,10 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	for (size_t s = 0; s < segments; ++s) {
 		const size_t len = per + (s < rem ? 1 : 0);
 		if (len == 0) continue;
-		int chosen = PickNextWorker();
+		int chosen = PickNextWorker(pref);
 		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			std::this_thread::yield();
-			chosen = PickNextWorker();
+			chosen = PickNextWorker(pref);
 		}
 		submitRun(first, len, chosen);
 		first += len;

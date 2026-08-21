@@ -3,6 +3,37 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.5.0 - 2026-08-21
+
+**`PushBatch` now takes an explicit `CorePref pref = CorePref::Default` parameter**, closing the
+gap flagged (but deliberately deferred) in 2.2.0 and documented in the 2.3.0/2.4.0 README notes:
+every task in a batch used to be placed at `CorePref::Default` regardless of what was asked for,
+because `PickNextWorker()` was always called with no argument. Both call sites inside `PushBatch`
+(the explicit-cpuaffinity fallback and the segment loop) now call `PickNextWorker(pref)` instead.
+`PushBatch` still assumes a batch is homogeneous in class -- it does not scan `tasks[]` for mixed
+`corePref` values itself, deliberately: most callers (`ParallelFor`, any already-homogeneous
+submission) already know their batch is one class, and a scan-and-partition on every call would tax
+that common case to serve the one caller that actually has mixed input. Purely additive to the
+signature (new trailing defaulted parameter) -- every existing call site compiles unchanged.
+
+**That one caller is `Thread.cpp`'s `drainInbox`** (the 2.2.0 immediate-task inbox drain), the
+actual place a real, mixed-corePref backlog can land in practice. It now does an in-place 3-way
+partition of the already-popped `batch[]` (Dutch-flag style: P / Default-Wide-Any / E, since the
+latter three all route identically -- see `CorePref`'s own comment), then calls `PushBatch` once
+per non-empty bucket with the matching `pref`. Zero extra allocation, and the realistic common case
+(everything `Default`, which is 100% of shipped callers today) still costs exactly the one
+`PushBatch` call it always did -- the partition only does extra work when there's actually a mix to
+split.
+
+`SchedulerImmediateDrainTest`'s 150-task backlog now cycles `Default`/`P`/`E` every third task
+instead of being uniformly `Default`, specifically to exercise the new partition. What it verifies,
+and the limit of what it CAN verify: every task still runs exactly once regardless of the mix, on
+any hardware -- that's the honest, portable check. It does NOT (and cannot, without a real hybrid
+CPU on the test runner) assert that a `P` task actually lands on a P-class worker, since on a
+non-hybrid machine every worker reports as class P and the distinction is unobservable from the
+outside. 10/10 stress runs clean; full suite green; bench sanity-checked with no regression (latency
+4.36us, matching the pre-existing 4.3-4.9us range).
+
 ## 2.4.0 - 2026-08-21
 
 **New model: `tests/verify/fiberresume_model.tla`**, checking `Fiber::ResumeQueueless()`'s own CAS

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <iostream>
 #include <cstring>   // std::memset -- MSVC pulls this in transitively, libstdc++ does not
+#include <utility>   // std::swap, for drainInbox's in-place corePref partition
 using namespace JLib;
 thread_local Thread* Thread::instance = nullptr;
 
@@ -640,10 +641,13 @@ void Thread::Worker() {
 				// small -- ParallelFor's default would over-segment it and pay more notifies than the
 				// spread is worth (see PushBatch's own header on that regression).
 				//
-				// PushBatch places every task at CorePref::Default regardless of its individual
-				// corePref, unlike the old per-task Requeue which honored it. Currently behavior-
-				// identical: no shipped caller sets CorePref::P/E (class routing is opt-in and dormant).
-				// Revisit if a future P/E-routed caller ever gets PushImmediate-pinned.
+				// PushBatch places a whole call as ONE class (see its own corePref note) -- so a
+				// drained inbox that actually mixes P/E/Default tasks (2.1.0+ allows this; class
+				// routing is opt-in but no longer hypothetical once one caller uses it) needs
+				// splitting into homogeneous runs FIRST, one PushBatch call per run. Done in place on
+				// batch[] itself (Dutch-flag 3-way partition), not via separate scratch arrays or
+				// heap vectors -- this is a hot path and the common case (everything Default, which
+				// is 100% of it today) must still cost exactly one PushBatch call, not three.
 				//
 				// batch[] can hold null entries (see the pop loops in section 5 below, which guard the
 				// same way) -- PushBatch links tasks[i]->next contiguously and cannot tolerate a hole,
@@ -657,7 +661,33 @@ void Thread::Worker() {
 						for (size_t i = 0; i < count; ++i)
 							if (batch[i]) batch[live++] = batch[i];
 						if (live == 0) continue;
-						scheduler->PushBatch(batch, live, /*cpuaffinity*/0, /*minPerSegment*/8, inboxIsHiPri);
+
+						// [0, pEnd) = P, [pEnd, eStart) = Default/Wide/Any (all route identically --
+						// see CorePref's own comment), [eStart, live) = E.
+						size_t pEnd = 0, mid = 0, eStart = live;
+						while (mid < eStart) {
+							CorePref pr = batch[mid]->corePref;
+							if (pr == CorePref::P) {
+								std::swap(batch[pEnd], batch[mid]);
+								++pEnd; ++mid;
+							}
+							else if (pr == CorePref::E) {
+								--eStart;
+								std::swap(batch[mid], batch[eStart]);
+							}
+							else {
+								++mid;
+							}
+						}
+						if (pEnd > 0)
+							scheduler->PushBatch(batch, pEnd, /*cpuaffinity*/0, /*minPerSegment*/8,
+								inboxIsHiPri, CorePref::P);
+						if (eStart > pEnd)
+							scheduler->PushBatch(batch + pEnd, eStart - pEnd, /*cpuaffinity*/0,
+								/*minPerSegment*/8, inboxIsHiPri, CorePref::Default);
+						if (live > eStart)
+							scheduler->PushBatch(batch + eStart, live - eStart, /*cpuaffinity*/0,
+								/*minPerSegment*/8, inboxIsHiPri, CorePref::E);
 					}
 				};
 				drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);

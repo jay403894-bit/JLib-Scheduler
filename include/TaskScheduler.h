@@ -387,8 +387,14 @@ namespace JLib {
 		// N times -- wants 1, because for it any segmenting strictly REDUCES notifies. Getting this
 		// backwards is a real regression in both directions, so it is a parameter rather than a
 		// constant: see ParallelFor's flat path.
+		// pref: the batch is still assumed HOMOGENEOUS -- every task in one call is placed as this
+		// ONE class, not read per-task. A genuinely mixed-corePref set of tasks is the CALLER's job
+		// to split into homogeneous runs and call PushBatch once per run -- see Thread.cpp's
+		// drainInbox for the pattern. Deliberately not scanned here: most callers (ParallelFor, any
+		// already-homogeneous submission) already know their batch is one class, and a scan-and-
+		// partition on every call would tax that common case to serve the one caller that needs it.
 		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0, size_t minPerSegment=64,
-		               bool hiPri=false);
+		               bool hiPri=false, CorePref pref=CorePref::Default);
 
 		// Submit [begin, end) as ceil(n/chunkSize) TASKS rather than n of them, each task looping
 		// over its own chunk and calling fn(i) per index. Returns the number of tasks created.
