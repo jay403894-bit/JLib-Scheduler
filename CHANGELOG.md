@@ -3,6 +3,40 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.10.0 - 2026-08-23
+
+**[CRITICAL for anyone using coroutines] The deque's steal tag was lying about `TaskType`, and
+fiberless helpers could not steal coroutine work.** Two halves of one problem, both introduced by
+2.8.0.
+
+`TaskDeque` packs steal-vetting bits into the spare low bits of the stored `Task*` so a predicate can
+vet a candidate without dereferencing memory the thief has not claimed. `TaskType` had **one** bit
+there -- `type == Native ? 0x4 : 0` -- from when the enum had two values. 2.8.0 added a third, so
+every coroutine task round-tripped out of the tag as **`TaskType::Fiber`**. Harmless purely by luck:
+the single predicate reading it asked for `== Native`, so the lie produced a decline rather than a
+wrong steal. It would have become a real bug the instant any predicate asked for `== Fiber`. Now two
+bits, with a `static_assert` so a fourth `TaskType` cannot reintroduce it quietly.
+
+**And the decline was itself wrong.** A coroutine is resumed by calling a function on whatever stack
+is current -- exactly like a Native task -- so a fiberless caller can run one perfectly well; only a
+Fiber-backed task genuinely cannot be claimed. The predicate is now "does not need a fiber" rather
+than "is Native", so a blocked main thread helping through `WaitFor` or a `SchedulerMutex` spin no
+longer idles next to coroutine work it is able to do.
+
+**Those two changes are one change, and the second half is what makes the first safe.**
+`TryRunStolenNativeTask` ran `Execute()` and then unconditionally decremented the WaitGroup,
+`DestroyTask`d and `Free`d -- correct for a Native task, a **double free** for a coroutine, which is
+owned and released by the C++20 side. It now reads the type BEFORE `Execute()` (a completing
+coroutine frees its own Task, so `task` may be dangling the instant `Execute()` returns) and skips
+completion for coroutines, matching `Worker()`'s fast path exactly.
+
+Verified by negative control rather than by reasoning: with the guard removed, the coroutine suite
+dies with `0xC0000374` (heap corruption) and three failed checks -- which also proves the path is
+genuinely exercised, since `WaitFor` on the main thread is what steals those coroutine tasks.
+
+`TryRunStolenNativeTask` keeps its name despite now stealing coroutines too; it is public API and not
+worth churning. Read "Native" there as "a task that does not require a fiber".
+
 ## 2.9.0 - 2026-08-23
 
 **The stale-library guard can now see `Task` layout changes. It could not, and 2.8.0 was exactly the

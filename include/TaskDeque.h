@@ -75,23 +75,34 @@ namespace JLib {
         }
 
         // ---- tag encoding -------------------------------------------------------------------
-        // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bit 2: type == Native   bit 3: spare
+        // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bits 2-3: TaskType
+        //
+        // TaskType USED TO BE ONE BIT -- `type == Native ? 0x4 : 0` -- back when the enum had two
+        // values. 2.8.0 added Coroutine and that encoding silently started LYING: a coroutine task
+        // round-tripped as TaskType::Fiber, because "not Native" was the only other thing the bit
+        // could say. It was harmless purely by luck (the one predicate reading it asked for
+        // == Native, so the lie produced a decline rather than a wrong steal) and would have become
+        // a real bug the moment any predicate asked for == Fiber. Two bits, and a static_assert so
+        // a fourth TaskType cannot reintroduce it quietly.
         static constexpr uintptr_t kTagMask = 0xF;
         static_assert(alignof(Task) > kTagMask,
             "TaskDeque packs steal-vetting bits into the low bits of a Task*; Task's alignment "
             "must leave them free. Shrinking alignas(Task) breaks this silently.");
+        static_assert(static_cast<unsigned>(TaskType::Coroutine) <= 3,
+            "TaskType must fit in the deque's two tag bits (2-3); adding a fifth value needs a "
+            "wider tag, and alignof(Task) is what limits how wide it can get.");
 
         static uintptr_t tag(Task* item) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(item);
             return p | (static_cast<uintptr_t>(item->corePref) & 0x3)
-                     | (item->type == TaskType::Native ? 0x4u : 0u);
+                     | ((static_cast<uintptr_t>(item->type) & 0x3) << 2);
         }
         static Task* untag(uintptr_t v) {
             return reinterpret_cast<Task*>(v & ~kTagMask);
         }
         static StealBits bits(uintptr_t v) {
             return StealBits{ static_cast<CorePref>(v & 0x3),
-                              (v & 0x4) != 0 ? TaskType::Native : TaskType::Fiber };
+                              static_cast<TaskType>((v >> 2) & 0x3) };
         }
 
         // Owner-only push.

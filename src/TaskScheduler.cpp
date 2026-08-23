@@ -1454,8 +1454,16 @@ Task* TaskScheduler::GetTask() {
 	// Vets the deque's TAG, not the task -- see TaskDeque::StealBits. Both fields this needs
 	// (type, corePref) ride in the stored pointer's spare low bits precisely so this predicate
 	// never has to dereference a candidate the thief has not claimed.
-	auto nativeOnly = [&](StealBits sb) {
-		return sb.type == TaskType::Native && StealClassCompatible(sb.corePref, thiefIsP, degen);
+	// NOT "== Native" -- "does not need a fiber". A coroutine is resumed by calling a function on
+	// whatever stack is current, exactly like a Native task, so a fiberless caller can run one
+	// perfectly well; only a Fiber-backed task genuinely cannot be claimed here. Excluding
+	// coroutines would leave a blocked main thread spinning next to coroutine work it is able to do.
+	//
+	// Whoever widens this must also keep TryRunStolenNativeTask's completion path in step: a
+	// coroutine task is owned and freed by the C++20 side, so running one here and then applying the
+	// usual DestroyTask/Free would be a double free. The two changes are one change.
+	auto fiberlessRunnable = [&](StealBits sb) {
+		return sb.type != TaskType::Fiber && StealClassCompatible(sb.corePref, thiefIsP, degen);
 	};
 
 	if (!forceLoPri) {
@@ -1463,7 +1471,7 @@ Task* TaskScheduler::GetTask() {
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
 			size_t target = (start + i) % numThreads;
-			if (auto s = hiPri[target]->steal_if(nativeOnly)) {
+			if (auto s = hiPri[target]->steal_if(fiberlessRunnable)) {
 				consecutiveHiPriSteals++;
 				return *s;
 			}
@@ -1476,7 +1484,7 @@ Task* TaskScheduler::GetTask() {
 	size_t start = rand() % numThreads;
 	for (size_t i = 0; i < numThreads; ++i) {
 		size_t target = (start + i) % numThreads;
-		if (auto s = loPri[target]->steal_if(nativeOnly))
+		if (auto s = loPri[target]->steal_if(fiberlessRunnable))
 			return *s;
 	}
 
@@ -1484,10 +1492,15 @@ Task* TaskScheduler::GetTask() {
 }
 
 bool TaskScheduler::TryRunStolenNativeTask() {
-	// Steal ONE Native and run it to completion right here with the full completion bookkeeping
-	// Worker()'s fast path does. GetTask vets the Native flag AT THE DEQUE (steal_if) -- a fiber-backed task
-	// is never claimed by this fiberless caller in the first place, so the old steal-then-Requeue
-	// relocation path (claim CAS + re-push + notify = contention/thrash) no longer exists.
+	// Steals ONE task this fiberless caller can actually run and runs it right here. GetTask vets the
+	// type AT THE DEQUE (steal_if) -- a fiber-backed task is never claimed in the first place, so the
+	// old steal-then-Requeue relocation path (claim CAS + re-push + notify = contention/thrash) no
+	// longer exists.
+	//
+	// "Native" IN THE NAME IS NOW NARROWER THAN THE BEHAVIOUR: since 2.8.0 this also steals
+	// TaskType::Coroutine, because resuming a coroutine is a function call on the current stack and
+	// needs no fiber. Only Fiber-backed tasks are off limits. The name is kept rather than churned
+	// because it is public API; read it as "a task that does not require a fiber".
 	Task* task = GetTask();
 	if (!task) {
 		// Nothing stealable anywhere -- but "anywhere" only covers DEQUES, and if this caller is a
@@ -1517,14 +1530,26 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 		if (!task) return false;
 	}
 
+	// Read BEFORE Execute(), for the same reason Worker() does: a coroutine can run to completion
+	// inside resume(), and completing frees both its frame and this Task -- so `task` may be dangling
+	// the moment Execute() returns, and reading ->type then to decide what to do about it is itself
+	// a use-after-free.
+	const bool isCoroutine = (task->type == TaskType::Coroutine);
+
 	task->Execute();
-	if (task->waitGroup) {
-		int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-		if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-			task->waitGroup->WakeAll();   // only touches wg if someone registered
+
+	// Same ownership rule as the worker's fast path, and it has to be the same or this is a double
+	// free: a coroutine signals its own WaitGroup and returns its own Task to the slab from inside
+	// the coroutine. Everything below belongs to tasks this caller actually owns.
+	if (!isCoroutine) {
+		if (task->waitGroup) {
+			int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+			if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+				task->waitGroup->WakeAll();   // only touches wg if someone registered
+		}
+		DestroyTask(task);
+		taskAllocator.Free(task);
 	}
-	DestroyTask(task);
-	taskAllocator.Free(task);
 
 	if (EpochManager::Instance().ShouldSelfReclaim()) {
 		EpochManager::Instance().Tick();
