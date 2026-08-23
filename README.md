@@ -11,6 +11,7 @@ you:
 - **Three execution modes on one pool** -- plain tasks, fibers, and C++20 coroutines, sharing one
   lock and one semaphore
 - **Fiber-based blocking only when you actually suspend**, so you never pay fiber overhead unless you need it
+- **Optional C++20 Coroutines in addition to fibers**
 
 **The C++17 core is a feature, not a floor we have not raised yet.** Console SDKs, older MSVC and
 long-lived engine codebases are still on C++17, and the whole scheduler -- deques, stealing, fibers,
