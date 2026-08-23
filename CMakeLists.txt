@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.7.0")
+set(JLIBSCHED_VERSION "2.8.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -482,6 +482,21 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/bench/compare")
 add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primitives_test.cpp")
 target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)
 target_compile_features(SchedulerPrimitivesTest PRIVATE cxx_std_17)
+
+# The C++20 coroutine mode. Compiled at cxx_std_20 while the Scheduler target stays cxx_std_17 --
+# which is the point, and is checked by the build rather than by discipline: if anything from
+# Coroutine.h ever leaks into the core, the library target fails to compile at C++17.
+#
+# OFF by default. Not because coroutine support is experimental, but because requiring C++20 to
+# build the test suite would quietly make C++20 the project's real floor, and a C++17 job system
+# this complete is worth keeping buildable on C++17.
+option(JLIBSCHED_COROUTINES "Build the C++20 coroutine mode's tests (the header itself is always shipped)" OFF)
+if(JLIBSCHED_COROUTINES)
+    add_executable(SchedulerCoroutineTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/coroutine_test.cpp")
+    target_link_libraries(SchedulerCoroutineTest PRIVATE Scheduler)
+    target_compile_features(SchedulerCoroutineTest PRIVATE cxx_std_20)
+    message(STATUS "JLib::Scheduler: C++20 coroutine tests ENABLED (core still builds as C++17)")
+endif()
 
 # ABI harness for the Windows/ARM64 context switch -- the Windows counterpart of
 # tests/fibertest_aarch64.cpp, which the POSIX ABI job builds directly with `c++` and cannot be

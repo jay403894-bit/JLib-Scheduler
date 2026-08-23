@@ -3,6 +3,125 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.8.0 - 2026-08-23
+
+**A THIRD EXECUTION MODE: C++20 COROUTINES, AS AN OPTIONAL HEADER. The core stays C++17.**
+
+`TaskType::Coroutine` joins `Native` and `Fiber`. A coroutine is resumed through the same
+`fn(data)` call the worker already makes for every task -- `fn` is a trampoline, `data` is
+`coroutine_handle::address()` -- so `<coroutine>` and C++20 never enter the library. `Task` did not
+grow by a byte. Everything C++20 lives in `include/Coroutine.h`, which nothing else includes, and the
+boundary is checked by the build rather than by discipline: the `Scheduler` target is compiled as
+C++17, so anything leaking out of that header fails to compile. Tests for it are behind
+`-DJLIBSCHED_COROUTINES=ON`, off by default, so requiring C++20 to build the suite cannot quietly
+make C++20 the project's real floor.
+
+New in that header:
+
+- **`Coro` + `Spawn()`** -- fire-and-forget coroutines scheduled on the pool, reporting completion
+  through a `WaitGroup`.
+- **`Reschedule`** -- `co_await` it to yield the worker and continue on whichever picks the task up.
+  It is also the minimal awaiter: every I/O awaiter will have this exact shape, differing only in
+  *when* the task is re-pushed.
+- **`Lazy<T>`** -- a coroutine that returns a value, awaitable from another coroutine, with
+  `SyncWait()` for non-coroutine callers. No future type is involved and none is needed: the promise
+  *is* the shared state, and `SyncWait` reuses the existing `WaitGroup`. Exceptions are stored as an
+  `exception_ptr` and rethrown at the awaiting `co_await`, so `try`/`catch` around an await works.
+- **Superset lock and semaphore.** `SchedulerMutex` and `SchedulerSemaphore` were EXTENDED, not
+  duplicated -- there is still one lock, not a third choice. Their waiter queues now hold a `Waiter`
+  that is either a fiber (resume it) or a coroutine task (re-push it), so a fiber and a coroutine
+  contending on the same object is well defined. Bare threads still never queue: they cannot suspend,
+  so they keep spinning on `Try_Lock` and helping. None of this needed C++20 -- a coroutine waiter is
+  a `Task*` and re-arming it is a `Push` -- so the superset logic is in the C++17 core and only the
+  `co_await LockAsync(m)` spelling is in the optional header.
+
+**The design decision worth knowing before touching any of it: THE WORKER NEVER COMPLETES A
+COROUTINE TASK.** The obvious alternative -- a "finished" flag the worker checks after resuming --
+was written first and is racy. A coroutine that suspends becomes re-pushable *inside* `resume()`, so
+a second worker can pick it up, finish it and free it while the first is still deciding what it saw;
+both then observe "finished" and both free. No flag read closes that. Sole ownership by the C++20
+side removes the race instead of narrowing it, and removed the flag with it.
+
+`Event` and `DirectEvent` deliberately gain NO coroutine support. They are arbitrary-point
+suspension -- a fiber parks from any stack depth because `ContextSwitch` takes the whole stack with
+it -- and a coroutine suspends only where a `co_await` is written. The coroutine analogue of an event
+is an awaitable, a different construct, not a polymorphic `Event`.
+
+Two bugs found by the tests rather than by reading, both recorded at their sites: a nested `Lazy`
+that suspended re-pushed a task still pointing at the *root* handle, resuming the wrong coroutine and
+producing wrong VALUES rather than a crash (fixed by `detail::ArmResume`, which also forced the
+trampoline to use `coroutine_handle<>` rather than a typed handle, since a typed one makes every
+nested resume undefined behaviour that happens to work); and a dangling-lambda-coroutine in the test
+itself, where a temporary `[&]{...}()` closure passed to `Spawn` died at the end of the
+full-expression while the coroutine was still suspended.
+
+The deep-await-chain test exists for one reason: `final_suspend` returns the continuation's handle so
+the compiler tail-calls into it, making a chain of N awaits cost O(1) stack. Resuming the
+continuation directly instead is O(N) and shows up only as a stack overflow under depth. 100,000
+nested awaits pass; nothing shallower would catch it.
+
+**REBUILD REQUIRED, and the stale-library guard will NOT tell you.** `Task`'s layout changed while
+`sizeof(Task)` stayed 64, and size is what the guard compares -- so a translation unit compiled
+against these headers and linked to an older `Scheduler.lib` would read the flag bits from the wrong
+offsets and say nothing. `trivialDtor` is the field that makes this dangerous rather than merely
+wrong: read from the wrong bit, the completion path either skips `~Task()` and leaks every lambda
+capture, or runs a destructor it should not have. See the note at the end of this entry.
+
+**`Task`'s six flag bytes are now one packed byte.** `hiPri`, `requiredSize`, `type`,
+`priorityBoost`, `corePref` and `trivialDtor` occupied one byte each at offsets 48-53, with two
+bytes of tail padding. As bitfields they fit in a single byte at 48, which frees 49-55 -- including a
+4-byte, 4-aligned slot at offset 52. `sizeof(Task)` is unchanged at 64 (still exactly one cache
+line) and so is the 192-byte lambda capture budget, because those bytes were padding either way.
+
+The point is the reclaimed slot, not the byte saved: a 32-bit field can now be added for the
+cancellation-token index the I/O runtime work needs, without pushing `Task` onto a second cache line
+or shrinking what callers may capture. **Nothing claims it yet, deliberately** -- an unused field is
+what `stopFlag` was, and it was removed for that reason.
+
+Two traps are commented at the site because neither is visible in the code:
+
+- **Bitfields cannot carry default member initializers before C++20** (P0683R1), and this library is
+  C++17. Both constructors now initialize all six explicitly; one that forgets leaves a field
+  *indeterminate*, not zero.
+- **Adjacent bitfields in one allocation unit are a single memory location**, so two threads writing
+  logically independent flags here is a data race. Safe today only because all six are written before
+  the task is published and never again. Re-wiring lock priority inheritance would break that -- it
+  writes `hiPri` from a thread other than the one running the task, while push/steal read `hiPri` --
+  at which point those two must leave the block.
+
+Packing bitfields of *different declared types* into one unit is a compiler behaviour, not a standard
+guarantee (MSVC does it when the types are the same size, which is why all six are 1-byte types). If
+a compiler declines, the block silently grows back, the reclaimed slot stops existing, and
+`sizeof(Task) == 64` still holds -- so `detail::TaskFlagPacking` exists purely to `static_assert` the
+packing actually happened.
+
+Measured against three baseline runs, medians: throughput/1p 0.88 -> 0.94 M/s, PushBatch 15.79 ->
+15.60 M/s, latency 4.39 -> 4.48 us, frame DAG 21.24 -> 20.87 us/graph. Every delta is inside the
+run-to-run spread and they point in opposite directions, which is noise, not effect: the added
+mask-and-shift is below what a multi-binary comparison can resolve here (~10%).
+
+**`SchedulerMutex` has not inherited priority since 2026-07-20, and its comments claimed it did.**
+Boosting the holder on contention arrived in `8555cbd` ("implemented starvation prevention") and its
+only call site was deleted five days later in `21719ac`, the rewrite that turned this from a spinlock
+into the suspend-or-help lock it is now. `BoostTaskPriority` still has no callers anywhere in the
+library or its consumers, so `priorityBoost` is permanently 0 and `UnboostTaskPriority` -- which
+`Unlock()` does still call -- always takes its false branch.
+
+The removal was correct and the class comment now says why, so the boost does not get re-added as a
+fix for a hang it cannot cause: priority inversion needs a high-priority waiter to starve the holder
+of CPU, and nothing here can. `hiPri` is queue order only, every worker runs at the same OS priority,
+and a task that has STARTED owns its worker until it yields -- so hiPri work cannot deschedule a
+running lock holder. What made inversion real before was that waiters SPUN and genuinely competed for
+a core; suspending and helping both removed that. The residual case (holder is a suspended fiber
+whose resume sits in a loPri queue under hiPri flood) is bounded by `kStealFairnessWindow`. Same
+shape as the age-based promotion removed once single-item stealing made it redundant: a mitigation
+outliving its premise. No code changed.
+
+**Known gap, not fixed here:** `AbiComponents` compares `sizeof(Task)`, so it cannot see a `Task`
+layout change that preserves size -- exactly this one. Folding `sizeof(detail::TaskFlagPacking)` into
+the reported value would close it, but that changes the guard's own return value and wants doing
+deliberately rather than as a side effect of this change.
+
 ## 2.7.0 - 2026-08-23
 
 **A fast spin before the contended bare-thread lock path was built, measured, and REVERTED. Do not

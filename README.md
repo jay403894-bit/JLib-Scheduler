@@ -1,13 +1,23 @@
 # JLib::Scheduler
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
-A hybrid runtime for C++17+ that gives you:
+A hybrid runtime whose **core is C++17**, with **C++20 coroutines as an optional header**. It gives
+you:
 
 - **Cilk-style work-stealing** for fast parallel loops (`ParallelFor`, `PushArray`)
 - **No cost model in the range APIs** -- `ParallelFor` has no probe and no calibrated constant; steals decide how work is divided
 - **TaskFlow-style dependency graphs** (`TaskDAG`) with AND/OR gates
 - **Middleware-safe threads by default** -- no TLS surprises
+- **Three execution modes on one pool** -- plain tasks, fibers, and C++20 coroutines, sharing one
+  lock and one semaphore
 - **Fiber-based blocking only when you actually suspend**, so you never pay fiber overhead unless you need it
+
+**The C++17 core is a feature, not a floor we have not raised yet.** Console SDKs, older MSVC and
+long-lived engine codebases are still on C++17, and the whole scheduler -- deques, stealing, fibers,
+DAGs, the verified concurrency -- builds and runs there. Coroutines live in one opt-in header
+(`Coroutine.h`) that nothing else includes, so including it is the only thing that requires C++20.
+The boundary is enforced by the build rather than by discipline: the library target is compiled as
+C++17, so anything that leaked out of that header would fail to compile.
 
 Built for real-time engines that mix compute-heavy loops, dependency-aware pipelines, and I/O-bound
 middleware in the same frame.
@@ -25,7 +35,7 @@ that reports get acted on -- not as a response time. During a work week the same
 have taken weeks, and a report may sit for a while before anyone looks at it. Nothing here is
 staffed.
 
-Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 · BSD
+Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 (C++20 for optional coroutines) · BSD
 
 
 I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.

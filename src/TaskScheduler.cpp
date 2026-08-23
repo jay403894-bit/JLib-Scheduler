@@ -1803,7 +1803,7 @@ void SchedulerMutex::Lock() {
 			// and flips us to SUSPEND_SIGNALED, and the worker's park step wakes us instead of
 			// parking.
 			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
-			waitingFibers.push(current);
+			waiters.push(Waiter{ current, nullptr });
 			spinLock.clear(std::memory_order_release);
 		}
 		// Deliberately NOT Thread::Suspend(). Fiber::Suspend() stores WANTS_SUSPEND
@@ -1837,7 +1837,7 @@ void SchedulerMutex::Unlock()
 	if (OnBareThread() && t_heldMutexes > 0) --t_heldMutexes;
 
 	Task* wasHolder;
-	Fiber* nextFiber = nullptr;
+	Waiter next{};
 	{
 		while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 		wasHolder = lockHolder;
@@ -1847,9 +1847,11 @@ void SchedulerMutex::Unlock()
 
 	{
 		while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
-		if (!waitingFibers.empty()) {
-			nextFiber = waitingFibers.front();
-			waitingFibers.pop();
+		if (!waiters.empty()) {
+			// Ownership passes to the waiter: `locked` deliberately STAYS true. Clearing it here
+			// would let a third party take the lock in front of the waiter we are about to release.
+			next = waiters.front();
+			waiters.pop();
 		}
 		else {
 			locked = false;
@@ -1862,9 +1864,43 @@ void SchedulerMutex::Unlock()
 		TaskScheduler::Instance().UnboostTaskPriority(wasHolder);
 	}
 
-	if (nextFiber) {
-		Thread::Resume(nextFiber);
+	// Release whichever kind of waiter was queued. This is the only place the two kinds diverge, and
+	// both hand the waiter to somebody else -- so after either call the waiter may already be running
+	// and neither `next` nor anything it points at may be touched again.
+	if (next.fiber) {
+		Thread::Resume(next.fiber);
 	}
+	else if (next.coro) {
+		// The coroutine now HOLDS the lock (locked stayed true above). Record it as the holder before
+		// it can possibly run, so a concurrent Unlock from it sees a consistent holder rather than a
+		// stale one. Then re-push: a worker picks the task up and the resume trampoline continues the
+		// coroutine at the point after its co_await.
+		{
+			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			lockHolder = next.coro;
+			holderLock.clear(std::memory_order_release);
+		}
+		if (TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(next.coro);
+	}
+}
+
+bool SchedulerMutex::LockAsyncEnqueue(Task* coroTask) {
+	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+	if (!locked) {
+		locked = true;
+		spinLock.clear(std::memory_order_release);
+		{
+			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			lockHolder = coroTask;
+			holderLock.clear(std::memory_order_release);
+		}
+		return true;    // acquired outright -- caller must not suspend
+	}
+	// Queued. The task becomes reachable by Unlock the instant spinLock is cleared, so nothing may
+	// touch it after this point.
+	waiters.push(Waiter{ nullptr, coroTask });
+	spinLock.clear(std::memory_order_release);
+	return false;
 }
 
 bool SchedulerMutex::Try_Lock()
@@ -1907,7 +1943,7 @@ void SchedulerSemaphore::Wait() {
 			// fiber parks forever. Become parkable first, and switch directly rather than through
 			// Fiber::Suspend so a SUSPEND_SIGNALED set in between is not clobbered.
 			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
-			waitingFibers.push(current);
+			waiters.push(Waiter{ current, nullptr });
 			spinLock.clear(std::memory_order_release);
 		}
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerSemaphore::Wait");
@@ -1943,6 +1979,19 @@ SchedulerSemaphore::ScopedPermit::~ScopedPermit() {
 	sem.Signal();
 }
 
+bool SchedulerSemaphore::WaitAsyncEnqueue(Task* coroTask) {
+	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+	if (permits > 0) {
+		--permits;
+		spinLock.clear(std::memory_order_release);
+		return true;    // got a permit -- caller must not suspend
+	}
+	// Queued. Reachable by Signal() the instant spinLock clears; touch nothing after.
+	waiters.push(Waiter{ nullptr, coroTask });
+	spinLock.clear(std::memory_order_release);
+	return false;
+}
+
 bool SchedulerSemaphore::Try_Wait() {
 	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 	if (permits > 0) {
@@ -1962,14 +2011,19 @@ void SchedulerSemaphore::Signal()
 	}
 
 	// 2. Safely manipulate the queue and permits
-	if (!waitingFibers.empty()) {
-		Fiber* fiber = waitingFibers.front();
-		waitingFibers.pop();
+	if (!waiters.empty()) {
+		// The permit passes DIRECTLY to this waiter and is never returned to `permits` -- otherwise
+		// a third party could take it before the waiter we are releasing ever runs.
+		const Waiter next = waiters.front();
+		waiters.pop();
 
-		// 3. Release lock BEFORE resuming the fiber to minimize contention overhead
+		// 3. Release lock BEFORE resuming/pushing to minimize contention overhead. After either
+		// call the waiter may already be running, so nothing below may touch it.
 		spinLock.clear(std::memory_order_release);
 
-		Thread::Resume(fiber);
+		if (next.fiber) Thread::Resume(next.fiber);
+		else if (next.coro && TaskScheduler::IsInitialized())
+			TaskScheduler::Instance().Push(next.coro);
 	}
 	else {
 		if (permits < maxPermits) {

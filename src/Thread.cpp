@@ -440,21 +440,53 @@ void Thread::Worker() {
 			// which is exactly what WaitOnEvent*'s guards check for -- a mismarked Native
 			// task that tries to suspend anyway fails loudly there instead of corrupting the
 			// worker's real call stack.
-			if (task_to_run->type == TaskType::Native) {
+			// Coroutines ride this path too: resuming one is a plain fn(data) call -- fn is a
+			// trampoline, data is the handle address -- that runs on this worker's stack and
+			// returns, exactly like a Native task. That type erasure is what keeps <coroutine> and
+			// C++20 out of the core entirely. They differ only in who completes them (below).
+			if (task_to_run->type == TaskType::Native || task_to_run->type == TaskType::Coroutine) {
+				// READ BEFORE Execute(), and this is load-bearing rather than tidy. A coroutine's
+				// resume can run the body to completion, and completion frees both the frame and
+				// this Task -- so `task_to_run` may be DANGLING the instant Execute() returns.
+				// Touching ->type afterwards to decide what to do about it is a use-after-free.
+				const bool isCoroutine = (task_to_run->type == TaskType::Coroutine);
+
 				currentRunningTask = task_to_run;
 				busy.store(true, std::memory_order_relaxed);
 				task_to_run->Execute();
-				if (task_to_run->waitGroup) {
-					int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-						task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
-				}
-				busy.store(false, std::memory_order_relaxed);
-				currentRunningTask = nullptr;
 
-				scheduler->CleanupTaskMetadata(task_to_run);
-				DestroyTask(task_to_run);
-				scheduler->GetAllocator()->Free(task_to_run);
+				// OWNERSHIP: the worker completes Native tasks and NEVER completes coroutine ones.
+				//
+				// The tempting design -- a "did it finish" flag the worker checks after resuming --
+				// is racy and was written and discarded here. A coroutine that suspends is re-pushed
+				// by whatever armed its resume, so a SECOND worker can pick it up, run it to
+				// completion and free it while the first worker is still deciding; both then observe
+				// "finished" and both free. There is no flag read that closes that, because the
+				// window opens the moment the task becomes re-pushable, which is inside resume().
+				//
+				// Giving the C++20 side sole ownership removes the race instead of racing better:
+				// the coroutine signals its own WaitGroup and frees its own Task exactly once, from
+				// inside the coroutine, before its frame goes away. See JLib/Coroutine.h.
+				if (!isCoroutine) {
+					if (task_to_run->waitGroup) {
+						int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+						if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+							task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
+					}
+					busy.store(false, std::memory_order_relaxed);
+					currentRunningTask = nullptr;
+
+					scheduler->CleanupTaskMetadata(task_to_run);
+					DestroyTask(task_to_run);
+					scheduler->GetAllocator()->Free(task_to_run);
+				}
+				else {
+					// Coroutine: the task may already be freed, so nothing below may touch it.
+					// Clearing these two is still required and still safe -- neither reads the task.
+					busy.store(false, std::memory_order_relaxed);
+					currentRunningTask = nullptr;
+					task_to_run = nullptr;
+				}
 
 				// Release the core claimed by PushImmediate/PushToCore. Sound because an immediate
 				// task goes into THIS worker's immediate slot and cannot be stolen, so the worker

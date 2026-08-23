@@ -910,21 +910,67 @@ namespace JLib {
 	}
 #endif
 
-	// Priority-inheritance-aware mutex wrapper. When a task tries to lock and blocks, the
-	// lock holder's priority is temporarily boosted to prevent priority inversion deadlock.
+	// Fiber-aware mutex. A blocked fiber SUSPENDS (freeing its worker); a blocked bare thread runs
+	// stolen Native work instead of spinning.
+	//
+	// IT NO LONGER INHERITS PRIORITY, and the comment here claimed it did for a month. Boosting the
+	// holder on contention was added in 8555cbd ("implemented starvation prevention", 2026-07-15)
+	// and its single call site was removed five days later in 21719ac, the rewrite that turned this
+	// from a spinlock into the suspend-or-help lock described above. `BoostTaskPriority` still
+	// exists and still has no callers anywhere in the library or its consumers, so `priorityBoost`
+	// is permanently 0 and `UnboostTaskPriority` -- which Unlock() does still call -- always takes
+	// its false branch.
+	//
+	// That removal was correct, and it is worth knowing WHY so nobody re-adds the boost as a fix for
+	// a hang it cannot cause. Classic priority inversion needs a high-priority waiter to starve the
+	// holder of CPU. Nothing here can: `hiPri` is QUEUE ORDER ONLY -- never OS thread priority,
+	// never placement -- every worker runs at the same OS priority, and a task that has already
+	// STARTED owns its worker until it yields or finishes, so no amount of hiPri work can deschedule
+	// a running lock holder. What made inversion real in the old design was that waiters SPUN, so
+	// they genuinely competed with the holder for a core; suspending and helping both removed that.
+	// The one residual case -- the holder is a suspended fiber whose resume sits in a loPri queue
+	// while hiPri work floods in -- is bounded by kStealFairnessWindow, which forces a loPri scan
+	// every 8 consecutive hiPri steals. Same shape as the age-based promotion that was removed once
+	// single-item stealing made it redundant: a mitigation outliving its premise.
+	// One queued waiter on a SchedulerMutex or SchedulerSemaphore. EXACTLY ONE of the two pointers is
+	// non-null, and which one decides how the waiter is released:
+	//
+	//   fiber != nullptr   a suspended fiber        -> Thread::Resume(fiber)
+	//   coro  != nullptr   a suspended coroutine    -> TaskScheduler::Push(coro), which re-runs its
+	//                                                  resume trampoline on some worker
+	//
+	// BARE THREADS ARE NOT HERE, deliberately. A blocked bare thread cannot suspend, so it never
+	// queues at all -- it spins on Try_Lock/Try_Wait running stolen work (see ContendedSpinStep) and
+	// finds the lock free on its own. Only contexts that can actually park need waking.
+	//
+	// THIS IS THE WHOLE COST OF SUPERSETTING. Everything else about these primitives is unchanged:
+	// the release path pops a waiter as it always did and branches on which kind it is. Note that
+	// nothing here needs C++20 -- a coroutine waiter is just a Task* and re-arming it is a Push --
+	// so this stays in the C++17 core, and only the `co_await` spelling lives in Coroutine.h.
+	//
+	// LIFETIME, same invariant the condition variable already relies on: a Waiter is held by VALUE in
+	// the queue, so it does not point into a suspended stack. The Task*/Fiber* it carries outlive the
+	// wait because a waiter cannot leave before it is released, and every release path removes the
+	// entry from the queue BEFORE resuming or pushing it.
+	struct Waiter {
+		Fiber* fiber = nullptr;
+		Task*  coro  = nullptr;
+	};
+
 	class SchedulerMutex {
 	private:
 		std::atomic_flag spinLock = ATOMIC_FLAG_INIT;
 		bool locked = false;
 		Task* lockHolder = nullptr;
-		std::queue<Fiber*> waitingFibers; // fibers waiting for the lock
+		std::queue<Waiter> waiters;   // fibers AND coroutines; see Waiter
 		std::atomic_flag holderLock = ATOMIC_FLAG_INIT;
 
 	public:
 		SchedulerMutex() = default;
 		~SchedulerMutex() = default;
 
-		// Acquires the lock, boosting the holder's priority on contention to prevent inversion.
+		// Acquires the lock. (No priority boost happens on contention despite what this line used to
+		// say -- see the class comment above for when that stopped being true and why it is fine.)
 		//
 		// Callable from EITHER context, and the two behave differently on contention:
 		//   on a fiber      -- the fiber is queued and SUSPENDED, freeing the worker for other work.
@@ -952,12 +998,29 @@ namespace JLib {
 
 		// Non-blocking try_lock
 		bool Try_Lock();
+
+		// COROUTINE PATH. Do not call this directly -- use `co_await JLib::LockAsync(m)` from
+		// Coroutine.h, which is the only correct way to reach it.
+		//
+		// Acquires the lock if it is free, and otherwise queues `coroTask` to be re-pushed when the
+		// lock is released. Returns TRUE if the lock was taken (the caller must NOT suspend) and
+		// FALSE if the task was queued (the caller must stay suspended).
+		//
+		// The test and the enqueue happen under the SAME spinLock acquisition, and that is the entire
+		// reason this is one call rather than a Try_Lock followed by an enqueue. Split them and a
+		// release landing in the gap finds an empty queue, sets locked = false and wakes nobody --
+		// after which this task queues onto a free lock and waits for an Unlock that will never come.
+		// Same lost-wakeup shape as the 1.3.5 bug, reached a different way.
+		//
+		// Once this returns false the task is visible to Unlock, so the caller must touch neither the
+		// task nor its coroutine handle again: it may already be running on another worker.
+		bool LockAsyncEnqueue(Task* coroTask);
 	};
 
 	class SchedulerSemaphore {
 	private:
 		std::mutex mtx;
-		std::queue<Fiber*> waitingFibers;  // suspended fibers waiting for a permit
+		std::queue<Waiter> waiters;        // suspended fibers AND coroutines; see Waiter
 		std::atomic_flag spinLock = ATOMIC_FLAG_INIT; // Must be here!
 		int permits;
 		const int maxPermits;
@@ -972,6 +1035,17 @@ namespace JLib {
 		bool Try_Wait();
 
 		void Signal();
+
+		// COROUTINE PATH. Use `co_await JLib::AcquireAsync(sem)` from Coroutine.h rather than calling
+		// this directly. Takes a permit if one is available (returns true, caller must NOT suspend),
+		// otherwise queues the task to be re-pushed by Signal() (returns false, caller stays
+		// suspended). Test and enqueue share one spinLock acquisition for the same lost-wakeup reason
+		// spelled out on SchedulerMutex::LockAsyncEnqueue.
+		//
+		// The ownership asymmetry documented on ScopedPermit applies here too and more sharply: a
+		// permit taken by a coroutine has no owner the scheduler can track, and a coroutine can be
+		// resumed on any worker, so nothing counts this as an acquisition for the helping guard.
+		bool WaitAsyncEnqueue(Task* coroTask);
 
 		// RAII permit, and the ONLY way to hold one safely across a blocking call on a bare thread.
 		//

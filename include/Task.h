@@ -30,7 +30,19 @@ namespace JLib {
     // There is no context to switch away from, so suspending throws inside a noexcept Execute() and
     // fail-fasts (STATUS_STACK_BUFFER_OVERRUN on Windows) with no message. Ask for TaskType::Fiber
     // explicitly for anything that waits on something.
-    enum class TaskType : uint8_t { Native, Fiber };
+    // HOW a task suspends, which is the only thing the worker needs to tell them apart by.
+    //
+    //   Native    runs to completion on the worker's own stack. Must never suspend -- there is no
+    //             fiber to switch away to, which is why assignedFiber stays nullptr and the
+    //             WaitOnEvent* guards check for exactly that.
+    //   Fiber     owns a stack; suspends by ContextSwitch and resumes later on any worker.
+    //   Coroutine a C++20 coroutine handle, resumed through the SAME fn(data) call as everything
+    //             else (fn is a trampoline, data is coroutine_handle::address()), so the worker
+    //             needs no <coroutine> include and the core stays C++17. It differs from Native in
+    //             ONE respect and it is a lifetime rule, not a dispatch rule: fn() returning means
+    //             "suspended OR finished", so the completion path must consult Task::coroDone
+    //             before freeing. See JLib/Coroutine.h for the C++20 half.
+    enum class TaskType : uint8_t { Native, Fiber, Coroutine };
 
     // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). FULLY ORTHOGONAL to hiPri by
     // design: hiPri is QUEUE ORDER (drained/stolen first) and NOTHING ELSE; placement is governed SOLELY
@@ -59,11 +71,15 @@ namespace JLib {
     struct alignas(16) Task {
         using Func = void(*)(void*);
 
-        // Exactly ONE cache line (see the static_assert below): vptr + 5 pointer fields + the
-        // byte flags. Three former members were removed to get here, each with no functionality
-        // loss: stopFlag (had zero readers anywhere -- cooperative cancellation passes a flag
-        // through `data` instead), and onComplete/onCompleteData/callbackFlag (their ONLY user
-        // was TaskDAG, which now wraps fn/data with its own trampoline -- see TaskDAG::Fire).
+        // Exactly ONE cache line (see the static_assert below): vptr + 5 pointer fields + a single
+        // packed byte of flags. Three former members were removed to get here, each with no
+        // functionality loss: stopFlag (had zero readers anywhere -- cooperative cancellation passes
+        // a flag through `data` instead), and onComplete/onCompleteData/callbackFlag (their ONLY
+        // user was TaskDAG, which now wraps fn/data with its own trampoline -- see TaskDAG::Fire).
+        //
+        // LAYOUT AS OF 2.8.0: vptr 0 | fn 8 | data 16 | assignedFiber 24 | next 32 | waitGroup 40 |
+        // flags 48 | FREE 49-55 | nextWaiter 56. Bytes 52-55 are 4-aligned and unclaimed -- room for
+        // one 32-bit field (a cancellation-token index is the intended tenant) at zero size cost.
         // The vtable pointer stays: Thread.cpp/TaskScheduler.cpp destroy tasks via `t->~Task()`
         // through the BASE pointer, and that virtual dispatch is what runs ~LambdaTask (and any
         // captured objects' destructors) -- dropping it would silently leak lambda captures.
@@ -72,19 +88,41 @@ namespace JLib {
         Fiber* assignedFiber = nullptr;
         std::atomic<Task*> next{ nullptr };
         WaitGroup* waitGroup = nullptr;
-        uint8_t hiPri = false;
-        FiberSize requiredSize = FiberSize::Standard;
+        // ---- PACKED FLAG BLOCK ------------------------------------------------------------------
+        // These six were one byte each (offsets 48-53) with two bytes of tail padding after them.
+        // Packed, they fit in a SINGLE byte at 48, which frees 49-55 -- in particular a 4-byte,
+        // 4-aligned slot at offset 52 -- without growing Task past its one-cache-line budget. The
+        // intended tenant is a cancellation-token index (see the I/O runtime work); nothing claims
+        // it yet, and deliberately so: a field with no readers is what `stopFlag` was.
+        //
+        // C++17 CONSTRAINT, and it is a real trap: bitfields may not carry default member
+        // initializers before C++20 (P0683R1). Every constructor below therefore has to set all six
+        // EXPLICITLY. A constructor that forgets one leaves it indeterminate rather than zero, so
+        // this is a use-of-uninitialized bug rather than a wrong-default bug. Do not add a
+        // constructor here without extending its init list.
+        //
+        // CONCURRENCY, the other trap: adjacent bitfields in one allocation unit are a SINGLE
+        // memory location in the C++ model, so two threads writing different fields here race even
+        // though the fields are logically independent. That is safe today only because all six are
+        // written before the task is published and never again -- including priorityBoost, whose
+        // only writer (BoostTaskPriority) has had no callers since 21719ac. If lock priority
+        // inheritance is ever re-wired it would write hiPri and priorityBoost from a thread other
+        // than the one running the task, while the push and steal paths read hiPri -- at which
+        // point those two must come back out of this block or become atomics. TSan would see it;
+        // the compiler will not.
+        uint8_t   hiPri         : 1;
+        FiberSize requiredSize  : 1;
         // See TaskType above for the contract. Defaults to Native here too -- previously this field
         // (noFiber) defaulted to 0/false (fiber-capable) while CreateTask's own parameter defaulted
         // to true (native), a mismatch that only mattered for a bare Task constructed directly
         // rather than through CreateTask. Fixed as part of the same change rather than carried
-        // forward silently.
-        TaskType type = TaskType::Native;
-        uint8_t priorityBoost = 0;  // Original priority before boost (0 = no boost, otherwise original hiPri)
-        // P/E-core placement hint (see CorePref above). Lives in what was tail PADDING -- FiberSize is
-        // uint8_t, so the byte block ends at offset 53 with 11 spare bytes under the 64-byte assert.
-        CorePref corePref = CorePref::Default;
-
+        // forward silently. TWO bits, not one: Native/Fiber today, with room for the coroutine mode.
+        TaskType  type          : 2;
+        // Original priority before boost (0 = no boost, otherwise original hiPri). One bit is exact:
+        // it only ever stores hiPri, which is itself one bit.
+        uint8_t   priorityBoost : 1;
+        // P/E-core placement hint (see CorePref above). Two bits covers Default/P/E/Wide.
+        CorePref  corePref      : 2;
         // Set when this task's destructor provably has nothing to do, letting the completion path
         // skip `t->~Task()` -- a virtual call through the vtable on every single task.
         //
@@ -98,7 +136,9 @@ namespace JLib {
         // CreateTask (the MPSC queues' stub_, TaskDAG's nodes) never set it and keep paying the
         // call, which costs those cold paths nothing and means a missed set can only ever be slow,
         // never wrong. The inverse default would make an oversight leak captures silently.
-        uint8_t trivialDtor = 0;
+        uint8_t   trivialDtor   : 1;
+        // ---- end packed flag block --------------------------------------------------------------
+
 
         // Intrusive link for Event's waiter stack, living in the same tail padding -- the byte
         // block above ends well short of 64, so this costs nothing and the one-cache-line assert
@@ -113,9 +153,17 @@ namespace JLib {
         // read only after Event::SignalAll has taken the whole list with an acquiring exchange.
         Task* nextWaiter = nullptr;
 
-        Task() : next(nullptr), fn(nullptr), data(nullptr), assignedFiber(nullptr) { ; }
+        // Both constructors initialize EVERY bitfield -- see the C++17 note on the flag block.
+        // Members are listed in declaration order so the initialization order is the written one.
+        Task()
+            : fn(nullptr), data(nullptr), assignedFiber(nullptr), next(nullptr),
+              hiPri(0), requiredSize(FiberSize::Standard), type(TaskType::Native),
+              priorityBoost(0), corePref(CorePref::Default), trivialDtor(0) { ; }
         Task(Func f, void* d = nullptr, uint8_t hipri =false, FiberSize size = FiberSize::Standard)
-            : fn(f), data(d), hiPri(hipri), requiredSize(size) {
+            // hipri is a uint8_t taking any value; normalize rather than truncate into one bit.
+            : fn(f), data(d), assignedFiber(nullptr), next(nullptr),
+              hiPri(hipri ? 1 : 0), requiredSize(size), type(TaskType::Native),
+              priorityBoost(0), corePref(CorePref::Default), trivialDtor(0) {
         }
         virtual ~Task() {
 
@@ -155,6 +203,27 @@ namespace JLib {
     // One cache line, exactly -- if this fires, a new field pushed Task over 64 bytes and every
     // per-task access just started paying a second line. Grow deliberately or shrink elsewhere.
     static_assert(sizeof(Task) == 64, "Task must stay exactly one 64-byte cache line");
+
+    namespace detail {
+        // Mirrors Task's packed flag block, and exists because that block can fail SILENTLY.
+        // Packing bitfields of DIFFERENT declared types into one allocation unit is not guaranteed
+        // by the standard -- MSVC does it when the types are the same SIZE, which is why these are
+        // all 1-byte types, but that is a compiler behaviour and not a promise. If some compiler
+        // declines, the block grows back to six bytes, the 4-byte aligned slot reclaimed at offset
+        // 52 quietly stops existing, and `sizeof(Task) == 64` STILL HOLDS -- because those bytes
+        // were padding before the packing too. So the cache-line assert above cannot see this
+        // failure and it needs its own.
+        struct TaskFlagPacking {
+            uint8_t   hiPri         : 1;
+            FiberSize requiredSize  : 1;
+            TaskType  type          : 2;
+            uint8_t   priorityBoost : 1;
+            CorePref  corePref      : 2;
+            uint8_t   trivialDtor   : 1;
+        };
+        static_assert(sizeof(TaskFlagPacking) == 1,
+                      "Task's six flags must pack into a single byte -- see the flag block in Task");
+    }
 
     template<typename F>
     class alignas(16) LambdaTask : public Task {
