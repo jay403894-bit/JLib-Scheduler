@@ -66,6 +66,83 @@ namespace {
 		}
 	}
 
+	// Plain CpuRelax retries a contended bare-thread Try_Lock/Try_Wait takes before escalating to
+	// ContendedSpinStep. ZERO IS THE MEASURED OPTIMUM. Do not raise it.
+	//
+	// THE IDEA, AND WHY IT IS WRONG. TryRunStolenNativeTask() walks steal candidates across every
+	// deque -- real work, not a cheap check -- so paying it on the very first failed try looks
+	// wasteful when the holder is about to release within a handful of cycles. A brief plain spin
+	// first "obviously" catches that fast-flip case for a few PAUSE instructions instead. That
+	// argument is intuitive, it is what this code did for part of 2.7.0's development, and
+	// bench/lock_contention.cpp says it is backwards.
+	//
+	// MEASURED 2026-08-23 (see that file's RESULTS for the full table). Sweeping 0/16/64/256/1024
+	// with the arms rotating inside one process, against an A/A noise floor and a fiber control:
+	//
+	//   tiny critical section, 8 bare contenders, saturated pool, 8 workers
+	//     spin=0     p50     0 ns   p99  38,900 ns   17.8 M acq/s   304 k pool tasks/s
+	//     spin=64    p50 4,400 ns   p99  61,900 ns    0.7 M acq/s   195 k pool tasks/s
+	//     spin=1024  p50 5,000 ns   p99  68,200 ns    0.6 M acq/s   171 k pool tasks/s
+	//
+	// Monotonic in the spin count, reproduced at 8 and 31 workers, and 0 wins on latency AND lock
+	// throughput AND the pool's own throughput simultaneously -- so this is not the
+	// latency-versus-throughput trade it was expected to be. There is no regime in the sweep where
+	// spinning first pays: uncontended is unaffected (Try_Lock succeeds on the first attempt and
+	// never reaches here) and a long critical section is unaffected (the spin always exhausts).
+	//
+	// WHY, most likely: ContendedSpinStep is not merely a slower retry, it is BACKOFF. A tight
+	// CpuRelax loop re-runs Try_Lock's spinLock.test_and_set at full rate, and every one of those is
+	// a write to the same cache line the HOLDER needs in order to finish and release. Spinning
+	// harder starves the thread being waited on. The expensive-looking steal attempt spaces those
+	// writes out, which is why it wins even in the bg=off rows where the steal always fails and
+	// finds nothing to run.
+	//
+	// The knob survives only so the result stays reproducible; see JLIBSCHED_TUNABLE_FAST_SPIN in
+	// CMakeLists.txt. At 0 the comparison below folds away and the loop compiles to exactly what
+	// shipped before this experiment.
+#ifndef JLIBSCHED_FAST_SPIN_TRIES
+#define JLIBSCHED_FAST_SPIN_TRIES 0
+#endif
+#if defined(JLIBSCHED_TUNABLE_FAST_SPIN)
+	// DIAGNOSTIC BUILDS ONLY (bench/lock_contention.cpp). A shipping build gets the constexpr below
+	// and the compiler folds the comparison away entirely.
+	//
+	// This exists because the constant could not be measured any other way. As a compile-time
+	// constant each candidate value is a separate BINARY, so the arms cannot be interleaved inside
+	// one process -- and measured against an A/A control (the same binary built twice), the
+	// process-to-process drift on this machine ran to a p90 of 52% and a max of 118% on lock
+	// throughput. No plausible effect survives that floor. Making the value settable at runtime lets
+	// one process rotate through every arm round by round, which puts all of them under the same
+	// machine conditions instead of charging each arm whatever the OS was doing when it launched.
+	//
+	// Plain int, not std::atomic: it is written between measured rounds with no contention in
+	// flight, and making it atomic would put an acquire load in the spin loop being measured.
+	int g_fastSpinTries = JLIBSCHED_FAST_SPIN_TRIES;
+#define JLIB_FAST_SPIN_LIMIT (g_fastSpinTries)
+#else
+	constexpr int kFastSpinTries = JLIBSCHED_FAST_SPIN_TRIES;
+#define JLIB_FAST_SPIN_LIMIT (kFastSpinTries)
+#endif
+
+	// Shared shape of SchedulerMutex::Lock's and SchedulerSemaphore::Wait's bare-thread paths.
+	// At the shipped bound of 0 this is exactly `while (!tryOp()) ContendedSpinStep();` -- the
+	// comparison is against a compile-time constant and folds away entirely. `tryOp` is Try_Lock or
+	// Try_Wait; true means acquired.
+	template <typename TryOp>
+	inline void SpinThenHelp(TryOp&& tryOp) {
+		int fastSpins = 0;
+		(void)fastSpins;
+		while (!tryOp()) {
+			if (fastSpins < JLIB_FAST_SPIN_LIMIT) {
+				++fastSpins;
+				platform::CpuRelax();
+			}
+			else {
+				ContendedSpinStep();
+			}
+		}
+	}
+
 	// Ownership is tracked for BARE THREADS ONLY. A fiber can acquire on one worker and resume on
 	// another, so a per-thread count would be corrupted by migration -- see DESIGN.md's rule that
 	// nothing thread-derived survives a suspend. The count only ever decides whether to help, and
@@ -75,6 +152,19 @@ namespace {
 		return t == nullptr || t->currentFiber == nullptr;
 	}
 }
+
+#if defined(JLIBSCHED_TUNABLE_FAST_SPIN)
+// Diagnostic accessors for the tunable above. Deliberately NOT part of TaskScheduler: this is not a
+// scheduler setting, it is a benchmark hook that only exists in a build configured for measurement.
+// Set it only while no contended acquisition is in flight (bench/lock_contention.cpp changes it
+// between rounds, never during one).
+namespace JLib {
+	namespace detail {
+		void SetFastSpinTries(int n) { g_fastSpinTries = (n < 0) ? 0 : n; }
+		int  GetFastSpinTries()      { return g_fastSpinTries; }
+	}
+}
+#endif
 
 static_assert(sizeof(Task) <= TaskAllocator::SLOT, "Task doesn't fit a slot");
 static_assert(alignof(Task) <= 16, "Task over-aligned for a slot");
@@ -1730,9 +1820,10 @@ void SchedulerMutex::Lock() {
 		}
 	}
 	else {
-		// Bare thread: cannot suspend, so help with stolen Native work while waiting. See the
-		// block comment above ContendedSpinStep for what that costs and what guards it.
-		while (!Try_Lock()) ContendedSpinStep();
+		// Bare thread: cannot suspend, so help with stolen Native work while waiting -- but only
+		// after a brief plain spin comes up empty. See SpinThenHelp for why the fast spin exists
+		// and the block comment above ContendedSpinStep for what the escalated path costs.
+		SpinThenHelp([this] { return Try_Lock(); });
 		// Ownership is counted inside Try_Lock, which is the single place a bare thread takes this
 		// lock -- including when a caller uses Try_Lock directly.
 	}
@@ -1823,7 +1914,7 @@ void SchedulerSemaphore::Wait() {
 		ContextSwitch(&current->ctx, current->homeCtx);
 	}
 	else {
-		// Same contended-wait discipline as SchedulerMutex; see ContendedSpinStep.
+		// Same contended-wait discipline as SchedulerMutex; see SpinThenHelp and ContendedSpinStep.
 		//
 		// This RESPECTS t_heldMutexes but does not add to it, and the asymmetry is deliberate. A
 		// semaphore permit has no owner: the thread that takes one is frequently not the thread that
@@ -1831,7 +1922,7 @@ void SchedulerSemaphore::Wait() {
 		// an acquisition would make a consumer's count climb forever and permanently disable helping
 		// on that thread. So the inversion guard covers mutexes, which have real ownership, and a
 		// thread holding only a permit is a documented gap rather than a tracked one.
-		while (!Try_Wait()) ContendedSpinStep();
+		SpinThenHelp([this] { return Try_Wait(); });
 	}
 }
 

@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.6.0")
+set(JLIBSCHED_VERSION "2.7.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -44,6 +44,16 @@ option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs 
 # Same OFF-by-default rule as JLIBSCHED_STEAL_STATS and for the same reason: a clock read on every
 # wake is not free, and this is instrumenting a ~us-scale measurement.
 option(JLIBSCHED_LATENCY_STATS "Record wake/preSteal/found timestamps (diagnostic; perturbs latency)" OFF)
+
+# Bare-thread contended-lock fast spin: how many plain CpuRelax retries SchedulerMutex::Lock and
+# SchedulerSemaphore::Wait take before escalating to the steal-and-help path (ContendedSpinStep).
+#
+# 0 IS THE MEASURED OPTIMUM AND THE ONLY VALUE THAT SHOULD SHIP. It is not a tuning opportunity: the
+# 2026-08-23 sweep found the metric monotonic in this number, with 0 winning lock latency, lock
+# throughput and pool throughput simultaneously at both 8 and 31 workers. It stays configurable only
+# so that result can be re-derived rather than taken on trust. See the block comment on
+# kFastSpinTries in src/TaskScheduler.cpp and the RESULTS in bench/lock_contention.cpp.
+set(JLIBSCHED_FAST_SPIN_TRIES "0" CACHE STRING "Plain-spin retries before a contended bare-thread lock starts helping (0 = measured optimum)")
 
 # AArch64 spin hint. Default is isb, which is NOT the architectural analogue of x86 PAUSE -- that is
 # YIELD, and YIELD retires as a NOP on non-SMT cores, which is nearly all of them, so it gives a spin
@@ -357,6 +367,26 @@ elseif(NOT JLIBSCHED_ARM_SPIN_HINT STREQUAL "isb")
     message(FATAL_ERROR "JLIBSCHED_ARM_SPIN_HINT must be isb, yield or nop (got: ${JLIBSCHED_ARM_SPIN_HINT})")
 endif()
 
+# PRIVATE, unlike the two above: kFastSpinTries lives in an anonymous namespace in
+# src/TaskScheduler.cpp, not in a header, so no consumer translation unit can disagree with the
+# library about it and nothing outside needs to see it. (bench/lock_contention.cpp gets it passed
+# separately, purely so it can stamp the value it was built against into its own output.)
+if(NOT JLIBSCHED_FAST_SPIN_TRIES MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "JLIBSCHED_FAST_SPIN_TRIES must be a non-negative integer (got: ${JLIBSCHED_FAST_SPIN_TRIES})")
+endif()
+target_compile_definitions(Scheduler PRIVATE JLIBSCHED_FAST_SPIN_TRIES=${JLIBSCHED_FAST_SPIN_TRIES})
+
+# Makes that constant settable at RUNTIME, for bench/lock_contention.cpp only. OFF by design and for
+# the same reason as the two instrumentation options above: a shipping build folds the constant into
+# the spin loop, and a diagnostic build must never be mistaken for one. PUBLIC rather than PRIVATE
+# because it gates a DECLARATION in TaskScheduler.h -- the library and the bench have to agree on
+# whether JLib::detail::SetFastSpinTries exists at all, and disagreeing is a link error at best.
+option(JLIBSCHED_TUNABLE_FAST_SPIN "Expose the fast-spin bound as a runtime setting (diagnostic; for the lock bench)" OFF)
+if(JLIBSCHED_TUNABLE_FAST_SPIN)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_TUNABLE_FAST_SPIN=1)
+    message(STATUS "JLib::Scheduler: fast-spin bound is RUNTIME-TUNABLE (diagnostic build, not for shipping)")
+endif()
+
 target_include_directories(Scheduler PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
@@ -382,6 +412,21 @@ target_link_libraries(SchedulerBench PRIVATE Scheduler)
 target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 # Stamped into the header line so a pasted result identifies the build that produced it.
 target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED_VERSION}")
+
+# The lock primitives had no benchmark at all until 2.7.0 -- bench.cpp covers push/steal/ParallelFor
+# and never takes a SchedulerMutex. This one measures them, and it is what established that the
+# bare-thread fast spin had to be 0.
+#
+# ONLY BUILT IN A TUNABLE BUILD, and it must stay that way: the source #errors without
+# JLIBSCHED_TUNABLE_FAST_SPIN because without a runtime-settable bound its arms would all be the
+# same code, and a benchmark that silently compares a value against itself is worse than no
+# benchmark. Adding it unconditionally would also break ALL_BUILD -- and therefore CI -- in every
+# normal configuration.
+if(JLIBSCHED_TUNABLE_FAST_SPIN)
+    add_executable(SchedulerLockBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/lock_contention.cpp")
+    target_link_libraries(SchedulerLockBench PRIVATE Scheduler)
+    target_compile_features(SchedulerLockBench PRIVATE cxx_std_17)
+endif()
 
 # ---- tests ------------------------------------------------------------------------------------
 # A CMake target rather than a hand-compiled file, specifically so CI can run it everywhere without

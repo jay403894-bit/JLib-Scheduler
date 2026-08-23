@@ -17,6 +17,9 @@ build-stats/
 build-latency/
 build-latency-stats/
 build-compare/
+# -DJLIBSCHED_TUNABLE_FAST_SPIN=ON (the lock bench) -- same reason: it is a diagnostic
+# configuration and must not be mistaken for, or overwrite, the normal build tree.
+build-lockbench/
 cmake-build*/
 out/
 CMakeCache.txt

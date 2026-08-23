@@ -3,6 +3,59 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.7.0 - 2026-08-23
+
+**A fast spin before the contended bare-thread lock path was built, measured, and REVERTED. Do not
+re-propose it.** The idea: `SchedulerMutex::Lock` and `SchedulerSemaphore::Wait`, on a bare thread,
+call `ContendedSpinStep()` on every failed `Try_Lock`/`Try_Wait`, and that step walks steal
+candidates across every deque. Trying a handful of plain `CpuRelax` retries first "obviously" avoids
+paying for a steal scan when the holder is about to release in a few cycles. It is intuitive, and it
+is wrong: measured against the shipped behaviour, it is a **large regression**, monotonic in the spin
+count.
+
+The decisive numbers (tiny critical section, 8 bare contenders, saturated pool, 8 workers):
+
+| spin | p50 | p99 | lock acq/s | pool tasks/s |
+|-----:|----:|----:|-----------:|-------------:|
+| **0 (shipped)** | **0 ns** | 38,900 ns | **17,789,590** | **304,750** |
+| 64 | 4,400 ns | 61,900 ns | 715,976 | 195,384 |
+| 1024 | 5,000 ns | 68,200 ns | 625,812 | 171,135 |
+
+Reproduced at 8 and 31 workers. 0 wins lock latency, lock throughput *and* the pool's own throughput
+simultaneously, so it never became the latency-versus-throughput trade it was built to arbitrate.
+The likely mechanism: `ContendedSpinStep` is not merely a slower retry, it is **backoff**. A tight
+`CpuRelax` loop re-runs `Try_Lock`'s `spinLock.test_and_set` at full rate, and every one of those is
+a write to the same cache line the *holder* needs in order to finish and release -- so spinning
+harder starves the thread being waited on. That also explains the rows with no background load,
+where 0 still wins by ~2x despite its steal attempt always failing and running nothing.
+
+Net effect on shipped behaviour versus 2.6.0: **none.** The bound is 0 and the comparison folds away
+at compile time, so the generated loop is what it always was. What is new is that it is now a
+measured 0 rather than an unexamined one.
+
+**New: `bench/lock_contention.cpp` (`SchedulerLockBench`), the first benchmark of the lock
+primitives in this repo** -- `bench.cpp` covers push/steal/`ParallelFor` and never takes a
+`SchedulerMutex`, so the constant above had nothing to be tuned against even in principle. It sweeps
+critical-section length (0 ns / 200 ns / 2 us / 50 us) x contender count (1/2/8/16) x caller kind
+(bare thread vs fiber) x background load (off/on), and reports lock latency percentiles, lock
+throughput and completed pool work together, because an arm that improves one at the expense of
+another has not won.
+
+Two controls are built into it, and the first version of the harness was **discarded because of
+them**. That version built one binary per spin value; its A/A control (same source and flags, built
+twice under two labels) showed process-to-process drift with a p90 of 52% and a max of 118% on lock
+throughput, and its fiber control -- which cannot be affected by the spin count, since fibers suspend
+and never enter that path -- moved up to 246%. No plausible effect survives a floor like that, and
+more repetitions do not fix variance that lives *between* processes. The arms now rotate inside a
+single process, round by round with a shifting start offset; the A/A gap fell to ~0.3% and the fiber
+control to within +-1.3%.
+
+**New diagnostic option `JLIBSCHED_TUNABLE_FAST_SPIN` (OFF).** Makes the bound settable at runtime so
+that comparison stays reproducible, and gates the bench target -- which `#error`s without it, since
+without a runtime-settable bound every arm would be the same code and the benchmark would silently
+compare a value against itself. Same OFF-by-default discipline as `JLIBSCHED_STEAL_STATS` and
+`JLIBSCHED_LATENCY_STATS`.
+
 ## 2.6.0 - 2026-08-21
 
 **README: `CorePref::P`/`::E`'s reliability is now documented as coupled to `AffinityPolicy`, not

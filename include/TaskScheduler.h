@@ -897,6 +897,19 @@ namespace JLib {
 		TaskMPSCQueue mainQ;
 		std::mutex poolMutex;
 	};
+#if defined(JLIBSCHED_TUNABLE_FAST_SPIN)
+	// PRESENT ONLY IN A DIAGNOSTIC BUILD (-DJLIBSCHED_TUNABLE_FAST_SPIN=ON). Makes the bare-thread
+	// fast-spin bound settable at runtime so bench/lock_contention.cpp can rotate through candidate
+	// values inside ONE process. It has to be one process: as a pure compile-time constant each
+	// value is a separate binary, and an A/A control showed process-to-process drift far larger than
+	// any effect the constant could have. Not a scheduler setting and not available in a normal
+	// build -- see kFastSpinTries in src/TaskScheduler.cpp.
+	namespace detail {
+		void SetFastSpinTries(int n);
+		int  GetFastSpinTries();
+	}
+#endif
+
 	// Priority-inheritance-aware mutex wrapper. When a task tries to lock and blocks, the
 	// lock holder's priority is temporarily boosted to prevent priority inversion deadlock.
 	class SchedulerMutex {
