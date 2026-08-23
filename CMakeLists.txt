@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.11.1")
+set(JLIBSCHED_VERSION "2.12.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -517,15 +517,11 @@ if(JLIBSCHED_CORO_STATS)
     message(STATUS "JLib::Scheduler: coroutine frame-size instrumentation ON (diagnostic build)")
 endif()
 
-# EXPERIMENTAL: allocate coroutine frames from a slab with per-thread caches instead of global new.
-# The case for it is allocator CONTENTION at many concurrently-allocating threads, not per-call
-# latency -- single-threaded, frame allocation is only ~2% of a spawn. Runtime-switchable so the
-# pooled and unpooled arms can be interleaved in one process rather than compared across binaries.
-option(JLIBSCHED_CORO_POOL "Pool coroutine frames in a slab (experimental; see bench/coroutine_bench.cpp)" OFF)
-if(JLIBSCHED_CORO_POOL)
-    target_compile_definitions(Scheduler INTERFACE JLIBSCHED_CORO_POOL=1)
-    message(STATUS "JLib::Scheduler: coroutine frame POOLING ON (experimental)")
-endif()
+# NOTE: there is deliberately no option for coroutine frame pooling. It is ON, always, as of 2.12.0 --
+# frames come from the scheduler's task slab, and the escape hatch is the RUNTIME call
+# JLib::SetCoroFramePooling(false), not a build flag. A build flag would have meant two ABIs and no
+# way to A/B it in one process; the runtime switch is what let the two arms be interleaved to measure
+# it in the first place. See the frame-allocation section in include/Coroutine.h.
 
 # ABI harness for the Windows/ARM64 context switch -- the Windows counterpart of
 # tests/fibertest_aarch64.cpp, which the POSIX ABI job builds directly with `c++` and cannot be

@@ -103,24 +103,45 @@ namespace JLib {
 
 #endif // JLIBSCHED_CORO_STATS
 
-    // ---- frame pooling (experimental) -----------------------------------------------------------
+    // ---- frame allocation -----------------------------------------------------------------------
     //
-    // Allocates coroutine frames from a slab with per-thread caches instead of global new.
+    // COROUTINE FRAMES COME FROM THE SCHEDULER'S TASK SLAB, not global new. On by default.
     //
-    // THE ARGUMENT FOR IT IS CONTENTION, NOT LATENCY. A single thread allocating frames gains almost
-    // nothing -- measured at 2.2% of a spawn, see bench/coroutine_bench.cpp. But an allocator's cost
-    // is not linear in thread count: a general-purpose one falls back to shared arenas once
-    // per-thread caches miss, and coroutine frames make that worse than usual because they are
-    // routinely allocated on one thread and freed on another (Spawn runs on the caller, the frame
-    // dies inside the coroutine on whatever worker finished it), which is exactly the pattern that
-    // defeats a thread-cached malloc. A slab with per-thread caches is built for that shape.
+    // ONE SOURCE OF MEMORY TRUTH is the main reason. The slab is one contiguous, prefaulted region
+    // with fixed 256-byte slots: no size-class mismatch, no splitting, no coalescing, so external
+    // fragmentation is impossible rather than merely reduced, and a process running for hours has the
+    // same layout it had at startup. Routing frames through it means one arena to size, one place to
+    // observe, one failure mode -- and it closes the coroutine-shaped hole in the zero-allocation
+    // steady state this library advertises.
     //
-    // RUNTIME-SWITCHABLE ON PURPOSE. `SlotInSlab` tells a pooled pointer from a heap one, so `delete`
-    // stays correct no matter which mode was active when the frame was allocated -- which means the
-    // pooled and unpooled arms can be interleaved inside ONE process. That matters: comparing them
-    // across two binaries is exactly the method that produced a 52% p90 noise floor in the fast-spin
-    // work this morning and nearly shipped a regression.
-#if defined(JLIBSCHED_CORO_POOL)
+    // THE MEASUREMENTS (bench/coroutine_bench.cpp, and note that the first two are what actually
+    // decided it -- fragmentation is a long-run property no benchmark here can see):
+    //   Lazy await, inline    31.1 -> 16.3 ns   1.9x faster; the composition path, used most often
+    //   frame alloc+free      28.1 -> ~17 ns
+    //   coroutine spawn       1291 -> ~1263 ns
+    //   16 concurrent producer threads               ~18% SLOWER -- the one real regression
+    //
+    // The regression is specific in shape: with frames pooled, every coroutine takes TWO slots from
+    // one allocator instead of one, and a workload that migrates one way (producers allocate, workers
+    // free) pushes all of that through the shared refill/flush list. Below 8 threads the per-thread
+    // cache absorbs it and the slab's cheap fast path wins; at 16 the shared list becomes the
+    // bottleneck and malloc's independent arenas scale better. Call SetCoroFramePooling(false) if
+    // your workload is that shape.
+    //
+    // CAPACITY, AND IT IS THE THING TO ACTUALLY WATCH: each spawned coroutine now consumes TWO slab
+    // slots -- its Task and its frame. A slab sized for N tasks holds N/2 concurrent coroutines. See
+    // TaskScheduler::SetTaskSlabSize. Oversized frames (>256 bytes) fall through to global new rather
+    // than failing, so an unusually fat coroutine is slower, never broken.
+    //
+    // WHY IT IS RUNTIME-SWITCHABLE RATHER THAN A BUILD FLAG: SlotInSlab tells a pooled pointer from a
+    // heap one, so `delete` stays correct no matter which mode was active at allocation. That is what
+    // let both arms be interleaved inside one process to measure this -- comparing across two
+    // binaries is the method that produced a 52% p90 noise floor in the fast-spin work and nearly
+    // shipped a regression.
+    //
+    // LIFETIME CONTRACT: a coroutine must not outlive the scheduler. Its Task would dangle too, so
+    // this adds no new constraint -- but a frame in the slab is unmapped with the slab, so a frame
+    // destroyed after shutdown is the same bug, not a new one.
     namespace detail {
         // A DEDICATED pool, deliberately not a second TaskAllocator.
         //
@@ -175,29 +196,43 @@ namespace JLib {
     inline bool CoroFramePooling() {
         return detail::FramePoolEnabled().load(std::memory_order_relaxed);
     }
-#endif
 
-#if defined(JLIBSCHED_CORO_STATS) || defined(JLIBSCHED_CORO_POOL)
     namespace detail {
+        // Frames come from THE SCHEDULER'S OWN TaskAllocator, not a second arena.
+        //
+        // That is not a shortcut, it is the whole point. TaskAllocator's per-thread free-list cache
+        // is a `static thread_local` in a STATIC member function -- one cache per thread for the
+        // entire class. That property is what makes a second instance corrupt the heap (see the
+        // constructor guard) and it is equally what makes the central slab worth using: a single
+        // per-thread cache already serves every allocation routed through it, and refill/flush
+        // rebalance through a shared backing list. A separate pool cannot share any of that, which
+        // is why the first attempt here -- a private bump allocator with a per-thread free list and
+        // no rebalancing -- collapsed under this workload's one-way migration (producers allocate,
+        // workers free) and exhausted its slots.
+        //
+        // Slot size is 256 and every frame measured so far fits (largest 224); anything larger falls
+        // through to global new. Frames and Tasks now compete for the same slab, which is a real
+        // coupling: a coroutine-heavy phase consumes slots a task push would otherwise get. That is
+        // the trade being measured, not an oversight.
         inline void* FrameAlloc(std::size_t n) {
 #if defined(JLIBSCHED_CORO_STATS)
             FrameStats().Record(n);
 #endif
-#if defined(JLIBSCHED_CORO_POOL)
-            if (n <= CoroFramePool::kSlot && FramePoolEnabled().load(std::memory_order_relaxed))
-                if (void* p = FramePool().Alloc()) return p;
-#endif
+            if (n <= TaskAllocator::SLOT && FramePoolEnabled().load(std::memory_order_relaxed)
+                && TaskScheduler::IsInitialized())
+                if (void* p = TaskScheduler::Instance().GetAllocator()->Alloc()) return p;
             return ::operator new(n);
         }
         inline void FrameFree(void* p) noexcept {
 #if defined(JLIBSCHED_CORO_STATS)
             FrameStats().Release();
 #endif
-#if defined(JLIBSCHED_CORO_POOL)
             // Discriminates by ADDRESS, not by the current mode -- which is what makes the runtime
-            // switch safe.
-            if (FramePool().Contains(p)) { FramePool().Free(p); return; }
-#endif
+            // switch safe, and what lets both arms be interleaved in one process.
+            if (TaskScheduler::IsInitialized()) {
+                auto* a = TaskScheduler::Instance().GetAllocator();
+                if (a->SlotInSlab(p)) { a->Free(p); return; }
+            }
             ::operator delete(p);
         }
     }
@@ -236,10 +271,6 @@ namespace JLib {
                         (long long)leaked);
     }
 #endif // JLIBSCHED_CORO_STATS
-
-#else   // neither diagnostic enabled: declare no allocation functions at all
-#define JLIB_CORO_FRAME_ALLOC
-#endif
 
     namespace detail {
         // The bridge between the C++17 worker and a C++20 frame. Stored in Task::fn, so the worker

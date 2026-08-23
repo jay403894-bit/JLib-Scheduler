@@ -3,6 +3,59 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.12.0 - 2026-08-23
+
+**Coroutine frames now come from the scheduler's task slab instead of global new. On by default.**
+2.11.0 rejected this; that conclusion was drawn on the wrong evidence and is reversed here.
+
+**BEHAVIOUR CHANGE TO CHECK IF YOU SIZE YOUR SLAB:** a spawned coroutine now consumes **two** slots --
+one for its `Task`, one for its frame. A slab sized for N tasks holds N/2 concurrent coroutines.
+Frames larger than `TaskAllocator::SLOT` (256 bytes) fall through to global new rather than failing,
+so an unusually large coroutine is slower, never broken. `JLib::SetCoroFramePooling(false)` opts out
+at runtime.
+
+What changed the answer, in order of weight:
+
+**Fragmentation, which no benchmark here can measure.** Fixed 256-byte slots in one contiguous
+prefaulted region cannot fragment -- no size classes, no splitting, no coalescing -- so a process
+running for hours has the layout it had at startup. 2.11.0 concluded "not worth it" on throughput
+alone and stated that more confidently than the evidence supported; a few-second benchmark never
+fragments anything, and its silence was not evidence of absence.
+
+**One source of memory truth.** One arena to size, one place to observe, one failure mode -- and no
+coroutine-shaped hole in the zero-allocation steady state this library advertises.
+
+**And the measurement that had been missed entirely.** 2.11.0 tested a *private* pool, which was the
+wrong design: `TaskAllocator`'s per-thread cache is class-static, which is both why a second instance
+corrupts the heap (2.11.0's own guard) and why the central slab is the only version worth measuring.
+Retested through the scheduler's own allocator:
+
+| | global new | task slab | |
+|---|---:|---:|---|
+| `Lazy` await, inline | 31.1 ns | **16.3 ns** | **1.9x faster** |
+| frame alloc + free | 28.1 ns | ~17 ns | |
+| coroutine spawn | 1291 ns | ~1263 ns | |
+| 16 producer threads | -- | -- | ~18% slower |
+
+The inline-`Lazy` path nearly halved. That is the composition path -- `co_await Child()` on the
+awaiting worker with no dispatch -- so it is the one that runs at frequency. It also disposes of the
+concern that declaring `operator new` on the promise would inhibit the compiler's frame elision: it
+did not, and the slab's fast path simply beat malloc's.
+
+The 16-thread regression is real, reproducible across four runs, and accepted knowingly. Its shape is
+specific: pooling doubles traffic through one allocator, and a workload that migrates one way
+(producers allocate, workers free) pushes all of it through the shared refill/flush list. Below 8
+threads the per-thread cache absorbs that; at 16 the shared list becomes the bottleneck and malloc's
+independent arenas scale better.
+
+**`JLIBSCHED_CORO_POOL` is gone as a build flag** -- deliberately not replaced. Shipped behaviour
+belongs in the code with a runtime switch, not behind a second ABI; and the runtime switch is what
+made it measurable at all, since it lets both arms interleave inside one process rather than being
+compared across two binaries (the method that produced a 52% noise floor in the fast-spin work).
+
+**Also: the GCC check now covers the C++20 coroutine translation units**, not just the C++17 library
+sources. That gap is what let 2.11.0 ship a Linux build break.
+
 ## 2.11.1 - 2026-08-23
 
 **[CRITICAL] 2.11.0 does not compile on Linux/GCC. Use this instead.**

@@ -120,6 +120,73 @@
 //
 // So the conclusion does not rest on the pooled column being good. It rests on the global column
 // showing nothing to fix.
+//
+// ---- RETESTED WITH THE CENTRAL SLAB (2026-08-23) --------------------------------------------
+//
+// The run above used a PRIVATE pool, and that was the wrong design to test. TaskAllocator's
+// per-thread free-list cache is a `static thread_local` in a STATIC member function -- one cache per
+// thread for the whole class -- which is both why a second instance corrupts the heap and why the
+// central slab is the only version worth measuring: one cache already serves every allocation routed
+// through it, with refill/flush rebalancing through a shared backing list. A private pool cannot
+// share any of that, which is exactly why it collapsed under this workload's one-way migration.
+//
+// So frames were routed through the scheduler's OWN TaskAllocator instead. Speedup vs global new,
+// four consecutive runs (arms still interleaved in-process):
+//
+//   threads     run1   run2   run3   run4
+//     1         1.06   1.05   1.05   1.04
+//     2         1.02   1.05   1.01   1.00
+//     4         1.07   1.00   1.08   1.03
+//     8         1.04   1.03   1.02   1.02
+//    16         0.82   0.71   0.90   0.84
+//
+// The central slab IS better than the private pool -- a consistent 2-6% win up to 8 threads where the
+// private one was a wash. STILL NOT WORTH SHIPPING, and the reason inverts the original argument:
+// at 16 threads it loses by ~18%, reproducibly, in every run.
+//
+// WHY THE REVERSAL, and it is the interesting part. Pooling frames centrally does not add a new
+// contention point, it DOUBLES THE TRAFFIC THROUGH AN EXISTING ONE -- every coroutine now takes two
+// slots from the same allocator instead of one, and this workload migrates one way (producers
+// allocate, workers free), so the shared refill/flush list carries all of it. Below 8 threads the
+// per-thread cache absorbs that and the slab's cheaper fast path wins. At 16 the shared list becomes
+// the bottleneck and malloc -- which scales across independent arenas -- simply handles it better.
+//
+// That matters more than the size of the loss: high thread count is precisely the regime an I/O
+// runtime would live in, so the contention argument that motivated pooling in the first place ends up
+// arguing AGAINST it. Add the coupling it introduces -- a coroutine-heavy phase consuming task slab
+// slots -- and there is nothing left to recommend it.
+//
+// Cross-run caveat worth heeding: absolute numbers moved a lot between runs (global at 16 threads
+// ranged 134..360 ns across sessions). Only the interleaved speedup column is comparable; the
+// absolutes are not, which is the same reason the arms are interleaved at all.
+//
+// ---- DECISION: SHIPPED, ON BY DEFAULT (2.12.0) -----------------------------------------------
+//
+// The contention rows above are not the whole picture, and reading only them would have got this
+// wrong. Checking the per-item rows WITH pooling on turned up the number that actually decided it:
+//
+//                        global new   task slab
+//   Lazy await, inline      31.1 ns     16.3 ns    1.9x FASTER
+//   frame alloc+free        28.1 ns      ~17 ns
+//   coroutine spawn          1291 ns     ~1263 ns
+//   16 producer threads          --          --    ~18% slower (the one regression)
+//
+// The inline-Lazy path nearly HALVED. That is the composition path -- `co_await Child()` running on
+// the awaiting worker with no dispatch -- so it is the one likely to run at high frequency, and it
+// also disposes of the worry that declaring `operator new` on the promise would inhibit the
+// compiler's frame elision. It did not; the slab's fast path simply beat malloc's.
+//
+// AND THE DECIDING ARGUMENT IS NOT IN THIS FILE AT ALL: fragmentation. Fixed 256-byte slots in one
+// contiguous prefaulted region cannot fragment -- no size classes, no splitting, no coalescing -- so
+// a process running for hours has the layout it had at startup. A few-second benchmark cannot see
+// that, and its silence is not evidence of absence. Routing frames through the same slab gives the
+// application ONE source of memory truth: one arena to size, one place to observe, one failure mode,
+// and no coroutine-shaped hole in the zero-allocation steady state this library advertises.
+//
+// The 16-thread regression is accepted knowingly, and the escape hatch is runtime rather than
+// compile-time: SetCoroFramePooling(false). The cost that needs documenting louder than the
+// regression is CAPACITY -- each spawned coroutine now takes TWO slab slots, so a slab sized for N
+// tasks holds N/2 concurrent coroutines. See TaskScheduler::SetTaskSlabSize.
 
 #include "TaskScheduler.h"
 #include "Coroutine.h"

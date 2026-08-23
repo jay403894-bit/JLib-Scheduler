@@ -557,6 +557,13 @@ namespace JLib {
 		// RunLazyRange and ParallelFor's grain-floor comment) -- but a slab too small for a real
 		// workload turns that fallback from an occasional safety net into the common case, which
 		// costs the dispatch benefit this scheduler exists for. Measure before shrinking it.
+		// COROUTINES CONSUME TWO SLOTS EACH, as of 2.12.0. A spawned coroutine takes one slot for its
+		// Task and one for its C++20 frame, which now comes from this same slab rather than global
+		// new -- so a slab sized for N tasks holds N/2 concurrent coroutines, not N. That is the
+		// price of having one arena to size and observe instead of two, and of coroutines not
+		// punching a hole in the zero-allocation steady state above. Frames larger than
+		// TaskAllocator::SLOT fall through to global new instead of failing. See the frame-allocation
+		// section in Coroutine.h, including JLib::SetCoroFramePooling(false) to opt out.
 		static void SetTaskSlabSize(size_t slots);
 		static size_t TaskSlabSize();
 
