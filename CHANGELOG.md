@@ -3,6 +3,24 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.11.1 - 2026-08-23
+
+**[CRITICAL] 2.11.0 does not compile on Linux/GCC. Use this instead.**
+
+`TaskAllocator.h` gained an unconditional second-instance guard in 2.11.0 that calls
+`fprintf`/`fflush`/`abort` without including `<cstdio>` or `<cstdlib>`. MSVC and AppleClang pull them
+in transitively, so Windows x64, Windows ARM64 and macOS arm64 all passed; both GCC legs failed to
+build. The canary path has used `std::fprintf` the same way for a long time and never surfaced it,
+because nothing in CI builds with `JLIBSCHED_ALLOC_CANARY` -- an unconditional use was all it took.
+
+**Also: `build-corobench/` was committed by accident** -- 6.3 MB of `.obj`, `.lib` and `.exe` swept in
+because the new diagnostic build tree had no matching `.gitignore` entry. Untracked here, and
+`.gitignore` now carries a `build-*/` catch-all rather than one hand-maintained line per tree. The
+explicit entries stay for documentation, but narrow-by-default is only worth it for the `x64/` folders
+some JLib repos commit deliberately -- a CMake tree is never worth committing, so there is no reason
+to keep re-learning this per directory. The files remain in history for 2.11.0; only future clones of
+this commit onward avoid re-downloading them.
+
 ## 2.11.0 - 2026-08-23
 
 **[CRITICAL] Constructing a second `TaskAllocator` now aborts with a diagnostic instead of corrupting

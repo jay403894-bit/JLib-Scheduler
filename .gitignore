@@ -20,6 +20,14 @@ build-compare/
 # -DJLIBSCHED_TUNABLE_FAST_SPIN=ON (the lock bench) -- same reason: it is a diagnostic
 # configuration and must not be mistaken for, or overwrite, the normal build tree.
 build-lockbench/
+# -DJLIBSCHED_CORO_STATS / -DJLIBSCHED_CORO_POOL (the coroutine bench).
+build-corobench/
+# Catch-all for the same shape. The entries above are kept for documentation -- each names what its
+# tree is for -- but this is what actually protects against the next one: 2.11.0 committed 6.3 MB of
+# .obj/.lib/.exe from build-corobench/ because a new diagnostic tree was created and the matching
+# ignore line was not. Narrow-by-default is right for x64/ folders some JLib repos commit on
+# purpose; it is not worth re-learning for CMake trees, which are never worth committing.
+build-*/
 cmake-build*/
 out/
 CMakeCache.txt

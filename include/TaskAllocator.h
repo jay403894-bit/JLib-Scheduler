@@ -8,6 +8,12 @@
 #include <cstddef>
 #include <mutex>
 #include <atomic>
+// Unconditional, not inside the canary block below: the second-instance guard in the constructor
+// uses fprintf/fflush/abort in EVERY build. MSVC pulls these in transitively so this was green on
+// Windows and macOS and broke both Linux/GCC legs in 2.11.0 -- the canary path had used them for
+// ages without an include, but nothing builds the canary in CI, so it never surfaced.
+#include <cstdio>    // fprintf, fflush, stderr
+#include <cstdlib>   // abort
 // THE FREE-LIST CANARY SWITCH.
 //
 // These checks were `#ifdef _DEBUG`, which meant they were OFF in the Development configuration --
