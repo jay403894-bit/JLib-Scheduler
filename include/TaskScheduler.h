@@ -1165,16 +1165,58 @@ namespace JLib {
 		// Naming the field that moved tells you which header changed, which usually tells you which
 		// library was not rebuilt.
 		struct AbiComponents {
-			uint32_t sizeEpochManager, sizeTask, sizeTaskAllocator, sizeTaskDeque;
+			// taskLayout is a FINGERPRINT, not a size -- see TaskLayoutFingerprint below. The field
+			// COUNT and their types are this function's ABI, so nothing may be added here without
+			// breaking every already-built library: an older one would return fewer bytes than the
+			// caller allocated and the guard would compare against uninitialized memory to decide
+			// whether the guard should fire. Widening the MEANING of an existing field costs
+			// nothing, which is why that is what was done when Task's layout needed covering.
+			uint32_t sizeEpochManager, taskLayout, sizeTaskAllocator, sizeTaskDeque;
 			uint32_t sizeTaskMPSCQueue, sizeWaitGroup, sizeTaskScheduler;
 			uint32_t offsetAbiCanary, iteratorDebugLevel;
 		};
 
 		namespace {
+			// A fingerprint of Task's LAYOUT rather than merely its size, because size alone is blind
+			// to the change class that matters most here.
+			//
+			// 2.8.0 packed six one-byte flags into a single byte. Every one of them moved, and
+			// sizeof(Task) stayed 64 -- they had been followed by padding either way. A translation
+			// unit compiled against the new header and linked to the older library would have read
+			// `trivialDtor` from the wrong bit: silently skipping ~Task and leaking every lambda
+			// capture, or running a destructor it should not have. The guard would have reported
+			// everything in agreement, which is worse than having no guard, because it reports
+			// success.
+			//
+			// Hashed rather than reported directly because the facts that matter do not fit in one
+			// number: size, alignment, the packed flag block's width, and the offset of every named
+			// member. Any reorder, resize or repack changes it. The cost is that a mismatch prints
+			// two opaque values instead of "64 vs 72" -- acceptable, since the only useful response
+			// to ANY mismatch here is the one the message already gives: rebuild.
+			//
+			// offsetof on Task is conditionally-supported (a vtable makes it non-standard-layout) and
+			// is used on exactly the same footing as the existing offsetof(TaskScheduler, abiCanary)
+			// below. Every compiler this library targets supports it.
+			inline uint32_t TaskLayoutFingerprint() {
+				uint32_t h = 2166136261u;                       // FNV-1a
+				auto mix = [&h](uint32_t v) { h ^= v; h *= 16777619u; };
+				mix((uint32_t)sizeof(Task));
+				mix((uint32_t)alignof(Task));
+				mix((uint32_t)sizeof(TaskFlagPacking));         // width of the packed flag block
+				mix(TaskFlagBitLayout());                       // and every flag's BIT POSITION in it
+				mix((uint32_t)offsetof(Task, fn));
+				mix((uint32_t)offsetof(Task, data));
+				mix((uint32_t)offsetof(Task, assignedFiber));
+				mix((uint32_t)offsetof(Task, next));
+				mix((uint32_t)offsetof(Task, waitGroup));
+				mix((uint32_t)offsetof(Task, nextWaiter));
+				return h;
+			}
+
 			inline AbiComponents LocalAbiComponents() {
 				AbiComponents c{};
 				c.sizeEpochManager    = (uint32_t)sizeof(EpochManager);
-				c.sizeTask            = (uint32_t)sizeof(Task);
+				c.taskLayout          = TaskLayoutFingerprint();
 				c.sizeTaskAllocator   = (uint32_t)sizeof(TaskAllocator);
 				c.sizeTaskDeque       = (uint32_t)sizeof(TaskDeque);
 				c.sizeTaskMPSCQueue   = (uint32_t)sizeof(TaskMPSCQueue);
@@ -1220,7 +1262,7 @@ namespace JLib {
 
 			const struct { const char* name; uint32_t l, h; } fields[] = {
 				{ "sizeof(EpochManager)",              lib.sizeEpochManager,   hdr.sizeEpochManager   },
-				{ "sizeof(Task)",                      lib.sizeTask,           hdr.sizeTask           },
+				{ "Task layout (size/align/offsets)",  lib.taskLayout,         hdr.taskLayout         },
 				{ "sizeof(TaskAllocator)",             lib.sizeTaskAllocator,  hdr.sizeTaskAllocator  },
 				{ "sizeof(TaskDeque)",                 lib.sizeTaskDeque,      hdr.sizeTaskDeque      },
 				{ "sizeof(TaskMPSCQueue)",             lib.sizeTaskMPSCQueue,  hdr.sizeTaskMPSCQueue  },

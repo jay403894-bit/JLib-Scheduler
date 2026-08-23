@@ -17,31 +17,32 @@ namespace JLib {
 
     enum class FiberSize : uint8_t { Standard, Heavy };
 
-    // Whether a task runs on a bare OS thread with no fiber underneath (Native) or gets a fiber so
-    // it may suspend (Fiber). Replaces the `noFiber` bool in 2.0: requesting suspend capability used
-    // to mean writing `noFiber = false`, a double negative repeated at every call site that needed
-    // it, each requiring its own explanatory comment to stay readable. `TaskType::Fiber` is the same
-    // request spelled as a direct, positive statement, and -- unlike a renamed bool -- the compiler
-    // refuses any call site still passing a bare `true`/`false` literal instead of naming a value,
-    // so a change here cannot silently invert what an existing call site meant.
+    // Replaces the `noFiber` bool in 2.0: requesting suspend capability used to mean writing
+    // `noFiber = false`, a double negative repeated at every call site that needed it, each
+    // requiring its own explanatory comment to stay readable. `TaskType::Fiber` is the same request
+    // spelled as a direct, positive statement, and -- unlike a renamed bool -- the compiler refuses
+    // any call site still passing a bare `true`/`false` literal instead of naming a value, so a
+    // change here cannot silently invert what an existing call site meant. 2.8 added a third value
+    // to the same enum for the same reason.
     //
-    // Native is the default, unchanged: the overwhelmingly common short task needs no fiber, no
-    // context switch, no 64KB stack, and MUST NOT suspend -- no WaitFor, no WaitOnEvent, no CoYield.
-    // There is no context to switch away from, so suspending throws inside a noexcept Execute() and
-    // fail-fasts (STATUS_STACK_BUFFER_OVERRUN on Windows) with no message. Ask for TaskType::Fiber
-    // explicitly for anything that waits on something.
-    // HOW a task suspends, which is the only thing the worker needs to tell them apart by.
+    // HOW a task suspends -- the only thing the worker needs to tell them apart by:
     //
-    //   Native    runs to completion on the worker's own stack. Must never suspend -- there is no
-    //             fiber to switch away to, which is why assignedFiber stays nullptr and the
-    //             WaitOnEvent* guards check for exactly that.
+    //   Native    runs to completion on the worker's own stack. The overwhelmingly common short
+    //             task: no fiber, no context switch, no 64KB stack. MUST NOT suspend -- no WaitFor,
+    //             no WaitOnEvent -- because there is no context to switch away from, so suspending
+    //             throws inside a noexcept Execute() and fail-fasts (STATUS_STACK_BUFFER_OVERRUN on
+    //             Windows) with no message. assignedFiber stays nullptr, which is exactly what the
+    //             WaitOnEvent* guards check for. This is the default; ask for Fiber explicitly for
+    //             anything that waits on something.
     //   Fiber     owns a stack; suspends by ContextSwitch and resumes later on any worker.
     //   Coroutine a C++20 coroutine handle, resumed through the SAME fn(data) call as everything
     //             else (fn is a trampoline, data is coroutine_handle::address()), so the worker
     //             needs no <coroutine> include and the core stays C++17. It differs from Native in
-    //             ONE respect and it is a lifetime rule, not a dispatch rule: fn() returning means
-    //             "suspended OR finished", so the completion path must consult Task::coroDone
-    //             before freeing. See JLib/Coroutine.h for the C++20 half.
+    //             ONE respect, and it is a lifetime rule rather than a dispatch rule: fn() returning
+    //             means "suspended OR finished", and the worker cannot tell which -- so it NEVER
+    //             completes a coroutine task at all. The C++20 side owns it start to finish and
+    //             frees it from inside the coroutine. See JLib/Coroutine.h for why any flag-based
+    //             alternative is racy.
     enum class TaskType : uint8_t { Native, Fiber, Coroutine };
 
     // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). FULLY ORTHOGONAL to hiPri by
@@ -68,6 +69,37 @@ namespace JLib {
                        // mechanism today; separate NAME so intent reads at call sites and the two can
                        // diverge later without API churn.
     };
+    // Task's packed flag block, declared once and expanded in two places: Task itself, and
+    // detail::TaskFlagPacking, which exists so the packing can be static_asserted and so the
+    // stale-library guard can fingerprint it. Sharing the tokens is the point -- see the note at the
+    // expansion site in Task.
+    //
+    //   hiPri         queue order only, never placement, never OS priority.
+    //   requiredSize  Standard or Heavy fiber stack.
+    //   type          Native / Fiber / Coroutine. TWO bits: three values today, room for a fourth.
+    //                 Defaults to Native here as well as in CreateTask -- the predecessor field
+    //                 (noFiber) defaulted the opposite way from CreateTask's parameter, which only
+    //                 mattered for a Task constructed directly, and was fixed rather than carried.
+    //   priorityBoost original hiPri before a boost, 0 meaning "not boosted". One bit is exact
+    //                 because it only ever stores hiPri, which is itself one bit. Nothing writes it:
+    //                 BoostTaskPriority has had no callers since 21719ac (see SchedulerMutex).
+    //   corePref      P/E placement hint; two bits covers Default/P/E/Wide.
+    //   trivialDtor   set when the destructor provably has nothing to do, letting the completion
+    //                 path skip the virtual `t->~Task()` on every single task. The vptr itself
+    //                 cannot go -- it is what runs ~LambdaTask and any captured objects' destructors
+    //                 -- but the CALL can, whenever the concrete type has no captures to destroy.
+    //                 DEFAULT 0 ("not known to be trivial") on purpose: tasks built anywhere other
+    //                 than CreateTask (the MPSC queues' stub_, TaskDAG's nodes) never set it and
+    //                 keep paying the call, so a missed set can only ever be slow, never wrong. The
+    //                 inverse default would make an oversight leak captures silently.
+#define JLIB_TASK_FLAG_FIELDS            \
+        uint8_t   hiPri         : 1;     \
+        FiberSize requiredSize  : 1;     \
+        TaskType  type          : 2;     \
+        uint8_t   priorityBoost : 1;     \
+        CorePref  corePref      : 2;     \
+        uint8_t   trivialDtor   : 1;
+
     struct alignas(16) Task {
         using Func = void(*)(void*);
 
@@ -110,33 +142,13 @@ namespace JLib {
         // than the one running the task, while the push and steal paths read hiPri -- at which
         // point those two must come back out of this block or become atomics. TSan would see it;
         // the compiler will not.
-        uint8_t   hiPri         : 1;
-        FiberSize requiredSize  : 1;
-        // See TaskType above for the contract. Defaults to Native here too -- previously this field
-        // (noFiber) defaulted to 0/false (fiber-capable) while CreateTask's own parameter defaulted
-        // to true (native), a mismatch that only mattered for a bare Task constructed directly
-        // rather than through CreateTask. Fixed as part of the same change rather than carried
-        // forward silently. TWO bits, not one: Native/Fiber today, with room for the coroutine mode.
-        TaskType  type          : 2;
-        // Original priority before boost (0 = no boost, otherwise original hiPri). One bit is exact:
-        // it only ever stores hiPri, which is itself one bit.
-        uint8_t   priorityBoost : 1;
-        // P/E-core placement hint (see CorePref above). Two bits covers Default/P/E/Wide.
-        CorePref  corePref      : 2;
-        // Set when this task's destructor provably has nothing to do, letting the completion path
-        // skip `t->~Task()` -- a virtual call through the vtable on every single task.
-        //
-        // The vptr cannot go (see the note above: it is what runs ~LambdaTask and any captured
-        // objects' destructors), but the CALL can, whenever the concrete type has no captures to
-        // destroy: the (fn, data) overload builds a plain Task with an empty ~Task, and the lambda
-        // overload builds a LambdaTask<F> whose only member is F, so it is a no-op exactly when F
-        // is trivially destructible.
-        //
-        // DEFAULT IS 0 -- "not known to be trivial" -- on purpose. Tasks built anywhere other than
-        // CreateTask (the MPSC queues' stub_, TaskDAG's nodes) never set it and keep paying the
-        // call, which costs those cold paths nothing and means a missed set can only ever be slow,
-        // never wrong. The inverse default would make an oversight leak captures silently.
-        uint8_t   trivialDtor   : 1;
+        // DECLARED VIA A MACRO so that detail::TaskFlagPacking below is the SAME TOKENS, not a
+        // hand-copied mirror. The stale-library guard fingerprints that struct to detect exactly this
+        // block being repacked or reordered -- a change that moves every flag while leaving
+        // sizeof(Task) at 64. A mirror maintained by hand would be a correctness property enforced by
+        // discipline, and it would fail silently and invisibly the first time someone forgot. Sharing
+        // the tokens makes drift impossible instead of unlikely. Per-field notes are on the macro.
+        JLIB_TASK_FLAG_FIELDS
         // ---- end packed flag block --------------------------------------------------------------
 
 
@@ -213,16 +225,40 @@ namespace JLib {
         // 52 quietly stops existing, and `sizeof(Task) == 64` STILL HOLDS -- because those bytes
         // were padding before the packing too. So the cache-line assert above cannot see this
         // failure and it needs its own.
-        struct TaskFlagPacking {
-            uint8_t   hiPri         : 1;
-            FiberSize requiredSize  : 1;
-            TaskType  type          : 2;
-            uint8_t   priorityBoost : 1;
-            CorePref  corePref      : 2;
-            uint8_t   trivialDtor   : 1;
-        };
+        struct TaskFlagPacking { JLIB_TASK_FLAG_FIELDS };
         static_assert(sizeof(TaskFlagPacking) == 1,
                       "Task's six flags must pack into a single byte -- see the flag block in Task");
+
+        // The bit layout of that block, as an actual observation rather than an assumption.
+        //
+        // sizeof alone is not enough for the stale-library guard: swapping two 1-bit flags, or moving
+        // a flag between allocation units without changing the total width, leaves sizeof at 1 while
+        // relocating the bits every consumer reads. So each field is set ALONE in a zeroed copy and
+        // the resulting bytes are hashed -- which encodes, for every field, exactly which byte and
+        // which bits it occupies. Any reorder, rewidth or repack changes the result.
+        //
+        // Safe to poke at raw bytes here in a way it would not be on Task: this is a trivial
+        // aggregate with no vtable and no base, so zeroing it and reading it back is well defined.
+        inline uint32_t TaskFlagBitLayout() {
+            uint32_t h = 2166136261u;                      // FNV-1a
+            auto mixByte = [&h](unsigned char b) { h ^= b; h *= 16777619u; };
+
+            TaskFlagPacking p{};
+            auto probe = [&](auto setter) {
+                unsigned char* raw = reinterpret_cast<unsigned char*>(&p);
+                for (size_t i = 0; i < sizeof p; ++i) raw[i] = 0;
+                setter(p);
+                for (size_t i = 0; i < sizeof p; ++i) mixByte(raw[i]);
+            };
+
+            probe([](TaskFlagPacking& f) { f.hiPri         = 1; });
+            probe([](TaskFlagPacking& f) { f.requiredSize  = FiberSize::Heavy; });
+            probe([](TaskFlagPacking& f) { f.type          = TaskType::Coroutine; });
+            probe([](TaskFlagPacking& f) { f.priorityBoost = 1; });
+            probe([](TaskFlagPacking& f) { f.corePref      = CorePref::Wide; });
+            probe([](TaskFlagPacking& f) { f.trivialDtor   = 1; });
+            return h;
+        }
     }
 
     template<typename F>

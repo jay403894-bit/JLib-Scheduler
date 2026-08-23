@@ -3,6 +3,56 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.9.0 - 2026-08-23
+
+**The stale-library guard can now see `Task` layout changes. It could not, and 2.8.0 was exactly the
+change it would have missed.**
+
+Packing the six flag bytes into one moved every flag while leaving `sizeof(Task)` at 64 -- they had
+been followed by padding either way -- and size is what `AbiComponents` compared. A translation unit
+compiled against 2.8.0's headers and linked to a 2.7.0 library would have read `trivialDtor` from the
+wrong bit, silently skipping `~Task` and leaking every lambda capture, or running a destructor it
+should not have. The guard would have reported everything in agreement, which is worse than no guard
+because it reports success.
+
+`sizeTask` is now `taskLayout`, a FINGERPRINT rather than a size. **No field was added**, and that
+constraint drove the design: the field count and types are the guard function's own ABI, so an older
+library would return fewer bytes than the caller allocated and the guard would be comparing against
+uninitialized memory to decide whether to fire. Widening an existing field's meaning costs nothing.
+
+The fingerprint hashes size, alignment, the packed flag block's width, every named member's offset,
+and -- the part that closes the actual hole -- **each flag's bit position, observed rather than
+assumed**. `sizeof` cannot see two 1-bit flags swapping places, but that relocates bits every
+consumer reads. Each field is set alone in a zeroed copy of the block and the resulting bytes hashed,
+which encodes exactly which byte and which bits it occupies.
+
+**A second hole, closed structurally rather than by discipline.** `detail::TaskFlagPacking` was a
+hand-written mirror of Task's flags; repack the real fields and forget the mirror, and the
+fingerprint misses it. Both now expand one `JLIB_TASK_FLAG_FIELDS` macro, so they cannot drift.
+
+VERIFIED IN BOTH DIRECTIONS, not merely reasoned about. With the library built and saved, two flags
+were reordered in the header -- `sizeof(Task)` still 64, `sizeof(TaskFlagPacking)` still 1, every
+named member at an identical offset -- and a consumer compiled against it and linked to the stale
+library aborted as it should:
+
+```
+[JLib::Scheduler] FATAL: this translation unit was compiled against DIFFERENT ...
+  Task layout (size/align/offsets)     751614434 vs 2509107104
+```
+
+Restoring the header and recompiling against the SAME library exits 0, so it detects the change
+without firing on agreement.
+
+Cost, stated plainly: a mismatch now prints two opaque hashes instead of "64 vs 72". The only useful
+response to any mismatch was always the one the message already gives -- rebuild -- but the
+diagnostic is less readable than it was.
+
+**Also fixes two comments that 2.8.0 left stale**, in the release-before-last's own style: the
+`TaskType` block still described `Task::coroDone`, a field that was removed when the coroutine
+ownership model changed and the worker stopped completing coroutine tasks at all; and the new
+three-mode description had been stacked on top of the old two-mode one rather than merged, so the
+enum carried two overlapping explanations. No code changed for either.
+
 ## 2.8.0 - 2026-08-23
 
 **A THIRD EXECUTION MODE: C++20 COROUTINES, AS AN OPTIONAL HEADER. The core stays C++17.**
