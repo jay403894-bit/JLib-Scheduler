@@ -191,9 +191,19 @@ namespace JLib {
         // Freeing a slot on a DIFFERENT thread than allocated it is fine, and is normal here --
         // epoch reclamation runs the deleter on whichever thread happens to reclaim. Slots are
         // interchangeable within one allocator, so a slot simply migrates to that thread's cache.
+        // ONE CACHE PER THREAD FOR THE WHOLE CLASS, not per instance -- `static thread_local` in a
+        // static member function. Every Alloc and Free routes through here, so two live
+        // TaskAllocators would share a free list and hand out each other's slots. The constructor
+        // enforces that there is never a second one; see the note there.
         static Cache& local() {
             static thread_local Cache c;
             return c;
+        }
+
+        // Instances alive right now. Exists solely for that constructor check.
+        static std::atomic<int>& LiveInstances() {
+            static std::atomic<int> n{ 0 };
+            return n;
         }
 
     public:
@@ -215,10 +225,42 @@ namespace JLib {
         // DEFAULT-initializes, so the 256 MB memset that `vector<Block>(n)` performed is gone even
         // in the eager path. That part was pure waste -- the link loop overwrites the first 8 bytes
         // of every slot immediately afterwards.
+        // THIS CLASS IS SINGLETON-SHAPED AND THE GUARD BELOW IS WHY.
+        //
+        // local() -- the per-thread free-list cache every Alloc and Free goes through -- is a
+        // function-local `static thread_local` inside a STATIC member function. That is ONE cache per
+        // thread for the entire CLASS, not per instance. Construct a second TaskAllocator and both
+        // slabs feed the same free list: slots from one slab are handed out by the other, and the
+        // process dies of heap corruption with no hint as to why. That is not hypothetical -- it is
+        // what happened the first time coroutine frames were pooled from a second instance
+        // (0xC0000374, immediately, see bench/coroutine_bench.cpp).
+        //
+        // Checked unconditionally rather than under JLIBSCHED_ALLOC_CANARY: this runs once per
+        // allocator for the life of the process, so it costs nothing measurable, and the failure it
+        // prevents is both catastrophic and completely undiagnosable from the symptom.
+        //
+        // If a second slab is ever genuinely wanted, the fix is to make the cache per-instance --
+        // not to delete this.
         explicit TaskAllocator(size_t slots, bool lazy = false)
             : mem(new Block[slots]), memSlots(slots) {
+            if (LiveInstances().fetch_add(1, std::memory_order_relaxed) != 0) {
+                std::fprintf(stderr,
+                    "[JLib::Scheduler] FATAL: a second TaskAllocator was constructed.\n"
+                    "  TaskAllocator's per-thread free-list cache is shared by ALL instances (it is a\n"
+                    "  static thread_local in a static member function), so two slabs feed one free\n"
+                    "  list and each hands out the other's slots. This corrupts the heap immediately\n"
+                    "  and the crash appears somewhere unrelated.\n"
+                    "  Use one allocator, or make local() per-instance first.\n");
+                std::fflush(stderr);
+                std::abort();
+            }
             if (!lazy) Prefault(slots);
         }
+
+        ~TaskAllocator() { LiveInstances().fetch_sub(1, std::memory_order_relaxed); }
+
+        TaskAllocator(const TaskAllocator&) = delete;
+        TaskAllocator& operator=(const TaskAllocator&) = delete;
 
 #ifdef JLIBSCHED_ALLOC_CANARY
         // Bytes [8,16) of a slot hold the intrusive "next free" link's tail + are otherwise

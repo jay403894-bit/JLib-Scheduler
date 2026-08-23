@@ -57,6 +57,190 @@
 
 namespace JLib {
 
+    // ---- frame-size instrumentation (diagnostic builds only) -----------------------------------
+    //
+    // WHY THIS EXISTS. A spawned coroutine costs TWO allocations: the frame, which the compiler
+    // emits an `operator new` for, and a Task from the slab. Pooling the frame is the obvious next
+    // optimization -- and its two inputs, how BIG frames are and how MANY are live at once, are
+    // chosen by the compiler from whichever locals live across suspend points. They cannot be
+    // reasoned out from the source. Picking a pool slot size without them would be inventing a
+    // constant, which is how kFastSpinTries got its value and how that turned into a 24x regression.
+    //
+    // So: measure first. This records a histogram of real frame sizes and the live/peak counts, and
+    // is OFF by default like every other diagnostic here. It does NOT pool anything -- it hands
+    // every allocation straight to global new -- because the point is to find out whether pooling is
+    // worth doing and what to size it for.
+#if defined(JLIBSCHED_CORO_STATS)
+    namespace detail {
+        struct CoroFrameStats {
+            // Bucketed at the slot sizes a pool would plausibly use, not at powers of two for their
+            // own sake: the question this answers is "what slot size covers most frames".
+            static constexpr size_t kBuckets = 7;   // <=64, <=128, <=256, <=512, <=1024, <=2048, more
+            std::atomic<uint64_t> bucket[kBuckets];
+            std::atomic<uint64_t> allocations{ 0 };
+            std::atomic<uint64_t> maxSize{ 0 };
+            std::atomic<int64_t>  live{ 0 };
+            std::atomic<int64_t>  peakLive{ 0 };
+
+            void Record(size_t n) {
+                allocations.fetch_add(1, std::memory_order_relaxed);
+                size_t b = 0;
+                for (size_t lim = 64; b < kBuckets - 1 && n > lim; ++b, lim *= 2) {}
+                bucket[b].fetch_add(1, std::memory_order_relaxed);
+
+                uint64_t prevMax = maxSize.load(std::memory_order_relaxed);
+                while (n > prevMax && !maxSize.compare_exchange_weak(prevMax, n)) {}
+
+                const int64_t now = live.fetch_add(1, std::memory_order_relaxed) + 1;
+                int64_t peak = peakLive.load(std::memory_order_relaxed);
+                while (now > peak && !peakLive.compare_exchange_weak(peak, now)) {}
+            }
+            void Release() { live.fetch_sub(1, std::memory_order_relaxed); }
+        };
+
+        inline CoroFrameStats& FrameStats() { static CoroFrameStats s{}; return s; }
+    }
+
+#endif // JLIBSCHED_CORO_STATS
+
+    // ---- frame pooling (experimental) -----------------------------------------------------------
+    //
+    // Allocates coroutine frames from a slab with per-thread caches instead of global new.
+    //
+    // THE ARGUMENT FOR IT IS CONTENTION, NOT LATENCY. A single thread allocating frames gains almost
+    // nothing -- measured at 2.2% of a spawn, see bench/coroutine_bench.cpp. But an allocator's cost
+    // is not linear in thread count: a general-purpose one falls back to shared arenas once
+    // per-thread caches miss, and coroutine frames make that worse than usual because they are
+    // routinely allocated on one thread and freed on another (Spawn runs on the caller, the frame
+    // dies inside the coroutine on whatever worker finished it), which is exactly the pattern that
+    // defeats a thread-cached malloc. A slab with per-thread caches is built for that shape.
+    //
+    // RUNTIME-SWITCHABLE ON PURPOSE. `SlotInSlab` tells a pooled pointer from a heap one, so `delete`
+    // stays correct no matter which mode was active when the frame was allocated -- which means the
+    // pooled and unpooled arms can be interleaved inside ONE process. That matters: comparing them
+    // across two binaries is exactly the method that produced a 52% p90 noise floor in the fast-spin
+    // work this morning and nearly shipped a regression.
+#if defined(JLIBSCHED_CORO_POOL)
+    namespace detail {
+        // A DEDICATED pool, deliberately not a second TaskAllocator.
+        //
+        // TaskAllocator CANNOT BE INSTANTIATED TWICE. Its per-thread free-list cache is a
+        // function-local `static thread_local` inside a STATIC member function, so it is one cache
+        // per thread for the whole CLASS, shared by every instance. A second slab feeding the same
+        // free list hands frame slots out as Tasks; the first attempt at this pooled frames from a
+        // second TaskAllocator and died with 0xC0000374 immediately. Nothing in that class says so.
+        //
+        // Same shape otherwise: bump-allocate fresh slots, per-thread free list for reuse. A frame
+        // freed on a different thread than it was allocated on lands on the FREEING thread's list,
+        // which is the behaviour being tested -- that migration is the norm here, since Spawn runs
+        // on the caller and the frame dies on whichever worker finished the coroutine.
+        class CoroFramePool {
+        public:
+            static constexpr size_t kSlot = 256;      // covers every frame size measured (max 224)
+            static constexpr size_t kSlots = 1u << 16; // 16 MB, committed on first use
+
+            void* Alloc() {
+                void*& head = tls();
+                if (head) { void* p = head; head = *reinterpret_cast<void**>(p); return p; }
+                const size_t i = bump_.fetch_add(1, std::memory_order_relaxed);
+                if (i >= kSlots) return nullptr;      // exhausted -> caller falls back to global new
+                return Base() + i * kSlot;
+            }
+            void Free(void* p) noexcept {
+                void*& head = tls();
+                *reinterpret_cast<void**>(p) = head;
+                head = p;
+            }
+            bool Contains(const void* p) const noexcept {
+                const std::byte* q = reinterpret_cast<const std::byte*>(p);
+                const std::byte* b = Base();
+                return q >= b && q < b + kSlots * kSlot;
+            }
+        private:
+            static std::byte* Base() {
+                static std::byte* m = new std::byte[kSlots * kSlot];
+                return m;
+            }
+            static void*& tls() { static thread_local void* head = nullptr; return head; }
+            std::atomic<size_t> bump_{ 0 };
+        };
+
+        inline CoroFramePool& FramePool() { static CoroFramePool p; return p; }
+        inline std::atomic<bool>& FramePoolEnabled() { static std::atomic<bool> b{ true }; return b; }
+    }
+    // Turn pooling on or off at runtime. Frames already allocated stay valid either way.
+    inline void SetCoroFramePooling(bool on) {
+        detail::FramePoolEnabled().store(on, std::memory_order_relaxed);
+    }
+    inline bool CoroFramePooling() {
+        return detail::FramePoolEnabled().load(std::memory_order_relaxed);
+    }
+#endif
+
+#if defined(JLIBSCHED_CORO_STATS) || defined(JLIBSCHED_CORO_POOL)
+    namespace detail {
+        inline void* FrameAlloc(std::size_t n) {
+#if defined(JLIBSCHED_CORO_STATS)
+            FrameStats().Record(n);
+#endif
+#if defined(JLIBSCHED_CORO_POOL)
+            if (n <= CoroFramePool::kSlot && FramePoolEnabled().load(std::memory_order_relaxed))
+                if (void* p = FramePool().Alloc()) return p;
+#endif
+            return ::operator new(n);
+        }
+        inline void FrameFree(void* p) noexcept {
+#if defined(JLIBSCHED_CORO_STATS)
+            FrameStats().Release();
+#endif
+#if defined(JLIBSCHED_CORO_POOL)
+            // Discriminates by ADDRESS, not by the current mode -- which is what makes the runtime
+            // switch safe.
+            if (FramePool().Contains(p)) { FramePool().Free(p); return; }
+#endif
+            ::operator delete(p);
+        }
+    }
+
+    // Expanded inside each promise_type. A macro rather than a base class because `operator new` for
+    // a coroutine frame is looked up in the promise's own scope, and keeping the declaration literally
+    // there avoids depending on how a given compiler handles the inherited form.
+    //
+    // When neither diagnostic is enabled this expands to NOTHING, so a normal build declares no
+    // allocation functions at all and the compiler uses global new with no indirection -- and stays
+    // free to elide the allocation entirely, which a declared operator new can inhibit.
+#define JLIB_CORO_FRAME_ALLOC                                                                   \
+        static void* operator new(std::size_t n) { return ::JLib::detail::FrameAlloc(n); }      \
+        static void operator delete(void* p) noexcept { ::JLib::detail::FrameFree(p); }         \
+        static void operator delete(void* p, std::size_t) noexcept { ::JLib::detail::FrameFree(p); }
+
+#if defined(JLIBSCHED_CORO_STATS)
+    // Prints the histogram. Call it after the workload, not during -- it reads relaxed counters and
+    // makes no attempt at a consistent snapshot.
+    inline void DumpCoroFrameStats() {
+        auto& s = detail::FrameStats();
+        static const char* kNames[] = { "<=64", "<=128", "<=256", "<=512", "<=1024", "<=2048", ">2048" };
+        std::printf("coroutine frames: %llu allocated, peak %lld live, largest %llu bytes\n",
+                    (unsigned long long)s.allocations.load(),
+                    (long long)s.peakLive.load(),
+                    (unsigned long long)s.maxSize.load());
+        for (size_t i = 0; i < detail::CoroFrameStats::kBuckets; ++i) {
+            const uint64_t c = s.bucket[i].load();
+            if (!c) continue;
+            std::printf("  %-8s %10llu  (%.1f%%)\n", kNames[i], (unsigned long long)c,
+                        100.0 * (double)c / (double)(s.allocations.load() ? s.allocations.load() : 1));
+        }
+        const int64_t leaked = s.live.load();
+        if (leaked != 0)
+            std::printf("  WARNING: %lld frames still live -- a leak, or work still in flight\n",
+                        (long long)leaked);
+    }
+#endif // JLIBSCHED_CORO_STATS
+
+#else   // neither diagnostic enabled: declare no allocation functions at all
+#define JLIB_CORO_FRAME_ALLOC
+#endif
+
     namespace detail {
         // The bridge between the C++17 worker and a C++20 frame. Stored in Task::fn, so the worker
         // calls it without knowing what a coroutine is.
@@ -115,6 +299,11 @@ namespace JLib {
         using Handle = std::coroutine_handle<promise_type>;
 
         struct promise_type {
+            // Must live in the PROMISE, not in Coro. The compiler looks up `operator new` for a
+            // coroutine frame in the promise type's scope; on the wrapper class it is simply never
+            // called, and the instrumentation silently measures nothing. (It did, briefly.)
+            JLIB_CORO_FRAME_ALLOC
+
             // Set by Spawn() before the task is ever pushed, and read only from inside this
             // coroutine. Null until spawned, which is what makes an un-spawned Coro safe to destroy.
             Task* task = nullptr;
@@ -331,6 +520,8 @@ namespace JLib {
 
     namespace detail {
         struct LazyPromiseBase {
+            JLIB_CORO_FRAME_ALLOC
+
             // Who to resume when this coroutine finishes. Empty for a Lazy nobody has awaited.
             std::coroutine_handle<> continuation{};
             std::exception_ptr eptr;

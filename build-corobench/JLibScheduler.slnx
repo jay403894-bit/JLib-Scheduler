@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+	<Configurations>
+		<BuildType Name="Debug"/>
+		<BuildType Name="Development"/>
+		<BuildType Name="Release"/>
+		<Platform Name="x64"/>
+	</Configurations>
+	<Project Path="ALL_BUILD.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c9a358c4-0724-3e52-9b41-01a94209e658" DefaultStartup="true">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="SchedulerBench.vcxproj"/>
+		<BuildDependency Project="SchedulerCoroBench.vcxproj"/>
+		<BuildDependency Project="SchedulerCoroutineTest.vcxproj"/>
+		<BuildDependency Project="SchedulerEventSmoke.vcxproj"/>
+		<BuildDependency Project="SchedulerFiberBudgetTest.vcxproj"/>
+		<BuildDependency Project="SchedulerImmediateDrainTest.vcxproj"/>
+		<BuildDependency Project="SchedulerPrimitivesTest.vcxproj"/>
+		<BuildDependency Project="SchedulerTaskSlabSizeTest.vcxproj"/>
+		<BuildDependency Project="SchedulerTopologyTest.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="INSTALL.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="f0285ccd-4d15-304a-abe8-3e66ef3bebfe">
+		<BuildDependency Project="ALL_BUILD.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<Build Solution="Debug|*" Project="false"/>
+		<Build Solution="Development|*" Project="false"/>
+		<Build Solution="Release|*" Project="false"/>
+	</Project>
+	<Project Path="Scheduler.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="7eb99512-a9e6-3eb2-a985-c2f8bae6a596">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerBench.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="fc4ab054-5ae0-3b15-ba45-ed3d371a1473">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerCoroBench.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="da13637b-0fd2-34df-a6a0-18319ad7a050">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerCoroutineTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="a5637995-5bde-3514-9745-077531b04d74">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerEventSmoke.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="e2c09fa3-e9ed-32dc-a7d1-9409de17a7be">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerFiberBudgetTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="68e848d0-e9a0-3a20-9b0e-3327299eca1a">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerImmediateDrainTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="a419d422-6bfa-34ce-b1b7-759b9023bf8b">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerPrimitivesTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="1f334d80-8bd7-3e25-b15e-9ecc1fbb68b8">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerTaskSlabSizeTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="6cccbe6a-46c7-3ae6-8f52-8c118125cf45">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="SchedulerTopologyTest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="fcd064fb-0723-3a67-a671-191ac6efe25a">
+		<BuildDependency Project="Scheduler.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="ZERO_CHECK.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="fc720220-6da0-3be2-819b-5b2117271cd6"/>
+</Solution>

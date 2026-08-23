@@ -3,6 +3,70 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.11.0 - 2026-08-23
+
+**[CRITICAL] Constructing a second `TaskAllocator` now aborts with a diagnostic instead of corrupting
+the heap.** `local()` -- the per-thread free-list cache every `Alloc` and `Free` routes through -- is
+a function-local `static thread_local` inside a STATIC member function, so it is one cache per thread
+for the entire CLASS rather than per instance. Two live allocators feed one free list and each hands
+out the other's slots. Nothing documented that, nothing prevented it, and the symptom is heap
+corruption surfacing somewhere unrelated.
+
+Found the hard way: pooling coroutine frames from a second `TaskAllocator` died with `0xC0000374`
+immediately. The guard is unconditional rather than behind `JLIBSCHED_ALLOC_CANARY` -- it runs once
+per allocator for the life of the process, so it costs nothing measurable, and the failure it
+prevents is undiagnosable from the symptom. `TaskAllocator` is also non-copyable now, which it should
+always have been for the same reason. If a second slab is ever genuinely wanted, the fix is to make
+the cache per-instance, not to delete the guard.
+
+**New: `bench/coroutine_bench.cpp` (`SchedulerCoroBench`), and the answer it was built for is NO.**
+The question was whether coroutine frames should come off a slab instead of global new. Measured
+rather than argued, and the interesting numbers are not the verdict:
+
+| | ns/item | vs native |
+|---|---:|---:|
+| native task | 1192.5 | -- |
+| coroutine | 1291.0 | 1.08x |
+| coro + suspend | 1821.3 | 1.53x *(bimodal, 367..1851 -- do not quote alone)* |
+| Lazy await | 31.1 | 0.03x |
+| **frame alloc+free** | **28.1** | 0.02x |
+
+The whole third execution mode costs **8% over a plain Native task** on the same push/steal/complete
+path, because resume is just the `fn(data)` call the worker already makes. And **`Lazy` awaited
+inline is 41x cheaper than a spawn** (31 ns vs 1291 ns) -- the lazy, run-on-the-awaiting-worker,
+symmetric-transfer design paying off, and the argument against ever making `co_await Child()` fork.
+
+Frame allocation is ~2% of a spawn, so pooling was tested on the axis that could actually justify it
+-- **allocator contention** -- with pooled and unpooled arms interleaved in one process (the pool is
+runtime-switchable precisely so they can be, rather than compared across two binaries):
+
+```
+threads   pooled ns   global ns   speedup
+  1         1314.1      1310.7     1.00x
+  2          819.4       783.1     0.96x
+  4          528.0       539.0     1.02x
+  8          356.6       346.6     0.97x
+ 16          420.2       360.8     0.86x
+```
+
+Still no, and the decisive column is `global`: its per-item cost FALLS as threads are added
+(1310 -> 347) then flattens. A contended allocator's cost RISES with thread count. There is nothing
+to remove; the flattening is the scheduler path saturating. The test pool has no cross-thread
+rebalancing and this workload migrates one way, so it exhausts past 2 threads and rows 4-16 measure a
+partly-exhausted pool -- rows 1-2 are the clean ones and are a wash. The conclusion rests on the
+global column showing nothing to fix, not on the pooled column being good.
+
+**New diagnostics, both OFF by default:** `JLIBSCHED_CORO_STATS` records a histogram of real
+coroutine frame sizes (640,008 frames measured: 75% <=64 bytes, largest 224 -- the sizing input if
+pooling is ever revisited), and `JLIBSCHED_CORO_POOL` enables the experimental frame pool. Neither is
+in a normal build; when both are off, the promise types declare no allocation functions at all, so
+the compiler is left free to elide frames entirely.
+
+**Also fixes the instrumentation itself**, which initially measured nothing: the `operator new` hook
+was placed on the `Coro` class rather than on `Coro::promise_type`. A coroutine frame's allocation
+functions are looked up in the PROMISE type's scope, so on the wrapper they are simply never called.
+Caught because "peak 1 live" is impossible for a benchmark that holds 20,000 coroutines at once.
+
 ## 2.10.0 - 2026-08-23
 
 **[CRITICAL for anyone using coroutines] The deque's steal tag was lying about `TaskType`, and

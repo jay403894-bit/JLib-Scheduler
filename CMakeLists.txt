@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.10.0")
+set(JLIBSCHED_VERSION "2.11.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -496,6 +496,35 @@ if(JLIBSCHED_COROUTINES)
     target_link_libraries(SchedulerCoroutineTest PRIVATE Scheduler)
     target_compile_features(SchedulerCoroutineTest PRIVATE cxx_std_20)
     message(STATUS "JLib::Scheduler: C++20 coroutine tests ENABLED (core still builds as C++17)")
+
+    add_executable(SchedulerCoroBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/coroutine_bench.cpp")
+    target_link_libraries(SchedulerCoroBench PRIVATE Scheduler)
+    target_compile_features(SchedulerCoroBench PRIVATE cxx_std_20)
+endif()
+
+# Records a histogram of real coroutine FRAME SIZES and live/peak counts. Exists to answer one
+# question with data instead of intuition: is pooling coroutine frames worth it, and what slot size
+# would cover them? Both inputs are chosen by the compiler from whichever locals live across suspend
+# points, so neither can be read off the source. OFF by default, same discipline as
+# JLIBSCHED_STEAL_STATS -- it adds a counter to every frame allocation, so timings taken with it on
+# are inflated and must not be compared against timings taken with it off.
+#
+# INTERFACE, not PRIVATE: it changes code in Coroutine.h, which the library never includes and
+# consumers do. Putting it on the library's own compile line would do nothing at all.
+option(JLIBSCHED_CORO_STATS "Record coroutine frame-size histogram (diagnostic; see bench/coroutine_bench.cpp)" OFF)
+if(JLIBSCHED_CORO_STATS)
+    target_compile_definitions(Scheduler INTERFACE JLIBSCHED_CORO_STATS=1)
+    message(STATUS "JLib::Scheduler: coroutine frame-size instrumentation ON (diagnostic build)")
+endif()
+
+# EXPERIMENTAL: allocate coroutine frames from a slab with per-thread caches instead of global new.
+# The case for it is allocator CONTENTION at many concurrently-allocating threads, not per-call
+# latency -- single-threaded, frame allocation is only ~2% of a spawn. Runtime-switchable so the
+# pooled and unpooled arms can be interleaved in one process rather than compared across binaries.
+option(JLIBSCHED_CORO_POOL "Pool coroutine frames in a slab (experimental; see bench/coroutine_bench.cpp)" OFF)
+if(JLIBSCHED_CORO_POOL)
+    target_compile_definitions(Scheduler INTERFACE JLIBSCHED_CORO_POOL=1)
+    message(STATUS "JLib::Scheduler: coroutine frame POOLING ON (experimental)")
 endif()
 
 # ABI harness for the Windows/ARM64 context switch -- the Windows counterpart of
