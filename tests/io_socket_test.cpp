@@ -58,8 +58,8 @@ int main() {
     WSADATA wsa{};
     const int wsaRc = ::WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    JLib::TaskScheduler::SetReserveTimerCore(true);
-    JLib::TaskScheduler::SetReserveIoCore(true);
+    JLib::TaskScheduler::EnableTimers(true);
+    JLib::TaskScheduler::EnableIoReactor(true);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
     auto& io = JLib::IoReactor::Instance();

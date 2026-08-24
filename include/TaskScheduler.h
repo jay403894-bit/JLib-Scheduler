@@ -731,6 +731,36 @@ namespace JLib {
 		static void SetSlabSizes(const SlabSizes& sizes);
 		static SlabSizes CurrentSlabSizes();
 
+		// ---- OPTIONAL SERVICE LAYERS ------------------------------------------------------------
+		//
+		// This library is a JOB SYSTEM first. Deadlines and asynchronous I/O are layers on top, and
+		// an app that wants neither should pay for neither -- not a thread, not a core, not a
+		// surprise. So they are OFF until asked for, and asking has to happen before Init because
+		// the pool is sized once and each enabled service takes a core.
+		//
+		//     TaskScheduler::EnableIoReactor(true);   // implies timers
+		//     TaskScheduler::Init(0);                 // hw-3 workers: main, timer, completion
+		//
+		// ENFORCED, NOT ADVISED. Using a disabled layer fails at the first call, loudly and
+		// deterministically, rather than working while quietly running the machine one thread over.
+		// A warning was the first design and it was wrong: the failure it guards against is a few
+		// percent of throughput, forever, which nobody notices and nobody attributes correctly. A
+		// hard stop at the first Arm or the first Register is a two-minute fix.
+		//
+		// Enforcement only applies once a POOL EXISTS. Using the timer or the reactor without ever
+		// calling Init is legitimate -- there are no workers to oversubscribe.
+		//
+		// Ignored when an EXPLICIT poolSize is given: that is the app's own arithmetic and this must
+		// not silently second-guess it. The layers still have to be enabled to be used.
+		static void EnableTimers(bool on) noexcept;
+		static bool TimersEnabled() noexcept;
+
+		// Implies EnableTimers: an I/O timeout is a deadline, and every non-trivial reactor user
+		// wants one. Enabling I/O and then discovering timers are off would be a papercut with no
+		// upside.
+		static void EnableIoReactor(bool on) noexcept;
+		static bool IoReactorEnabled() noexcept;
+
 		// Give the timer thread a core of its own, so an app that uses deadlines does not run one
 		// thread over the machine.
 		//

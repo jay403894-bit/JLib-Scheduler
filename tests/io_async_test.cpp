@@ -65,8 +65,8 @@ static void Reset() {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    JLib::TaskScheduler::SetReserveTimerCore(true);
-    JLib::TaskScheduler::SetReserveIoCore(true);
+    JLib::TaskScheduler::EnableTimers(true);
+    JLib::TaskScheduler::EnableIoReactor(true);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
     auto& io = JLib::IoReactor::Instance();

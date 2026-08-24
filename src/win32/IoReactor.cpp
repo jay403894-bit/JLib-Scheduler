@@ -98,15 +98,6 @@ namespace JLib {
             if (running) return;
             running = true;
             worker = std::thread([this] { Run(); });
-
-#if defined(JLIB_DEVELOPMENT) || !defined(NDEBUG)
-            if (TaskScheduler::IsInitialized() && !TaskScheduler::ReserveIoCore()) {
-                std::fprintf(stderr,
-                    "[JLib::Scheduler] IoReactor started a thread, but the pool was sized without "
-                    "reserving a core for it -- call TaskScheduler::SetReserveIoCore(true) before "
-                    "Init, or pass an explicit poolSize that already accounts for it.\n");
-            }
-#endif
         }
 
         static IoResult Classify(BOOL ok, DWORD err, DWORD bytes) {
@@ -265,7 +256,29 @@ namespace JLib {
 
     bool IoReactor::IsAvailable() noexcept { return true; }
 
+    // OPT-IN, ENFORCED. This library is a job system first; the reactor is a layer, and an app that
+    // wanted only jobs should not be paying a thread and a core for one it never asked for. A pool
+    // sized without a completion core therefore refuses to run the reactor at all -- at the first
+    // call, loudly -- rather than working while running the machine one thread over for the life of
+    // the process. That deficit measured 3-4% the last time it happened and took a VTune session to
+    // find; this is a two-minute fix instead.
+    //
+    // Checked at REGISTER, which every path has to go through before it can submit anything, so one
+    // check covers the whole surface rather than eight.
+    //
+    // Only when a POOL EXISTS -- using the reactor with no scheduler is legitimate, since there are
+    // no workers to oversubscribe.
+    static bool IoLayerUsable() {
+        if (!TaskScheduler::IsInitialized() || TaskScheduler::IoReactorEnabled()) return true;
+        std::fprintf(stderr,
+            "[JLib::Scheduler] IoReactor used but the I/O layer is not enabled -- the pool was sized "
+            "without a core for its completion thread. Call TaskScheduler::EnableIoReactor(true) "
+            "before Init.\n");
+        return false;
+    }
+
     bool IoReactor::Register(void* handle) {
+        if (!IoLayerUsable()) return false;
         if (!handle || handle == INVALID_HANDLE_VALUE || !impl->port) return false;
         {
             std::lock_guard<std::mutex> lk(impl->m);
@@ -296,7 +309,7 @@ namespace JLib {
 
     // ---- sockets ---------------------------------------------------------------------------------
 
-    bool IoReactor::InitSockets() { return ResolveExtensions(); }
+    bool IoReactor::InitSockets() { return IoLayerUsable() && ResolveExtensions(); }
 
     bool IoReactor::RegisterSocket(IoSocket s) {
         // A SOCKET associates with a completion port exactly like a file handle -- on Windows it IS

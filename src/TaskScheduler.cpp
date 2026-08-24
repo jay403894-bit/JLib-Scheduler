@@ -184,10 +184,26 @@ static bool g_reserveTimerCore = false;
 
 static bool g_reserveIoCore = false;
 
-void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { g_reserveTimerCore = reserve; }
-bool TaskScheduler::ReserveTimerCore() noexcept { return g_reserveTimerCore; }
-void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { g_reserveIoCore = reserve; }
-bool TaskScheduler::ReserveIoCore() noexcept { return g_reserveIoCore; }
+// EnableIoReactor implies EnableTimers, and the implication is applied HERE rather than checked at
+// the point of use -- so there is one moment where the two are made consistent, and no path that can
+// observe I/O on with timers off.
+//
+// Turning I/O back OFF deliberately leaves timers on: it cannot know whether they were enabled on
+// their own account, and silently disabling a service the app asked for is worse than leaving one
+// enabled that it no longer needs.
+void TaskScheduler::EnableTimers(bool on) noexcept { g_reserveTimerCore = on; }
+bool TaskScheduler::TimersEnabled() noexcept { return g_reserveTimerCore; }
+
+void TaskScheduler::EnableIoReactor(bool on) noexcept {
+	g_reserveIoCore = on;
+	if (on) g_reserveTimerCore = true;
+}
+bool TaskScheduler::IoReactorEnabled() noexcept { return g_reserveIoCore; }
+
+void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { EnableTimers(reserve); }
+bool TaskScheduler::ReserveTimerCore() noexcept { return TimersEnabled(); }
+void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { EnableIoReactor(reserve); }
+bool TaskScheduler::ReserveIoCore() noexcept { return IoReactorEnabled(); }
 
 size_t TaskScheduler::GetSafeTC() {
 	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin

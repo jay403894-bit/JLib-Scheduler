@@ -50,7 +50,7 @@ int main() {
     // Init is STATIC and has to run before anything touches Instance(); the scheduler fast-fails
     // rather than hand out a half-built singleton.
     // The timer runs a thread of its own, so the pool is sized to leave it a core.
-    JLib::TaskScheduler::SetReserveTimerCore(true);
+    JLib::TaskScheduler::EnableTimers(true);
     JLib::TaskScheduler::Init(0);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 

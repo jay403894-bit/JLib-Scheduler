@@ -673,3 +673,9 @@ if(WIN32 AND JLIBSCHED_COROUTINES)
     target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler ws2_32)
     target_compile_features(SchedulerIoSocketTest PRIVATE cxx_std_20)
 endif()
+
+# The service layers are opt-in. This process enables nothing and checks that the pool keeps every
+# core and that both layers refuse to run -- the check that a job-system-only app pays for neither.
+add_executable(SchedulerIoOptInTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_optin_test.cpp")
+target_link_libraries(SchedulerIoOptInTest PRIVATE Scheduler)
+target_compile_features(SchedulerIoOptInTest PRIVATE cxx_std_17)

@@ -444,23 +444,23 @@ namespace JLib {
         std::lock_guard<std::mutex> lk(impl->m);
         if (impl->stopping) return TimerHandle{};
 
+        // OPT-IN, ENFORCED. A pool exists and nobody asked for deadlines, so the pool was sized
+        // without a core for this thread. Refusing here is deterministic and obvious at the first
+        // Arm; starting anyway would run the machine one thread over for the process's lifetime,
+        // which is a few percent nobody attributes correctly. Without a pool there is nothing to
+        // oversubscribe and the timer is free to run.
+        if (TaskScheduler::IsInitialized() && !TaskScheduler::TimersEnabled()) {
+            std::fprintf(stderr,
+                "[JLib::Scheduler] TimerQueue::Arm called but the timer layer is not enabled -- the "
+                "pool was sized without a core for it. Call TaskScheduler::EnableTimers(true) "
+                "before Init.\n");
+            return TimerHandle{};
+        }
+
         if (!impl->running) {
             impl->running = true;
             impl->worker = std::thread([this] { impl->Run(); });
 
-#if defined(JLIB_DEVELOPMENT) || !defined(NDEBUG)
-            // ONCE, the first time a deadline is armed. The auto pool size is hw-1 and its census
-            // calls that an exact fit, so this thread puts an app that never declared it one over
-            // the machine -- a deficit of exactly one, which last time it happened measured 3-4%
-            // and took a VTune session to find. Everything still works, slightly worse, forever,
-            // which is precisely why it gets said out loud rather than left to a profile.
-            if (TaskScheduler::IsInitialized() && !TaskScheduler::ReserveTimerCore()) {
-                std::fprintf(stderr,
-                    "[JLib::Scheduler] TimerQueue started a thread, but the pool was sized without "
-                    "reserving a core for it -- call TaskScheduler::SetReserveTimerCore(true) "
-                    "before Init, or pass an explicit poolSize that already accounts for it.\n");
-            }
-#endif
         }
 
         // Rounded UP: a 1ms deadline on a 1ms tick must not fire at 0. A timer is allowed to be
