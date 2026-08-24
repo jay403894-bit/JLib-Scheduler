@@ -1793,6 +1793,16 @@ void TaskScheduler::CleanupTaskMetadata(Task* task) {
 }
 
 
+bool JLib::CurrentTaskCancelled() {
+	if (!TaskScheduler::IsInitialized()) return false;
+	Task* t = TaskScheduler::Instance().GetCurrentTask();
+	// Off a task entirely -- main, an app thread -- is not cancelled. So is a task that was never
+	// given a scope. Both answer the same way and for the same reason: nobody asked for this work
+	// to stop.
+	if (!t) return false;
+	return CancelToken(t->cancelToken).Cancelled();
+}
+
 void SchedulerMutex::Lock() {
 	auto thread = Thread::GetCurrent();
 	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
@@ -1828,7 +1838,7 @@ void SchedulerMutex::Lock() {
 			// and flips us to SUSPEND_SIGNALED, and the worker's park step wakes us instead of
 			// parking.
 			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
-			waiters.push(Waiter{ current, nullptr });
+			waiters.push(Waiter{ current, nullptr, nullptr, CancelToken::kNone });
 			spinLock.clear(std::memory_order_release);
 		}
 		// Deliberately NOT Thread::Suspend(). Fiber::Suspend() stores WANTS_SUSPEND
@@ -1870,18 +1880,45 @@ void SchedulerMutex::Unlock()
 		holderLock.clear(std::memory_order_release);
 	}
 
-	{
-		while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
-		if (!waiters.empty()) {
-			// Ownership passes to the waiter: `locked` deliberately STAYS true. Clearing it here
-			// would let a third party take the lock in front of the waiter we are about to release.
-			next = waiters.front();
-			waiters.pop();
+	// SKIP-AT-RELEASE. Walk past waiters whose scope has been cancelled, resuming each with
+	// Cancelled so it can unwind, until one that still wants the lock is found. Ownership stays with
+	// US the whole time -- `locked` is only cleared when the queue runs dry -- so no third party can
+	// take the lock in front of the waiter we eventually hand it to.
+	//
+	// ONE WAITER PER SPINLOCK ACQUISITION, deliberately. Resuming inside the queue lock would nest
+	// it under whatever Thread::Resume takes (the notify mutex, a deque push), which is how lock
+	// cycles get built. Popping one, releasing, then resuming costs a little more contention when
+	// several waiters are cancelled at once -- a rare case -- and cannot deadlock.
+	for (;;) {
+		bool haveWaiter = false;
+		{
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			if (!waiters.empty()) {
+				next = waiters.front();
+				waiters.pop();
+				haveWaiter = true;
+			}
+			else {
+				locked = false;   // nobody left to hand it to; genuinely unlocked now
+			}
+			spinLock.clear(std::memory_order_release);
 		}
-		else {
-			locked = false;
+		if (!haveWaiter) { next = Waiter{}; break; }
+
+		// A null result slot means the waiter is NOT cancellable and must not be skipped -- see the
+		// note on Waiter. Only an opted-in waiter can be passed over.
+		if (next.result && CancelToken(next.token).Cancelled()) {
+			*next.result = WaitResult::Cancelled;
+			// Resumed WITHOUT the lock. It returns Cancelled and unwinds; we keep ownership and
+			// look for someone who still wants it.
+			if (next.fiber) Thread::Resume(next.fiber);
+			else if (next.coro && TaskScheduler::IsInitialized())
+				TaskScheduler::Instance().Push(next.coro);
+			continue;
 		}
-		spinLock.clear(std::memory_order_release);
+
+		if (next.result) *next.result = WaitResult::Ok;
+		break;   // this one gets the lock; released below, outside the spinlock
 	}
 
 	// Only unboos if scheduler is initialized AND it's not a recursive/shutdown path
@@ -1909,6 +1946,81 @@ void SchedulerMutex::Unlock()
 	}
 }
 
+WaitResult SchedulerMutex::LockCancellable() {
+	auto thread = Thread::GetCurrent();
+	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
+
+	// The token is read ONCE, here, and carried in the Waiter. The releaser cannot look it up
+	// later: it has a Fiber*, and there is no fiber->task link to walk back through.
+	Task* callerTask = TaskScheduler::IsInitialized() ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
+	const uint32_t tok = callerTask ? callerTask->cancelToken : CancelToken::kNone;
+
+	// Already cancelled before we even try: fail immediately rather than acquire a lock the caller
+	// is about to be told to drop.
+	if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+
+	if (current != nullptr) {
+		WaitResult result = WaitResult::Ok;   // stack local -- stable until we are resumed
+		{
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			if (!locked) {
+				locked = true;
+				spinLock.clear(std::memory_order_release);
+				{
+					while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+					lockHolder = callerTask;
+					holderLock.clear(std::memory_order_release);
+				}
+				return WaitResult::Ok;
+			}
+			// Parkable BEFORE discoverable, exactly as Lock() does -- see the long note there; the
+			// reverse order is the 1.3.5 lost wakeup.
+			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
+			waiters.push(Waiter{ current, nullptr, &result, tok });
+			spinLock.clear(std::memory_order_release);
+		}
+		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerMutex::LockCancellable");
+		ContextSwitch(&current->ctx, current->homeCtx);
+
+		// Resumed. `result` says whether that came with the lock or with a cancellation.
+		if (result == WaitResult::Cancelled) return WaitResult::Cancelled;
+		{
+			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			lockHolder = callerTask;
+			holderLock.clear(std::memory_order_release);
+		}
+		return WaitResult::Ok;
+	}
+
+	// Bare thread: never enqueues, so skip-at-release cannot reach it. It polls the token between
+	// attempts instead -- which is also why its cancellation is prompt where a fiber's waits for the
+	// next release.
+	while (!Try_Lock()) {
+		if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+		ContendedSpinStep();
+	}
+	return WaitResult::Ok;
+}
+
+bool SchedulerMutex::LockAsyncEnqueue(Task* coroTask, WaitResult* result) {
+	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+	if (!locked) {
+		locked = true;
+		spinLock.clear(std::memory_order_release);
+		{
+			while (holderLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			lockHolder = coroTask;
+			holderLock.clear(std::memory_order_release);
+		}
+		if (result) *result = WaitResult::Ok;
+		return true;
+	}
+	waiters.push(Waiter{ nullptr, coroTask, result,
+	                     coroTask ? coroTask->cancelToken : CancelToken::kNone });
+	spinLock.clear(std::memory_order_release);
+	return false;
+}
+
 bool SchedulerMutex::LockAsyncEnqueue(Task* coroTask) {
 	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 	if (!locked) {
@@ -1923,7 +2035,7 @@ bool SchedulerMutex::LockAsyncEnqueue(Task* coroTask) {
 	}
 	// Queued. The task becomes reachable by Unlock the instant spinLock is cleared, so nothing may
 	// touch it after this point.
-	waiters.push(Waiter{ nullptr, coroTask });
+	waiters.push(Waiter{ nullptr, coroTask, nullptr, CancelToken::kNone });
 	spinLock.clear(std::memory_order_release);
 	return false;
 }
@@ -2035,20 +2147,43 @@ void SchedulerSemaphore::Signal()
 		platform::CpuRelax();
 	}
 
-	// 2. Safely manipulate the queue and permits
+	// 2. Safely manipulate the queue and permits.
+	//
+	// SKIP-AT-RELEASE, same rule as SchedulerMutex::Unlock: walk past waiters whose scope was
+	// cancelled, waking each with Cancelled so it can unwind, and give the permit to the first that
+	// still wants it. The permit is never parked in `permits` while a real waiter exists, so nobody
+	// can take it in front of the waiter being released. One waiter per spinlock acquisition, so a
+	// resume never happens underneath the queue lock.
 	if (!waiters.empty()) {
-		// The permit passes DIRECTLY to this waiter and is never returned to `permits` -- otherwise
-		// a third party could take it before the waiter we are releasing ever runs.
-		const Waiter next = waiters.front();
-		waiters.pop();
+		for (;;) {
+			const Waiter next = waiters.front();
+			waiters.pop();
+			const bool empty = waiters.empty();
 
-		// 3. Release lock BEFORE resuming/pushing to minimize contention overhead. After either
-		// call the waiter may already be running, so nothing below may touch it.
-		spinLock.clear(std::memory_order_release);
+			// Release BEFORE resuming: after either call the waiter may already be running, so
+			// nothing below may touch it.
+			spinLock.clear(std::memory_order_release);
 
-		if (next.fiber) Thread::Resume(next.fiber);
-		else if (next.coro && TaskScheduler::IsInitialized())
-			TaskScheduler::Instance().Push(next.coro);
+			// Null result slot => not cancellable => never skipped. See the note on Waiter.
+			const bool skip = next.result && CancelToken(next.token).Cancelled();
+			if (skip) *next.result = WaitResult::Cancelled;
+			else if (next.result) *next.result = WaitResult::Ok;
+
+			if (next.fiber) Thread::Resume(next.fiber);
+			else if (next.coro && TaskScheduler::IsInitialized())
+				TaskScheduler::Instance().Push(next.coro);
+
+			if (!skip) return;          // permit handed over
+
+			// That one did not want it. Take the queue lock again and look for another; if there is
+			// nobody left, the permit goes back to the counter.
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+			if (empty || waiters.empty()) {
+				if (permits < maxPermits) ++permits;
+				spinLock.clear(std::memory_order_release);
+				return;
+			}
+		}
 	}
 	else {
 		if (permits < maxPermits) {

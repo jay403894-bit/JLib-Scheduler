@@ -445,6 +445,37 @@ void Thread::Worker() {
 		hasQueuedWork.store(false, std::memory_order_seq_cst);
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
+			// CANCELLATION, OBSERVED AT PICKUP. One flag in the scope; every task carrying a token
+			// to it reads the new value the next time it is touched, and this is one of those
+			// points. Nothing was removed from any queue to make this work -- which is exactly why
+			// it reaches a task parked anywhere, including an Event's lock-free waiter stack, with
+			// no change to Event at all.
+			//
+			// ONLY AN UNSTARTED TASK MAY BE DISCARDED. A queued entry may be a RESUME: Thread::Resume
+			// ends in Requeue(owningTask), so a suspended fiber returns through these same queues,
+			// and a coroutine awaiter re-pushes its Task the same way. Discarding one of those
+			// abandons a live stack or frame rather than cancelling it -- see Task::started. A
+			// started task is let through to run, and observes the cancellation at its own next
+			// suspend point or poll, where it can unwind properly.
+			if (!task_to_run->started &&
+			    CancelToken(task_to_run->cancelToken).Cancelled()) {
+				// Same disposal the DAG uses for a node that never runs: release the WaitGroup first
+				// so nothing waiting on this work blocks forever on something abandoned.
+				if (task_to_run->waitGroup) {
+					const int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+						task_to_run->waitGroup->WakeAll();
+				}
+				scheduler->CleanupTaskMetadata(task_to_run);
+				DestroyTask(task_to_run);
+				scheduler->GetAllocator()->Free(task_to_run);
+				task_to_run = nullptr;
+				if (EpochManager::Instance().ShouldSelfReclaim()) EpochManager::Instance().Tick();
+				ready.store(true, std::memory_order_release);
+				continue;
+			}
+			task_to_run->started = 1;
+
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
 			// or ContextSwitch paid at all. Only safe because Native tasks are a CONTRACT --
 			// they must never call WaitOnEvent*/anything that suspends (there's no fiber here

@@ -36,6 +36,12 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
         std::abort();
     }
 
+    // Stamp the graph's cancellation scope onto the task, so a Cancel() reaches it even after it
+    // has been dispatched and is running -- Fire()'s flag only governs what has NOT been dispatched.
+    // A task that already carries a token keeps it: an explicitly-scoped task is not overridden by
+    // being put in a graph.
+    if (t && t->cancelToken == CancelToken::kNone) t->cancelToken = scope.Token().Raw();
+
     // Allocate the node memory from the scheduler's allocator
     void* mem = scheduler.GetAllocator()->Alloc();
     if (!mem) return nullptr;
@@ -163,11 +169,22 @@ bool TaskDAG::Submit() {
     if (HasCycle()) {
         // A cyclic node never runs, so it never self-frees via OnTaskFinished -- reclaim
         // here (node + its task) so a rejected DAG doesn't leak. Caller should fix the graph.
+        //
+        // AND RELEASE THE WAITGROUPS, which this did not do. A task that is destroyed here never
+        // runs, so nothing else will ever decrement for it -- and anyone sitting in WaitFor on this
+        // graph then blocks forever. Rejecting a bad graph turned into hanging the caller who asked
+        // to wait for it, which is a worse outcome than the cycle. Same sequence Worker()'s fast
+        // path and TaskDAG::DisposeUnexecutedTask use.
         for (auto* n : nodes) {
             Task* t = n->task;
             n->~TaskNode();
             scheduler.GetAllocator()->Free(n);
             if (t) {
+                if (t->waitGroup) {
+                    const int old = t->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+                    if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+                        t->waitGroup->WakeAll();
+                }
                 t->~Task();
                 scheduler.GetAllocator()->Free(t);
             }
@@ -190,16 +207,48 @@ bool TaskDAG::Submit() {
 }
 
 void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
-    dependent->dependencies_left.fetch_add(1, std::memory_order_relaxed);
-    uint64_t key = reinterpret_cast<uintptr_t>(dependent);
-    dependency->dependents->add(key, dependent);
+    if (!dependent || !dependency) return;
+
+    // APPEND, AND DO NOT DEDUPLICATE. This used to key the entry on the dependent's own pointer so a
+    // repeated edge was dropped -- which cost an O(n) search per edge AND was wrong: the counter was
+    // incremented unconditionally while the duplicate add returned false, so
+    //   AddDependency(b, a); AddDependency(b, a);
+    // left b with dependencies_left == 2 and a with ONE dependent. The countdown could then only
+    // reach 1, and Kahn's -- which uses dependencies_left as the in-degree -- decremented once and
+    // never drained b, so HasCycle reported a cycle in an acyclic graph and Submit silently rejected
+    // it. Verified: that exact pair hung with ran=0.
+    //
+    // Duplicates are self-consistent when nothing dedups them: two entries, two decrements, zero
+    // reached, and Fire's `submitted` exchange makes the second fire a no-op anyway -- which is what
+    // the dedup was guarding against and why it was never needed.
+    //
+    // Increment ONLY after the edge is really recorded. A push that fails on an exhausted slab must
+    // not leave a phantom dependency behind, or the dependent waits forever for an edge that does
+    // not exist. (Build is single-threaded -- see the note on TaskDAG::nodes -- so there is no race
+    // between the push and the increment.)
+    if (dependency->dependents->push(dependent)) {
+        dependent->dependencies_left.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 
-void TaskDAG::OnTaskFinished(TaskNode* node) {
+void TaskDAG::OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome) {
     // Trigger each dependent. AND fires when its countdown reaches 0; OR fires on the
     // FIRST predecessor -- Fire's `submitted` exchange turns later predecessors into no-ops.
-    node->dependents->for_each([this](TaskNode* dep) {
+    //
+    // CANCELLATION RIDES THE SAME WALK. A cancelled predecessor fires its dependents IMMEDIATELY as
+    // cancelled, whatever the gate:
+    //   AND -- an input that will never produce means the countdown can never legitimately reach 0,
+    //          so waiting for it would strand the node forever. Fire now, cancelled.
+    //   OR  -- first result wins, which is what `submitted` already enforces. If the first arrival
+    //          is a cancellation the gate is cancelled, and a later OK is a no-op.
+    // The countdown is still decremented on the normal path only; once a cancel has fired the node,
+    // any later completion is deduped by `submitted` regardless of what the counter says.
+    node->dependents->for_each([this, outcome](TaskNode* dep) {
+        if (outcome == TaskNode::Outcome::Cancelled) {
+            Fire(dep, TaskNode::Outcome::Cancelled);
+            return;
+        }
         bool ready = (dep->gateType == TaskNode::OR)
             ? true
             : (dep->dependencies_left.fetch_sub(1, std::memory_order_acq_rel) - 1 == 0);
@@ -220,10 +269,60 @@ void TaskDAG::NodeDeleter(void* p) {
 }
 
 
-void TaskDAG::Fire(TaskNode* node) {
+void TaskDAG::Cancel() {
+    // One flag, read at the top of Fire(). Fire is the single funnel every node passes through on
+    // its way to being dispatched, so this converts the entire remaining graph as it unrolls --
+    // without a node registry, which Submit() deliberately does not keep (nodes self-free after it).
+    // Already-dispatched work is untouched; see the declaration for exactly what that excludes.
+    cancelled.store(true, std::memory_order_release);
+    // The other half: tasks already dispatched cannot be un-dispatched, but they can be TOLD.
+    // Cancelling the scope makes CurrentTaskCancelled() true inside every node's task, so a
+    // long-running body that polls can give up instead of finishing work nobody wants.
+    scope.Cancel();
+}
+
+void TaskDAG::DisposeUnexecutedTask(TaskNode* node) {
+    Task* t = node->task;
+    if (!t) return;                 // gate or external node: nothing was ever allocated to run
+    node->task = nullptr;           // exactly once, even if something re-enters
+
+    // THE WAITGROUP MUST STILL BE DECREMENTED. A cancelled task never runs, so nothing else will
+    // ever decrement for it -- and a caller sitting in WaitFor would then block forever on work that
+    // has been abandoned. Cancelling a graph would deadlock whoever asked to wait for it, which is
+    // the opposite of the point. Same sequence Worker()'s fast path uses, minus the Execute.
+    if (t->waitGroup) {
+        const int old = t->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+        if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+            t->waitGroup->WakeAll();
+    }
+    scheduler.CleanupTaskMetadata(t);
+    DestroyTask(t);
+    scheduler.GetAllocator()->Free(t);
+}
+
+void TaskDAG::Fire(TaskNode* node, TaskNode::Outcome outcome) {
 
     if (node->submitted.exchange(true, std::memory_order_acq_rel)) {
         return; // already fired by another predecessor (dedups OR, and AND races)
+    }
+
+    // A graph-wide cancel demotes anything not yet dispatched, and this is the only place it needs
+    // checking: every node reaches dispatch through here exactly once, guarded by the exchange above.
+    if (cancelled.load(std::memory_order_acquire)) {
+        outcome = TaskNode::Outcome::Cancelled;
+    }
+
+    if (outcome == TaskNode::Outcome::Cancelled) {
+        // A CANCELLED node is a pure state transition: its payload never runs, whatever kind of node
+        // it is. Release the task it would have run -- nothing else ever will -- then propagate, so
+        // the dependents see the cancellation and decide by their own gate type.
+        //
+        // For an EXTERNAL node this also means it is never armed, so a signal that arrives later
+        // finds EXT_ARMED unset and does nothing. That is the correct outcome and not a lost wakeup:
+        // the node has already completed, as cancelled.
+        DisposeUnexecutedTask(node);
+        OnTaskFinished(node, TaskNode::Outcome::Cancelled);
+        return;
     }
 
     if (node->isGate) {

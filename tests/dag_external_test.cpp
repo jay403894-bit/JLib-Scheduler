@@ -143,6 +143,61 @@ int main() {
         if (ran.load() != kN) std::printf("      expected %d, got %d\n", kN, ran.load());
     }
 
+    // ---- duplicate edges (regression) ---------------------------------------------------------
+    // AddDependency used to key each entry on the dependent's pointer so a repeated edge was
+    // dropped, while dependencies_left was incremented unconditionally. The counter and the edge
+    // count then disagreed: the countdown could only reach 1, and Kahn's -- which uses the counter
+    // as the in-degree -- never drained the node, so HasCycle reported a cycle in an acyclic graph
+    // and Submit silently rejected it. This hung with nothing having run at all.
+    std::printf("duplicate edges (regression)\n");
+    {
+        std::atomic<int> ran{ 0 };
+        JLib::WaitGroup wg;
+        JLib::TaskDAG dag(sched);
+
+        auto* ta = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+        ta->waitGroup = &wg; wg.n.fetch_add(1, std::memory_order_relaxed);
+        auto* a = dag.CreateNode(ta);
+
+        auto* tb = sched.CreateTask([&ran] { ran.fetch_add(10, std::memory_order_relaxed); });
+        tb->waitGroup = &wg; wg.n.fetch_add(1, std::memory_order_relaxed);
+        auto* b = dag.CreateNode(tb);
+
+        dag.AddDependency(b, a);
+        dag.AddDependency(b, a);      // the same edge, twice
+        Check(b->dependencies_left.load() == 2, "both edges were counted");
+        Check(dag.Submit(), "an acyclic graph with a duplicate edge is NOT rejected");
+
+        sched.WaitFor(wg);            // hung here before the fix
+        Check(ran.load() == 11, "both nodes ran exactly once");
+    }
+
+    // ---- a rejected cyclic graph must release its WaitGroups (regression) ---------------------
+    // Submit's cycle path destroyed the tasks without decrementing, so rejecting a bad graph hung
+    // whoever was waiting on it -- a worse outcome than the cycle itself.
+    std::printf("rejected cyclic graph releases its WaitGroups (regression)\n");
+    {
+        std::atomic<int> ran{ 0 };
+        JLib::WaitGroup wg;
+        JLib::TaskDAG dag(sched);
+
+        auto* ta = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+        ta->waitGroup = &wg; wg.n.fetch_add(1, std::memory_order_relaxed);
+        auto* a = dag.CreateNode(ta);
+
+        auto* tb = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+        tb->waitGroup = &wg; wg.n.fetch_add(1, std::memory_order_relaxed);
+        auto* b = dag.CreateNode(tb);
+
+        dag.AddDependency(b, a);
+        dag.AddDependency(a, b);      // a genuine cycle
+        Check(!dag.Submit(), "the cycle was detected and the graph rejected");
+
+        sched.WaitFor(wg);            // hung here before the fix
+        Check(true, "WaitFor returned rather than blocking on abandoned tasks");
+        Check(ran.load() == 0, "nothing from a rejected graph ran");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
     return g_fail == 0 ? 0 : 1;
 }

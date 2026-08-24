@@ -27,6 +27,19 @@ namespace JLib {
         Task::Func origFn = nullptr;
         void* origData = nullptr;
 
+        // HOW a node finished. Cancellation is an OUTCOME, not a separate unwind: a cancelled node
+        // does not run its payload, it just transitions and propagates, so the existing dependent
+        // walk does all the work and there is no reverse traversal anywhere.
+        //
+        //   AND  any CANCELLED input  -> CANCELLED, immediately, without waiting for the countdown.
+        //   OR   FIRST input wins     -> if the first to complete is CANCELLED the gate is
+        //                                CANCELLED, and a later OK does not change it.
+        //
+        // Both fall out of Fire's existing `submitted` exchange, which already means "first caller
+        // wins" -- it was written to dedup OR predecessors and AND races, and an outcome rides
+        // through it without needing any new counter.
+        enum class Outcome : uint8_t { Completed, Cancelled };
+
         // How this node decides it's ready, given its direct predecessors:
         //   AND -> fire once ALL predecessors finish (dependencies_left counts down to 0)
         //   OR  -> fire on the FIRST predecessor (the `submitted` exchange dedups the rest)

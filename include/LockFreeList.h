@@ -211,6 +211,38 @@ namespace JLib {
 			allocator.Free(head);
 			allocator.Free(tail);
 		}
+		// APPEND, no key, no search. A Treiber-style push directly after the sentinel head: one CAS,
+		// O(1), and it never walks the list.
+		//
+		// WHY THIS EXISTS RATHER THAN add(). The one user of this container is TaskNode::dependents,
+		// which only ever appends and iterates -- it never looks anything up. It used add(), whose
+		// key was the dependent's own pointer, purely to DEDUPLICATE edges; that cost a
+		// Window::find walk per edge (so wiring a node with k dependents was O(k^2)) and, worse, it
+		// was incorrect: AddDependency incremented dependencies_left unconditionally while a
+		// duplicate add returned false, so the countdown could never reach zero and Kahn's saw an
+		// in-degree that did not match the edges, reporting a false cycle. Duplicate edges are
+		// self-consistent WITHOUT dedup -- two entries, two decrements, reaching zero -- so removing
+		// it fixes the bug and deletes the search at the same time.
+		//
+		// A list built with push() must not be used with add/remove/contains: those assume keys are
+		// sorted and every node here carries key 0. Nothing mixes them.
+		//
+		// Returns false only if the slab is exhausted. The caller must check -- add() historically
+		// did not, and placement-new over a null slot is the "access violation writing 0x0" that
+		// TaskNode's constructor comment already describes.
+		bool push(T item) {
+			EpochGuard guard(CurrentEpochSlot());
+			void* mem = allocator.Alloc();
+			if (!mem) return false;
+			LNode<T>* node = new (mem) LNode<T>(0, item);
+			node->owner = &allocator;
+			while (true) {
+				LNodeBase* first = head->next.getReference();
+				node->next.set(first, false);
+				if (head->next.compareAndSet(first, node, false, false)) return true;
+			}
+		}
+
 		bool add(uint64_t key, T item) {
 			EpochGuard guard(CurrentEpochSlot());   // RAII: leaves on every return path
 			while (true) {

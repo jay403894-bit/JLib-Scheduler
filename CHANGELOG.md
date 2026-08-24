@@ -3,6 +3,105 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.14.0 - 2026-08-24
+
+**COOPERATIVE CANCELLATION.** `TaskDAG::Cancel()` aborts a graph, and tasks can be cancelled
+individually through a scope. The design rule is one line, and everything below is a consequence of
+it:
+
+> **Cancellation is a flag, observed wherever the task is next touched. Nothing is ever removed from
+> any list.**
+
+That is why it reaches a fiber parked in an `Event`'s lock-free waiter stack **with no change to
+`Event` at all** -- the waiter stays parked and linked, and the cancellation is delivered when
+`SignalAll` resumes it. Removing a single waiter from that stack would have needed a different
+representation for a waiter entry, and this needs none.
+
+**Cancellation is an OUTCOME, not an unwind.** A cancelled DAG node does not run its payload; it
+transitions and propagates, so the ordinary dependent walk does all the work and nothing traverses
+backwards. `AND` cancels on any cancelled input, without waiting for its countdown. `OR` takes
+whichever result arrives first, cancelled included -- and a later `OK` does not revive it. Both fall
+out of `Fire`'s existing `submitted.exchange`, which already meant "first caller wins", so neither
+gate needed a new counter.
+
+**`CancelToken` / `CancelScope`** (new, `include/CancelToken.h`). A 4-byte handle -- 16-bit slot,
+16-bit generation -- living in the space the 2.9.0 flag packing reclaimed, so `sizeof(Task)` stays 64
+and the lambda capture budget stays 192. The generation is not decoration: slots recycle, and without
+it a token held by a finished task would report whichever scope inherited the slot. It **fails open**
+-- a scope that cannot get a slot, or a task with no scope, reports not-cancelled, because the
+inverse would abort live work over an unrelated resource shortage.
+
+**Four observation points, one rule:**
+
+- **Poll** -- `CurrentTaskCancelled()`, the only check a Native task can have, since it has no
+  suspension points.
+- **Pickup** -- a worker discards a cancelled task rather than running it.
+- **Release** -- `Unlock`/`Signal` skip cancelled waiters, waking each with `Cancelled` so it unwinds,
+  and hand ownership to the first that still wants it. `LockCancellable()` is the opt-in form.
+- **Resume** -- a started task is let through so it can unwind properly.
+
+**`Task::started` is load-bearing, and the reason is not obvious.** `Thread::Resume` ends in
+`Requeue(owningTask)`, so a suspended fiber returns through the *same queues as fresh work*, and a
+coroutine awaiter re-pushes its Task the same way. Only an unstarted task may be discarded.
+Discarding a started one does not cancel it, it abandons it: the fiber never returns to
+`GlobalFiberPool`, every destructor on its stack is skipped -- including any `SchedulerMutex` it
+holds, which then stays locked forever -- and a coroutine's frame and WaitGroup leak with it. Both
+paths are tested.
+
+**A cancelled task still releases its WaitGroup.** Nothing else ever will, so a caller in `WaitFor`
+would block forever on abandoned work -- cancelling would deadlock whoever asked to wait for it.
+
+**Not cancellable, deliberately:** a task already running (cooperative everywhere -- Go, C#, and Rust
+all land here, because the alternative is asynchronous stack destruction); a `SchedulerConditionVariable`
+wait (its waiters are semaphores, needing its own pass); and an already-armed DAG external node,
+which needs the per-node cancel callback that is the next phase.
+
+**[CRITICAL] Two pre-existing TaskDAG bugs, both of which hang rather than fail.** Neither is a
+regression from recent work; both were found while investigating whether the dependents list should
+become a skip list, and the investigation ended by deleting the reason it was a keyed structure at
+all.
+
+**A duplicate edge silently rejected the graph.** `AddDependency` keyed each entry on the dependent's
+own pointer so a repeated edge was dropped, while `dependencies_left` was incremented
+unconditionally. So `AddDependency(b, a)` twice left `b` counting 2 against ONE recorded edge: the
+countdown could only reach 1, and `HasCycle` -- which uses that counter as Kahn's in-degree --
+never drained `b` and reported a cycle in an acyclic graph. `Submit` then returned false and reclaimed
+everything, so **nothing ran at all**. Verified before the fix: that exact pair hung with `ran=0`.
+
+**A rejected cyclic graph hung every waiter.** `Submit`'s cycle path destroyed the tasks without
+decrementing their WaitGroups, so nothing would ever decrement for them and anyone in `WaitFor`
+blocked forever. Rejecting a bad graph was worse than the cycle. Independent of the above and
+applies to any genuinely cyclic graph.
+
+**The fix removed the deduplication rather than repairing it, which also removed an O(n) search.**
+The dedup existed to stop a dependent firing twice -- something `Fire`'s `submitted.exchange` already
+prevented, so it was guarding against the impossible. Duplicate edges are self-consistent when
+nothing dedups them: two entries, two decrements, zero reached, second `Fire` a no-op, and Kahn's
+in-degree matches the edge count again.
+
+`LockFreeList` gains `push()` -- a Treiber-style append after the sentinel head. One CAS, O(1), no
+walk. `add()` searched for an insertion point via `Window::find`, so wiring a node with k dependents
+was **O(k²)**; it is now O(k). `push()` also checks the allocator, which `add()` never did --
+placement-new over a null slot is the "access violation writing 0x0" that `TaskNode`'s constructor
+comment already describes. `AddDependency` now increments only when the edge is really recorded, so
+an exhausted slab cannot leave a phantom dependency the node waits on forever.
+
+**Scope acquisition is O(1) instead of a linear probe.** `CancelScope`'s constructor CAS-probed up to
+4,096 slots looking for a free one, and `TaskDAG` holds a `CancelScope` member -- so every graph
+construction paid that scan, once per frame for a per-frame graph, with contended CAS writes rather
+than plain reads. Slots are now handed out from an intrusive free list threaded through the table.
+The head carries an **ABA tag in its high 16 bits**, which is not optional: a plain index stack lets a
+stalled popper publish a stale successor after its slot has been recycled, silently corrupting the
+list. Tested by churning 50,000 sequential scopes through a 4,096-slot table (which fails open, not
+loudly, if recycling breaks) and 80,000 concurrent acquisitions across 8 threads checking that no two
+live scopes ever share a slot.
+
+**Worth recording for the question that started this:** the dependents list should not be a skip list
+or a hash table. It appends and iterates and never looks anything up; a skip list is O(log n) to
+append and iterates the same O(n) through fatter nodes, and a hash table iterates O(capacity) when
+iteration is the hot path. Removing the key made it O(1) append with smaller nodes -- simpler and
+faster than either.
+
 ## 2.13.0 - 2026-08-23
 
 **`TaskDAG` can now wait on things without holding a fiber.** Previously the only way for a DAG node

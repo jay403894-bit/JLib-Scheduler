@@ -151,6 +151,44 @@ namespace JLib {
         JLIB_TASK_FLAG_FIELDS
         // ---- end packed flag block --------------------------------------------------------------
 
+        // FIELD ORDER HERE IS LOAD-BEARING. `started` fills the single padding byte at 49 so the
+        // 4-byte token still lands 4-aligned at 52 and nextWaiter stays at 56. Declare them the
+        // other way round and `started` takes 56, pushing nextWaiter past the cache line --
+        // sizeof(Task) goes 64 -> 80 under alignas(16). The static_assert below catches it, and did.
+        //
+        // Has this task's body begun? Set at first pickup and never cleared.
+        //
+        // LOAD-BEARING FOR CANCELLATION, and the reason is that a queued task is not always a task
+        // waiting to START. Thread::Resume ends in TaskScheduler::Requeue(owningTask), so a fiber
+        // that suspended comes back through the same queues as fresh work, and a coroutine awaiter
+        // re-pushes its Task the same way. Those entries are handles to a LIVE 64KB stack or a live
+        // coroutine frame.
+        //
+        // So a cancelled task can only be DISCARDED when this is 0. Discarding a started one does
+        // not cancel it, it abandons it: the fiber never returns to GlobalFiberPool (leaked from a
+        // budget of 64 per worker), every destructor on its stack is skipped -- including any
+        // SchedulerMutex it still holds, which then stays locked forever -- and a coroutine's frame
+        // and WaitGroup leak with it. A started task is cancelled by being RESUMED with Cancelled so
+        // it unwinds normally. Same outcome for the caller; the only difference is which one is
+        // safe. (Rust's "drop the future" runs the frame's destructors for exactly this reason.)
+        //
+        // Lives in the spare bytes the 2.9.0 flag packing freed (49-51), so sizeof(Task) stays 64.
+        // Not a bitfield: written by the worker that picks the task up while other threads may read
+        // the flags at 48, so it needs its own memory location.
+        uint8_t started = 0;
+
+        // The cancellation scope this task belongs to, or CancelToken::kNone. A 4-byte HANDLE, not
+        // a flag: scopes are what get cancelled -- every node in a graph, every operation for a
+        // connection -- and many tasks reference one. See CancelToken.h.
+        //
+        // THIS IS WHAT THE 2.9.0 FLAG PACKING WAS FOR. Packing six one-byte flags into one freed
+        // bytes 49-55, including the 4-aligned slot at 52 this occupies: sizeof(Task) stays 64, one
+        // cache line, and the lambda capture budget is untouched at 192 bytes. Deliberately a plain
+        // uint32_t rather than a bitfield member -- it is written before the task is published and
+        // read afterwards from other threads, so it needs its own memory location rather than
+        // sharing an allocation unit with the flags above.
+        uint32_t cancelToken = 0xFFFFFFFFu;   // CancelToken::kNone, spelled out to avoid the include
+
 
         // Intrusive link for Event's waiter stack, living in the same tail padding -- the byte
         // block above ends well short of 64, so this costs nothing and the one-cache-line assert

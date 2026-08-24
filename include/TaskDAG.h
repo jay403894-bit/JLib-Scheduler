@@ -74,7 +74,9 @@ namespace JLib {
              auto* node = static_cast<TaskNode*>(data);
              TaskDAG* owner = node->owner;
              node->origFn(node->origData);   // the node's actual task
-             owner->OnTaskFinished(node);    // fire dependents (retires node -- last touch)
+             // Ran to the end, so the outcome is Completed. A node that is CANCELLED never reaches
+             // here at all -- it is never dispatched, so its payload never runs.
+             owner->OnTaskFinished(node, TaskNode::Outcome::Completed);
          }
         // Offline cycle check (Kahn's). MUST be called before any node is submitted --
         // it walks every tracked node, which self-free once running. Returns true if the
@@ -89,16 +91,62 @@ namespace JLib {
         // it also clears node tracking at the right moment (nodes self-free after this).
         bool Submit();
 
-        void OnTaskFinished(TaskNode* node);
+        void OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome = TaskNode::Outcome::Completed);
+
+        // ABORT THE GRAPH. Every node not yet dispatched completes as CANCELLED instead of running,
+        // and that outcome propagates through the dependents exactly as a normal completion does --
+        // AND cancels on any cancelled input, OR takes whichever result arrives first. Cancelled
+        // nodes never run their payload; their tasks are destroyed and returned to the slab, and
+        // their WaitGroups are decremented so anything blocked in WaitFor is released rather than
+        // hanging on work that will never happen.
+        //
+        // WHAT IT DOES NOT DO, deliberately, in this first phase:
+        //   * A task already RUNNING keeps running. Nothing can safely stop it mid-body -- that is
+        //     cooperative everywhere (Go, C#, Rust land in the same place) because the alternative
+        //     is asynchronous stack destruction. Poll a flag of your own if a long task needs to
+        //     notice.
+        //   * A task already QUEUED still runs. It has been dispatched; the cancel only stops what
+        //     has not been.
+        //   * An external node already ARMED is not reached. Nothing here knows how to cancel the
+        //     outside operation it represents -- that needs a per-node cancel callback, which is
+        //     the next phase. Until then, whoever armed it must still signal or cancel it, or the
+        //     graph below it never completes.
+        //
+        // Idempotent and callable from any thread.
+        void Cancel();
+        bool Cancelled() const { return cancelled.load(std::memory_order_acquire); }
+
+        // The cancellation scope every node's task is stamped with. Cancel() cancels it, so ONE call
+        // reaches both halves of the problem: nodes not yet dispatched are converted by Fire()'s
+        // flag check, and tasks already RUNNING see it through CurrentTaskCancelled() and can give
+        // up at their own next check. Without this a running node had no way to hear about an abort
+        // at all.
+        //
+        // Hand it to work this graph spawns but does not own -- coroutines, nested parallel loops --
+        // so an abort reaches those too:
+        //     t->cancelToken = dag.Token().Raw();
+        CancelToken Token() const { return scope.Token(); }
+
         void EndFrame();
     private:
         TaskScheduler& scheduler;
+        // Set by Cancel(). Read at the top of Fire(), which is the single funnel every node passes
+        // through on its way to being dispatched -- so one flag converts the whole remaining graph
+        // without needing a registry of nodes (Submit() clears that list; see the note there).
+        std::atomic<bool> cancelled{ false };
+        // One scope per graph, stamped onto every node's task by CreateNode. Lives as long as the
+        // DAG object, which must outlive the work it submitted -- the same requirement the node
+        // pointers already impose.
+        CancelScope scope;
+        // Completion for a node that will never run: decrement its WaitGroup, then destroy and free
+        // its task. Mirrors Worker()'s fast path exactly, minus the Execute.
+        void DisposeUnexecutedTask(TaskNode* node);
         // Tracks every node created this build, for cycle detection / root discovery.
         // Single-threaded build only; entries dangle after Submit() (nodes self-free),
         // so it is cleared there and never iterated post-submit.
         std::vector<TaskNode*> nodes;
 
-        void Fire(TaskNode* node);   // run the node (or, for a gate, propagate instantly)
+        void Fire(TaskNode* node, TaskNode::Outcome outcome = TaskNode::Outcome::Completed);
         static void NodeDeleter(void* p);   // EBR deleter: ~TaskNode + return its slot to the slab
     };
 

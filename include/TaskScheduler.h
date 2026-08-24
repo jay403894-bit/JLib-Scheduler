@@ -4,6 +4,7 @@
 #pragma once
 #define NOMINMAX
 #include "Task.h"
+#include "CancelToken.h"
 #include "TaskMPSCQueue.h"
 #include "Epochs.h"
 #include "TaskDeque.h"
@@ -971,9 +972,47 @@ namespace JLib {
 	// the queue, so it does not point into a suspended stack. The Task*/Fiber* it carries outlive the
 	// wait because a waiter cannot leave before it is released, and every release path removes the
 	// entry from the queue BEFORE resuming or pushing it.
+	// Has the currently-running task's scope been cancelled?
+	//
+	// THE ONLY CANCELLATION CHECK A NATIVE TASK GETS, and that is by necessity rather than design: a
+	// Native task has no suspension points, so there is nowhere for the runtime to deliver the news.
+	// Call it wherever a long body can usefully give up:
+	//
+	//     for (auto& chunk : work) {
+	//         if (JLib::CurrentTaskCancelled()) return;   // RAII unwinds as usual
+	//         Process(chunk);
+	//     }
+	//
+	// Fibers and coroutines will also observe cancellation at their suspension points -- that half is
+	// not built yet, see CancelToken.h -- but polling stays available to all three and is the right
+	// tool for a compute loop that never suspends.
+	//
+	// Returns false off a task entirely, and false for a task whose scope has been destroyed:
+	// unscoped work is not cancelled work. One load through a table; no lock.
+	bool CurrentTaskCancelled();
+
+	// How a cancellable wait ended.
+	enum class WaitResult : uint8_t {
+		Ok,          // acquired the lock / took the permit
+		Cancelled,   // the scope was cancelled; NOTHING WAS ACQUIRED -- do not Unlock or Signal
+	};
+
 	struct Waiter {
 		Fiber* fiber = nullptr;
 		Task*  coro  = nullptr;
+
+		// SKIP-AT-RELEASE. A cancellable waiter carries a pointer to a result slot it owns -- a
+		// local on the suspended fiber's stack, or a member of the awaiter inside a coroutine
+		// frame. Both are stable precisely because a waiter cannot leave before it is resumed, and
+		// resuming it is what lets it leave.
+		//
+		// A NULL SLOT MEANS "NOT CANCELLABLE", and that is the safety property, not an oversight.
+		// Plain Lock()/Wait() pass null and are never skipped, so they cannot come back without the
+		// thing they asked for. If cancellation applied to them, a caller who ignored the result
+		// would proceed believing it held a lock it does not hold -- silent, and far worse than
+		// waiting. Cancellation is opt-in per call site for exactly that reason.
+		WaitResult* result = nullptr;
+		uint32_t    token  = 0xFFFFFFFFu;   // CancelToken::kNone
 	};
 
 	class SchedulerMutex {
@@ -1018,6 +1057,25 @@ namespace JLib {
 		// Non-blocking try_lock
 		bool Try_Lock();
 
+		// Lock(), but observes the calling task's cancellation scope. Returns Cancelled if the
+		// scope was cancelled while waiting -- IN WHICH CASE THE LOCK IS NOT HELD and Unlock() must
+		// not be called.
+		//
+		// DELIVERY IS SKIP-AT-RELEASE, and the delay is the deliberate part of the design. A
+		// cancelled waiter is not plucked out of the queue -- removing one entry would need the
+		// queue to support arbitrary removal and the canceller to know which lock to look in. It is
+		// skipped when the lock is NEXT RELEASED: Unlock walks past it, resumes it with Cancelled so
+		// it can unwind, and hands ownership to the first waiter that is still interested.
+		//
+		// So cancellation here is bounded by how long the current holder keeps the lock, not
+		// immediate. That is acceptable because a lock nobody releases hangs an uncancelled waiter
+		// just as thoroughly; it is not a case cancellation was going to rescue. Waking a parked
+		// waiter the instant Cancel() is called needs a scope->waiter registry, which costs more
+		// than it currently buys.
+		//
+		// A BARE THREAD checks the token between spins instead, since it never enqueues.
+		[[nodiscard]] WaitResult LockCancellable();
+
 		// COROUTINE PATH. Do not call this directly -- use `co_await JLib::LockAsync(m)` from
 		// Coroutine.h, which is the only correct way to reach it.
 		//
@@ -1034,6 +1092,11 @@ namespace JLib {
 		// Once this returns false the task is visible to Unlock, so the caller must touch neither the
 		// task nor its coroutine handle again: it may already be running on another worker.
 		bool LockAsyncEnqueue(Task* coroTask);
+
+		// Cancellable form of the above, for `co_await LockAsyncCancellable(m)`. `result` is a slot
+		// inside the awaiter (and therefore inside the coroutine frame), which survives the
+		// suspension for the same reason a fiber's stack local does.
+		bool LockAsyncEnqueue(Task* coroTask, WaitResult* result);
 	};
 
 	class SchedulerSemaphore {
