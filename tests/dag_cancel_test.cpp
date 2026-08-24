@@ -790,19 +790,125 @@ int main() {
         Check(reachedEnd.load() == 1, "the suspended task was resumed and unwound, not discarded");
     }
 
+
+    // ---- direct cancellation now reaches a waiter queue ----------------------------------------
+    // Task.h says a task is cancelled if EITHER its scope was cancelled OR it was cancelled
+    // individually, and TaskScheduler.h calls IsTaskCancelled "THE one place cancellation is
+    // decided". Until 3.2.1 the mutex and semaphore release paths did not go through it -- they read
+    // the SCOPE TOKEN copied into the Waiter, so cancelledDirect was invisible and a directly
+    // cancelled waiter parked on a semaphore could not be cancelled at all.
+    //
+    // This waiter has NO SCOPE (token kNone), so the old predicate had nothing to look at. If the
+    // release path ever goes back to reading the token, this waiter takes the permit and the first
+    // check below fails.
+    std::printf("a DIRECTLY cancelled waiter is skipped at release\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        std::atomic<int> cancelled{ 0 }, acquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                cancelled.fetch_add(1, std::memory_order_relaxed);
+            else
+                acquired.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->waitGroup = &wg;                       // deliberately no cancelToken
+        sched.Push(t);
+
+        Check(WaitUntil(parked, 1), "the unscoped waiter parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        // Exactly what Event::CancelWaiters does to a waiter it has claimed.
+        t->cancelledDirect = 1;
+        sem.Signal();
+        sched.WaitFor(wg);
+
+        Check(cancelled.load() == 1, "it woke Cancelled from cancelledDirect alone, with no scope");
+        Check(acquired.load() == 0, "it did not take the permit");
+        Check(sem.Try_Wait(), "and the permit went back to the counter for someone who wants it");
+    }
+
+    // ---- THE CLEANUP TRAP ----------------------------------------------------------------------
+    // Pins the behaviour documented at SchedulerMutex::LockCancellable, because a rule with no test
+    // is a rule somebody "fixes" later.
+    //
+    // An unwind path runs BECAUSE the scope was cancelled, so its token is already cancelled when it
+    // gets there. LockCancellable pre-checks the token before touching the mutex, so on that path it
+    // returns Cancelled WITHOUT EVEN LOOKING AT THE LOCK -- here the mutex is provably free and it
+    // still refuses. Not a race that leaks sometimes: it is every time. Cleanup uses plain Lock().
+    std::printf("LockCancellable refuses a FREE lock once the scope is cancelled\n");
+    {
+        JLib::SchedulerMutex m;
+        JLib::CancelScope scope;
+        // NOT cancelled before the push: a task whose scope is already cancelled is DISCARDED AT
+        // PICKUP and never runs, which would test the pickup path instead of this one. The task
+        // cancels itself below, exactly as work does when it discovers it has been abandoned.
+        std::atomic<int> refused{ 0 }, gotIt{ 0 }, cleanedUp{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            scope.Cancel();          // now we are on an unwind path, and the token is cancelled
+
+            // Nobody holds this mutex. Try_Lock would succeed right now.
+            if (m.LockCancellable() == JLib::WaitResult::Cancelled) refused.fetch_add(1, std::memory_order_relaxed);
+            else { gotIt.fetch_add(1, std::memory_order_relaxed); m.Unlock(); }
+
+            // What the unwind must actually use. Plain Lock() cannot fail, so the release happens.
+            m.Lock();
+            cleanedUp.fetch_add(1, std::memory_order_relaxed);
+            m.Unlock();
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->cancelToken = scope.Token().Raw();
+        t->waitGroup = &wg;
+        sched.Push(t);
+        sched.WaitFor(wg);
+
+        Check(refused.load() == 1, "an uncontended lock was still refused: the pre-check fires first");
+        Check(gotIt.load() == 0, "it never acquired, so there is nothing to Unlock");
+        Check(cleanedUp.load() == 1, "plain Lock() on the same free mutex succeeded: cleanup belongs there");
+        Check(m.Try_Lock(), "and the mutex is undamaged afterwards");
+        m.Unlock();
+    }
+
     // ---- scope slots recycle -------------------------------------------------------------------
     // There are 4,096 slots. Creating far more scopes than that proves ReleaseSlot returns them:
     // if it did not, everything past the 4,096th would fail open (Valid() == false) and cancellation
     // would silently stop working -- which is exactly the failure mode that would never show up in
     // a behavioural test, because failing open looks like "nothing was cancelled".
+    //
+    // Valid() IS NOT ENOUGH ON ITS OWN, and this test used to stop there. Valid() only says a slot
+    // was obtained; it says nothing about whether the token still RESOLVES to it. So each scope is
+    // also made to report its OWN cancellation -- the least it can possibly be asked to do, and the
+    // thing that goes silently false if the generation check ever stops matching.
+    //
+    // The count is past 65,536 ON PURPOSE. The free list is LIFO, so create/destroy in a loop reuses
+    // the SAME slot every time and drives one generation counter as fast as it can go. 65,536 is
+    // where a 16-bit generation field wraps, and a per-frame scope reaches it in about 18 minutes at
+    // 60fps -- well inside one play session, and invisible unless something checks resolution.
     std::printf("cancel scope slots recycle\n");
     {
         int invalid = 0;
-        for (int i = 0; i < 50000; ++i) {
+        long long firstUnresolvable = -1;
+        for (long long i = 0; i < 70000; ++i) {
             JLib::CancelScope s;
             if (!s.Valid()) { ++invalid; break; }
+            s.Cancel();
+            if (!s.Token().Cancelled()) { firstUnresolvable = i; break; }
         }
-        Check(invalid == 0, "50,000 sequential scopes through a 4,096-slot table, all valid");
+        Check(invalid == 0, "70,000 sequential scopes through a 4,096-slot table, all valid");
+
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+                      "every one of them could still report its own cancellation%s",
+                      firstUnresolvable < 0 ? ""
+                                            : " -- FAILED OPEN, see iteration in the count below");
+        Check(firstUnresolvable < 0, msg);
+        if (firstUnresolvable >= 0)
+            std::printf("      first scope that could not resolve its own token: %lld\n", firstUnresolvable);
     }
 
     // Same under contention: the free list is a Treiber stack with an ABA tag, and a lost or

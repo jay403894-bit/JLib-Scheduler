@@ -18,12 +18,20 @@
 // destroying a stack asynchronously, which no language can make safe. Nothing here can stop a task
 // that is mid-body and not looking.
 //
-// WHAT IS AND IS NOT IN THIS FIRST CUT. The token plumbing, the Native poll path, and TaskDAG
-// integration are here. WAKING AN ALREADY-PARKED WAITER IS NOT -- a fiber asleep on an Event, or a
-// coroutine queued on a SchedulerMutex, is not reached by Cancel() yet. That needs waiters to be
-// removable from those lists, which is a real lifetime problem and not a small one; see the note in
-// SchedulerConditionVariable::Wait about what a wait that can return UNSIGNALLED costs. It is
-// deliberately a separate step so this one does not touch the model-checked wake protocol.
+// WAKING AN ALREADY-PARKED WAITER IS IMPLEMENTED as of 3.1.0/3.2.0, and this note used to say it was
+// not. Event, SchedulerSemaphore and SchedulerConditionVariable each have an eager CancelWaiters
+// that wakes matching waiters with no signal at all. SchedulerMutex deliberately does not: a binary
+// SchedulerSemaphore(1, 1) already is an eagerly cancellable lock, and a second lock type would be a
+// worse copy of it. Every one of those paths removes a waiter from its structure BEFORE waking it,
+// because the queue entries point into suspended stack frames.
+//
+// STILL MISSING: timers and timeouts, which is the only real gap. See the CHANGELOG for 3.2.0.
+//
+// TWO BOUNDS WORTH KNOWING. There are kCancelSlots (4,096) LIVE scopes, not the 65,536 the token's
+// 16-bit index could address -- and exhaustion fails open, so a workload that keeps a scope per
+// connection must size this deliberately. And a generation is 16 bits, so a handle stale by exactly
+// 65,536 reuses of its slot aliases whatever holds it now; the free list is LIFO, so a create/destroy
+// loop drives ONE slot's counter and reaches that bound far sooner than a spread-out workload would.
 
 #include <atomic>
 #include <cstdint>

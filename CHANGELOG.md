@@ -3,6 +3,73 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.2.1 - 2026-08-24
+
+Found by auditing cancellation before starting timers and async I/O, rather than by any test.
+
+### `CancelScope` failed open permanently after 65,536 reuses of a slot
+
+The constructor packs `generation & 0xFFFF` into the token. `ResolveCancelSlot` compared the **full
+32-bit** counter against it. The moment a slot's counter passed 65,535 the comparison could never
+match again: resolve returned null, `Cancelled()` read false, and **that slot stopped cancelling
+anything, permanently and silently.**
+
+Reachable, not theoretical. The free list is **LIFO**, so a create/destroy loop reuses one slot and
+drives one counter -- a per-frame `TaskDAG` scope reaches 65,536 in about **18 minutes at 60fps**,
+and from then on every scope that took the slot was dead too.
+
+Fixed by masking the comparison. Wrapping is the *correct* behaviour: 16 bits of generation means a
+handle stale by exactly 65,536 reuses aliases a live scope, which is the documented bound. Never
+matching is not a safer version of that -- it is the exact failure the generation exists to prevent,
+applied to every token instead of a rare one.
+
+**Why no test caught it.** The recycle test looped 50,000 scopes checking only `s.Valid()` -- which
+is just `raw_ != kNone`, "a slot was obtained." It never checked the token still RESOLVED, so it
+would have passed at any iteration count. It now makes each scope report its **own** cancellation --
+the least a scope can be asked to do -- and runs 70,000 to cross the wrap. It reproduces at 65,119.
+
+### Cancellation checks now really do go through one place
+
+`IsTaskCancelled` is documented as "THE one place cancellation is decided," so that a new way of
+being cancelled reaches every observation point. It did not: nine checks in the mutex, semaphore and
+condition-variable paths read the scope token copied into the `Waiter`, so **`cancelledDirect` was
+invisible to every waiter queue** -- a task cancelled individually and parked on a semaphore could
+not be cancelled at all.
+
+The reason given for the copy was that a releaser holds a `Fiber*` and there is no fiber-to-task link
+to walk back through. **There always was one:** `Fiber::owningTask`. A parked waiter is mid-task by
+definition, so it is valid for exactly the window a waiter queue cares about.
+
+Release-side checks now resolve `next.fiber ? next.fiber->owningTask : next.coro`; caller-side
+pre-checks use the `callerTask` they already had. **Every execution mode ends at a `Task`** -- which
+is the point, because `Task` is the common denominator and a coroutine or Native task has no fiber.
+The `Waiter` still carries the token, but only so `CancelWaiters` can select a *scope*.
+
+Pinned by a test using an **unscoped** waiter -- token `kNone`, so the old predicate had nothing to
+look at -- cancelled by `cancelledDirect` alone.
+
+### Documented: never put cleanup behind a cancellable spelling
+
+An unwind path runs *because* the scope was cancelled, so its token is already cancelled when it
+gets there -- and every cancellable acquire pre-checks the token *before touching the primitive*. So
+`LockCancellable` on an unwind path returns `Cancelled` **without even looking at the lock**: the
+mutex can be sitting free and it still refuses, every time, and the release never happens.
+
+Cancellable spellings are for the productive work you are abandoning. The unwind that abandoning it
+requires uses plain `Lock()`, which cannot fail. Documented at `LockCancellable` and pinned by a test
+that shows a free mutex being refused.
+
+Also corrected there: **a cancellable lock is `SchedulerSemaphore(1, 1)`** -- `WaitCancellable`
+acquires, `Signal` releases, `CancelWaiters` ejects eagerly, `maxPermits = 1` clamps a double
+release. That is why there is no eager cancel on `SchedulerMutex` and no second lock type. The trade
+is ownership: a permit has no owner.
+
+### Header corrections
+
+`CancelToken.h` still said waking an already-parked waiter was not implemented; it has been since
+3.1.0. It also claimed 65,536 live scopes when `kCancelSlots` is **4,096** -- and exhaustion fails
+open, which a workload keeping a scope per connection needs to know.
+
 ## 3.2.0 - 2026-08-24
 
 **`SchedulerConditionVariable::WaitCancellable(mutex)` and `CancelWaiters(token)`.** A condition
@@ -61,12 +128,25 @@ abort; a default-constructed token means everyone, for teardown.
 | `SchedulerConditionVariable` | eager (`CancelWaiters`), skip-at-release (`WaitCancellable`), uncancellable (`Wait`) |
 | coroutines awaiting a mutex or permit | skip-at-release |
 | `TaskDAG`, worker pickup | outcome / discard |
-| `SchedulerMutex` | **deliberately uncancellable** |
-| fork-join fences | **deliberately uncancellable** |
+| `SchedulerMutex` | skip-at-release only (`LockCancellable` / `LockAsyncCancellable`) -- **no eager `CancelWaiters`** |
+| fork-join fences | **uncancellable, deliberately** |
 
-The last two are not gaps. A critical section that aborts mid-wait complicates every RAII invariant
-around it and its holder releases promptly anyway; sixteen workers finishing a broadphase step
-should run to completion.
+The last two rows are limits, not gaps. The mutex has the opt-in cancellable spelling; what it has
+no version of is an EAGER cancel -- and it needs none, because **`SchedulerSemaphore sem(1, 1)` is
+already an eagerly cancellable lock**: `WaitCancellable` acquires, `Signal` releases,
+`CancelWaiters(tok)` ejects a waiter immediately, and `maxPermits = 1` clamps a double release
+instead of inventing a second permit. A second lock type would be a worse copy of a primitive that
+exists. The trade is **ownership** -- a permit has no owner, so you give up the holder record and
+the diagnostics built on it. A fence has neither spelling: sixteen workers finishing a broadphase
+step should run to completion.
+
+**And cleanup must never sit behind a cancellable spelling.** An unwind path runs *because* the
+scope was cancelled, so its token is already cancelled when it gets there -- and every cancellable
+acquire pre-checks the token before touching the primitive. `LockCancellable` on an unwind path
+returns `Cancelled` **without even looking at the lock**: not a race that leaks sometimes, but a
+free lock refused every single time, with the release never happening. Cancellable spellings are for
+the productive work you are abandoning; the unwind that abandoning it requires uses plain `Lock()`,
+which cannot fail. Documented at `LockCancellable` in the header.
 
 **Timers and timeouts remain the real gap, because no such primitive exists.** An entity dying and
 unwinding its queued delays, and `co_await Acquire(timeout)`, both need a deadline structure with

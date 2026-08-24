@@ -2074,7 +2074,14 @@ void SchedulerMutex::Unlock()
 
 		// A null result slot means the waiter is NOT cancellable and must not be skipped -- see the
 		// note on Waiter. Only an opted-in waiter can be passed over.
-		if (next.result && CancelToken(next.token).Cancelled()) {
+		//
+		// ASK THE TASK, not the token. Fiber::owningTask is the task suspended on this fiber, and a
+		// parked waiter is mid-task by definition, so it is exactly the right task for the whole
+		// window this queue cares about. Going through IsTaskCancelled is what makes the "one place
+		// cancellation is decided" claim in TaskScheduler.h actually true here: a waiter cancelled
+		// INDIVIDUALLY (cancelledDirect, no scope involved) is now skipped too. Reading the copied
+		// token saw only the scope, so a directly-cancelled waiter parked here was uncancellable.
+		if (next.result && IsTaskCancelled(next.fiber ? next.fiber->owningTask : next.coro)) {
 			*next.result = WaitResult::Cancelled;
 			// Resumed WITHOUT the lock. It returns Cancelled and unwinds; we keep ownership and
 			// look for someone who still wants it.
@@ -2117,14 +2124,16 @@ WaitResult SchedulerMutex::LockCancellable() {
 	auto thread = Thread::GetCurrent();
 	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
 
-	// The token is read ONCE, here, and carried in the Waiter. The releaser cannot look it up
-	// later: it has a Fiber*, and there is no fiber->task link to walk back through.
+	// The token is still carried in the Waiter, but ONLY so CancelWaiters can tell which SCOPE a
+	// waiter belongs to. Whether it is cancelled is asked of the task itself at release, through
+	// Fiber::owningTask -- this comment used to claim there was no fiber->task link to walk back
+	// through, and there always was one.
 	Task* callerTask = TaskScheduler::IsInitialized() ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
 	const uint32_t tok = callerTask ? callerTask->cancelToken : CancelToken::kNone;
 
 	// Already cancelled before we even try: fail immediately rather than acquire a lock the caller
 	// is about to be told to drop.
-	if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+	if (IsTaskCancelled(callerTask)) return WaitResult::Cancelled;
 
 	if (current != nullptr) {
 		WaitResult result = WaitResult::Ok;   // stack local -- stable until we are resumed
@@ -2163,7 +2172,7 @@ WaitResult SchedulerMutex::LockCancellable() {
 	// attempts instead -- which is also why its cancellation is prompt where a fiber's waits for the
 	// next release.
 	while (!Try_Lock()) {
-		if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+		if (IsTaskCancelled(callerTask)) return WaitResult::Cancelled;
 		ContendedSpinStep();
 	}
 	return WaitResult::Ok;
@@ -2283,16 +2292,15 @@ WaitResult SchedulerSemaphore::WaitCancellable() {
 	auto thread = Thread::GetCurrent();
 	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
 
-	// Read ONCE, here, and carried in the Waiter. The releaser cannot look it up later: it holds a
-	// Fiber*, and there is no fiber->task link to walk back through. Same reasoning as
-	// SchedulerMutex::LockCancellable.
+	// The token is still carried in the Waiter so CancelWaiters can select a SCOPE. Whether a waiter
+	// is cancelled is asked of its task at release, via Fiber::owningTask -- see SchedulerMutex.
 	Task* callerTask = TaskScheduler::IsInitialized() ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
 	const uint32_t tok = callerTask ? callerTask->cancelToken : CancelToken::kNone;
 
 	// Already cancelled before trying: fail immediately rather than consume a permit the caller is
 	// about to be told to drop. Taking one here would strand it -- the caller returns Cancelled and
 	// has no reason to Signal.
-	if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+	if (IsTaskCancelled(callerTask)) return WaitResult::Cancelled;
 
 	if (current != nullptr) {
 		WaitResult result = WaitResult::Ok;   // stack local -- stable until we are resumed
@@ -2326,7 +2334,7 @@ WaitResult SchedulerSemaphore::WaitCancellable() {
 	bool got = false;
 	SpinThenHelp([&] {
 		if (Try_Wait()) { got = true; return true; }
-		return CancelToken(tok).Cancelled();
+		return IsTaskCancelled(callerTask);
 	});
 	return got ? WaitResult::Ok : WaitResult::Cancelled;
 }
@@ -2401,7 +2409,9 @@ void SchedulerSemaphore::Signal()
 			spinLock.clear(std::memory_order_release);
 
 			// Null result slot => not cancellable => never skipped. See the note on Waiter.
-			const bool skip = next.result && CancelToken(next.token).Cancelled();
+			// Ask the TASK, via Fiber::owningTask -- see the matching note in SchedulerMutex::Unlock.
+			// This is what lets a directly-cancelled waiter (cancelledDirect) be skipped here too.
+			const bool skip = next.result && IsTaskCancelled(next.fiber ? next.fiber->owningTask : next.coro);
 			if (skip) *next.result = WaitResult::Cancelled;
 			else if (next.result) *next.result = WaitResult::Ok;
 
@@ -2588,7 +2598,7 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
 	if (current != nullptr) {
 		// Already cancelled: do not park at all. The mutex is still held here and stays held, so
 		// this returns exactly as the contract promises -- with the lock, and with nothing waited on.
-		if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+		if (IsTaskCancelled(callerTask)) return WaitResult::Cancelled;
 
 		SchedulerSemaphore localWaitSemaphore(0, 1);
 
@@ -2609,11 +2619,11 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
 
 	// Bare thread: no fiber to park, so nothing to eject and no early return to make safe. The
 	// cancellation it can observe is the one that is already true.
-	if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+	if (IsTaskCancelled(callerTask)) return WaitResult::Cancelled;
 	mutex.Unlock();
 	ContendedSpinStep();
 	mutex.Lock();
-	return CancelToken(tok).Cancelled() ? WaitResult::Cancelled : WaitResult::Ok;
+	return IsTaskCancelled(callerTask) ? WaitResult::Cancelled : WaitResult::Ok;
 }
 
 // EAGER cancellation. Removes matching waiters from the queue and then wakes them, in that order.

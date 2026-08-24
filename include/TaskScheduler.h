@@ -1237,6 +1237,31 @@ namespace JLib {
 		// waiter the instant Cancel() is called needs a scope->waiter registry, which costs more
 		// than it currently buys.
 		//
+		// NEVER PUT CLEANUP BEHIND THIS SPELLING. A mutex is the primitive most likely to guard the
+		// very state an unwind has to touch -- a pool to return a block to, a registry to remove
+		// yourself from -- and an unwind path runs BECAUSE the scope was cancelled. So the token is
+		// already cancelled by the time it gets there, the pre-check above fires, and this returns
+		// Cancelled WITHOUT EVEN LOOKING AT THE LOCK. Not a race that leaks sometimes: the lock can
+		// be sitting free and it still returns Cancelled, every single time, and the release never
+		// happens.
+		//
+		// The rule that follows: cancellable spellings are for the PRODUCTIVE work you are
+		// abandoning. The unwind that abandoning it requires uses plain Lock(), which cannot fail --
+		// cancellation is what put you on that path, so it must not also be able to block your exit
+		// from it.
+		//
+		// AND IF YOU DO WANT AN EAGERLY CANCELLABLE LOCK, YOU ALREADY HAVE ONE: SchedulerSemaphore
+		// sem(1, 1). WaitCancellable() acquires, Signal() releases, CancelWaiters(tok) ejects a
+		// waiter immediately, and maxPermits=1 clamps a double release instead of inventing a second
+		// permit. That is why there is no eager cancel here and no second lock type -- it would be a
+		// worse copy of a primitive that already exists.
+		//
+		// The trade is OWNERSHIP, and it is the whole difference: a permit has no owner (see Lock's
+		// note on why holding one is unguarded), so a binary semaphore gives up the holder record,
+		// the deadlock diagnostics built on it, and the guarantee that whoever releases is whoever
+		// acquired. Take the semaphore when the wait may be unbounded and abandonment is a real
+		// outcome; take the mutex when you want the lock to be owned.
+		//
 		// A BARE THREAD checks the token between spins instead, since it never enqueues.
 		[[nodiscard]] WaitResult LockCancellable();
 

@@ -69,7 +69,20 @@ namespace JLib {
             // The generation is read AFTER the bounds check and compared before the caller reads
             // `cancelled`. A slot recycled since this handle was issued fails here, which is the
             // whole point: without it a stale token reports whichever scope inherited the slot.
-            if (s->generation.load(std::memory_order_acquire) != gen) return nullptr;
+            // MASK BEFORE COMPARING. The token carries only the low 16 bits (the ctor packs
+            // `generation & 0xFFFF`), while this counter is a full 32-bit value that keeps
+            // climbing. Comparing them unmasked worked until a slot's counter passed 65,535 and
+            // then could NEVER match again: resolve returned null, Cancelled() read false, and the
+            // slot FAILED OPEN PERMANENTLY -- cancellation silently stopped working with no error
+            // anywhere. The free list is LIFO, so a create/destroy loop reuses one slot and drives
+            // one counter; a per-frame scope reached this in about 18 minutes at 60fps, and from
+            // then on every scope taking that slot was dead too.
+            //
+            // Wrapping is the CORRECT behaviour here, not a leftover: 16 bits of generation means a
+            // handle stale by exactly 65,536 reuses aliases a live scope, and that is the documented
+            // bound. Silently never matching is not a safer version of that -- it is the failure
+            // mode the generation exists to prevent, applied to every token instead of a rare one.
+            if ((s->generation.load(std::memory_order_acquire) & 0xFFFFu) != gen) return nullptr;
             return s;
         }
 
