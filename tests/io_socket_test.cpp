@@ -29,6 +29,8 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <vector>
+#include <new>
 
 static int g_fail = 0;
 static void Check(bool c, const char* what) {
@@ -262,6 +264,104 @@ int main() {
 
     ::closesocket(client2);
     ::closesocket(accepted2);
+
+    // ---- IoStream serialises concurrent writers ------------------------------------------------
+    // THE TEST THAT JUSTIFIES IoStream EXISTING. Many coroutines write framed messages to one socket
+    // at the same time. Each message is sent as TWO segments -- a header and a body -- so a pair of
+    // unserialised sends can interleave and produce a header immediately followed by somebody else's
+    // body. The receiver reassembles and checks every frame, so interleaving shows up as a corrupt
+    // frame rather than as a hang or an error code.
+    //
+    // Written deliberately in the shape that is WRONG without IoStream: N independent writers, no
+    // ordering discipline anywhere in the caller.
+    std::printf("IoStream serialises concurrent writers on one socket\n");
+    {
+        SOCKET c3 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ::connect(c3, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
+        SOCKET a3 = ::accept(listener, nullptr, nullptr);
+        Check(a3 != INVALID_SOCKET && io.RegisterSocket(a3) && io.RegisterSocket(c3),
+              "a third connection for the concurrency test");
+        // Squeeze the send buffer so the provider has to break a large send up.
+        int snd = 4096;
+        ::setsockopt(c3, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd), sizeof snd);
+
+        // WHAT THIS TEST DOES AND DOES NOT PROVE -- read before trusting it.
+        //
+        // It proves IoStream WORKS: 6 concurrent writers, 1.1 MB through one socket, every frame
+        // delivered whole and in one piece.
+        //
+        // It does NOT prove IoStream is NECESSARY. The negative control -- the same test on the raw
+        // unserialised overload -- was run repeatedly at 96 KB frames with SO_SNDBUF squeezed to
+        // 4 KB to force the provider to split, and NEVER reproduced interleaving. An earlier version
+        // used 16-byte frames and was outright vacuous; this one is merely inconclusive.
+        //
+        // So the justification for IoStream is MSDN.s documented warning and portability across
+        // Winsock providers, NOT an observed failure here. That is a weaker case than "we saw it
+        // corrupt", and it is the honest one. The read direction is the stronger argument anyway:
+        // two outstanding receives on one stream socket are filled in completion order, and which
+        // bytes land in which buffer is arbitrary regardless of provider.
+        constexpr int kWriters = 6;
+        constexpr int kHalf    = 96 * 1024;
+        constexpr int kFrame   = kHalf * 2;
+
+        // Heap, not the coroutine frame: frames come from the task slab in size classes measured in
+        // bytes, and 96 KB of locals would not fit in one.
+        static std::vector<char> payload[kWriters];
+        for (int i = 0; i < kWriters; ++i)
+            payload[i].assign(kFrame, static_cast<char>('A' + i));
+
+        static JLib::IoStream stream{ 0 };
+        stream.~IoStream();
+        new (&stream) JLib::IoStream(c3);          // rebind to this connection
+
+        // The receiver has to run CONCURRENTLY: with a 4 KB send buffer the senders block until
+        // somebody drains, so receiving after WaitFor would simply deadlock.
+        std::vector<char> got(static_cast<size_t>(kWriters) * kFrame);
+        std::atomic<int> total{ 0 };
+        std::thread drain([&] {
+            int n = 0, want = kWriters * kFrame;
+            while (n < want) {
+                const int k = ::recv(a3, got.data() + n, want - n, 0);
+                if (k <= 0) break;
+                n += k;
+            }
+            total.store(n, std::memory_order_release);
+        });
+
+        JLib::WaitGroup wg;
+        for (int i = 0; i < kWriters; ++i) {
+            JLib::Spawn([](JLib::IoStream* st, int id) -> JLib::Coro {
+                // Both halves carry the SAME letter, so a frame whose halves disagree -- or whose
+                // bytes are not all one letter -- is proof that two sends interleaved.
+                const JLib::IoBuffer v[2] = {
+                    { payload[id].data(),         kHalf },
+                    { payload[id].data() + kHalf, kHalf },
+                };
+                co_await JLib::SendVAsync(*st, v, 2);
+                co_return;
+            }(&stream, i), &wg);
+        }
+        sched.WaitFor(wg);
+        drain.join();
+
+        char m[128];
+        std::snprintf(m, sizeof m, "received all %d bytes (%d)", kWriters * kFrame, total.load());
+        Check(total.load() == kWriters * kFrame, m);
+
+        // Every frame must be kFrame bytes of ONE letter. Interleaving shows up as a letter change
+        // partway through a frame.
+        int corrupt = 0;
+        for (int f = 0; f + kFrame <= total.load(); f += kFrame) {
+            const char letter = got[f];
+            for (int k = 1; k < kFrame; ++k)
+                if (got[f + k] != letter) { ++corrupt; break; }
+        }
+        std::snprintf(m, sizeof m, "every frame is intact -- no interleaving (%d corrupt)", corrupt);
+        Check(corrupt == 0, m);
+
+        ::closesocket(c3);
+        ::closesocket(a3);
+    }
 
     // ---- UDP ------------------------------------------------------------------------------------
     // Separate calls because an unconnected datagram socket has no peer: every datagram carries one,

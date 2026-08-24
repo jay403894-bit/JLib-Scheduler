@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace JLib {
 
@@ -97,7 +98,11 @@ namespace JLib {
         IoRequest* head = nullptr;      // in-flight, newest first
         std::size_t count = 0;
 
-        std::thread worker;
+        // MANY THREADS ON ONE PORT is what IOCP is built for, and the port's own concurrency limit
+        // (set at creation) caps how many the kernel lets RUN at once -- so extra threads cost a
+        // stack and nothing else while they are parked in GetQueuedCompletionStatus. The count comes
+        // from TaskScheduler because the pool reserves one core for each, and the two must agree.
+        std::vector<std::thread> workers;
         bool running  = false;
         bool stopping = false;
 
@@ -121,10 +126,12 @@ namespace JLib {
         }
 
         // Caller holds `m`.
-        void EnsureThread() {
+        void EnsureThreads() {
             if (running) return;
             running = true;
-            worker = std::thread([this] { Run(); });
+            const unsigned n = TaskScheduler::IoCompletionThreads();
+            workers.reserve(n);
+            for (unsigned i = 0; i < n; ++i) workers.emplace_back([this] { Run(); });
         }
 
         static IoResult Classify(BOOL ok, DWORD err, DWORD bytes) {
@@ -162,7 +169,13 @@ namespace JLib {
                     // Not a completion: the port died, or Stop() posted the wake-up below.
                     if (!ok) return;
                     std::lock_guard<std::mutex> lk(m);
-                    if (stopping && count == 0) return;
+                    if (stopping && count == 0) {
+                        // Cascade the exit: one more wake-up so the next thread also sees it. Stop
+                        // posts one per thread, and this makes the shutdown robust if a thread
+                        // consumed a wake-up while work was still draining.
+                        ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
+                        return;
+                    }
                     continue;
                 }
 
@@ -204,7 +217,10 @@ namespace JLib {
                 if (resume && TaskScheduler::IsInitialized())
                     TaskScheduler::Instance().Push(resume);
 
-                if (lastOne) return;
+                if (lastOne) {
+                    ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
+                    return;
+                }
             }
         }
 
@@ -238,7 +254,7 @@ namespace JLib {
                     if (out) *out = IoResult{ IoStatus::Failed, 0, ERROR_SHUTDOWN_IN_PROGRESS };
                     return true;
                 }
-                EnsureThread();
+                EnsureThreads();
                 // LINKED BEFORE SUBMITTED, the same ordering rule as every parking path here: a fast
                 // operation can complete on the reactor thread while this one is still inside
                 // ReadFile, and the completion must find the request already discoverable.
@@ -265,7 +281,11 @@ namespace JLib {
     };
 
     IoReactor::IoReactor() : impl(new Impl()) {
-        impl->port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
+        // The last argument is the port.s CONCURRENCY LIMIT: how many threads the kernel lets run
+        // at once, not how many may wait. Matched to the thread count so extra threads park in
+        // GetQueuedCompletionStatus and cost a stack rather than a core.
+        impl->port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0,
+                                              TaskScheduler::IoCompletionThreads());
     }
 
     IoReactor::~IoReactor() {
@@ -310,7 +330,7 @@ namespace JLib {
         {
             std::lock_guard<std::mutex> lk(impl->m);
             if (impl->stopping) return false;
-            impl->EnsureThread();
+            impl->EnsureThreads();
         }
         // Associating with an existing port returns the port itself; the completion key is unused
         // because the OVERLAPPED already identifies the request.
@@ -539,12 +559,14 @@ namespace JLib {
         RequestCancel(CancelToken{});
 
         if (needJoin) {
-            std::thread t;
-            { std::lock_guard<std::mutex> lk(impl->m); t.swap(impl->worker); }
-            // Wake the drain loop so it notices `stopping` once the queue is empty. A null OVERLAPPED
-            // is how it tells a wake-up from a completion.
-            ::PostQueuedCompletionStatus(impl->port, 0, 0, nullptr);
-            if (t.joinable()) t.join();
+            std::vector<std::thread> ts;
+            { std::lock_guard<std::mutex> lk(impl->m); ts.swap(impl->workers); }
+            // ONE WAKE-UP PER THREAD. A null OVERLAPPED is how the drain loop tells a wake-up from a
+            // completion; each thread also posts one more on its way out, so the exit cascades even
+            // if a thread consumed a wake-up while work was still draining.
+            for (std::size_t i = 0; i < ts.size(); ++i)
+                ::PostQueuedCompletionStatus(impl->port, 0, 0, nullptr);
+            for (auto& t : ts) if (t.joinable()) t.join();
         }
         impl->running = false;
     }

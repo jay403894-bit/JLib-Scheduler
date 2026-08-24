@@ -758,8 +758,21 @@ namespace JLib {
 		// Implies EnableTimers: an I/O timeout is a deadline, and every non-trivial reactor user
 		// wants one. Enabling I/O and then discovering timers are off would be a papercut with no
 		// upside.
-		static void EnableIoReactor(bool on) noexcept;
+		//
+		// `completionThreads` is HOW MANY THREADS DRAIN THE COMPLETION PORT, and it is a parameter of
+		// this call rather than a knob on IoReactor for one reason: the pool reserves one core PER
+		// completion thread, so the two numbers must agree. As separate settings they would drift,
+		// and drifting means silent oversubscription -- the exact failure this opt-in exists to stop.
+		//
+		//     EnableIoReactor(true, 4);  Init(0);   // hw-6: main, timer, 4 completion threads
+		//
+		// DEFAULT 1, AND NOT MEASURED. IOCP is built for many threads on one port and a busy server
+		// will want more than one -- but the crossover has not been benchmarked here, and the honest
+		// default is the one whose cost is known. Raise it against a profile, not a hunch; the port's
+		// concurrency limit is set to match, so the kernel runs at most this many at once regardless.
+		static void EnableIoReactor(bool on, unsigned completionThreads = 1) noexcept;
 		static bool IoReactorEnabled() noexcept;
+		static unsigned IoCompletionThreads() noexcept;
 
 		// Give the timer thread a core of its own, so an app that uses deadlines does not run one
 		// thread over the machine.

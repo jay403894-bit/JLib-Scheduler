@@ -213,23 +213,125 @@ namespace JLib {
         });
     }
 
+
     // ================================================================================================
-    // ONE OPERATION PER DIRECTION PER STREAM SOCKET. THIS IS THE CALLER'S JOB.
+    // IoStream -- A STREAM SOCKET THAT CANNOT CORRUPT ITSELF.
+    //
+    // Two sends in flight on one TCP socket are two independent operations. MSDN warns that some
+    // Winsock providers split a large send into several transmissions, "and this may cause
+    // unintended data interleaving from multiple concurrent send requests on the same
+    // stream-oriented socket" -- silent corruption, no crash and no error code.
+    //
+    // HONESTY ABOUT THE EVIDENCE: that was NOT reproduced here. The negative control in
+    // io_socket_test -- the same concurrent-writer test on the raw unserialised overload, at 96 KB
+    // frames with SO_SNDBUF squeezed to 4 KB -- never interleaved on the default Windows TCP
+    // provider. So this guard rests on the documented warning and on portability across providers,
+    // not on an observed failure.
+    //
+    // THE READ DIRECTION IS THE STRONGER CASE and does not depend on any of that: two outstanding
+    // receives on one stream socket are filled in completion order, and which bytes land in which
+    // buffer is arbitrary. That is inherent, not provider-specific.
+    //
+    // The first version of this file documented that and left it to the caller. That was wrong. The
+    // rule "one coroutine owns the write side" is easy to state and nothing enforces it, while
+    // multiple writers on one connection -- a request handler and a keepalive, say -- is a design
+    // anyone might reach for. A hazard that severe should not be guarded by a comment.
+    //
+    // WHY THIS SHAPE, and not a queue inside the reactor. Serialising centrally means a socket ->
+    // state map and a hash lookup on the hot path of every send, paid by everyone. Here the state
+    // lives WHERE THE CONNECTION STATE ALREADY LIVES: the caller owns an IoStream per connection,
+    // exactly as it owns an IoRequest per operation. No map, no allocation, and the cost is one
+    // uncontended SchedulerMutex acquire -- which suspends rather than blocks, so a second writer
+    // waits without occupying anything.
+    //
+    // Read and write have SEPARATE locks. They are independent directions and a full-duplex protocol
+    // must be able to send while a receive is outstanding; one lock would deadlock exactly the
+    // request/response pattern this exists to support.
+    //
+    // The raw IoSocket overloads above remain, for a caller that has its own ordering guarantee and
+    // does not want to pay for a second one. They are the escape hatch, not the default.
+    // ================================================================================================
+    class IoStream {
+    public:
+        explicit IoStream(IoSocket s) noexcept : sock_(s) {}
+
+        IoStream(const IoStream&) = delete;
+        IoStream& operator=(const IoStream&) = delete;
+
+        IoSocket Socket() const noexcept { return sock_; }
+
+        // Exposed so a caller can hold the write side across SEVERAL sends -- a framed message
+        // written as a burst, where the ordering guarantee has to span more than one call.
+        SchedulerMutex& WriteLock() noexcept { return write_; }
+        SchedulerMutex& ReadLock()  noexcept { return read_; }
+
+    private:
+        IoSocket       sock_;
+        SchedulerMutex write_;
+        SchedulerMutex read_;
+    };
+
+    // Serialised send. Acquires the stream's write side, sends, releases.
+    //
+    // A Lazy rather than a plain awaiter because this is genuinely TWO suspension points -- the lock
+    // and then the transfer -- and hand-rolling a two-phase awaiter to save one slab frame would be
+    // trading a correctness-critical path for an unmeasured micro-optimisation. Lazy awaits inline;
+    // it does not spawn.
+    //
+    // A CANCELLED LOCK SENDS NOTHING and reports Cancelled, which is the same rule as everywhere
+    // else: Cancelled means no bytes moved.
+    [[nodiscard]] inline Lazy<IoResult> SendAsync(IoStream& s, const void* buf, std::uint32_t len,
+                                                  std::uint32_t flags = 0,
+                                                  CancelToken token = CancelToken{}) {
+        if (co_await LockAsyncCancellable(s.WriteLock()) == WaitResult::Cancelled)
+            co_return IoResult{ IoStatus::Cancelled, 0, 0 };
+
+        const IoResult r = co_await SendAsync(s.Socket(), buf, len, flags, token);
+        s.WriteLock().Unlock();
+        co_return r;
+    }
+
+    [[nodiscard]] inline Lazy<IoResult> SendVAsync(IoStream& s, const IoBuffer* bufs,
+                                                   std::uint32_t count, std::uint32_t flags = 0,
+                                                   CancelToken token = CancelToken{}) {
+        if (co_await LockAsyncCancellable(s.WriteLock()) == WaitResult::Cancelled)
+            co_return IoResult{ IoStatus::Cancelled, 0, 0 };
+
+        const IoResult r = co_await SendVAsync(s.Socket(), bufs, count, flags, token);
+        s.WriteLock().Unlock();
+        co_return r;
+    }
+
+    // Serialised receive. Concurrent receives on one stream socket deliver arbitrary slices to
+    // arbitrary callers, which is the same hazard in the other direction.
+    [[nodiscard]] inline Lazy<IoResult> RecvAsync(IoStream& s, void* buf, std::uint32_t len,
+                                                  std::uint32_t flags = 0,
+                                                  CancelToken token = CancelToken{}) {
+        if (co_await LockAsyncCancellable(s.ReadLock()) == WaitResult::Cancelled)
+            co_return IoResult{ IoStatus::Cancelled, 0, 0 };
+
+        const IoResult r = co_await RecvAsync(s.Socket(), buf, len, flags, token);
+        s.ReadLock().Unlock();
+        co_return r;
+    }
+    // ================================================================================================
+    // ONE OPERATION PER DIRECTION PER STREAM SOCKET -- WHICH IoStream ABOVE ENFORCES FOR YOU.
+    //
+    // This note is about the RAW IoSocket overloads, which do not serialise. Use IoStream unless you
+    // have your own ordering guarantee; what follows is why the guarantee is needed at all.
     //
     // Two SendAsync calls in flight on the same TCP socket are two independent operations, and the
     // kernel does not promise to complete them in the order they were submitted. Their bytes can
     // INTERLEAVE, which for a stream protocol is silent corruption -- a header from one message
     // followed by the body of another, with nothing reporting an error anywhere.
     //
-    // The reactor deliberately does not serialise them. Doing so would mean a per-socket queue,
-    // taken on every send, on the hot path of every connection -- a cost paid by every correct
-    // caller to protect an incorrect one. And "correct" here is easy: one coroutine owns the write
-    // side of a connection, and it awaits each send before starting the next, which is what a
-    // sequential-looking coroutine does naturally.
+    // The RAW overloads do not serialise, so that a caller with its own ordering guarantee is not
+    // charged for a second one. IoStream is the answer for everyone else, and it is cheap: the lock
+    // lives in the connection state the caller already owns, and an uncontended acquire is a fast
+    // path that suspends rather than blocks when it is not.
     //
-    // If several producers must share a socket, put a SchedulerMutex or a queue in front of it. That
-    // is a protocol decision -- a strict order, a fair one, per-message or per-batch -- and this
-    // layer has no basis for making it.
+    // Holding IoStream::WriteLock() across several sends is the spelling for a framed message written
+    // as a burst, where the guarantee has to span more than one call.
     //
     // Reads have the same shape and the same rule. Concurrent recv on one stream socket delivers
     // arbitrary slices to arbitrary callers.

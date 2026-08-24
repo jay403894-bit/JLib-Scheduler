@@ -194,11 +194,17 @@ static bool g_reserveIoCore = false;
 void TaskScheduler::EnableTimers(bool on) noexcept { g_reserveTimerCore = on; }
 bool TaskScheduler::TimersEnabled() noexcept { return g_reserveTimerCore; }
 
-void TaskScheduler::EnableIoReactor(bool on) noexcept {
+static unsigned g_ioCompletionThreads = 1;
+
+void TaskScheduler::EnableIoReactor(bool on, unsigned completionThreads) noexcept {
 	g_reserveIoCore = on;
+	// Clamped rather than trusted: zero threads would mean nothing ever drains the port and every
+	// operation would hang, which is a worse failure than being told a number was ignored.
+	g_ioCompletionThreads = (completionThreads == 0) ? 1 : completionThreads;
 	if (on) g_reserveTimerCore = true;
 }
 bool TaskScheduler::IoReactorEnabled() noexcept { return g_reserveIoCore; }
+unsigned TaskScheduler::IoCompletionThreads() noexcept { return g_ioCompletionThreads; }
 
 void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { EnableTimers(reserve); }
 bool TaskScheduler::ReserveTimerCore() noexcept { return TimersEnabled(); }
@@ -228,7 +234,10 @@ size_t TaskScheduler::GetSafeTC() {
 
 	unsigned int reserved = 1;                       // main
 	if (g_reserveTimerCore) reserved += 1;           // the timer thread
-	if (g_reserveIoCore)    reserved += 1;           // IoReactor.s completion thread
+	// ONE CORE PER COMPLETION THREAD. Set together by EnableIoReactor precisely so these two
+	// numbers cannot drift apart -- a pool sized for one thread while four drain the port is the
+	// silent oversubscription the opt-in exists to prevent.
+	if (g_reserveIoCore)    reserved += g_ioCompletionThreads;
 	if (cores <= reserved) return 1;
 	return static_cast<size_t>(cores - reserved);
 }
