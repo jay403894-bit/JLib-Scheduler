@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <array>
 #include <vector>
 
 namespace {
@@ -58,6 +59,20 @@ std::atomic<int> g_done{ 0 };
 // One operation, timed across the dispatch seam only. `completedAtNs` is stamped by the reactor
 // after the result is stored and before the resume is pushed, so the syscall and the kernel's own
 // time are excluded -- what is left is Push plus the worker getting to it.
+constexpr int kBurst = 32;
+std::vector<JLib::IoSocket> g_bc, g_bs;
+std::vector<std::array<char, 8>> g_brx;
+
+// Burst variant: one per socket, so a single wave of sends produces kBurst completions close
+// enough together that the reactor actually has something to coalesce. The one-at-a-time pass
+// cannot exercise batching at all -- every batch there is size 1.
+JLib::Coro BurstOp(int slot, int sample) {
+    const JLib::IoResult r = co_await JLib::RecvAsync(g_bs[slot], g_brx[slot].data(), 8);
+    const long long now = JLib::MonotonicNs();
+    if (r.completedAtNs != 0) g_samples[sample * kBurst + slot] = now - r.completedAtNs;
+    co_return;
+}
+
 JLib::Coro OneOp(int i) {
     const JLib::IoResult r = co_await JLib::RecvAsync(g_server, g_rx, sizeof g_rx);
     const long long now = JLib::MonotonicNs();
@@ -152,6 +167,44 @@ int main(int argc, char** argv) {
 
     std::printf("\n  HOT is workers already awake; COLD is the pool parked between operations.\n"
                 "  The gap between them IS the OS wake, and COLD is what a real request pays.\n");
+
+    // ---- BURST: kBurst completions arriving together, which is the case coalescing exists for ----
+    // The passes above feed ONE operation at a time, so every batch is size 1 and batching can only
+    // show its cost. This is the arrival pattern it was built for.
+    {
+        const int rounds = (samples / kBurst) > 0 ? (samples / kBurst) : 1;
+        g_bc.resize(kBurst); g_bs.resize(kBurst); g_brx.resize(kBurst);
+        for (int i = 0; i < kBurst; ++i) {
+            SOCKET bc = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            ::connect(bc, reinterpret_cast<sockaddr*>(&a), sizeof a);
+            SOCKET bs = ::accept(lis, nullptr, nullptr);
+            io.RegisterSocket(bc); io.RegisterSocket(bs);
+            g_bc[i] = static_cast<JLib::IoSocket>(bc);
+            g_bs[i] = static_cast<JLib::IoSocket>(bs);
+        }
+
+        g_samples.assign(size_t(rounds) * kBurst, 0);
+        for (int rd = 0; rd < rounds; ++rd) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(coldMs));
+            JLib::WaitGroup wg;
+            for (int i = 0; i < kBurst; ++i) JLib::Spawn(BurstOp(i, rd), &wg);
+            std::this_thread::sleep_for(std::chrono::microseconds(400));
+            // One wave, back to back, so the completions land close enough to coalesce.
+            for (int i = 0; i < kBurst; ++i)
+                ::send(static_cast<SOCKET>(g_bc[i]), g_tx, sizeof g_tx, 0);
+            sched.WaitFor(wg);
+        }
+
+        std::vector<long long> valid;
+        for (long long v : g_samples) if (v > 0) valid.push_back(v);
+        if (valid.empty()) std::printf("  BURST  NO TIMESTAMPS -- needs -DJLIBSCHED_IO_LOCK_STATS=ON.\n");
+        else Report("BURST", std::move(valid));
+
+        for (int i = 0; i < kBurst; ++i) {
+            ::closesocket(static_cast<SOCKET>(g_bc[i]));
+            ::closesocket(static_cast<SOCKET>(g_bs[i]));
+        }
+    }
 
     io.Stop();
     ::closesocket(c); ::closesocket(s); ::closesocket(lis);
