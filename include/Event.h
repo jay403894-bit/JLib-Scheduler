@@ -219,6 +219,19 @@ namespace JLib {
             Task* hi[kBuf]; std::size_t nhi = 0;
 
             for (std::size_t w = 0; w < tb->words; ++w) {
+                // LOAD BEFORE EXCHANGE, and this is not a micro-optimisation. The exchange is an
+                // RMW: doing it unconditionally per word dirties a cache line for every word in
+                // the table whether or not anyone is waiting in it. At 31 workers the table is
+                // 35 words, so waking ONE waiter cost 35 RMWs -- against the retired Treiber
+                // stack's single exchange plus a pointer walk. That is a regression the test
+                // suite cannot see (it only checks correctness) and the DAG benches cannot see
+                // (they never touch Event); only the comparison harness's Event arm would.
+                //
+                // An acquire load is a plain mov on x86 and does not take the line exclusive.
+                // Seeing zero here and missing a waiter that arrives immediately after is the
+                // SAME already-documented weakening as a waiter landing in an already-scanned
+                // word: registered-before-the-signal-began still implies woken.
+                if (tb->occupied[w].load(std::memory_order_acquire) == 0) continue;
                 std::uint64_t bits = tb->occupied[w].exchange(0, std::memory_order_acq_rel);
                 while (bits) {
                     const unsigned b = platform::CountTrailingZeros64(bits);

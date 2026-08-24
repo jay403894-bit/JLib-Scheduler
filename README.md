@@ -249,18 +249,24 @@ blocking, ms for all 2560 tasks, each library measured alone):
 
 | block for | this (`Sleep`) | marl |
 |---|---|---|
-| 50 µs | 8.0 | **5.0** |
-| 150 µs | 7.4 | **4.9** |
-| 300 µs | 6.6 | **5.6** |
-| 600 µs | **7.4** | 8.8 |
-| 2000 µs | **22.2** | 22.6 |
+| 50 µs | 6.4 | **4.8** |
+| 150 µs | 6.1 | **4.8** |
+| 300 µs | 6.3 | **5.8** |
+| 600 µs | **7.4** | 8.0 |
+| 2000 µs | **21.2** | 22.5 |
+
+Re-measured at 3.0.0. marl is the control here and it barely moved (5.0 -> 4.8, 4.9 -> 4.8,
+5.6 -> 5.8, 8.8 -> 8.0, 22.6 -> 22.5), which is what says the machine and harness are
+comparable across the gap and the movement in our column is signal rather than drift. Do not
+read that movement as one change though: these were last taken at 1.4.0 and many releases sit
+between.
 
 marl leads below roughly 400 µs and this leads above it. Two things worth knowing rather than
 smoothing over. Its `Event` carries sticky signalled state and waits on a predicate, so an
 already-satisfied wait costs it nothing, while `JLib::Event` is a stateless rendezvous and always
 pays a suspend/resume round trip -- that is a capability difference, not a slower fiber. And the
 fiber machinery itself is not where this row's cost lives: measured separately, attaching a fiber is
-free within noise and a full suspend/resume round trip is ~166 ns, against a ~1.3 µs baseline cost
+free within noise and a full suspend/resume round trip is ~92 ns, against a ~1.24 µs baseline cost
 to submit a task at all. Three earlier explanations for this row -- the event registry lock, the
 serial resume path, and fiber acquisition -- were each measured and each wrong.
 
