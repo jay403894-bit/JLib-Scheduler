@@ -3,6 +3,77 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.13.0 - 2026-08-23
+
+**`TaskDAG` can now wait on things without holding a fiber.** Previously the only way for a DAG node
+to wait was to be a fiber task that blocks -- correct, but a suspended fiber holds a 64KB stack and
+one slot of a budget defaulting to 64 per worker. A thousand pending waits was 64 MB of stacks and an
+exhausted pool, which inside a DAG can *deadlock* rather than merely stall, because the nodes holding
+the fibers may be waiting on work that cannot get one.
+
+**New: `CreateExternalNode()` / `SignalExternal()`.** A node with no task that completes when
+something outside the pool says so:
+
+```cpp
+auto* io   = dag.CreateExternalNode();
+dag.AddDependency(consume, io);
+// from an IOCP completion, a GPU fence callback, any thread:
+dag.SignalExternal(io);
+```
+
+No fiber, no worker, no stack. The test holds **4,000 pending simultaneously**, signalled from four
+threads. This is the shape a GPU fence wait wants in a frame graph -- and unlike the fiber-suspend
+bridge it works from the MAIN thread, which is not a fiber and cannot suspend at all.
+
+The ordering is the hard part and is the same hazard as `WaitOnEventArmed` and the 1.3.5 lost wakeup:
+an external completion may arrive BEFORE the node's own dependencies are satisfied. `Fire()` and
+`SignalExternal` therefore rendezvous on an atomic bit pair, and whichever observes the *other's* bit
+already set is the one that propagates -- exactly one can. Verified by negative control: deleting only
+the early-signal branch makes "the early signal was remembered" fail and nothing else, so a test
+covering just the natural order would have passed against the broken version.
+
+**New: coroutines can complete a DAG node.** `Spawn(MyCoro(), node)` signals the external node when
+the coroutine finishes, making coroutine work a dependency edge:
+
+```cpp
+auto* n = dag.CreateExternalNode();
+dag.AddDependency(consume, n);
+JLib::Spawn(DoAsyncWork(...), n);
+```
+
+**This does NOT make the DAG require C++20**, and the implementation is arranged to keep that true
+rather than merely asserted. `Coroutine.h` does not include `TaskDAG.h`; it forward-declares
+`TaskNode` and a free `SignalExternalNode` defined on the C++17 side, so the two optional features do
+not drag each other into every translation unit and the dependency direction stays C++20 -> C++17.
+`SignalExternal` is plain C++17, and an external node is equally happy being completed by an IOCP
+callback or a bare thread. `tests/dag_external_test.cpp` is compiled as **C++17** to keep proving it.
+
+**Two guards, because the DAG's completion rule has edges that failed silently.** The DAG defines
+"node complete" as "the task's fn returned":
+
+- **`CreateNode` rejects `TaskType::Coroutine`.** Resuming a coroutine returns at *every* suspension,
+  so a coroutine node would fire its dependents at the first `co_await` while still running --
+  producing wrong results rather than crashing. Use an external node instead (above).
+- **`CreateMainNode` rejects `TaskType::Fiber`.** Main is not a fiber, so anything that suspends in a
+  main node fail-fasts with no message. The guard names a capability that never existed rather than
+  removing one.
+
+Both abort with a diagnostic and both were verified by probe. **Fiber nodes on the pool are
+unaffected and remain the supported way to suspend** -- `ContextSwitch` preserves the completion
+trampoline's frame, so `origFn` returns only on real completion.
+
+**The fiber-exhaustion warning now reports the ACTUAL budget** (`64 standard per worker x 31 workers
+= 1984 total`) instead of the hardcoded default, so a reader who already raised it can tell whether
+their call took effect. It also now says that inside a `TaskDAG` the condition may never clear,
+rather than describing it only as a stall.
+
+**Docs: `SetTaskSlabSize` now lists everything that draws on the slab** -- a task is 1 slot, a DAG
+node is **2** (the `TaskNode` and its dependents list; its constructor allocates twice, and this
+applies to gates and external nodes too), a spawned coroutine is 2. More usefully, it records that
+the failure modes differ: a coroutine frame FALLS BACK to global new and never fails, a task returns
+nullptr, and a `TaskNode` constructor THROWS. Found by writing a test that exhausted a deliberately
+small slab and blamed the wrong participant.
+
 ## 2.12.0 - 2026-08-23
 
 **Coroutine frames now come from the scheduler's task slab instead of global new. On by default.**

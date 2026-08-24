@@ -31,6 +31,34 @@ namespace JLib {
         // A gate has no task; it fires its dependents instantly when its trigger is met.
         // Compose gates to express arbitrary boolean readiness, e.g. (A && B) || C.
         TaskNode* CreateGate(TaskNode::LogicType type);
+
+        // A node with no task that completes when SOMETHING OUTSIDE THE POOL says so, rather than
+        // by running. Use it to make an external completion -- an overlapped I/O finishing, a GPU
+        // fence signalling, a coroutine reaching its end -- a real dependency edge instead of
+        // something a task sits and blocks on.
+        //
+        //     auto* io   = dag.CreateExternalNode();
+        //     auto* next = dag.CreateNode(consumeTask);
+        //     dag.AddDependency(next, io);          // next waits on the I/O
+        //     ... issue the read, and from its completion callback:
+        //     dag.SignalExternal(io);               // next fires; no fiber was ever held
+        //
+        // WHY NOT JUST BLOCK IN A NODE. A fiber node that suspends holds a 64KB stack for the whole
+        // wait and one slot of a budget that defaults to 64 per worker; a thousand of them is 64 MB
+        // and an exhausted pool, which inside a DAG can deadlock rather than merely stall (see the
+        // fiber-exhaustion warning in Thread.cpp). An external node costs a few hundred bytes, no
+        // fiber, and no worker. It also works when the waiting side is the MAIN thread, which is not
+        // a fiber and cannot suspend at all.
+        //
+        // CONTRACT -- SIGNAL EXACTLY ONCE, AND ONLY FOR A NODE IN A SUBMITTED DAG. A completed node
+        // is retired to the epoch manager, so signalling one twice is a use-after-free on the second
+        // call, not a no-op. (The second call is ignored if the memory happens to still be live, but
+        // do not rely on that.) A DAG that is never signalled simply never completes those nodes:
+        // there is no timeout here by design, exactly as there is none on a worker's park.
+        //
+        // The signal may come from ANY thread, including one the scheduler knows nothing about.
+        TaskNode* CreateExternalNode();
+        void SignalExternal(TaskNode* node);
          void AddDependency(TaskNode* dependent, TaskNode* dependency);
 
          // Trampoline installed as the task's fn by Fire(): runs the node's real work, THEN
@@ -73,4 +101,16 @@ namespace JLib {
         void Fire(TaskNode* node);   // run the node (or, for a gate, propagate instantly)
         static void NodeDeleter(void* p);   // EBR deleter: ~TaskNode + return its slot to the slab
     };
+
+    // SignalExternal reachable from a TaskNode* alone, without naming TaskDAG.
+    //
+    // This exists so Coroutine.h -- the optional C++20 header -- can complete a DAG node with only a
+    // FORWARD DECLARATION of TaskNode and of this function, instead of including TaskDAG.h. Two
+    // optional features should not drag each other into every translation unit that uses one of
+    // them, and the direction has to stay C++20 -> C++17: the DAG must never learn what a coroutine
+    // is, or using a DAG at all would start requiring C++20.
+    //
+    // Works because CreateExternalNode records the owning DAG on the node. Same contract as
+    // TaskDAG::SignalExternal: exactly once, node must belong to a submitted DAG.
+    void SignalExternalNode(TaskNode* node);
 };

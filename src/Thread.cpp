@@ -363,11 +363,23 @@ Fiber* Thread::AcquireFiber(Task* task) {
 		// the cap and the cause is all a reader can act on.
 		static std::atomic<bool> warned{ false };
 		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			// Report the ACTUAL configured budget, not the default. This line used to say
+			// "(64 per core by default)" unconditionally, so a reader who had already raised the
+			// budget was told a number that was not theirs and could not tell whether their call
+			// had taken effect -- the one thing the message exists to help them decide.
+			const size_t perWorker = TaskScheduler::StandardFibersPerWorker();
+			const size_t workers   = scheduler ? scheduler->GetWorkerCount() : 0;
 			std::cerr << "[JLib::Scheduler] fiber pool exhausted. A SUSPENDED task holds its fiber, "
-			             "so the number of tasks that may be blocked AT ONCE is capped at the pool "
-			             "size (64 per core by default). Past that, workers re-queue and retry "
-			             "instead of running, which looks like a stall rather than an error. Either "
-			             "block fewer tasks concurrently, or call "
+			             "so the number of tasks that may be blocked AT ONCE is capped by the pool: "
+			          << perWorker << " standard per worker";
+			if (workers) std::cerr << " x " << workers << " workers = " << (perWorker * workers);
+			std::cerr << " total. Past that, workers re-queue and retry instead of running.\n"
+			             "  Usually that is a STALL that clears as blocked tasks finish. INSIDE A "
+			             "TaskDAG IT MAY NEVER CLEAR: if the tasks holding the fibers are waiting on "
+			             "work that cannot get a fiber because they are holding them all, nothing "
+			             "progresses again. A DAG whose concurrently-suspended nodes outnumber the "
+			             "budget above is the shape to look for.\n"
+			             "  Either block fewer tasks concurrently, or call "
 			             "TaskScheduler::SetFiberBudget(standardPerWorker, heavyPerWorker) BEFORE "
 			             "Init() to raise it. This warning prints once.\n";
 		}

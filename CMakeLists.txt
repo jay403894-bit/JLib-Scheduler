@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.12.0")
+set(JLIBSCHED_VERSION "2.13.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -478,6 +478,10 @@ target_compile_features(SchedulerTopologyTest PRIVATE cxx_std_17)
 # Third-party comparison harness. Adds nothing unless -DJLIBSCHED_ENKITS_DIR is passed, so a normal
 # build and CI never see it -- see bench/compare/CMakeLists.txt for why it is opt-in.
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/bench/compare")
+
+add_executable(SchedulerDagExternalTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_external_test.cpp")
+target_link_libraries(SchedulerDagExternalTest PRIVATE Scheduler)
+target_compile_features(SchedulerDagExternalTest PRIVATE cxx_std_17)
 
 add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primitives_test.cpp")
 target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)

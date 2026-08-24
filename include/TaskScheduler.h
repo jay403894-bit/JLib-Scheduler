@@ -557,13 +557,25 @@ namespace JLib {
 		// RunLazyRange and ParallelFor's grain-floor comment) -- but a slab too small for a real
 		// workload turns that fallback from an occasional safety net into the common case, which
 		// costs the dispatch benefit this scheduler exists for. Measure before shrinking it.
-		// COROUTINES CONSUME TWO SLOTS EACH, as of 2.12.0. A spawned coroutine takes one slot for its
-		// Task and one for its C++20 frame, which now comes from this same slab rather than global
-		// new -- so a slab sized for N tasks holds N/2 concurrent coroutines, not N. That is the
-		// price of having one arena to size and observe instead of two, and of coroutines not
-		// punching a hole in the zero-allocation steady state above. Frames larger than
-		// TaskAllocator::SLOT fall through to global new instead of failing. See the frame-allocation
-		// section in Coroutine.h, including JLib::SetCoroFramePooling(false) to opt out.
+		// WHAT ELSE DRAWS ON THIS SLAB, because "slots" is not the same as "tasks" and sizing it
+		// from the task count alone will come up short:
+		//
+		//   a task                1 slot
+		//   a TaskDAG node        2 slots  -- the TaskNode AND its dependents list; TaskNode's
+		//                                    constructor allocates twice. Applies to gates and
+		//                                    external nodes too, which have no task at all.
+		//   a spawned coroutine   2 slots  -- its Task and its frame (frames come from here as of
+		//                                    2.12.0, for one arena to size and observe rather than
+		//                                    two, and so coroutines do not punch a hole in the
+		//                                    zero-allocation steady state described above)
+		//
+		// THE FAILURE MODES DIFFER, which matters more than the counts. A coroutine frame FALLS BACK
+		// to global new when the slab is full or the frame exceeds TaskAllocator::SLOT, so it never
+		// fails -- frames borrow opportunistically and stop competing under pressure. A task returns
+		// nullptr; a TaskNode's constructor THROWS. Size for the tasks and nodes; the frames will
+		// look after themselves.
+		//
+		// JLib::SetCoroFramePooling(false) opts frames back out to global new entirely.
 		static void SetTaskSlabSize(size_t slots);
 		static size_t TaskSlabSize();
 

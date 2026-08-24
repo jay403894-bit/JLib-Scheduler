@@ -11,6 +11,7 @@
 
 #include "TaskScheduler.h"
 #include "Coroutine.h"
+#include "TaskDAG.h"   // only THIS test needs both; Coroutine.h does not include TaskDAG.h
 
 #include <atomic>
 #include <cstdio>
@@ -103,6 +104,14 @@ static JLib::Lazy<int> CatchesThrower(bool* caught) {
 static JLib::Lazy<long long> Chain(int n) {
     if (n == 0) co_return 0;
     co_return 1 + co_await Chain(n - 1);
+}
+
+// Suspends once, so the node is completed from a body that genuinely migrated workers rather than
+// one that ran straight through.
+static JLib::Coro NodeWork(std::atomic<int>* counter) {
+    counter->fetch_add(1, std::memory_order_relaxed);
+    co_await JLib::Reschedule{};
+    co_return;
 }
 
 // Shared state for the superset-primitive tests. A struct rather than captures because the
@@ -403,6 +412,80 @@ int main() {
         const long long got = JLib::SyncWait(Chain(kDepth));
         Check(got == kDepth, "100,000-deep await chain returned the right value");
         if (got != kDepth) std::printf("      expected %d, got %lld\n", kDepth, got);
+    }
+
+    // ---- coroutine completes a DAG external node ---------------------------------------------
+    // Coroutine work as a dependency EDGE rather than something a fiber node blocks on. The DAG
+    // never learns what a coroutine is -- it just gets an external node signalled, exactly as an
+    // IOCP completion would signal one.
+    std::printf("coroutine completes a DAG external node\n");
+    {
+        std::atomic<int> ran{ 0 };
+        JLib::TaskDAG dag(sched);
+        auto* n    = dag.CreateExternalNode();
+        auto* tail = dag.CreateNode(sched.CreateTask([&ran] { ran.fetch_add(10, std::memory_order_relaxed); }));
+        dag.AddDependency(tail, n);
+        Check(dag.Submit(), "DAG submitted");
+
+        Check(JLib::Spawn(NodeWork(&ran), n), "coroutine spawned onto the external node");
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (ran.load(std::memory_order_acquire) != 11 &&
+               std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        Check(ran.load() == 11, "coroutine ran, signalled the node, and the dependent fired");
+    }
+
+    // Many at once -- the reason this exists. As fiber nodes these would be 2,000 x 64KB of stacks
+    // against a 64-per-worker budget; as coroutines it is two slab slots each.
+    // DELIBERATELY MODEST, and the arithmetic is the reason. This file runs on a 4,096-slot slab so
+    // the leak check above can bite, and every participant here draws from it:
+    //
+    //   external node   2 slots  (TaskNode + its dependents list -- TaskNode's ctor allocates twice)
+    //   tail node       2 slots
+    //   tail task       1 slot
+    //   coroutine       2 slots  (Task + frame; frames come from this slab as of 2.12.0)
+    //   ------------------------------------------------------------------------------
+    //                   7 slots per iteration, plus whatever EBR has not reclaimed yet
+    //
+    // 400 needed ~2,800 and died. The scale demonstration lives in dag_external_test (4,000 pending
+    // nodes on a default slab); this one only has to prove the coroutine->node wiring works.
+    //
+    // The failure mode is worth knowing: TaskNode's constructor THROWS on exhaustion rather than
+    // returning null, so an uncaught one terminates. Caught below so a future sizing drift reports
+    // itself instead of crashing.
+    std::printf("100 coroutines, one external node each\n");
+    {
+        const int kN = 100;
+        std::atomic<int> ran{ 0 };
+        JLib::TaskDAG dag(sched);
+        std::vector<JLib::TaskNode*> ext;
+        ext.reserve(kN);
+        bool allocOk = true;
+        try {
+            for (int i = 0; i < kN; ++i) {
+                auto* n = dag.CreateExternalNode();
+                auto* task = sched.CreateTask([&ran] { ran.fetch_add(10, std::memory_order_relaxed); });
+                auto* t = task ? dag.CreateNode(task) : nullptr;
+                if (!n || !t) { allocOk = false; break; }
+                dag.AddDependency(t, n);
+                ext.push_back(n);
+            }
+        }
+        catch (const std::exception& e) {
+            allocOk = false;
+            std::printf("      slab exhausted: %s\n", e.what());
+        }
+        Check(allocOk, "every node allocated (slab not exhausted)");
+        Check(dag.Submit(), "DAG submitted");
+        int spawnFailures = 0;
+        for (auto* n : ext) if (!JLib::Spawn(NodeWork(&ran), n)) ++spawnFailures;
+        Check(spawnFailures == 0, "all 100 coroutines spawned");
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (ran.load(std::memory_order_acquire) != kN * 11 &&
+               std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        Check(ran.load() == kN * 11, "every coroutine completed its node exactly once");
+        if (ran.load() != kN * 11) std::printf("      expected %d, got %d\n", kN * 11, ran.load());
     }
 
     std::printf("\n%s\n", g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");

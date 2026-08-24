@@ -57,6 +57,14 @@
 
 namespace JLib {
 
+    // Declared, NOT included. Completing a DAG node from a coroutine needs only these two names, and
+    // pulling in TaskDAG.h would make every coroutine translation unit compile the DAG -- coupling
+    // two features that are independently optional. The direction matters more than the compile
+    // time: this header may depend on the C++17 core, never the reverse, or using a TaskDAG would
+    // start requiring C++20. See SignalExternalNode in TaskDAG.h.
+    struct TaskNode;
+    void SignalExternalNode(TaskNode* node);
+
     // ---- frame-size instrumentation (diagnostic builds only) -----------------------------------
     //
     // WHY THIS EXISTS. A spawned coroutine costs TWO allocations: the frame, which the compiler
@@ -339,6 +347,21 @@ namespace JLib {
             // coroutine. Null until spawned, which is what makes an un-spawned Coro safe to destroy.
             Task* task = nullptr;
 
+            // Optional: a TaskDAG external node this coroutine completes when it finishes. Null for
+            // an ordinary Spawn. Just the node, not the DAG -- TaskNode carries its owner, which is
+            // why CreateExternalNode sets it.
+            //
+            // This is how a coroutine PARTICIPATES IN A GRAPH without being a node. It cannot be one:
+            // the DAG defines completion as "the task's fn returned", and resuming a coroutine
+            // returns at every suspension (see the guard in TaskDAG::CreateNode). Signalling from the
+            // end of the body says the same thing accurately, and costs one pointer.
+            //
+            // What it buys: a DAG that waits on coroutine work no longer needs a fiber node to block
+            // in. A suspended fiber node holds a 64KB stack; a suspended coroutine holds its frame
+            // and its Task -- two slab slots, ~512 bytes. That is the difference between hundreds of
+            // concurrent waits and tens of thousands.
+            TaskNode* dagNode = nullptr;
+
             Coro get_return_object() noexcept { return Coro{ Handle::from_promise(*this) }; }
 
             // The coroutine must NOT begin on the thread that called the factory function -- it
@@ -381,6 +404,16 @@ namespace JLib {
                 sched.CleanupTaskMetadata(t);
                 DestroyTask(t);
                 sched.GetAllocator()->Free(t);
+
+                // LAST, and after the Task is back in the slab. Signalling fires the node's
+                // dependents, which may start running on another worker before this call returns --
+                // so everything this coroutine still owns is released first. (The frame outlives
+                // this by a moment; final_suspend destroys it once Complete returns. Nothing the
+                // dependents can reach points at it.)
+                if (TaskNode* n = dagNode) {
+                    dagNode = nullptr;                 // exactly once, like the task above
+                    SignalExternalNode(n);
+                }
             }
         };
 
@@ -435,6 +468,43 @@ namespace JLib {
 
         // Last line for a reason: once pushed, a worker may resume, finish and free all of this
         // before Push() has even returned. Nothing may be read back afterwards.
+        return sched.Push(t);
+    }
+
+    // Schedules a coroutine that COMPLETES A DAG EXTERNAL NODE when it finishes, making coroutine
+    // work a dependency edge in a graph:
+    //
+    //     auto* n = dag.CreateExternalNode();
+    //     dag.AddDependency(consume, n);          // consume waits for the coroutine
+    //     JLib::Spawn(DoAsyncWork(...), n);
+    //
+    // A coroutine still cannot BE a node -- the DAG reads completion as "the task's fn returned",
+    // and resuming a coroutine returns at every suspension (see TaskDAG::CreateNode's guard).
+    // Signalling from the end of the body says the same thing accurately.
+    //
+    // The alternative is a fiber node that Spawns and WaitFors, which is correct but holds a 64KB
+    // stack for the whole wait. This holds a frame and a Task -- two slab slots -- so a graph can
+    // have tens of thousands of coroutine waits outstanding instead of hundreds.
+    //
+    // NOTHING HERE MAKES THE DAG REQUIRE C++20. Only this header does, and only a translation unit
+    // that spawns a coroutine includes it; `SignalExternal` is plain C++17 and an external node is
+    // equally happy being completed by an IOCP callback, a fence, or any thread.
+    inline bool Spawn(Coro&& c, TaskNode* node,
+                      uint8_t hiPri = 0, CorePref pref = CorePref::Default) {
+        Coro::Handle h = c.Release();
+        if (!h) return false;
+
+        auto& sched = TaskScheduler::Instance();
+        Task* t = sched.CreateTask(&detail::ResumeCoroutine,
+                                   h.address(), hiPri, FiberSize::Standard,
+                                   TaskType::Coroutine, pref);
+        if (!t) { h.destroy(); return false; }
+
+        h.promise().task    = t;
+        h.promise().dagNode = node;
+
+        // Last line: once pushed, a worker may run this to completion -- signalling the node and
+        // freeing all of it -- before Push() returns.
         return sched.Push(t);
     }
 
