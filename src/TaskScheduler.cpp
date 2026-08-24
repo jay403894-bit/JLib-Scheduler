@@ -2266,6 +2266,71 @@ void SchedulerSemaphore::Wait() {
 	}
 }
 
+
+// Cancellable Wait. The release side of this already existed and could not be reached: Signal()
+// has walked past cancelled waiters since 2.14.0, but Wait() pushed Waiter{current, nullptr}, and
+// a null result slot means "not cancellable, never skipped" by the contract on Waiter. So the
+// machinery was complete and had no entry point.
+//
+// WHY A SEPARATE FUNCTION rather than making Wait() cancellable, which is the same argument as
+// SchedulerMutex::Lock vs LockCancellable and worth repeating because getting it wrong is silent:
+// a caller who ignored the result would proceed believing it holds a permit it does not hold. Plain
+// Wait() can therefore never come back empty-handed, and cancellation is opt-in per call site.
+//
+// A CANCELLED RETURN MEANS NO PERMIT WAS TAKEN. Do not call Signal() to "give it back" -- there is
+// nothing to give back, and doing so manufactures a permit from nowhere.
+WaitResult SchedulerSemaphore::WaitCancellable() {
+	auto thread = Thread::GetCurrent();
+	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
+
+	// Read ONCE, here, and carried in the Waiter. The releaser cannot look it up later: it holds a
+	// Fiber*, and there is no fiber->task link to walk back through. Same reasoning as
+	// SchedulerMutex::LockCancellable.
+	Task* callerTask = TaskScheduler::IsInitialized() ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
+	const uint32_t tok = callerTask ? callerTask->cancelToken : CancelToken::kNone;
+
+	// Already cancelled before trying: fail immediately rather than consume a permit the caller is
+	// about to be told to drop. Taking one here would strand it -- the caller returns Cancelled and
+	// has no reason to Signal.
+	if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+
+	if (current != nullptr) {
+		WaitResult result = WaitResult::Ok;   // stack local -- stable until we are resumed
+		{
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+
+			if (permits > 0) {
+				--permits;
+				spinLock.clear(std::memory_order_release);
+				return WaitResult::Ok;
+			}
+			// Parkable BEFORE discoverable, exactly as Wait() does -- see the long note there; the
+			// reverse order is the 1.3.5 lost wakeup.
+			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
+			waiters.push(Waiter{ current, nullptr, &result, tok });
+			spinLock.clear(std::memory_order_release);
+		}
+		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerSemaphore::WaitCancellable");
+		ContextSwitch(&current->ctx, current->homeCtx);
+
+		// Signal() wrote through `result` before resuming us, so it is settled by the time we run.
+		return result;
+	}
+
+	// BARE THREAD: no fiber to park, so there is nothing for Signal() to skip and the whole
+	// skip-at-release mechanism does not apply. A bare thread cannot be cancelled mid-wait, but it
+	// can observe cancellation between attempts, which is what the predicate does -- so this
+	// returns Cancelled promptly rather than never.
+	//
+	// Try_Wait() rather than a blocking wait, so a cancellation that lands while spinning is seen.
+	bool got = false;
+	SpinThenHelp([&] {
+		if (Try_Wait()) { got = true; return true; }
+		return CancelToken(tok).Cancelled();
+	});
+	return got ? WaitResult::Ok : WaitResult::Cancelled;
+}
+
 // Ownership is claimed AFTER Wait() returns, not before: while still acquiring, this thread holds
 // nothing, so helping is legitimate and desirable. It only stops helping once it actually owns the
 // permit. See the class comment in TaskScheduler.h for why Wait() itself cannot do this.

@@ -309,6 +309,102 @@ int main() {
     // ---- skip-at-release: a cancelled fiber waiting on a lock is passed over -------------------
     // The delivery mechanism, and the one that could silently do the wrong thing: a cancelled
     // waiter must come back WITHOUT the lock, and the lock must still reach someone who wants it.
+    // SchedulerSemaphore::WaitCancellable. The release side of this shipped in 2.14.0 and could not
+    // be reached until 3.0.3: Signal() walked past cancelled waiters, but Wait() pushed a null
+    // result slot, which by Waiter's contract means "never skipped". So the interesting checks are
+    // not "does the flag arrive" but the two things that would be silently wrong.
+    std::printf("SchedulerSemaphore::WaitCancellable\n");
+    {
+        JLib::SchedulerSemaphore sem(0);                  // no permits: every waiter parks
+        JLib::CancelScope scope;
+        std::atomic<int> cancelled{ 0 }, acquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                parked.fetch_add(1, std::memory_order_relaxed);
+                if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                    cancelled.fetch_add(1, std::memory_order_relaxed);
+                else
+                    acquired.fetch_add(1, std::memory_order_relaxed);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->cancelToken = scope.Token().Raw();
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        Check(WaitUntil(parked, kN), "all waiters parked on the semaphore");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        scope.Cancel();
+        // Marking does not wake anyone: skip-at-release means the waiter learns at the release, so
+        // the permits below are what actually drive them out.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        Check(cancelled.load() == 0 && acquired.load() == 0,
+              "cancelling alone does not wake a semaphore waiter");
+
+        // ONE Signal releases ALL FOUR, because each cancelled waiter is skipped and the walk
+        // continues. If skip-at-release were broken this would wake exactly one and the WaitFor
+        // below would hang -- which is the failure this section exists to catch.
+        sem.Signal();
+        sched.WaitFor(wg);
+        Check(cancelled.load() == kN, "every cancelled waiter returned Cancelled");
+        Check(acquired.load() == 0, "none of them believed it held a permit");
+
+        // THE PERMIT MUST STILL BE THERE. A cancelled waiter takes nothing, so the Signal above is
+        // still owed to somebody. If Cancelled consumed a permit this reads 0 and a later Wait()
+        // would park forever -- invisible in every check above.
+        Check(sem.Try_Wait(), "the permit survived: cancellation consumed nothing");
+    }
+
+    // Cancelled BEFORE the wait, but reached from INSIDE a running task. That distinction is the
+    // whole point of this section: a task cancelled before dispatch never runs at all -- the worker
+    // discards it at pickup -- so cancelling the scope and then pushing the task tests the pickup
+    // path, not this one. The first version of this check did exactly that, and "failed" because
+    // the body never executed rather than because the early-out was wrong.
+    std::printf("WaitCancellable declines a free permit when already cancelled\n");
+    {
+        JLib::SchedulerSemaphore sem(1);                  // a permit IS available
+        JLib::CancelScope scope;
+        std::atomic<int> result{ -1 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            scope.Cancel();                               // now running, and now cancelled
+            result.store(sem.WaitCancellable() == JLib::WaitResult::Cancelled ? 1 : 0,
+                         std::memory_order_release);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->cancelToken = scope.Token().Raw();
+        t->waitGroup = &wg;
+        sched.Push(t);
+        sched.WaitFor(wg);
+
+        Check(result.load() == 1, "returned Cancelled even though a permit was free");
+        Check(sem.Try_Wait(), "and left the permit for someone who can use it");
+    }
+
+    // The uncancelled path must be untouched -- a cancellable API that quietly changed ordinary
+    // behaviour would be worse than not having it.
+    std::printf("uncancelled WaitCancellable is an ordinary Wait\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        std::atomic<int> ok{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+        auto* t = sched.CreateTask([&] {
+            if (sem.WaitCancellable() == JLib::WaitResult::Ok)
+                ok.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->waitGroup = &wg;                                // NO cancel token at all
+        sched.Push(t);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        sem.Signal();
+        sched.WaitFor(wg);
+        Check(ok.load() == 1, "a waiter with no scope acquires normally");
+    }
+
     std::printf("skip-at-release on a contended mutex\n");
     {
         JLib::SchedulerMutex m;

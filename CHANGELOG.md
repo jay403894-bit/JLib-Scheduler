@@ -3,6 +3,50 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.0.3 - 2026-08-24
+
+**`SchedulerSemaphore::WaitCancellable()`** -- a fiber parked on a semaphore now observes
+`TaskDAG::Cancel()` instead of sitting there until somebody signals.
+
+The release side of this already existed and could not be reached. `Signal()` has walked past
+cancelled waiters since 2.14.0, setting `Cancelled` and continuing to the next -- but `Wait()`
+pushed `Waiter{ current, nullptr }`, and a null result slot means *not cancellable, never skipped*
+by the contract on `Waiter`. So the mechanism was complete and had no entry point. This adds the
+entry point; `Signal()` is unchanged.
+
+Separate from `Wait()` for the same reason `LockCancellable` is separate from `Lock`, and it is
+worth repeating because getting it wrong is silent: **a caller who ignored the result would proceed
+believing it holds a permit it does not hold.** Plain `Wait()` can never come back empty-handed, and
+cancellation stays opt-in per call site.
+
+**A `Cancelled` return means NO PERMIT WAS TAKEN.** Do not `Signal()` to give it back -- there is
+nothing to give back, and doing so manufactures a permit from nowhere. Tested directly: after four
+cancelled waiters are released by a single `Signal()`, the permit is still there.
+
+Bare threads get the same answer by a different route. There is no fiber to park, so nothing for
+`Signal()` to skip; instead the spin predicate checks the token, so a cancellation that lands while
+spinning is observed promptly rather than never.
+
+### What is still not cancellable
+
+- **`SchedulerConditionVariable::Wait(mutex)`** needs a decision rather than plumbing. A cancelled
+  waiter still has to RE-ACQUIRE THE MUTEX before returning, or the caller unlocks something it does
+  not hold -- the same class of hazard as the null-result rule, and it is not resolved by making the
+  semaphore underneath it cancellable.
+- **Coroutines awaiting a mutex.** `SchedulerMutex::LockAsyncEnqueue` already takes a `WaitResult*`
+  and the awaiter passes nothing, so the plumbing is half-built. This is the one that matters most
+  for asynchronous work, which is the thing most worth cancelling.
+
+Everything else is covered: fibers at yield, suspend and lock; `Event` waiters; DAG nodes; and
+worker pickup.
+
+### A note for anyone writing a cancellation test
+
+A task cancelled BEFORE dispatch never runs -- the worker discards it at pickup. So cancelling a
+scope and then pushing a task exercises the pickup path, not the wait path. To test an
+already-cancelled wait, the task has to cancel from INSIDE its own body. The first cut of this
+release's test got that wrong and "failed" because the body never executed.
+
 ## 3.0.2 - 2026-08-24
 
 **[CRITICAL] 3.0.0 and 3.0.1 do not compile for any Windows application. Skip them.**

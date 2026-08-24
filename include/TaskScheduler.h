@@ -1278,6 +1278,12 @@ namespace JLib {
 
 		void Wait();
 
+		// Cancellable Wait. Returns Cancelled if this task's scope was cancelled while parked, and
+		// in that case NO PERMIT WAS TAKEN -- do not Signal() to "give it back", there is nothing to
+		// give back. Separate from Wait() so a caller who ignores the result cannot proceed believing
+		// it holds a permit it does not hold; same rule as SchedulerMutex::LockCancellable.
+		[[nodiscard]] WaitResult WaitCancellable();
+
 		bool Try_Wait();
 
 		void Signal();
