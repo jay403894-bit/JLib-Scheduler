@@ -3,6 +3,102 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.0.2 - 2026-08-24
+
+**[CRITICAL] 3.0.0 and 3.0.1 do not compile for any Windows application. Skip them.**
+
+`TaskAllocator` had a member named `small`, and `rpcndr.h` -- which arrives through `windows.h` in
+essentially every real Windows program -- contains:
+
+```c
+#define small char
+```
+
+So `SlabPool<64> small;` expanded to `SlabPool<64> char;`. The first error is C2628 in
+`TaskAllocator.h`; the next hundred are cascade errors in `TaskScheduler.h` pointing nowhere near
+the cause, ending in an internal compiler error.
+
+This repository's own build stayed green throughout, because nothing in `tests/` or `bench/`
+included `windows.h` in a translation unit that also included the scheduler. It took building a game
+against the library to find a one-line problem.
+
+`tests/windows_header_guard.cpp` closes that gap, and found a SECOND instance on its first run:
+`SlabSizes::small`, in the public struct callers have to write. Members are now named for their slot
+size -- `slots256/slots128/slots80/slots64` and `pool256/...` internally.
+
+The guard DEFINES the macros rather than including `windows.h`, so it stays inside the convention
+that `windows.h` lives only behind `platform.h`, and it runs on every platform -- a Linux CI leg now
+catches a Windows-only break before a Windows machine sees it.
+
+### [CRITICAL] `CancelToken.cpp` was never in `Scheduler.vcxproj`
+
+Added in 2.14.0 with cooperative cancellation and picked up by CMake's glob, but never added to the
+hand-maintained MSBuild file list. **The Visual Studio build of the library has been unlinkable
+since 2.14.0** -- `CancelScope::CancelScope`, `~CancelScope`, `CancelScope::Cancel` and
+`detail::ResolveCancelSlot` all unresolved. Now listed in the project and its filters.
+
+Related: 3.0.0 added `~TaskDAG()` to free the edge chunks, so a consumer that rebuilds only some
+configurations gets `unresolved external symbol JLib::TaskDAG::~TaskDAG`. Rebuild Debug, Development
+AND Release -- the ABI guard's message has always said so, and this is what it looks like.
+
+### An 80-byte size class, chosen from a measured application
+
+Game01 instrumented with `-DJLIBSCHED_TASK_STATS=ON`, 37,480 real tasks:
+
+```
+largest 80 bytes, mean 77.5
+    <=64    5781  (15.4%)
+    <=80   31699  (84.6%)
+```
+
+**The distribution is bimodal at exactly 64 and 80, with nothing above 80.** A capture-free or
+single-8-byte-capture task is 64 (it fits `Task`'s tail padding); a two-capture lambda -- `[&flag, dt]`,
+`[fn, lo, hi]`, the shape real frame-loop code actually writes -- is 80. Bytes per task:
+
+| class set | B/task | vs 2.14.0 |
+|---|---|---|
+| 256 only (2.14.0) | 256.0 | 1.00x |
+| 64 + 256 | 226.4 | 0.88x |
+| 64 + 128 + 256 (3.0.1) | 118.1 | 0.46x |
+| **64 + 80 + 128 + 256 (this)** | **77.5** | **0.30x** |
+
+Note the second row: **the 64-byte class alone is worth almost nothing on tasks** -- barely a sixth
+of them fit it. It was added in 3.0.0 on the strength of the COROUTINE FRAME distribution (75%
+<=64), and that did not generalise. Two different workloads, two different answers, and only one of
+them had been measured.
+
+The 80-byte class lands on the mean exactly, because with only two sizes present there is no spread
+left to average over.
+
+### Defaults re-derived: 176 MB, down from 256 MB
+
+`slots256` is no longer where tasks live -- it serves DAG edge chunks (which want a full slot on
+purpose) and coroutine frames up to 224 bytes. So:
+
+```
+    256K x 256 =  64 MB        1M x 80 = 80 MB
+    128K x 128 =  16 MB      256K x 64 = 16 MB       total 176 MB
+```
+
+Down from 256 MB pre-3.0, with 1.63M task capacity against 1M. **An earlier cut of this release
+added the 80-byte pool without shrinking the 256-byte one and reserved 360 MB** -- a memory
+regression dressed as a memory optimisation. The slab-size test now pins all four pools and the
+total, because a test that pinned one would not have caught it.
+
+**The trade, stated because a default decides for everyone who never calls `SetSlabSizes`:** an
+application whose lambdas capture more than 128 bytes gets 256K task slots rather than 1M, since
+such a task goes straight to the 256-byte class and cannot fall back. No measured workload looks
+like that -- but none has been measured either, and that is a different statement from "the case is
+closed".
+
+### `JLIBSCHED_TASK_STATS` reports at process exit
+
+The report was hooked to `TaskScheduler::Join()`, which Game01 never calls -- the scheduler is a
+singleton that simply outlives `wWinMain`, so the flag produced a run that looked successful and
+wrote nothing. It now fires from a static destructor and writes `jlib-task-sizes.txt` to the working
+directory, because a GUI application has nowhere for stdout to land either. Buckets gained edges at
+80 and 96; the previous 32-byte buckets hid the bimodality behind a single `<=96` row.
+
 ## 3.0.1 - 2026-08-24
 
 **[CRITICAL] `Event::SignalAll` was doing an atomic RMW per word of the occupancy table, occupied or

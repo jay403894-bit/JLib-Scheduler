@@ -24,6 +24,9 @@
     <ClCompile Include="src\TaskDAG.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\CancelToken.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\Epochs.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

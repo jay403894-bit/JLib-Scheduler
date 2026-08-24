@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "3.0.1")
+set(JLIBSCHED_VERSION "3.0.2")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -468,6 +468,16 @@ target_compile_features(SchedulerImmediateDrainTest PRIVATE cxx_std_17)
 # Pure-logic tests for the >64-CPU path: mask math, the flat-id split, and the worker-to-CPU
 # assignment on unevenly sized processor groups. Runs anywhere, which is the point -- it is the only
 # check on the wide path that does not require hardware nobody here has.
+# A compile guard, not a behavioural test: it DEFINES the Windows macros rather than including
+# <windows.h>, so it stays inside the convention that windows.h lives only behind platform.h --
+# and it runs on every platform, so a Linux leg catches a Windows-only break first.
+# 3.0.0 shipped a member named `small`, which rpcndr.h defines as `char`, and this repository
+# had no translation unit that could see it. See tests/windows_header_guard.cpp.
+add_executable(SchedulerWindowsHeaderGuard "${CMAKE_CURRENT_SOURCE_DIR}/tests/windows_header_guard.cpp")
+target_link_libraries(SchedulerWindowsHeaderGuard PRIVATE Scheduler)
+target_compile_features(SchedulerWindowsHeaderGuard PRIVATE cxx_std_17)
+
+
 add_executable(SchedulerTopologyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/topology_test.cpp")
 target_link_libraries(SchedulerTopologyTest PRIVATE Scheduler)
 target_compile_features(SchedulerTopologyTest PRIVATE cxx_std_17)

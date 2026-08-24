@@ -1418,6 +1418,30 @@ bool TaskScheduler::IsOnFiber() {
 // The table is fully built -- both arrays allocated and zeroed -- BEFORE the single pointer that
 // publishes it, so a reader that acquires a non-null table always sees a complete one. The loser
 // of a creation race deletes its own and takes the winner's.
+
+#if defined(JLIBSCHED_TASK_STATS)
+namespace {
+	// FIRES AT PROCESS EXIT, not at TaskScheduler::Join(). Join was the obvious hook and it was the
+	// wrong one: Game01 -- the application this flag exists to measure -- never calls it. The
+	// scheduler is a singleton that simply outlives wWinMain, so hooking Join produced a run that
+	// looked successful and wrote nothing.
+	//
+	// Safe as a static destructor because everything it reads is trivially destructible (atomic
+	// counters in a plain array), so there is no cross-TU destruction-order hazard: those objects
+	// have no destructor to run before this one.
+	struct TaskSizeAtExit {
+		~TaskSizeAtExit() {
+			if (std::FILE* f = std::fopen("jlib-task-sizes.txt", "w")) {
+				JLib::detail::ReportTaskSizesTo(f);
+				std::fclose(f);
+			}
+			JLib::detail::ReportTaskSizes();   // and stdout, for console apps
+		}
+	};
+	TaskSizeAtExit g_taskSizeAtExit;
+}
+#endif
+
 Event::WaiterTable* Event::EnsureTable() {
 	if (WaiterTable* tb = table.load(std::memory_order_acquire)) return tb;
 
@@ -1675,7 +1699,12 @@ size_t TaskScheduler::HeavyFibersPerWorker()    { return g_heavyFibersPerWorker;
 // CONSERVATIVE BY CONSTRUCTION: each bucket is charged at its UPPER bound, so a task somewhere
 // inside a bucket is treated as the largest it could be. That understates the saving rather than
 // overstating it -- the reported win is a floor, not a hope.
-void JLib::detail::ReportTaskSizes() {
+void JLib::detail::ReportTaskSizes() { ReportTaskSizesTo(stdout); }
+
+// Writes to an explicit stream so the auto-report at shutdown can go to a FILE. A GUI application
+// (Game01 is wWinMain) has nowhere for stdout to land, and "run it and read the console" is not
+// available -- which would make this flag useless on exactly the code it exists to measure.
+void JLib::detail::ReportTaskSizesTo(std::FILE* out) {
 	uint64_t bucket[kTaskSizeBuckets] = {};
 	uint64_t total = 0, maxSize = 0, totalBytes = 0;
 	for (size_t s = 0; s < kTaskSizeShards; ++s) {
@@ -1688,15 +1717,15 @@ void JLib::detail::ReportTaskSizes() {
 		const uint64_t m = g_taskSizeShards[s].maxSize.load(std::memory_order_relaxed);
 		if (m > maxSize) maxSize = m;
 	}
-	if (!total) { std::printf("  task sizes: nothing recorded\n"); return; }
+	if (!total) { std::fprintf(out, "  task sizes: nothing recorded\n"); return; }
 
-	std::printf("  tasks created: %llu, largest %llu bytes, mean %.1f bytes\n",
+	std::fprintf(out, "  tasks created: %llu, largest %llu bytes, mean %.1f bytes\n",
 		(unsigned long long)total, (unsigned long long)maxSize, double(totalBytes) / double(total));
 	static const char* kLabel[kTaskSizeBuckets] = {
-		"  <=64", "  <=96", " <=128", " <=160", " <=192", " <=224", " <=256", "  >256" };
+		"  <=64", "  <=80", "  <=96", " <=128", " <=160", " <=192", " <=256", "  >256" };
 	for (size_t b = 0; b < kTaskSizeBuckets; ++b) {
 		if (!bucket[b]) continue;
-		std::printf("    %s  %10llu  (%5.1f%%)\n", kLabel[b],
+		std::fprintf(out, "    %s  %10llu  (%5.1f%%)\n", kLabel[b],
 			(unsigned long long)bucket[b], 100.0 * double(bucket[b]) / double(total));
 	}
 
@@ -1709,8 +1738,9 @@ void JLib::detail::ReportTaskSizes() {
 		{ "128 + 256",          { 128, 256, 0, 0 },   2 },
 		{ "64 + 128 + 256",     { 64, 128, 256, 0 },  3 },
 		{ "64 + 96 + 128 + 256",{ 64, 96, 128, 256 }, 4 },
+		{ "64 + 80 + 128 + 256",{ 64, 80, 128, 256 }, 4 },   // what 3.0.2 ships
 	};
-	std::printf("  bytes per task, by class set (charged at each bucket's upper bound):\n");
+	std::fprintf(out, "  bytes per task, by class set (charged at each bucket's upper bound):\n");
 	for (const Candidate& c : kCandidates) {
 		double bytes = 0;
 		for (size_t b = 0; b < kTaskSizeBuckets; ++b) {
@@ -1722,9 +1752,9 @@ void JLib::detail::ReportTaskSizes() {
 			bytes += double(charged) * double(bucket[b]);
 		}
 		const double per = bytes / double(total);
-		std::printf("    %-22s %6.1f B/task   (%.2fx of today)\n", c.name, per, per / 256.0);
+		std::fprintf(out, "    %-22s %6.1f B/task   (%.2fx of today)\n", c.name, per, per / 256.0);
 	}
-	std::printf("  NOTE: bench tasks are capture-free, so this is only meaningful run on a REAL app.\n");
+	std::fprintf(out, "  NOTE: bench tasks are capture-free, so this is only meaningful run on a REAL app.\n");
 }
 #endif
 

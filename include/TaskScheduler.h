@@ -82,7 +82,11 @@ namespace JLib {
 		}
 
 		// Upper bound of each bucket, so bucket i covers (kTaskSizeEdge[i-1], kTaskSizeEdge[i]].
-		inline constexpr size_t kTaskSizeEdge[kTaskSizeBuckets] = { 64, 96, 128, 160, 192, 224, 256, 0 };
+		// Edges at 80 and 96 because a REAL application turned out to be bimodal at exactly 64 and
+		// 80 (Game01, 28,619 tasks), and 32-byte buckets hid that -- everything landed in one "<=96"
+		// row that could have meant anything from 65 to 96. A histogram whose resolution is coarser
+		// than the decision it informs is a histogram that has to be re-run.
+		inline constexpr size_t kTaskSizeEdge[kTaskSizeBuckets] = { 64, 80, 96, 128, 160, 192, 256, 0 };
 
 		inline void RecordTaskSize(size_t n) {
 			TaskSizeShard& s = TaskSizeSlot();
@@ -98,9 +102,12 @@ namespace JLib {
 		}
 
 		void ReportTaskSizes();
+		// Explicit stream, so the shutdown auto-report can reach a file. A GUI app has no console.
+		void ReportTaskSizesTo(std::FILE* out);
 #else
 		inline void RecordTaskSize(size_t) {}
 		inline void ReportTaskSizes() {}
+		inline void ReportTaskSizesTo(std::FILE*) {}
 #endif
 	}
 
@@ -667,9 +674,33 @@ namespace JLib {
 		// cannot serve a request from another -- that is the price of size classes, and the right
 		// response is to let the caller state the split rather than to guess a divisor.
 		struct SlabSizes {
-			size_t big   = 1024 * 1024;   // 256-byte slots: Tasks, TaskNodes, DAG edge chunks
-			size_t mid   = 1024 * 1024 / 8;   // 128-byte slots: larger coroutine frames
-			size_t small = 1024 * 1024 / 8;   // 64-byte slots:  most coroutine frames
+			// NAMED FOR THEIR SLOT SIZE, not big/mid/small. `small` is a Windows macro (rpcndr.h:
+			// `#define small char`), so a member of that name breaks every consumer that includes
+			// windows.h -- which shipped in 3.0.0. Caught by tests/windows_header_guard.cpp on its
+			// first run, in the PUBLIC struct callers have to write, which is the worse place for it.
+			// DEFAULTS DERIVED FROM MEASUREMENT, not from a divisor. Game01 instrumented with
+			// JLIBSCHED_TASK_STATS over 37,480 real tasks: largest 80 bytes, mean 77.5, 15.4% at
+			// exactly 64 and 84.6% at exactly 80, NOTHING above 80. So the 80-byte pool is the
+			// primary one and the 256-byte pool is no longer where tasks live -- it now serves DAG
+			// edge chunks (which want a full slot on purpose) and coroutine frames up to 224 bytes.
+			//
+			//     256K x 256 =  64 MB      1M x 80 = 80 MB
+			//     128K x 128 =  16 MB    256K x 64 = 16 MB      total 176 MB
+			//
+			// That is DOWN from 256 MB pre-3.0, with 1.63M task capacity against 1M. An earlier cut
+			// of this release added the 80-byte pool WITHOUT shrinking the 256-byte one and reserved
+			// 360 MB -- a memory regression dressed as a memory optimisation.
+			//
+			// THE TRADE, stated because a default decides for everyone who never calls SetSlabSizes:
+			// an application whose lambdas capture more than 128 bytes gets 256K task slots here
+			// rather than 1M, because such a task goes straight to the 256-byte class and cannot
+			// fall back. No measured workload looks like that -- but none has been measured, either,
+			// and the honest version of "we have evidence for this shape and none for the other" is
+			// to say so rather than to imply the case is closed.
+			size_t slots256 = 1024 * 1024 / 4;   // DAG edge chunks, frames >128 B, oversized lambdas
+			size_t slots128 = 1024 * 1024 / 8;   // larger coroutine frames
+			size_t slots80  = 1024 * 1024;       // two-capture lambdas: the common frame-loop task
+			size_t slots64  = 1024 * 1024 / 4;   // capture-free / single-capture tasks, TaskNodes
 		};
 
 		// PRE-INIT ONLY: the allocator is constructed with these
@@ -1008,8 +1039,8 @@ namespace JLib {
 		// 1M tasks by default; see SetSlabSizes to change it. Eager unless SetLazyTaskSlab(true)
 		// was called before Init -- see that setter for why the default is the expensive one.
 		// Built from the per-class sizes -- see SlabSizes.
-		TaskAllocator taskAllocator{ CurrentSlabSizes().big, CurrentSlabSizes().mid,
-		                             CurrentSlabSizes().small, LazyTaskSlabEnabled() };
+		TaskAllocator taskAllocator{ CurrentSlabSizes().slots256, CurrentSlabSizes().slots128, CurrentSlabSizes().slots80,
+		                             CurrentSlabSizes().slots64, LazyTaskSlabEnabled() };
 
 	public:
 		// ABI LAYOUT CANARY. Not used by anything at runtime; its OFFSET is the payload.

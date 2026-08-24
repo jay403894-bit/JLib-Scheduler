@@ -26,9 +26,19 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("SetSlabSizes\n");
 
-    // Before Init() and before this process has ever called the setter -- must match what the
-    // member initializer always used (1024*1024) before this API existed.
-    Check(JLib::TaskScheduler::CurrentSlabSizes().big == 1024 * 1024, "default big pool is 1024*1024");
+    // Before Init() and before this process has ever called the setter. All four are pinned, not
+    // just one: these defaults were DERIVED FROM A MEASUREMENT (Game01, 37,480 tasks -- 15.4% at
+    // 64 bytes, 84.6% at 80, nothing above 80), and they total 176 MB against 256 MB pre-3.0. An
+    // earlier cut of the same release added the 80-byte pool without shrinking the 256-byte one
+    // and reserved 360 MB -- a memory regression shipped as a memory optimisation, and a test that
+    // pinned only one pool would not have said a word about it.
+    const JLib::TaskScheduler::SlabSizes def = JLib::TaskScheduler::CurrentSlabSizes();
+    Check(def.slots256 == 1024 * 1024 / 4, "default 256-byte pool is 256K slots (64 MB)");
+    Check(def.slots128 == 1024 * 1024 / 8, "default 128-byte pool is 128K slots (16 MB)");
+    Check(def.slots80  == 1024 * 1024,     "default 80-byte pool is 1M slots (80 MB) -- the primary");
+    Check(def.slots64  == 1024 * 1024 / 4, "default 64-byte pool is 256K slots (16 MB)");
+    Check(def.slots256 * 256 + def.slots128 * 128 + def.slots80 * 80 + def.slots64 * 64
+              == 176u * 1024 * 1024,       "defaults reserve 176 MB in total, down from 256 MB");
 
     // Small, and deliberately not a round number, so a coincidental pass against the untouched
     // default is impossible and exhaustion below is cheap to trigger and easy to reason about.
@@ -41,28 +51,30 @@ int main() {
     // Deliberately asymmetric values, none a divisor of another, so a setter that ignored a field
     // and fell back to `big / 8` would be caught rather than coincidentally agree.
     JLib::TaskScheduler::SlabSizes sizes;
-    sizes.big   = kSlots;
-    sizes.mid   = 21;
-    sizes.small = 53;
+    sizes.slots256 = kSlots;
+    sizes.slots128 = 21;
+    sizes.slots80  = 37;
+    sizes.slots64  = 53;
     JLib::TaskScheduler::SetSlabSizes(sizes);
 
-    Check(JLib::TaskScheduler::CurrentSlabSizes().big == kSlots, "getter reflects the new value");
+    Check(JLib::TaskScheduler::CurrentSlabSizes().slots256 == kSlots, "getter reflects the new value");
 
     JLib::TaskScheduler::Init(2);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
     // Did construction actually consume it, not just store it.
     const size_t capacity = sched.GetAllocator()->Capacity();
-    Check(sched.GetAllocator()->MidCapacity()   == 21, "128-byte pool got its own configured size");
+    Check(sched.GetAllocator()->MidCapacity()    == 21, "128-byte pool got its own configured size");
+    Check(sched.GetAllocator()->Slot80Capacity() == 37, "80-byte pool got its own configured size");
     Check(sched.GetAllocator()->BigCapacity()   == kSlots, "256-byte pool got its own configured size");
     Check(sched.GetAllocator()->SmallCapacity() == 53, "64-byte pool got its own configured size");
     char what[128];
     std::snprintf(what, sizeof(what), "allocator capacity is the configured %zu, got %zu",
-                  kSlots + 21 + 53, capacity);
+                  kSlots + 21 + 37 + 53, capacity);
     // Capacity() is the TOTAL across the three pools, because a Task can come from any of
     // them -- AllocSized falls through 64 -> 128 -> 256. Asserting against `big` alone would
     // have passed while the exhaustion check below silently measured something else.
-    Check(capacity == kSlots + 21 + 53, what);
+    Check(capacity == kSlots + 21 + 37 + 53, what);
 
     // The functional check, not just the number it reports: allocate well past kSlots and confirm
     // CreateTask actually runs out. Init() itself already consumes a handful of slots for its own
