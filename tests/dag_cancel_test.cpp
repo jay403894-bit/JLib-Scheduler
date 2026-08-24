@@ -872,6 +872,98 @@ int main() {
         Check(sem.Try_Wait(), "and the permit went back to the counter");
     }
 
+    // ---- EAGER cancel has to honour nesting ----------------------------------------------------
+    // 3.3.0 gave scopes a parent chain, and both eager CancelWaiters paths went on selecting waiters
+    // with `w.token == tok.Raw()`. So cancelling a CONNECTION did not eagerly wake anything parked
+    // under its REQUEST scopes.
+    //
+    // WHY THAT HID. Cancellation still WORKED -- Cancelled() walks the chain, so the pre-checks and
+    // skip-at-release were right all along. Only the EAGER wake degraded to lazy, and for a wait
+    // nothing will ever release on its own -- the only reason eager exists -- lazy means never. The
+    // test below is the shape that catches it: NO Signal is issued anywhere, so if the waiter is not
+    // ejected, WaitFor hangs rather than returning a wrong answer.
+    std::printf("eager cancel reaches waiters in NESTED scopes\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope conn;
+        JLib::CancelScope req(conn.Token());       // one level down
+        JLib::CancelScope op(req.Token());         // two levels down
+        std::atomic<int> cancelled{ 0 }, acquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                parked.fetch_add(1, std::memory_order_relaxed);
+                if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                    cancelled.fetch_add(1, std::memory_order_relaxed);
+                else
+                    acquired.fetch_add(1, std::memory_order_relaxed);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->cancelToken = op.Token().Raw();      // the INNERMOST scope
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        Check(WaitUntil(parked, kN), "all waiters parked under the innermost scope");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        // Cancel the OUTERMOST scope and eject from it. Nothing carries this token directly.
+        conn.Cancel();
+        sem.CancelWaiters(conn.Token());            // no Signal anywhere
+        sched.WaitFor(wg);
+
+        char m[144];
+        std::snprintf(m, sizeof m, "all %d were ejected by an ancestor two levels up (got %d)",
+                      kN, cancelled.load());
+        Check(cancelled.load() == kN, m);
+        Check(acquired.load() == 0, "none of them believed it held a permit");
+        Check(!sem.Try_Wait(), "no permit was invented");
+    }
+
+    // Selectivity survives the walk: a sibling branch must be untouched. IsWithin walks UP from the
+    // waiter, so a scope that is not an ancestor can never match however deep the chain is.
+    std::printf("and does not reach a sibling branch\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope root;
+        JLib::CancelScope left(root.Token()), right(root.Token());
+        std::atomic<int> leftCancelled{ 0 }, rightAcquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(2, std::memory_order_relaxed);
+
+        auto* a = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                leftCancelled.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        a->cancelToken = left.Token().Raw();
+        a->waitGroup = &wg;
+        sched.Push(a);
+
+        auto* b = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (sem.WaitCancellable() == JLib::WaitResult::Ok)
+                rightAcquired.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        b->cancelToken = right.Token().Raw();
+        b->waitGroup = &wg;
+        sched.Push(b);
+
+        Check(WaitUntil(parked, 2), "both branches parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        left.Cancel();
+        sem.CancelWaiters(left.Token());
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Check(leftCancelled.load() == 1, "the cancelled branch woke Cancelled");
+        Check(rightAcquired.load() == 0, "the sibling branch is still parked");
+
+        sem.Signal();
+        sched.WaitFor(wg);
+        Check(rightAcquired.load() == 1, "and got its permit when one arrived");
+    }
+
     // ---- THE CLEANUP TRAP ----------------------------------------------------------------------
     // Pins the behaviour documented at SchedulerMutex::LockCancellable, because a rule with no test
     // is a rule somebody "fixes" later.

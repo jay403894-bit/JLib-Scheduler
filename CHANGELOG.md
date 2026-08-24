@@ -3,6 +3,46 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.4.1 - 2026-08-24
+
+**Eager cancellation ignored scope nesting.** 3.3.0 gave scopes a parent chain, but both eager
+`CancelWaiters` paths went on selecting waiters with `w.token == tok.Raw()` -- so cancelling a
+CONNECTION scope did not eagerly wake anything parked under its REQUEST scopes.
+
+### Why it hid
+
+**Cancellation still worked.** `CancelToken::Cancelled()` walks the chain, so the pre-checks and
+skip-at-release were right the whole time. Only the EAGER wake silently degraded to lazy -- and for
+a wait that nothing will release on its own, which is the only reason eager exists, lazy means never.
+A throttle whose owner disconnected, a condition that will not become true again: parked forever,
+with a cancelled scope sitting right there saying so.
+
+Fixed with `CancelToken::IsWithin(ancestor)`, which walks the parent chain for an **identity** rather
+than for a flag. `Cancelled()` answers "should this stop"; `IsWithin` answers "does this belong to
+that scope", and the eager paths need the second. Now used by `SchedulerSemaphore::CancelWaiters` and
+`SchedulerConditionVariable::CancelWaiters`.
+
+An invalid ancestor is `false`, not "everyone" -- callers spell "everyone" by not passing a token at
+all, and a stale handle quietly matching everything is the opposite of safe.
+
+### Tested, including the negative control
+
+Four waiters parked under a scope **two levels** below the one that gets cancelled, with **no Signal
+issued anywhere** -- so a waiter that is not ejected hangs the test rather than returning a wrong
+answer. Plus a sibling branch that must stay parked, then acquire normally.
+
+With the fix reverted to `==`, that test **hangs** (the run times out at the section) rather than
+failing an assertion, which is the honest shape for this bug: nothing reports an error, the work
+simply never finishes.
+
+### The third one
+
+3.2.1 fixed the waiter queues bypassing `IsTaskCancelled`. 3.3.1 fixed the executors bypassing it.
+This fixes the eager selection not walking the chain the predicate walks. Every time the shape is
+identical -- **one place decides, and the call sites do not all go through it** -- and every time it
+was found by something else failing rather than by looking. There is no compile-time enforcement of
+this, and that is the actual defect.
+
 ## 3.4.0 - 2026-08-24
 
 **Deadlines.** `TimerQueue`, a hierarchical timer wheel, and the RAII `Deadline` that sits on it.

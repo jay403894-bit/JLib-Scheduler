@@ -2526,7 +2526,7 @@ void SchedulerSemaphore::CancelWaiters(CancelToken tok) {
 				// Cancellable, matches the scope (or no scope given == everyone), and there is room
 				// in this pass. Anything else is put back in order.
 				const bool cancellable = (w.result != nullptr);
-				const bool matches = !tok.Valid() || (w.token == tok.Raw());
+				const bool matches = !tok.Valid() || CancelToken(w.token).IsWithin(tok);
 				if (cancellable && matches && n < kBuf) victims[n++] = w;
 				else                                    keep.push(w);
 			}
@@ -2694,7 +2694,7 @@ void SchedulerConditionVariable::CancelWaiters(CancelToken tok) {
 				const CvWaiter w = waitingQueue.front();
 				waitingQueue.pop();
 
-				const bool matches = !tok.Valid() || (w.token == tok.Raw());
+				const bool matches = !tok.Valid() || CancelToken(w.token).IsWithin(tok);
 				if (matches && n < kBuf) victims[n++] = w.sem;
 				else                     keep.push(w);
 			}

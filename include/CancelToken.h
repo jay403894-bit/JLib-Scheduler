@@ -175,6 +175,40 @@ namespace JLib {
             return false;
         }
 
+        // Is this scope `ancestor`, or nested anywhere inside it?
+        //
+        // WHAT THIS IS FOR, and why Cancelled() is not enough. Cancelled() answers "should this stop"
+        // by walking UP for a set flag. This answers "does this belong to that scope" by walking up
+        // for an IDENTITY, and the eager cancel paths need the second: CancelWaiters(tok) has to
+        // pick out which waiters a scope owns, and a waiter parked under a nested scope is owned by
+        // the parent even though its token differs.
+        //
+        // Matching tokens with == instead is the bug this replaced. It is invisible in testing
+        // because cancellation still WORKS -- Cancelled() walks, so pre-checks and skip-at-release
+        // are right -- it is only the EAGER wake that silently degrades to lazy. For a wait that may
+        // never be released on its own, which is the only reason eager exists, lazy means never.
+        //
+        // An invalid `ancestor` is false, not "everyone": callers spell "everyone" by not calling
+        // this at all, and a stale handle quietly matching everything is the opposite of safe.
+        bool IsWithin(CancelToken ancestor) const noexcept {
+            if (!ancestor.Valid()) return false;
+            uint32_t raw = raw_;
+            for (int depth = 0; depth < detail::kMaxScopeDepth; ++depth) {
+                if (raw == kNone) return false;
+                if (raw == ancestor.raw_) return true;
+
+                const uint32_t index = raw & 0xFFFFu;
+                if (index >= detail::kCancelSlots) return false;
+                detail::CancelSlot* s = &detail::CancelSlotTable()[index];
+                const uint64_t st = s->state.load(std::memory_order_acquire);
+                // Stale link: the scope this named is gone, so the chain stops here. Same reading as
+                // a stale token itself.
+                if (detail::CancelSlot::GenOf(st) != (raw >> 16)) return false;
+                raw = s->parent.load(std::memory_order_acquire);
+            }
+            return false;
+        }
+
     private:
         uint32_t raw_ = kNone;
     };
