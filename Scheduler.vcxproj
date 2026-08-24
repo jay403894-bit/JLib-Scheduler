@@ -101,6 +101,7 @@
 
   <ItemGroup>
     <ClCompile Include="src\CancelToken.cpp" />
+    <ClCompile Include="src\Timer.cpp" />
     <ClCompile Include="src\Epochs.cpp" />
     <ClCompile Include="src\Fiber.cpp" />
     <ClCompile Include="src\GlobalFiberPool.cpp" />

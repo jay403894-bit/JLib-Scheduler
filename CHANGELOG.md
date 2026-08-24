@@ -3,6 +3,84 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.4.0 - 2026-08-24
+
+**Deadlines.** `TimerQueue`, a hierarchical timer wheel, and the RAII `Deadline` that sits on it.
+Core C++17 -- the library's compiled target is still `cxx_std_17` and nothing here needs a coroutine.
+
+```cpp
+CancelScope op(connection.Token());                    // cancelled if the peer goes away...
+Deadline d(50ms, op.Token(), EjectSemaphore, &sem);    // ...or if this fires first
+WaitResult r = sem.WaitCancellable();                  // one wait, both outcomes
+```
+
+### A timer cancels a SCOPE, and that is the whole mechanism
+
+Nothing in `Task` changed to make timeouts work -- a task still carries one 4-byte token, and 3.3.0's
+scope nesting composes the reasons. A deadline is not a new kind of cancellation; it is the same
+kind, arriving from a second party.
+
+**Two steps, in this order.** Setting the cancel flag does not wake anybody: cancellation is observed
+at suspension points, and a task already parked has passed its last one. So expiry calls `CancelVia`
+first -- so every LATER check agrees -- and then an eject that wakes whoever is parked now. Ejecting
+first leaves a window where a resumed task looks up its token and finds it live.
+
+`TimerEject` is a plain function pointer for a reason: the timer must not know about `Event`, or
+semaphores, or an I/O request -- and an I/O request's idea of waking is the most different of the
+three, since asking the OS to cancel a transfer does not end it. `EjectEvent`, `EjectSemaphore` and
+`EjectConditionVariable` cover the built-ins.
+
+**Removal is an optimisation, not a correctness requirement**, which is the payoff from building this
+after the scope work rather than before. An operation that beats its deadline destroys its scope; the
+timer then fires on a stale token, the generation check fails, and nothing happens. `Disarm` exists
+so the wheel does not fill with entries nobody wants.
+
+### Why a wheel, and why it does not tick
+
+**Cancel is the hot operation, not expiry.** A server arms a timeout per request and cancels almost
+all of them. That rules out a heap, which is O(n) to remove an arbitrary entry without a position
+index; the wheel is O(1) both ways -- the deadline's own bits pick the slot, and entries are
+intrusively doubly-linked. Four levels of 256 slots at a 1ms tick covers 2^32 ticks, about 49.7 days,
+with entries cascading down as time approaches.
+
+**No heap fallback for beyond-range deadlines.** The range is 49.7 days; a second structure
+maintained for a case that never occurs is a second structure to get wrong. Out-of-range clamps.
+
+**It does not tick when idle.** A thread waking a thousand times a second to look at empty slots
+measurably taxes the main thread here -- the same reason the pool defaults to Sleep over NoSleep. So
+each level carries a 256-bit occupancy bitmap scanned a word at a time, and the thread sleeps until
+the soonest occupied slot; with nothing armed it does an untimed wait and costs nothing.
+
+### `SetReserveTimerCore(bool)`
+
+The auto pool size is `hw-1`, and `GetSafeTC`'s own census calls that an exact fit -- workers and
+main, nothing spare. The timer thread therefore puts a deadline-using app exactly one over the
+machine, which is the deficit that measured 3-4% the last time it happened. Call this before `Init`
+and the pool sizes to `hw-2`.
+
+**Opt-in rather than automatic**, because the timer thread does not exist until something arms a
+deadline -- long after `Init` sized the pool -- and reserving unconditionally would take a worker
+from every app that never arms one. Ignored when an explicit `poolSize` is given: that is the app's
+own arithmetic. A Development build says so once if a deadline is armed without it, because silent
+oversubscription is the failure that is hardest to notice.
+
+### Why the timer thread is not a pool worker
+
+Its entire job is to sit in a TIMED wait, and that is the one thing a worker may never do -- a park
+that can return unsignalled is how a lost wakeup becomes "occasionally slow" instead of "hung". A
+permanently occupied worker is also strictly worse than a sleeping OS thread: the thread costs no
+scheduler quantum, the worker costs a slot that can never help. This is the only timed wait in the
+library, and it is on a thread with no work to lose.
+
+### Tested
+
+Fires; never fires EARLY (the only direction that is a bug -- late is a scheduling artifact, early
+cancels work that still had time); `Disarm` and RAII disarm; **a timer outliving its scope cancels
+nobody**, including the scope that inherits the freed slot; cascading across the level boundary;
+ordering; 4,000 armed and disarmed with the wheel returning to empty; 1,600 armed concurrently from
+eight threads; and the integration that matters -- **a deadline waking a task already parked on a
+semaphore nobody will ever signal**, with the timeout not escaping upward to the enclosing scope.
+
 ## 3.3.1 - 2026-08-24
 
 **A cancelled task could still run its payload.** Present since cancellation shipped; found by

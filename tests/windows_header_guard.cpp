@@ -50,6 +50,8 @@
 #include "Epochs.h"
 #include "Fiber.h"
 #include "Thread.h"
+#include "CancelToken.h"
+#include "Timer.h"
 #include "platform.h"
 
 #include <cstdio>

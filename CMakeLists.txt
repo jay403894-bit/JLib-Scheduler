@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "3.3.1")
+set(JLIBSCHED_VERSION "3.4.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -492,6 +492,10 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/bench/compare")
 add_executable(SchedulerDagCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_cancel_test.cpp")
 target_link_libraries(SchedulerDagCancelTest PRIVATE Scheduler)
 target_compile_features(SchedulerDagCancelTest PRIVATE cxx_std_17)
+
+add_executable(SchedulerTimerTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/timer_test.cpp")
+target_link_libraries(SchedulerTimerTest PRIVATE Scheduler)
+target_compile_features(SchedulerTimerTest PRIVATE cxx_std_17)
 
 add_executable(SchedulerDagBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/dag_scaling.cpp")
 target_link_libraries(SchedulerDagBench PRIVATE Scheduler)

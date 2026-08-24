@@ -178,6 +178,13 @@ GlobalFiberPool* TaskScheduler::globalPool = nullptr;
 TaskScheduler::TaskScheduler(size_t poolSize) {
 	StartPool(poolSize);
 }
+// Init-only, and a plain bool for the same reason as EpochManager's selfReclaim: written once before
+// any thread exists, read while sizing the pool. Nothing races it.
+static bool g_reserveTimerCore = false;
+
+void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { g_reserveTimerCore = reserve; }
+bool TaskScheduler::ReserveTimerCore() noexcept { return g_reserveTimerCore; }
+
 size_t TaskScheduler::GetSafeTC() {
 	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin
 	// CPUs 1..hw-1. HISTORY (don't relive it): this was briefly hw-2 (2026-07-31) because GameInput's
@@ -190,9 +197,19 @@ size_t TaskScheduler::GetSafeTC() {
 	// low-duty-cycle wakers that time-slice fine -- measured, not assumed. Apps whose profile disagrees
 	// (or that DON'T use manual-dispatch input) pass an EXPLICIT poolSize to Init (e.g. hw-2) -- that's
 	// the config surface, deliberately no env var; explicit sizes may claim up to full hw (StartPool).
+	//
+	// AND ONE MORE when the app has declared it will use deadlines. TimerQueue runs a thread of its
+	// own -- it has to, because it is the only place in the library a TIMED wait is allowed, and a
+	// worker that can return unsignalled is how a lost wakeup turns into "occasionally slow" instead
+	// of "hung". A thread is the cheap half of that trade: it sleeps untimed whenever nothing is
+	// armed, so it costs a slot in the census and almost no CPU. See SetReserveTimerCore.
 	unsigned int cores = std::thread::hardware_concurrency();
 	if (cores <= 1) return 1;
-	return static_cast<size_t>(cores - 1);
+
+	unsigned int reserved = 1;                       // main
+	if (g_reserveTimerCore) reserved += 1;           // the timer thread
+	if (cores <= reserved) return 1;
+	return static_cast<size_t>(cores - reserved);
 }
 void TaskScheduler::Init(size_t poolSize) {
 	if (instance != nullptr)

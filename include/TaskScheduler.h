@@ -731,6 +731,30 @@ namespace JLib {
 		static void SetSlabSizes(const SlabSizes& sizes);
 		static SlabSizes CurrentSlabSizes();
 
+		// Give the timer thread a core of its own, so an app that uses deadlines does not run one
+		// thread over the machine.
+		//
+		// WHY THIS IS NOT AUTOMATIC. The auto pool size is hw-1, and GetSafeTC's census calls that an
+		// EXACT FIT: workers + main, nothing spare. TimerQueue adds a thread, so an app using
+		// deadlines is oversubscribed by exactly one -- the deficit that cost a measured 3-4% the
+		// last time it happened (see GetSafeTC's history note on GameInput). But the timer thread
+		// only exists once something arms a deadline, and that is long after Init has sized the pool,
+		// so the scheduler cannot detect it -- and reserving unconditionally would take a worker away
+		// from every app that never arms one.
+		//
+		// So it is the app's declaration, like an explicit poolSize. Call it before Init:
+		//
+		//     TaskScheduler::SetReserveTimerCore(true);
+		//     TaskScheduler::Init(0);          // hw-2 workers; main and the timer take the rest
+		//
+		// Ignored when an EXPLICIT poolSize is given -- an explicit size is the app's own arithmetic
+		// and this must not silently second-guess it.
+		//
+		// A Development build complains the first time a deadline is armed without this set, because
+		// the alternative is the failure mode that is hardest to notice: everything works, slightly
+		// worse, forever.
+		static void SetReserveTimerCore(bool reserve) noexcept;
+		static bool ReserveTimerCore() noexcept;
 
 		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
 		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +
