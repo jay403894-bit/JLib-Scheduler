@@ -3,6 +3,48 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.0.1 - 2026-08-24
+
+**[CRITICAL] `Event::SignalAll` was doing an atomic RMW per word of the occupancy table, occupied or
+not.** It exchanged every word unconditionally, so at 31 workers -- a 35-word table -- waking ONE
+waiter cost **35 atomic read-modify-writes**, against the single exchange plus a pointer walk that
+the Treiber waiter stack it replaced in 2.15.0 had cost. Every signal on every event paid it.
+
+The fix is an acquire load before the exchange: a plain `mov` on x86 that does not take the cache
+line exclusive, so an empty word costs a read instead of a line ownership transfer.
+
+Seeing zero and missing a waiter that arrives immediately afterwards is the SAME weakening already
+documented for the table: a waiter registering into an already-scanned word is not woken by that
+signal, and the guarantee callers rely on -- *registered before the signal began implies woken* --
+is unaffected, because a waiter present before the scan started has its bit visible to it.
+
+**Worth reading even if you do not use `Event` directly, because of how it was missed.** Nothing in
+the repository could see this. The test suite checks correctness only; the DAG and coroutine benches
+never touch `Event`. `bench/compare/compare_marl.cpp`'s blocking-crossover arm is the ONLY
+performance coverage that class has, and it caught it immediately. Changing `Event` without
+re-running that harness means changing it with no coverage at all.
+
+### The comparison numbers were stale and are now current
+
+The blocking crossover in the README had been carrying 1.4.0 figures. Re-measured on the same
+machine (i9-13900K at Intel spec power limits, 31 workers):
+
+| block for | 1.4.0 | 3.0.1 | marl, 1.4.0 -> 3.0.1 |
+|---|---|---|---|
+| 50 µs | 8.0 | **6.4** | 5.0 -> 4.8 |
+| 150 µs | 7.4 | **6.1** | 4.9 -> 4.8 |
+| 300 µs | 6.6 | 6.3 | 5.6 -> 5.8 |
+| 600 µs | 7.4 | 7.4 | 8.8 -> 8.0 |
+| 2000 µs | 22.2 | **21.2** | 22.6 -> 22.5 |
+
+**marl is the control**, and it barely moved. That is what makes the movement in our column signal
+rather than machine drift -- and it is also why the README does not claim the `Event` rewrite caused
+it. Many releases sit between 1.4.0 and now; the honest statement is that these moved, not that one
+change moved them. The crossover is still around 400 µs.
+
+Also corrected while the numbers were in hand: a full fiber suspend/resume round trip measures
+**~92 ns**, not the ~166 ns the README had, against a ~1.24 µs cost to submit a task at all.
+
 ## 3.0.0 - 2026-08-24
 
 **A MAJOR because public API was REMOVED, not because the internals changed.** Downstream will not
