@@ -3,6 +3,102 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.3.0 - 2026-08-24
+
+**Cancellation scopes nest.** A scope built with a parent token is cancelled when it is cancelled OR
+when anything enclosing it is. Cancellation travels only DOWN -- a request timing out does not close
+its connection.
+
+```cpp
+CancelScope conn;
+CancelScope req(conn.Token());
+CancelScope op(req.Token());
+conn.Cancel();                 // op.Cancelled() == true
+```
+
+### Why this is the prerequisite for timers, and why `Task` did not grow
+
+A `Task` carries exactly ONE 4-byte token, and async I/O wants **three reasons to stop at once**:
+cancel this operation, cancel this connection, this operation timed out. That is what made a timeout
+look like it needed a new cancellation source -- a deadline field, a second token, something.
+
+It does not. **One token now expresses all of them**, because the walk does the composing: the timer
+cancels the operation's scope, the peer disconnecting cancels the connection's, and the same parked
+wait wakes for either. So the timer wheel needs no deadline in `Task` and does not touch `Task` at
+all -- it holds a token and cancels a scope. `Task` is unchanged, still 64 bytes, still one token.
+
+**The parent link lives in `CancelSlot`,** and that is the whole design decision. Three candidate
+homes, one that works:
+
+| | all three execution modes | uncapped |
+|---|---|---|
+| `Task` | yes | **no** -- 64-byte `static_assert` |
+| `Fiber` | **no** -- fiber mode only | yes |
+| `CancelSlot` | yes | yes |
+
+`Fiber` is disqualified on principle rather than cost: **`Task` is the common denominator**, and a
+coroutine or a Native task has no fiber at all. A fiber is a lookup path, never a home for state.
+
+`Cancelled()` walks to the root, capped at depth 8. On the common path -- an unparented scope --
+that is one extra load that reads `kNone` and stops, which matters because it runs at every suspend
+point. A cycle is unconstructible: a parent token must already exist when the child takes its slot.
+
+A child may safely outlive its parent. The link is a TOKEN, not a pointer, so an orphan stops
+inheriting rather than dangling -- and does not adopt whatever claims the parent's freed slot.
+
+### `CancelVia(CancelToken)`
+
+Cancels a scope you hold only a token for. A timer cannot own the scope it fires against: the scope
+belongs to the operation, and the operation usually finishes FIRST with the timer still queued. The
+generation check makes the late firing a no-op rather than a hazard, so "cancel the operation when
+the deadline expires" needs no unregistering on the fast path.
+
+### `generation` and the cancelled flag are now one word
+
+They were two atomics, which was safe only while the sole writer of the flag was the `CancelScope`
+that owned the slot. `CancelVia` breaks that: check the generation, then set the flag -- and between
+those two steps the scope can be destroyed and the slot re-issued, so the write lands on **an
+unrelated live scope.** Cancelling a random connection is exactly what the generation exists to
+prevent, so the check and the write have to be one atomic step.
+
+`std::atomic<uint64_t> state` = generation << 32 | cancelled bit. `CancelVia` is a CAS; `Cancel` is
+a `fetch_or` (it owns the slot, but must not clobber the generation sharing the word); the
+destructor bumps the generation and clears the flag in one CAS, because as two writes a `CancelVia`
+landing between them would hand the next scope a slot already cancelled; and `Cancelled()` gets both
+halves from one load, so the flag is always read against the generation it belongs to.
+
+### `kCancelSlots`: 4,096 -> 65,535
+
+4,096 was sized for one scope per frame or per graph. Async I/O wants one per connection AND one per
+in-flight operation, and **that is not bounded by the fiber pool** -- coroutines are the vehicle for
+I/O precisely because they are not fibers, their frames come from the task slab, and there can be
+hundreds of thousands in flight. An ordinary server would have reached 4,096, and exhaustion FAILS
+OPEN, which is the quietest failure available.
+
+**65,535 and not 65,536, which is not an off-by-one.** `CancelToken::kNone` is `0xFFFFFFFF` -- index
+`0xFFFF`, generation `0xFFFF`. A slot at index `0xFFFF` would emit a token bit-identical to `kNone`
+once every 65,536 generations, and that token reads as *unscoped*: the task silently stops being
+cancellable. One short makes the collision unconstructible.
+
+**The free-list head widened to 64 bits,** which was forced. It packed `(ABA tag << 16) | 1-based
+index`; a 1-based index over 65,535 slots needs all 16, leaving the empty sentinel and the tag
+nowhere, and 65,536 would not fit at all. Now 32-bit index and 32-bit tag, so slot count and ABA
+protection stop competing for one word. Silent corruption, not a compile error, had it been missed.
+
+`sizeof(CancelSlot)` is pinned at 16 by `static_assert`, so the table is ~1 MiB of BSS, untouched
+until scopes exist.
+
+### Tested
+
+Three-deep inheritance; a child's cancel not escaping upward; a child outliving its parent
+**including a new scope claiming the parent's freed slot**, which is where a missing generation
+check would surface; `CancelVia` live / idempotent / stale / re-issued; the table filled to its last
+slot with no aliasing, no `0xFFFF`, a failing-open overflow, and a full refill afterwards to catch a
+free list losing entries at the new boundary.
+
+And the one that matters -- **a parked task woken `Cancelled` by an enclosing scope it does not
+carry**, through `IsTaskCancelled` at a real suspension point. That is the shape a timeout will use.
+
 ## 3.2.1 - 2026-08-24
 
 Found by auditing cancellation before starting timers and async I/O, rather than by any test.

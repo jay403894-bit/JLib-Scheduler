@@ -27,11 +27,17 @@
 //
 // STILL MISSING: timers and timeouts, which is the only real gap. See the CHANGELOG for 3.2.0.
 //
-// TWO BOUNDS WORTH KNOWING. There are kCancelSlots (4,096) LIVE scopes, not the 65,536 the token's
-// 16-bit index could address -- and exhaustion fails open, so a workload that keeps a scope per
-// connection must size this deliberately. And a generation is 16 bits, so a handle stale by exactly
-// 65,536 reuses of its slot aliases whatever holds it now; the free list is LIFO, so a create/destroy
-// loop drives ONE slot's counter and reaches that bound far sooner than a spread-out workload would.
+// SCOPES NEST. A scope constructed with a parent token is cancelled when it is cancelled OR when
+// anything enclosing it is, so ONE token on a task can express several reasons to stop: a timeout
+// firing on the operation, or the connection it belongs to going away. That is why a timeout needs
+// no deadline field anywhere -- a timer just holds a token and calls CancelVia. Cancellation only
+// ever travels DOWN: a request timing out does not close its connection.
+//
+// TWO BOUNDS WORTH KNOWING. There are kCancelSlots (65,535) LIVE scopes -- one short of what the
+// token's 16-bit index could address, see the note there -- and exhaustion FAILS OPEN. And a
+// generation is 16 bits, so a handle stale by exactly 65,536 reuses of its slot aliases whatever
+// holds it now; the free list is LIFO, so a create/destroy loop drives ONE slot's counter and
+// reaches that bound far sooner than a spread-out workload would.
 
 #include <atomic>
 #include <cstdint>
@@ -45,22 +51,75 @@ namespace JLib {
         // cancelled -- every task in a graph, every operation for a connection -- and tasks
         // reference one.
         struct CancelSlot {
-            std::atomic<uint32_t> cancelled{ 0 };
-            std::atomic<uint32_t> generation{ 0 };   // bumped on release; defeats stale handles
+            // GENERATION AND CANCELLED FLAG IN ONE WORD, so they can be read and written together.
+            // High 32 bits generation, low bit cancelled.
+            //
+            // They were two atomics until the parent chain went in, and that was safe only while
+            // the sole writer of `cancelled` was the CancelScope that owned the slot. CancelVia
+            // breaks that: a timer holds a bare TOKEN, so it must check the generation and then set
+            // the flag -- and between those two steps the scope can be destroyed and the slot handed
+            // to somebody else, at which point the flag lands on an unrelated scope. Cancelling a
+            // random live connection is precisely what the generation exists to prevent, so the
+            // check and the write have to be one atomic step. One word makes that a CAS.
+            std::atomic<uint64_t> state{ 0 };
+
+            static constexpr uint64_t kCancelledBit = 1;
+            static uint32_t GenOf(uint64_t s) noexcept { return uint32_t(s >> 32) & 0xFFFFu; }
+            static bool     CancelledIn(uint64_t s) noexcept { return (s & kCancelledBit) != 0; }
+
+            // Enclosing scope, or 0xFFFFFFFF for a root. THE PARENT LINK LIVES HERE, NOT IN Task,
+            // and that is the whole design decision: a Task is capped at 64 bytes by static_assert
+            // and there are millions of them, while a slot is uncapped and there are at most 65,535.
+            // Putting it here also means nesting costs Task nothing at all -- a task still carries
+            // exactly one token, its innermost scope, and the chain is walked on the read side.
+            //
+            // Written once before the owning scope's token is published, then read from other
+            // threads; atomic for that, not for contention.
+            std::atomic<uint32_t> parent{ 0xFFFFFFFFu };
             // Intrusive free-list link, as a 1-BASED index (0 means end of list). Only touched while
             // this slot is free, so it needs no atomicity of its own -- the publish is the CAS on
             // the list head.
             uint32_t nextFree{ 0 };
         };
 
-        // Fixed table. Scope creation is not a hot path (one per graph, per connection, per
-        // request), so a linear CAS scan is fine and avoids another allocator.
-        inline constexpr uint32_t kCancelSlots = 4096;
+        // 16 bytes: 65,535 of them is a ~1 MiB static array. Stated so a change that quietly
+        // doubles it -- another atomic, a debug field -- has to argue with this line first.
+        static_assert(sizeof(CancelSlot) == 16, "CancelSlot pads the table; keep it 16 bytes");
+
+        // Fixed table, taken from an O(1) intrusive free list -- not the linear CAS scan this
+        // once used, which every TaskDAG construction paid for. No second allocator either way.
+        // 65,535 AND NOT 65,536, which looks like an off-by-one and is not. The token packs a 16-bit
+        // index, and CancelToken::kNone is 0xFFFFFFFF -- index 0xFFFF, generation 0xFFFF. A slot at
+        // index 0xFFFF would therefore produce a token IDENTICAL to kNone once every 65,536
+        // generations, and that token reads as "unscoped": the task silently stops being
+        // cancellable. Stopping one short means 0xFFFF is never a valid index and the collision is
+        // unconstructible.
+        //
+        // WHY THIS BIG. It was 4,096, sized for one scope per frame or per graph. Async I/O wants a
+        // scope per connection AND one per in-flight operation, and that is NOT bounded by the fiber
+        // pool: coroutines are the vehicle for I/O precisely because they are not fibers, their
+        // frames come from the task slab, and there can be hundreds of thousands in flight. 4,096
+        // would have been reached by an ordinary server, and exhaustion FAILS OPEN -- the quietest
+        // possible failure.
+        //
+        // The cost is a ~1 MiB zero-initialised static array, which lives in BSS and stays untouched
+        // until scopes are actually created.
+        inline constexpr uint32_t kCancelSlots = 65535;
         CancelSlot* CancelSlotTable();
 
         // Resolves a packed handle, returning null if the slot has been recycled since it was
         // issued. That generation check is the whole reason the handle is not a bare pointer.
         CancelSlot* ResolveCancelSlot(uint32_t raw);
+
+        // How far Cancelled() will walk before giving up. Real nesting is shallow -- connection,
+        // request, operation is three -- so this is a backstop against a corrupted chain, not a
+        // limit anyone should design against. A bounded walk cannot hang a suspend-point check.
+        //
+        // A CYCLE IS UNCONSTRUCTIBLE ANYWAY: a parent token must already exist when the child takes
+        // its slot, so a scope can never become its own ancestor. If a parent is destroyed and its
+        // slot recycled, the child's stored handle carries the OLD generation and stops resolving --
+        // it does not silently re-point at whatever moved in.
+        inline constexpr int kMaxScopeDepth = 8;
     }
 
     // A 4-byte handle: 16-bit slot index, 16-bit generation. Four bytes because that is exactly
@@ -84,10 +143,36 @@ namespace JLib {
         // False for an absent OR stale token. A task holding a handle to a scope that has since
         // been destroyed is not cancelled -- it is unscoped, which is the safe reading: the
         // alternative would cancel work at random as slots recycle.
+        //
+        // WALKS TO THE ROOT, so a scope is cancelled when IT was cancelled or when anything
+        // enclosing it was. That is what lets one token express several reasons to stop: an
+        // operation nested in a connection is cancelled by cancelling the operation (a timeout
+        // firing) OR by cancelling the connection (the peer went away), and the task carrying the
+        // operation's token sees both. Without the walk a Task would need one token per reason, and
+        // it has room for exactly one.
+        //
+        // Cost on the common path -- an unparented scope -- is one extra relaxed-ish load that
+        // reads kNone and stops. This is called at every suspend point, so that matters.
         bool Cancelled() const noexcept {
-            if (raw_ == kNone) return false;
-            detail::CancelSlot* s = detail::ResolveCancelSlot(raw_);
-            return s && s->cancelled.load(std::memory_order_acquire) != 0;
+            uint32_t raw = raw_;
+            for (int depth = 0; depth < detail::kMaxScopeDepth; ++depth) {
+                if (raw == kNone) return false;
+                const uint32_t index = raw & 0xFFFFu;
+                if (index >= detail::kCancelSlots) return false;
+
+                detail::CancelSlot* s = &detail::CancelSlotTable()[index];
+                // ONE load gets both halves, so the generation this answer is based on is the same
+                // generation the flag was read from. Two loads could straddle a recycle and report
+                // a new tenant's cancellation against an old handle.
+                const uint64_t st = s->state.load(std::memory_order_acquire);
+
+                // Stale: the scope this link named is gone. Stop rather than guess -- the same
+                // reading as a stale token itself, and the reason a child may outlive its parent.
+                if (detail::CancelSlot::GenOf(st) != (raw >> 16)) return false;
+                if (detail::CancelSlot::CancelledIn(st)) return true;
+                raw = s->parent.load(std::memory_order_acquire);
+            }
+            return false;
         }
 
     private:
@@ -104,6 +189,20 @@ namespace JLib {
     class CancelScope {
     public:
         CancelScope() noexcept;
+
+        // NESTED scope. Cancelling `parent` cancels this one and everything under it, without the
+        // canceller knowing what those are -- which is the point: a connection cancels its requests,
+        // a frame cancels the work it spawned, and nothing has to keep a registry of children.
+        //
+        // The parent is captured as a TOKEN, not a pointer, so a child outliving its parent is
+        // memory-safe: the generation check fails and the child simply stops inheriting. It does
+        // not dangle and it does not inherit from whatever takes the slot next.
+        //
+        // Passing an invalid or stale token gives an ordinary root scope. That is deliberate --
+        // failing open matches what an exhausted table already does, and the alternative would be
+        // to abort live work because a parent was already gone.
+        explicit CancelScope(CancelToken parent) noexcept;
+
         ~CancelScope();
 
         CancelScope(const CancelScope&) = delete;
@@ -121,5 +220,18 @@ namespace JLib {
     private:
         uint32_t raw_ = CancelToken::kNone;
     };
+
+    // Cancel a scope you hold only a TOKEN for, rather than the CancelScope object.
+    //
+    // WHAT THIS IS FOR. A timer cannot own the scope it fires against -- the scope belongs to the
+    // operation, and the operation usually finishes FIRST, with the timer still queued. So the timer
+    // holds a token, and the generation check makes the late firing a no-op instead of a hazard:
+    // the scope is gone, the slot has moved on, the handle stops resolving, and nothing happens.
+    // That is what makes "cancel the operation's scope when the deadline expires" implementable
+    // without a deadline field in Task and without unregistering timers on the fast path.
+    //
+    // Returns whether anything was cancelled, so a caller that cares can tell a live scope from a
+    // stale handle. Cancelling is one-way and idempotent, so calling twice is harmless.
+    bool CancelVia(CancelToken token) noexcept;
 
 } // namespace JLib

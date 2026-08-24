@@ -17,11 +17,13 @@
 #include "TaskScheduler.h"
 #include "TaskDAG.h"
 
+#include <new>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
+#include <algorithm>
 #include <vector>
 
 static int g_fail = 0;
@@ -831,6 +833,43 @@ int main() {
         Check(sem.Try_Wait(), "and the permit went back to the counter for someone who wants it");
     }
 
+    // THE ONE THAT MATTERS: a parked TASK, cancelled by an enclosing scope it never heard of.
+    // The task carries the innermost token only -- one uint32_t, exactly as before -- and the walk
+    // in CancelToken::Cancelled does the rest through IsTaskCancelled at a real suspension point.
+    // This is the shape a timeout will use: the timer cancels the operation, the peer disconnecting
+    // cancels the connection, and the same parked wait wakes for either.
+    std::printf("a parked task is cancelled by an ENCLOSING scope\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope conn;
+        JLib::CancelScope op(conn.Token());
+        std::atomic<int> cancelled{ 0 }, acquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                cancelled.fetch_add(1, std::memory_order_relaxed);
+            else
+                acquired.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->cancelToken = op.Token().Raw();          // the INNER scope only
+        t->waitGroup = &wg;
+        sched.Push(t);
+
+        Check(WaitUntil(parked, 1), "the waiter parked under the inner scope");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        conn.Cancel();                              // cancel the OUTER scope; nothing knows about t
+        sem.Signal();                               // skip-at-release has to see it through the walk
+        sched.WaitFor(wg);
+
+        Check(cancelled.load() == 1, "it woke Cancelled from a scope it does not carry");
+        Check(acquired.load() == 0, "it did not take the permit");
+        Check(sem.Try_Wait(), "and the permit went back to the counter");
+    }
+
     // ---- THE CLEANUP TRAP ----------------------------------------------------------------------
     // Pins the behaviour documented at SchedulerMutex::LockCancellable, because a rule with no test
     // is a rule somebody "fixes" later.
@@ -872,6 +911,148 @@ int main() {
         Check(cleanedUp.load() == 1, "plain Lock() on the same free mutex succeeded: cleanup belongs there");
         Check(m.Try_Lock(), "and the mutex is undamaged afterwards");
         m.Unlock();
+    }
+
+    // ---- the WHOLE table, including its last slot ------------------------------------------------
+    // Exercises the two things that had to change to raise kCancelSlots from 4,096 to 65,535.
+    //
+    // 1. The free-list head packs a ONE-BASED index, so a full table has to represent 65,535. That
+    //    did not fit alongside the ABA tag in 32 bits; the head is 64-bit now. If it were not, the
+    //    high slots would alias low ones and this loop would hand out duplicates or run short.
+    // 2. kCancelSlots stops at 65,535 rather than 65,536 so that index 0xFFFF is never valid --
+    //    a token at index 0xFFFF, generation 0xFFFF is bit-identical to kNone, and would read as
+    //    UNSCOPED. Every scope here is made to report its own cancellation, which is exactly what a
+    //    token silently equal to kNone could not do.
+    std::printf("the cancel table can be filled to its last slot\n");
+    {
+        std::vector<JLib::CancelScope> all(JLib::detail::kCancelSlots);
+        size_t invalid = 0, unresolvable = 0, aliased = 0;
+        std::vector<uint32_t> seen;
+        seen.reserve(JLib::detail::kCancelSlots);
+
+        for (auto& s : all) {
+            if (!s.Valid()) { ++invalid; continue; }
+            s.Cancel();
+            if (!s.Token().Cancelled()) ++unresolvable;
+            seen.push_back(s.Token().Raw() & 0xFFFFu);
+        }
+        std::sort(seen.begin(), seen.end());
+        for (size_t i = 1; i < seen.size(); ++i) if (seen[i] == seen[i - 1]) ++aliased;
+
+        char m[144];
+        std::snprintf(m, sizeof m, "all %u slots handed out (invalid: %zu)",
+                      JLib::detail::kCancelSlots, invalid);
+        Check(invalid == 0, m);
+        Check(unresolvable == 0, "every one of them resolved and reported its own cancellation");
+        Check(aliased == 0, "no two live scopes were given the same slot index");
+        Check(seen.empty() || seen.back() < 0xFFFFu, "no scope was issued index 0xFFFF, which is kNone");
+
+        // Full table. One more must fail OPEN -- invalid, cancelling nothing, never throwing.
+        {
+            JLib::CancelScope overflow;
+            Check(!overflow.Valid(), "a scope past the end of a full table is invalid");
+            Check(!overflow.Cancelled(), "and reports not-cancelled rather than cancelling everything");
+            overflow.Cancel();
+            Check(!overflow.Cancelled(), "cancelling an invalid scope is a no-op, not a crash");
+        }
+    }
+
+    // ...and the table comes back. If ReleaseSlot lost entries at the 64-bit boundary this is where
+    // it shows: the second fill would come up short.
+    std::printf("and the whole table is recovered afterwards\n");
+    {
+        std::vector<JLib::CancelScope> all(JLib::detail::kCancelSlots);
+        size_t invalid = 0;
+        for (auto& s : all) if (!s.Valid()) ++invalid;
+        Check(invalid == 0, "the table refilled completely after being emptied");
+    }
+
+    // ---- NESTED SCOPES -------------------------------------------------------------------------
+    // The parent link lives in CancelSlot, not in Task: a Task is capped at 64 bytes and there are
+    // millions of them, a slot is uncapped and there are 4,096. So nesting costs Task nothing -- it
+    // still carries exactly one token, its innermost scope -- and Cancelled() walks the chain.
+    //
+    // This is what lets ONE token express several reasons to stop, which is the whole point for I/O:
+    // an operation nested in a connection is cancelled by a timeout firing on the operation OR by
+    // the peer going away and the connection being cancelled.
+    std::printf("cancellation is inherited from an enclosing scope\n");
+    {
+        JLib::CancelScope conn;
+        JLib::CancelScope req(conn.Token());
+        JLib::CancelScope op(req.Token());
+
+        Check(!op.Cancelled(), "a fresh three-deep chain is not cancelled");
+
+        conn.Cancel();                                   // the OUTERMOST scope
+        Check(op.Cancelled(), "the innermost scope sees a cancel three levels up");
+        Check(req.Cancelled(), "and so does the one in between");
+        Check(conn.Cancelled(), "and the scope that was actually cancelled");
+    }
+
+    // One-way. A child aborting must not take its parent or its siblings with it -- one request
+    // timing out does not close the connection.
+    std::printf("a child's cancellation does not escape upward\n");
+    {
+        JLib::CancelScope conn;
+        JLib::CancelScope a(conn.Token()), b(conn.Token());
+
+        a.Cancel();
+        Check(a.Cancelled(), "the cancelled child is cancelled");
+        Check(!conn.Cancelled(), "its parent is not");
+        Check(!b.Cancelled(), "and neither is its sibling");
+    }
+
+    // A child MAY outlive its parent. The link is a token, not a pointer, so this is a resolve
+    // failure and not a dangle -- and critically the child must not start inheriting from whatever
+    // scope claims the parent's slot next.
+    std::printf("a child that outlives its parent stops inheriting, safely\n");
+    {
+        JLib::CancelToken childTok;
+        alignas(JLib::CancelScope) unsigned char storage[sizeof(JLib::CancelScope)];
+        JLib::CancelScope* child = nullptr;
+        {
+            JLib::CancelScope parent;
+            child = new (storage) JLib::CancelScope(parent.Token());
+            childTok = child->Token();
+            Check(!childTok.Cancelled(), "not cancelled while the parent is alive and uncancelled");
+        }   // parent destroyed; its slot goes back on the free list
+
+        Check(!childTok.Cancelled(), "still not cancelled once the parent is gone");
+
+        // The very next scope takes the parent's freed slot (LIFO). Cancelling it must not reach
+        // the orphan -- if the generation check were missing, this is where it would show up.
+        {
+            JLib::CancelScope squatter;
+            squatter.Cancel();
+            Check(!childTok.Cancelled(), "and a NEW scope on the parent's old slot does not adopt it");
+        }
+
+        child->Cancel();
+        Check(childTok.Cancelled(), "the orphan can still be cancelled in its own right");
+        child->~CancelScope();
+    }
+
+    // CancelVia: cancel through a bare token. This is what a timer will use -- it cannot own the
+    // scope, because the operation owns it and usually finishes first with the timer still queued.
+    std::printf("CancelVia cancels through a token, and is inert once the scope is gone\n");
+    {
+        JLib::CancelToken stale;
+        {
+            JLib::CancelScope s;
+            stale = s.Token();
+            Check(JLib::CancelVia(s.Token()), "a live token reports that it cancelled something");
+            Check(s.Cancelled(), "and the scope really is cancelled");
+            Check(JLib::CancelVia(s.Token()), "cancelling twice is idempotent, not an error");
+        }
+
+        // The scope is gone: exactly the state a timer finds when its operation completed first.
+        Check(!JLib::CancelVia(stale), "a stale token cancels nothing and says so");
+        Check(!stale.Cancelled(), "and nothing was set behind it");
+
+        // And it must not cancel whoever inherits the slot.
+        JLib::CancelScope next;
+        Check(!JLib::CancelVia(stale), "still inert once the slot has been re-issued");
+        Check(!next.Cancelled(), "the new tenant is untouched");
     }
 
     // ---- scope slots recycle -------------------------------------------------------------------
