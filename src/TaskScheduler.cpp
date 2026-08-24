@@ -2515,7 +2515,7 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex) {
 
 		// 2. Lock the CV internal queue and push our wait handle
 		LockQueue();
-		waitingQueue.push(&localWaitSemaphore);
+		waitingQueue.push(CvWaiter{ &localWaitSemaphore, CancelToken::kNone });
 		UnlockQueue();
 
 		// 3. Release the outer engine mutex so other threads/fibers can work
@@ -2558,12 +2558,113 @@ void SchedulerConditionVariable::Wait(SchedulerMutex& mutex) {
 	}
 }
 
+
+// Cancellable Wait. Structurally identical to Wait() with one difference that is the entire point:
+// it RE-ACQUIRES THE MUTEX BEFORE RETURNING, cancelled or not.
+//
+// THE INVARIANT, and why it is not negotiable. A condition variable's contract is that Wait returns
+// holding the lock. If a cancelled return skipped that, every caller would need a conditional
+// unlock, and the first one to forget would unlock a mutex it does not hold -- corrupting the mutex
+// for everyone, from a path that only runs when something is already going wrong. So the lock is
+// re-acquired unconditionally and only the RESULT differs; the caller's Unlock stays plain.
+//
+// Re-acquiring on a cancelled path is a wait, which sounds like it defeats the purpose. It does not,
+// for the reason the whole library is built on: for a fiber or a coroutine a wait is a SUSPENSION,
+// not a blocked thread. And the mutex being re-acquired is a critical section, which is the one
+// thing this design deliberately does not let you abandon -- see SchedulerMutex.
+//
+// THE STACK-FRAME INVARIANT IS PRESERVED. waitingQueue holds a pointer into this frame, so nothing
+// may let this function return while that pointer is still queued. Cancellation cannot return early
+// on its own: the only ways out are a notifier (which removes the entry before signalling) and
+// CancelWaiters (which removes it before waking). Both remove first, under the lock. That is why
+// this is safe where a timed wait would not be.
+WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
+	auto thread = Thread::GetCurrent();
+	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
+
+	Task* callerTask = TaskScheduler::IsInitialized() ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
+	const uint32_t tok = callerTask ? callerTask->cancelToken : CancelToken::kNone;
+
+	if (current != nullptr) {
+		// Already cancelled: do not park at all. The mutex is still held here and stays held, so
+		// this returns exactly as the contract promises -- with the lock, and with nothing waited on.
+		if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+
+		SchedulerSemaphore localWaitSemaphore(0, 1);
+
+		LockQueue();
+		waitingQueue.push(CvWaiter{ &localWaitSemaphore, tok });
+		UnlockQueue();
+
+		mutex.Unlock();
+
+		// Cancellable, so a Notify that skips this waiter at release reports Cancelled rather than
+		// handing it a permit -- and CancelWaiters can eject it outright.
+		const WaitResult r = localWaitSemaphore.WaitCancellable();
+
+		// UNCONDITIONAL. See the invariant above.
+		mutex.Lock();
+		return r;
+	}
+
+	// Bare thread: no fiber to park, so nothing to eject and no early return to make safe. The
+	// cancellation it can observe is the one that is already true.
+	if (CancelToken(tok).Cancelled()) return WaitResult::Cancelled;
+	mutex.Unlock();
+	ContendedSpinStep();
+	mutex.Lock();
+	return CancelToken(tok).Cancelled() ? WaitResult::Cancelled : WaitResult::Ok;
+}
+
+// EAGER cancellation. Removes matching waiters from the queue and then wakes them, in that order.
+//
+// REMOVE BEFORE WAKE, and never the reverse. Every entry is a pointer into a waiting fiber's stack
+// frame; waking a waiter lets that frame die, so waking one whose entry is still queued leaves a
+// dangling pointer for the next Notify to signal. The notifiers already obey this rule -- pop under
+// the lock, Signal outside it -- and this is the same rule for the same reason.
+//
+// Waking happens through the local semaphore's own eager path, which refuses to eject a waiter with
+// no result slot. So a plain Wait() is never woken here even if its scope is cancelled: it has
+// nowhere to report Cancelled, and returning it into its critical section believing the condition
+// held would be worse than leaving it parked.
+void SchedulerConditionVariable::CancelWaiters(CancelToken tok) {
+	constexpr size_t kBuf = 64;
+	SchedulerSemaphore* victims[kBuf];
+
+	for (;;) {
+		size_t n = 0;
+		{
+			LockQueue();
+
+			std::queue<CvWaiter> keep;
+			while (!waitingQueue.empty()) {
+				const CvWaiter w = waitingQueue.front();
+				waitingQueue.pop();
+
+				const bool matches = !tok.Valid() || (w.token == tok.Raw());
+				if (matches && n < kBuf) victims[n++] = w.sem;
+				else                     keep.push(w);
+			}
+			waitingQueue.swap(keep);
+
+			UnlockQueue();
+		}
+
+		if (n == 0) return;
+
+		// Out of the lock, and only now: each of these can wake and let its frame go.
+		for (size_t i = 0; i < n; ++i) victims[i]->CancelWaiters(tok);
+
+		if (n < kBuf) return;
+	}
+}
+
 void SchedulerConditionVariable::Notify_One() {
 	SchedulerSemaphore* nextSemaphore = nullptr;
 
 	LockQueue();
 	if (!waitingQueue.empty()) {
-		nextSemaphore = waitingQueue.front();
+		nextSemaphore = waitingQueue.front().sem;
 		waitingQueue.pop();
 	}
 	UnlockQueue();
@@ -2575,7 +2676,7 @@ void SchedulerConditionVariable::Notify_One() {
 }
 
 void SchedulerConditionVariable::Notify_All() {
-	std::queue<SchedulerSemaphore*> localQueue;
+	std::queue<CvWaiter> localQueue;
 
 	// Flush the global wait list into a local thread-isolated stack instantly
 	LockQueue();
@@ -2584,7 +2685,7 @@ void SchedulerConditionVariable::Notify_All() {
 
 	// Signal all waiting contexts sequentially
 	while (!localQueue.empty()) {
-		SchedulerSemaphore* sem = localQueue.front();
+		SchedulerSemaphore* sem = localQueue.front().sem;
 		localQueue.pop();
 		sem->Signal();
 	}

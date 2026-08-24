@@ -3,6 +3,76 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.2.0 - 2026-08-24
+
+**`SchedulerConditionVariable::WaitCancellable(mutex)` and `CancelWaiters(token)`.** A condition
+variable is the clearest case for cancellation there is -- the condition may simply never become
+true -- and it was the last waiting primitive without it.
+
+### The invariant: a cancelled return still holds the mutex
+
+`Wait` returns holding the lock. Cancellation does not get to break that. If a cancelled return came
+back without it, every caller would need a conditional unlock, and the first one to forget would
+unlock a mutex it does not hold -- corrupting it for everyone, from a path that only runs when
+something has already gone wrong. So the lock is re-acquired unconditionally and **only the result
+differs**; the caller's `Unlock()` stays plain.
+
+Re-acquiring on the cancelled path sounds like it defeats the purpose, and does not, for the reason
+the library is built on: for a fiber or a coroutine a wait is a SUSPENSION, not a blocked thread.
+The mutex being re-acquired is a critical section, which is the one thing this design deliberately
+will not let you abandon.
+
+The test proves it rather than asserting it: four waiters call `Unlock()` **unconditionally** on the
+cancelled path, exactly as a real caller would, and the mutex is then checked to be takeable. If a
+cancelled return had not held the lock, those unlocks would have released a mutex nobody held and
+the check would fail.
+
+### Eager, and why removal has to come first
+
+`CancelWaiters(tok)` wakes matching waiters with no `Notify` at all.
+
+`waitingQueue` holds a **raw pointer into each waiting fiber's stack frame** -- a transient
+semaphore living in `Wait`'s frame. Waking a waiter lets that frame die, so waking one whose entry is
+still queued leaves a dangling pointer for the next `Notify` to signal. Entries are therefore removed
+under the queue lock BEFORE anyone is woken, which is the same rule the notifiers already follow
+(pop under the lock, `Signal` outside it) and the same reason the header has always forbidden a
+timed wait here: a wait that can return unsignalled would pop its own frame while its address was
+still queued.
+
+That is also why cancellation is safe where a timeout would not be. Cancellation cannot return
+early on its own -- the only exits are a notifier or `CancelWaiters`, and both remove first.
+
+**A plain `Wait()` is never woken by cancellation**, whatever scope it is under. It has nowhere to
+report `Cancelled`, so returning it into its critical section believing the condition became true is
+worse than leaving it parked. Enforced twice over: the queue entry carries `kNone` for a plain wait,
+and the underlying semaphore refuses to eject a waiter with no result slot. Tested directly -- a
+plain waiter under a cancelled scope stays parked through the cancel and wakes only on a real
+`Notify_All`.
+
+The queue element gained the waiting scope's token, so `CancelWaiters` can pick out whose waits to
+abort; a default-constructed token means everyone, for teardown.
+
+### Cancellation coverage is now complete for the primitives that should have it
+
+| | |
+|---|---|
+| `Event` | eager |
+| `SchedulerSemaphore` | eager (`CancelWaiters`), skip-at-release (`WaitCancellable`), uncancellable (`Wait`) |
+| `SchedulerConditionVariable` | eager (`CancelWaiters`), skip-at-release (`WaitCancellable`), uncancellable (`Wait`) |
+| coroutines awaiting a mutex or permit | skip-at-release |
+| `TaskDAG`, worker pickup | outcome / discard |
+| `SchedulerMutex` | **deliberately uncancellable** |
+| fork-join fences | **deliberately uncancellable** |
+
+The last two are not gaps. A critical section that aborts mid-wait complicates every RAII invariant
+around it and its holder releases promptly anyway; sixteen workers finishing a broadphase step
+should run to completion.
+
+**Timers and timeouts remain the real gap, because no such primitive exists.** An entity dying and
+unwinding its queued delays, and `co_await Acquire(timeout)`, both need a deadline structure with
+removal designed in rather than retrofitted -- and its deadlines must stay out of the worker park
+path, where timed waits hide lost wakeups.
+
 ## 3.1.0 - 2026-08-24
 
 **EAGER CANCELLATION where a wait may never end.** Until now every primitive was strictly

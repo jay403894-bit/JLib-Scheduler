@@ -1353,8 +1353,18 @@ namespace JLib {
 		// User-space spinlock protecting the internal CV queue
 		std::atomic_flag spinLock = ATOMIC_FLAG_INIT;
 
-		// A queue of semaphores, each representing a waiting fiber context
-		std::queue<SchedulerSemaphore*> waitingQueue;
+		// One entry per waiting fiber: the transient semaphore it is parked on, plus the scope it
+		// waits under so CancelWaiters can pick out whose waits to abort.
+		//
+		// `sem` POINTS INTO THE WAITING FIBER'S STACK FRAME -- see the invariant note in Wait().
+		// Anything that lets a waiter return must remove its entry from this queue FIRST, under the
+		// lock, exactly as the notifiers do. That is the entire reason CancelWaiters below removes
+		// before it wakes rather than the other way round.
+		struct CvWaiter {
+			SchedulerSemaphore* sem   = nullptr;
+			uint32_t            token = 0xFFFFFFFFu;   // CancelToken::kNone
+		};
+		std::queue<CvWaiter> waitingQueue;
 
 		void LockQueue();
 		void UnlockQueue();
@@ -1365,6 +1375,26 @@ namespace JLib {
 
 		// Fibers suspend here; Native tasks spin and steal work
 		void Wait(SchedulerMutex& mutex);
+
+		// Cancellable Wait.
+		//
+		// THE INVARIANT: this RE-ACQUIRES THE MUTEX BEFORE RETURNING, cancelled or not. A condition
+		// variable's contract is that Wait returns holding the lock, and cancellation does not get
+		// to break it -- otherwise every caller would need a conditional unlock and the first one to
+		// forget would unlock a mutex it does not hold. So the caller's Unlock stays unconditional
+		// and only the RESULT differs.
+		//
+		// That is why this is safe where a timed wait would not be: re-acquiring is a wait, and for
+		// a fiber or a coroutine a wait is a suspension rather than a blocked thread.
+		[[nodiscard]] WaitResult WaitCancellable(SchedulerMutex& mutex);
+
+		// EAGER cancellation: wakes matching waiters without any Notify. A condition variable is the
+		// clearest case for it -- the condition may simply never become true.
+		//
+		// tok selects whose waits to abort; a default-constructed token means everyone, for
+		// teardown. Waiters that used plain Wait() are never woken: they have nowhere to report
+		// Cancelled.
+		void CancelWaiters(CancelToken tok = CancelToken{});
 
 		// Unblocks one waiting fiber context
 		void Notify_One();

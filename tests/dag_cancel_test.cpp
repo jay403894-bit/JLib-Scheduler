@@ -360,6 +360,118 @@ int main() {
 
     // SchedulerSemaphore::CancelWaiters -- EAGER, for a semaphore used as an I/O throttle. The
     // proof that it is eager is that NO Signal is issued anywhere below and WaitFor still returns.
+    // SchedulerConditionVariable::WaitCancellable. THE INVARIANT under test is not "does the flag
+    // arrive" -- it is that a CANCELLED return still holds the mutex. If it did not, every caller
+    // would need a conditional unlock, and the first to forget would unlock a mutex it does not
+    // hold, corrupting it for everyone from a path that only runs when something is already wrong.
+    //
+    // Proven by having each waiter Unlock() unconditionally on the cancelled path, exactly as a real
+    // caller would, and then checking the mutex is actually free afterwards. If a cancelled return
+    // came back WITHOUT the lock, those unlocks would be releasing a mutex nobody held.
+    std::printf("SchedulerConditionVariable::WaitCancellable holds the mutex on cancel\n");
+    {
+        JLib::SchedulerMutex m;
+        JLib::SchedulerConditionVariable cv;
+        JLib::CancelScope scope;
+        std::atomic<int> cancelled{ 0 }, woke{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                m.Lock();
+                parked.fetch_add(1, std::memory_order_relaxed);
+                const JLib::WaitResult r = cv.WaitCancellable(m);
+                if (r == JLib::WaitResult::Cancelled) cancelled.fetch_add(1, std::memory_order_relaxed);
+                else                                  woke.fetch_add(1, std::memory_order_relaxed);
+                m.Unlock();          // UNCONDITIONAL -- the whole point of the invariant
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->cancelToken = scope.Token().Raw();
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        Check(WaitUntil(parked, kN), "all waiters reached the condition variable");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        // EAGER: no Notify anywhere. The condition simply never becomes true, which is the case a
+        // condition variable most needs cancelling for.
+        scope.Cancel();
+        cv.CancelWaiters(scope.Token());
+        sched.WaitFor(wg);
+
+        Check(cancelled.load() == kN, "every waiter returned Cancelled with no notify at all");
+        Check(woke.load() == 0, "none reported a normal wake");
+
+        // THE INVARIANT. Every waiter unlocked unconditionally above; if a cancelled return had not
+        // held the lock, the mutex is now in a corrupt state and this cannot be taken.
+        Check(m.Try_Lock(), "the mutex is free: every cancelled return really did hold it");
+        m.Unlock();
+    }
+
+    // A plain Wait() must be untouched by cancellation -- it has nowhere to report Cancelled, so
+    // waking it would return it into its critical section believing the condition became true.
+    std::printf("CancelWaiters never wakes a plain condition-variable Wait\n");
+    {
+        JLib::SchedulerMutex m;
+        JLib::SchedulerConditionVariable cv;
+        JLib::CancelScope scope;
+        std::atomic<int> woke{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            m.Lock();
+            parked.fetch_add(1, std::memory_order_relaxed);
+            cv.Wait(m);                                   // NOT the cancellable spelling
+            woke.fetch_add(1, std::memory_order_relaxed);
+            m.Unlock();
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->cancelToken = scope.Token().Raw();             // cancelled scope, uncancellable wait
+        t->waitGroup = &wg;
+        sched.Push(t);
+
+        Check(WaitUntil(parked, 1), "the plain waiter parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        scope.Cancel();
+        cv.CancelWaiters(scope.Token());
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        Check(woke.load() == 0, "a plain Wait is not woken by cancellation");
+
+        cv.Notify_All();                                  // only a real notify releases it
+        sched.WaitFor(wg);
+        Check(woke.load() == 1, "and it wakes normally when the condition is notified");
+    }
+
+    // Uncancelled behaviour must be untouched: notify still works through the cancellable spelling.
+    std::printf("uncancelled WaitCancellable is an ordinary condition wait\n");
+    {
+        JLib::SchedulerMutex m;
+        JLib::SchedulerConditionVariable cv;
+        std::atomic<int> ok{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            m.Lock();
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (cv.WaitCancellable(m) == JLib::WaitResult::Ok)
+                ok.fetch_add(1, std::memory_order_relaxed);
+            m.Unlock();
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->waitGroup = &wg;                                // no scope at all
+        sched.Push(t);
+
+        Check(WaitUntil(parked, 1), "the waiter parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        cv.Notify_One();
+        sched.WaitFor(wg);
+        Check(ok.load() == 1, "a waiter with no scope is notified normally");
+        Check(m.Try_Lock(), "and the mutex came back to it and was released");
+        m.Unlock();
+    }
+
     std::printf("SchedulerSemaphore::CancelWaiters wakes without a signal\n");
     {
         JLib::SchedulerSemaphore sem(0);
