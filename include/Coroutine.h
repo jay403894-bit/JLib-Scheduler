@@ -196,11 +196,28 @@ namespace JLib {
 
         inline CoroFramePool& FramePool() { static CoroFramePool p; return p; }
         inline std::atomic<bool>& FramePoolEnabled() { static std::atomic<bool> b{ true }; return b; }
+        // Separate toggle for the 64-byte class so the two CLASSES can be interleaved as arms
+        // in ONE process, which is the only comparison this project trusts -- a cross-binary
+        // before/after is drift, not a measurement. Off means a small frame takes a 256-byte
+        // slot exactly as it did before the class existed.
+        //
+        // Safe to flip mid-run for the same reason the pool toggle is: FrameFree routes by
+        // ADDRESS, not by the current mode, so frames allocated under either setting free
+        // correctly afterwards.
+        inline std::atomic<bool>& SmallFrameClassEnabled() { static std::atomic<bool> b{ true }; return b; }
     }
     // Turn pooling on or off at runtime. Frames already allocated stay valid either way.
     inline void SetCoroFramePooling(bool on) {
         detail::FramePoolEnabled().store(on, std::memory_order_relaxed);
     }
+    // Runtime switch for the 64-byte frame class; see SmallFrameClassEnabled.
+    inline void SetCoroSmallFrameClass(bool on) {
+        detail::SmallFrameClassEnabled().store(on, std::memory_order_relaxed);
+    }
+    inline bool CoroSmallFrameClass() {
+        return detail::SmallFrameClassEnabled().load(std::memory_order_relaxed);
+    }
+
     inline bool CoroFramePooling() {
         return detail::FramePoolEnabled().load(std::memory_order_relaxed);
     }
@@ -226,9 +243,22 @@ namespace JLib {
 #if defined(JLIBSCHED_CORO_STATS)
             FrameStats().Record(n);
 #endif
-            if (n <= TaskAllocator::SLOT && FramePoolEnabled().load(std::memory_order_relaxed)
-                && TaskScheduler::IsInitialized())
-                if (void* p = TaskScheduler::Instance().GetAllocator()->Alloc()) return p;
+            if (FramePoolEnabled().load(std::memory_order_relaxed)
+                && TaskScheduler::IsInitialized()) {
+                auto* a = TaskScheduler::Instance().GetAllocator();
+                // One call, and the allocator picks the smallest class that fits. The frame
+                // sizes that justify the classes are recorded on TaskAllocator itself.
+                //
+                // SmallFrameClassEnabled() forces the old behaviour -- everything into a
+                // 256-byte slot -- so the two can be interleaved as arms in ONE process.
+                // A cross-binary before/after is drift, not a measurement; that is not
+                // theoretical here, it produced a 46->28.8 ns "win" that was noise.
+                const std::size_t want =
+                    SmallFrameClassEnabled().load(std::memory_order_relaxed)
+                        ? n
+                        : (n <= TaskAllocator::SLOT ? TaskAllocator::SLOT : n);
+                if (void* p = a->AllocSized(want)) return p;
+            }
             return ::operator new(n);
         }
         inline void FrameFree(void* p) noexcept {
@@ -239,7 +269,8 @@ namespace JLib {
             // switch safe, and what lets both arms be interleaved in one process.
             if (TaskScheduler::IsInitialized()) {
                 auto* a = TaskScheduler::Instance().GetAllocator();
-                if (a->SlotInSlab(p)) { a->Free(p); return; }
+                // Address routes it to the right class; false means it was never ours.
+                if (a->FreeSized(p)) return;
             }
             ::operator delete(p);
         }

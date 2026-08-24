@@ -36,6 +36,12 @@
 namespace JLib {
 	class Thread;
 
+	// How a cancellable wait ended.
+	enum class WaitResult : uint8_t {
+		Ok,          // acquired the lock / took the permit
+		Cancelled,   // the scope was cancelled; NOTHING WAS ACQUIRED -- do not Unlock or Signal
+	};
+
 	class TaskScheduler {
 		friend class Thread;
 		friend class GlobalFiberPool;
@@ -622,6 +628,22 @@ namespace JLib {
 		// a rehash moves the pointer not the object, and nothing erases entries).
 		void WaitOnEvent(Event& ev);
 		void WaitOnEvent(const std::string& eventName);
+
+		// WaitOnEvent, but reports whether this task was cancelled while parked.
+		//
+		// DELIVERY IS AT THE WAKE, not at the cancel. Event::CancelWaiters marks the task through
+		// the waiter index and leaves it exactly where it is -- the Treiber stack is never touched,
+		// so nothing is removed from it and its no-pop invariant holds. The task therefore stays
+		// parked until the event actually fires; SignalAll resumes it as usual, and this returns
+		// Cancelled instead of Ok.
+		//
+		// So a cancelled waiter is NOT woken early. If the event never fires it never returns --
+		// but an uncancelled waiter on that event does not return either, so cancellation was never
+		// what would have rescued it. Waking early would mean removing one waiter from a lock-free
+		// stack whose links ARE the tasks, which is the thing Event's header comment forbids.
+		//
+		// Returns Ok for a task with no cancellation of any kind, which is every existing caller.
+		[[nodiscard]] WaitResult WaitOnEventCancellable(Event& ev);
 		// Like WaitOnEvent, but runs 'arm' AFTER this fiber is registered as a waiter and
 		// marked parkable (WANTS_SUSPEND), and BEFORE it actually suspends. Use it to arm an
 		// external wakeup (e.g. a GPU-fence completion callback that will SignalAll this
@@ -972,6 +994,16 @@ namespace JLib {
 	// the queue, so it does not point into a suspended stack. The Task*/Fiber* it carries outlive the
 	// wait because a waiter cannot leave before it is released, and every release path removes the
 	// entry from the queue BEFORE resuming or pushing it.
+	// THE one place cancellation is decided. A task is cancelled if EITHER its scope was cancelled
+	// or it was cancelled individually (Event::CancelWaiters). Every observation point -- worker
+	// pickup, CurrentTaskCancelled, anything added later -- must go through here, so a new way of
+	// being cancelled reaches all of them rather than the one its author happened to be editing.
+	inline bool IsTaskCancelled(const Task* t) {
+		if (!t) return false;
+		if (t->cancelledDirect) return true;
+		return CancelToken(t->cancelToken).Cancelled();
+	}
+
 	// Has the currently-running task's scope been cancelled?
 	//
 	// THE ONLY CANCELLATION CHECK A NATIVE TASK GETS, and that is by necessity rather than design: a
@@ -990,12 +1022,6 @@ namespace JLib {
 	// Returns false off a task entirely, and false for a task whose scope has been destroyed:
 	// unscoped work is not cancelled work. One load through a table; no lock.
 	bool CurrentTaskCancelled();
-
-	// How a cancellable wait ended.
-	enum class WaitResult : uint8_t {
-		Ok,          // acquired the lock / took the permit
-		Cancelled,   // the scope was cancelled; NOTHING WAS ACQUIRED -- do not Unlock or Signal
-	};
 
 	struct Waiter {
 		Fiber* fiber = nullptr;
@@ -1291,7 +1317,6 @@ namespace JLib {
 				mix((uint32_t)offsetof(Task, assignedFiber));
 				mix((uint32_t)offsetof(Task, next));
 				mix((uint32_t)offsetof(Task, waitGroup));
-				mix((uint32_t)offsetof(Task, nextWaiter));
 				return h;
 			}
 

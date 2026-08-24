@@ -13,6 +13,7 @@
 // failed assertion in seconds.
 
 #define NOMINMAX
+#include "LockFreeHashMap.h"
 #include <TaskScheduler.h>
 #include <cstdio>
 #include <cstdlib>
@@ -873,6 +874,178 @@ static void TestCreateTaskAcceptsNamedCallable(JLib::TaskScheduler& sched) {
     Check(ran.load(std::memory_order_relaxed) == 84, "both the copied and the moved callable ran with captures intact");
 }
 
+// Event::SignalOne -- wake exactly one waiter. The operation the intrusive Treiber stack could not
+// support at all: its links were the tasks, so no single waiter could be removed. The fiber-indexed
+// table has no such constraint, and this is what the change bought.
+static void TestEventSignalOne(JLib::TaskScheduler& sched) {
+    std::printf("Event::SignalOne\n");
+
+    JLib::Event& ev = sched.GetEvent("signalone-probe");
+    static JLib::Event* evp = &ev;
+    static std::atomic<int> woke{ 0 };
+    static std::atomic<int> parked{ 0 };
+    woke.store(0, std::memory_order_relaxed);
+    parked.store(0, std::memory_order_relaxed);
+
+    Check(!ev.SignalOne(), "SignalOne on an event with no waiters reports nothing woken");
+
+    constexpr int kN = 8;
+    JLib::WaitGroup wg;
+    wg.n.store(kN, std::memory_order_relaxed);
+    for (int i = 0; i < kN; ++i) {
+        JLib::Task* t = sched.CreateTask(+[](void*) {
+            JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+            parked.fetch_add(1, std::memory_order_relaxed);
+            s.WaitOnEvent(*evp);
+            woke.fetch_add(1, std::memory_order_relaxed);
+        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        if (!t) { Check(false, "CreateTask returned null"); return; }
+        t->waitGroup = &wg;
+        sched.Push(t);
+    }
+
+    // Wait for all of them to be genuinely parked, not merely started.
+    for (int spin = 0; spin < 400 && parked.load(std::memory_order_acquire) < kN; ++spin)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    Check(parked.load() == kN, "all waiters parked");
+
+    // ONE waiter, not all of them. This is the check the whole redesign exists for.
+    Check(ev.SignalOne(), "SignalOne found a waiter");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    Check(woke.load() == 1, "exactly one waiter woke -- the rest are still parked");
+
+    // Drain the remainder one at a time; each call must take exactly one.
+    for (int i = 1; i < kN; ++i) {
+        const bool got = ev.SignalOne();
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        if (!got) { Check(false, "SignalOne failed to find a remaining waiter"); break; }
+    }
+    sched.WaitFor(wg);
+    Check(woke.load() == kN, "repeated SignalOne drained every waiter exactly once");
+    Check(!ev.SignalOne(), "the event is empty again afterwards");
+}
+
+// Concurrent SignalOne from several threads at once. The model says the slot exchange is what makes
+// a wake exclusive, not the bit claim, so this is the behavioural counterpart to that: N signallers
+// racing over N waiters must wake each waiter exactly once and never twice.
+static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
+    std::printf("Event::SignalOne under concurrent signallers\n");
+
+    JLib::Event& ev = sched.GetEvent("signalone-race");
+    static JLib::Event* evp2 = &ev;
+    static std::atomic<int> woke2{ 0 };
+    static std::atomic<int> parked2{ 0 };
+    woke2.store(0, std::memory_order_relaxed);
+    parked2.store(0, std::memory_order_relaxed);
+
+    constexpr int kN = 16;
+    JLib::WaitGroup wg;
+    wg.n.store(kN, std::memory_order_relaxed);
+    for (int i = 0; i < kN; ++i) {
+        JLib::Task* t = sched.CreateTask(+[](void*) {
+            JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+            parked2.fetch_add(1, std::memory_order_relaxed);
+            s.WaitOnEvent(*evp2);
+            woke2.fetch_add(1, std::memory_order_relaxed);
+        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        if (!t) { Check(false, "CreateTask returned null"); return; }
+        t->waitGroup = &wg;
+        sched.Push(t);
+    }
+    for (int spin = 0; spin < 400 && parked2.load(std::memory_order_acquire) < kN; ++spin)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+    // More signallers than waiters, all at once: the surplus must come back empty rather than
+    // double-waking anyone.
+    std::atomic<int> succeeded{ 0 };
+    std::vector<std::thread> signallers;
+    for (int i = 0; i < 4; ++i) {
+        signallers.emplace_back([&] {
+            for (int k = 0; k < kN; ++k)
+                if (ev.SignalOne()) succeeded.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& th : signallers) th.join();
+
+    sched.WaitFor(wg);
+    Check(succeeded.load() == kN, "successful SignalOne calls exactly equal the waiter count");
+    Check(woke2.load() == kN, "every waiter woke exactly once under concurrent signallers");
+}
+
+// LockFreeHashMap -- a general-purpose lock-free map, no longer used by the scheduler itself.
+// These checks lived in the DAG cancellation suite while Event indexed its waiters with this
+// map; Event now uses a flat fiber-indexed table, so they belong here with the other
+// standalone container and primitive tests instead of in a suite about DAG cancellation.
+static void TestLockFreeHashMap(JLib::TaskScheduler& sched) {
+    (void)sched;
+    // Keys here are Task* values from a slab of 64-byte slots, so they are 64-BYTE ALIGNED AND
+    // CONSECUTIVE -- exactly the input a hash that does not mix will collapse onto one bucket.
+    // does not mix will collapse onto a single bucket. Nothing about the scheduler's behaviour
+    // would change if that happened, which is why it gets a direct check rather than being left
+    // to the sections below to notice.
+    std::printf("hash spreads slab-aligned keys\n");
+    {
+        JLib::LockFreeHashMap<int> m(*JLib::TaskScheduler::Instance().GetAllocator(), 16);
+        std::vector<int> hits(m.buckets_count(), 0);
+        const uintptr_t base = 0x7ff600004000ull;      // a plausible slab base
+        for (int i = 0; i < 512; ++i) ++hits[m.bucket_index(base + uintptr_t(i) * 64)];
+
+        size_t used = 0, worst = 0;
+        for (int h : hits) { if (h) ++used; if (size_t(h) > worst) worst = size_t(h); }
+        Check(used == m.buckets_count(), "every bucket receives slab-aligned keys");
+        // Even would be 32 per bucket. Unmixed would be all 512 in one.
+        Check(worst <= 64, "no bucket takes a disproportionate share");
+    }
+
+    // Sizing. The bound on waiters is the TOTAL fiber budget, so these are the numbers that decide
+    // whether chains stay short on a big machine -- getting this wrong is invisible at runtime.
+    std::printf("index sizing follows the total fiber budget\n");
+    {
+        using Map = JLib::LockFreeHashMap<int>;
+        Check(Map::SuggestBuckets(64 * 4)  == 32,  "4 workers x 64 fibers -> 32 buckets (chain ~8)");
+        Check(Map::SuggestBuckets(64 * 16) == 128, "16 workers x 64 fibers -> 128 buckets (chain ~8)");
+        Check(Map::SuggestBuckets(8)       == 16,  "tiny bound still gets the 16-bucket floor");
+        Check(Map::SuggestBuckets(1u << 20) == 512, "huge bound is capped at the 512 ceiling");
+    }
+
+    // Lazy bucket creation is the new concurrent code: many threads racing to publish the FIRST
+    // bucket, where every loser must free the list it built. A leak here is silent, and a
+    // double-publish would lose entries outright.
+    std::printf("concurrent first-insert into one bucket\n");
+    {
+        JLib::LockFreeHashMap<int> m(*JLib::TaskScheduler::Instance().GetAllocator(), 64);
+        const int kThreads = 8, kPer = 64;
+
+        // All keys chosen to land in ONE bucket, so every thread races on the same slot.
+        const size_t target = m.bucket_index(0x1000);
+        std::vector<uint64_t> keys;
+        for (uint64_t k = 0x1000; keys.size() < size_t(kThreads * kPer); k += 8)
+            if (m.bucket_index(k) == target) keys.push_back(k);
+
+        std::vector<std::thread> ts;
+        std::atomic<int> added{ 0 };
+        for (int t = 0; t < kThreads; ++t) {
+            ts.emplace_back([&, t] {
+                for (int i = 0; i < kPer; ++i)
+                    if (m.add(keys[size_t(t * kPer + i)], t * kPer + i))
+                        added.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        for (auto& th : ts) th.join();
+
+        Check(added.load() == kThreads * kPer, "every racing insert landed");
+        int seen = 0;
+        m.for_each([&](int) { ++seen; });
+        Check(seen == kThreads * kPer, "and every one is reachable afterwards");
+
+        int stillThere = 0;
+        for (uint64_t k : keys) if (m.contains(k)) ++stillThere;
+        Check(stillThere == kThreads * kPer, "all keys found by lookup");
+    }
+}
+
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
     // "noreclaim" runs the WHOLE suite with worker self-triggered reclamation disabled, the way an
@@ -936,6 +1109,9 @@ int main(int argc, char** argv) {
     TestConditionVariableBareThreadContract();
     TestSemaphoreCrossThreadRelease();
     TestCreateTaskAcceptsNamedCallable(sched);
+    TestEventSignalOne(sched);
+    TestEventSignalOneConcurrent(sched);
+    TestLockFreeHashMap(sched);
 
     sched.Join();
     g_done.store(true, std::memory_order_release);

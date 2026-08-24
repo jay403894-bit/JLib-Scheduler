@@ -109,10 +109,11 @@ namespace JLib {
         // a flag through `data` instead), and onComplete/onCompleteData/callbackFlag (their ONLY
         // user was TaskDAG, which now wraps fn/data with its own trampoline -- see TaskDAG::Fire).
         //
-        // LAYOUT AS OF 2.8.0: vptr 0 | fn 8 | data 16 | assignedFiber 24 | next 32 | waitGroup 40 |
-        // flags 48 | FREE 49-55 | nextWaiter 56. Bytes 52-55 are 4-aligned and unclaimed -- room for
-        // one 32-bit field (a cancellation-token index is the intended tenant) at zero size cost.
-        // The vtable pointer stays: Thread.cpp/TaskScheduler.cpp destroy tasks via `t->~Task()`
+        // LAYOUT: vptr 0 | fn 8 | data 16 | assignedFiber 24 | next 32 | waitGroup 40 |
+        // flags 48 | started 49 | cancelledDirect 50 | pad 51 | cancelToken 52-55 | FREE 56-63.
+        // Bytes 56-63 came free when Event stopped linking waiters through Task -- see the
+        // tail-padding note further down. The vtable pointer stays: Thread.cpp/TaskScheduler.cpp
+        // destroy tasks via `t->~Task()`
         // through the BASE pointer, and that virtual dispatch is what runs ~LambdaTask (and any
         // captured objects' destructors) -- dropping it would silently leak lambda captures.
         Func fn;
@@ -152,9 +153,9 @@ namespace JLib {
         // ---- end packed flag block --------------------------------------------------------------
 
         // FIELD ORDER HERE IS LOAD-BEARING. `started` fills the single padding byte at 49 so the
-        // 4-byte token still lands 4-aligned at 52 and nextWaiter stays at 56. Declare them the
-        // other way round and `started` takes 56, pushing nextWaiter past the cache line --
-        // sizeof(Task) goes 64 -> 80 under alignas(16). The static_assert below catches it, and did.
+        // 4-byte token still lands 4-aligned at 52. Declare them the other way round and
+        // `started` takes 52 while the token is pushed to 56 -- sizeof(Task) goes 64 -> 80 under
+        // alignas(16). The static_assert below catches it, and did.
         //
         // Has this task's body begun? Set at first pickup and never cleared.
         //
@@ -177,6 +178,19 @@ namespace JLib {
         // the flags at 48, so it needs its own memory location.
         uint8_t started = 0;
 
+        // Cancelled DIRECTLY, independent of any scope. Set by whoever holds this exact task --
+        // Event::CancelWaiters is the reason it exists.
+        //
+        // WHY NOT REUSE cancelToken. A token points at a SHARED scope; a task usually already
+        // belongs to one (its graph's), and overwriting that to cancel this one task would silently
+        // detach it from the scope it was in. A separate bit composes instead of replacing: a task
+        // is cancelled if EITHER its scope was cancelled or it was cancelled individually.
+        //
+        // Lands at offset 50, in the padding the flag packing freed. Its own byte rather than a
+        // bitfield for the same reason as `started`: written from another thread while the flags at
+        // 48 are being read.
+        uint8_t cancelledDirect = 0;
+
         // The cancellation scope this task belongs to, or CancelToken::kNone. A 4-byte HANDLE, not
         // a flag: scopes are what get cancelled -- every node in a graph, every operation for a
         // connection -- and many tasks reference one. See CancelToken.h.
@@ -190,18 +204,15 @@ namespace JLib {
         uint32_t cancelToken = 0xFFFFFFFFu;   // CancelToken::kNone, spelled out to avoid the include
 
 
-        // Intrusive link for Event's waiter stack, living in the same tail padding -- the byte
-        // block above ends well short of 64, so this costs nothing and the one-cache-line assert
-        // still holds.
+        // 8 BYTES OF DELIBERATE TAIL PADDING. Event's waiter list used to be an intrusive Treiber
+        // stack linked through a Task* nextWaiter field here. It was retired when Event moved to
+        // a fiber-indexed slot table: the intrusive link was what forbade removing one specific
+        // waiter, and with it SignalOne. Nothing threads through a Task any more.
         //
-        // It is a SEPARATE field from `next` on purpose. `next` belongs to the queues, and a task
-        // could in principle be reachable from one while the other is in use; aliasing them would
-        // be exactly the sort of overlap that produced the fiber-duplication bugs. A fiber only
-        // ever waits on one event at a time, so a single link is enough.
-        //
-        // Not atomic: it is published by the CAS in Event::AddWaiter (which is the release) and
-        // read only after Event::SignalAll has taken the whole list with an acquiring exchange.
-        Task* nextWaiter = nullptr;
+        // The space is left UNCLAIMED on purpose rather than absorbed by a new field, so the
+        // 64-byte budget stays visibly available and the next thing that needs room finds it.
+        // Anything put here must keep static_assert(sizeof(Task) == 64) true and must be added
+        // to the ABI fingerprint in TaskScheduler.h.
 
         // Both constructors initialize EVERY bitfield -- see the C++17 note on the flag block.
         // Members are listed in declaration order so the initialization order is the written one.

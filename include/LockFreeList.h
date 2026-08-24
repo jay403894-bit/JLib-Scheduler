@@ -1,6 +1,23 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
+//
+// STATUS AS OF 2.15.0: NO PRODUCTION CALLER. The scheduler itself does not use this any more --
+// its last two consumers both moved to structures that fit their access patterns better, and the
+// reasons are worth knowing before reaching for it again:
+//
+//   - Event's waiter index became a flat array indexed by Fiber::poolIndex. Its keys were never
+//     arbitrary: a parked task always holds a fiber, fibers have dense stable indices, and a fiber
+//     parks on one event at a time, so a perfect hash already existed. A general map was strictly
+//     worse -- it allocated a cell per suspend on a path documented as allocation-free.
+//   - TaskNode::dependents became pointer-linked edges in DAG-owned chunk storage. Graph
+//     construction is single-threaded by contract, so the lock-freedom here was unreachable in
+//     practice, and the list cost four slab slots per node before a single edge existed.
+//
+// It is KEPT, not deleted: it is correct, TSan-probed (bench/tsan_probe.cpp), and it is the
+// substrate for LockFreeHashMap. Reach for it when the key space is genuinely arbitrary and
+// concurrent. When the keys are already a dense bounded index, they are a better index than any
+// hash of them.
 #pragma once
 #define NOMINMAX
 #include <vector>
@@ -16,17 +33,6 @@
 #include "Fiber.h"
 
 namespace JLib {
-	// Epoch slot for the current execution context: the running fiber's slot if we're on
-	// one, else this (bare) thread's fallback slot. The fiber branch is migration-proof --
-	// the slot travels with the fiber across a context switch. Bare threads (e.g. the main
-	// thread building a DAG) don't migrate, so their per-thread fallback is correct.
-	inline std::atomic<size_t>* CurrentEpochSlot() {
-		if (Thread* w = Thread::GetCurrent())
-			if (Fiber* f = w->currentFiber)
-				return &f->localEpoch;
-		return EpochManager::Instance().ThreadSlot(thread_id);
-	}
-
 	struct LNodeBase; // forward declaration
 
 	// MarkableReference stores a Node* and a bool mark
@@ -184,13 +190,31 @@ namespace JLib {
 		LockFreeList(TaskAllocator& alloc) : allocator(alloc) {
 			void* mem = allocator.Alloc();
 			void* mem2 = allocator.Alloc();
+			// SLAB EXHAUSTION. Placement-new onto null is the "access violation writing 0x0" this
+			// header already warns about twice, and it became genuinely reachable when
+			// LockFreeHashMap made bucket construction LAZY: the sentinels are no longer taken at
+			// startup on a fresh slab, but at some later FIRST INSERT, which can land on a dry one.
+			// Leave the list empty and report it through ok() instead of crashing -- a caller that
+			// cannot get a bucket degrades (see Event::AddWaiter), it does not die.
+			if (!mem || !mem2) {
+				if (mem)  allocator.Free(mem);
+				if (mem2) allocator.Free(mem2);
+				head = tail = nullptr;
+				return;
+			}
 			head = new (mem) LNode<T>(0, T());
 			tail = new (mem2) LNode<T>(UINT64_MAX, T());
 			head->owner = &allocator;
 			tail->owner = &allocator;
 			head->next.set(tail, false);
 		}
+
+		// False only if the slab was dry when this list was built -- see the constructor. Such a
+		// list is inert: every operation below returns as if it were empty, so a caller that fails
+		// to check gets nothing done rather than undefined behaviour.
+		bool ok() const { return head != nullptr; }
 		~LockFreeList() {
+			if (!head) return;   // never constructed -- see ok()
 			// Free every LIVE entry between the sentinels too, not just head/tail -- entries
 			// added via add() (e.g. TaskDAG::AddDependency's edges) were being leaked forever,
 			// since nothing ever called remove() on them and the destructor only reclaimed the
@@ -231,6 +255,7 @@ namespace JLib {
 		// did not, and placement-new over a null slot is the "access violation writing 0x0" that
 		// TaskNode's constructor comment already describes.
 		bool push(T item) {
+			if (!head) return false;   // inert list -- see ok()
 			EpochGuard guard(CurrentEpochSlot());
 			void* mem = allocator.Alloc();
 			if (!mem) return false;
@@ -244,6 +269,7 @@ namespace JLib {
 		}
 
 		bool add(uint64_t key, T item) {
+			if (!head) return false;   // inert list -- see ok()
 			EpochGuard guard(CurrentEpochSlot());   // RAII: leaves on every return path
 			while (true) {
 				Window window = Window::find(head, key);
@@ -254,6 +280,11 @@ namespace JLib {
 					return false;
 				}
 				void* mem = allocator.Alloc();
+				// Slab exhaustion is a NULL here, and placement-new over it is the "access
+				// violation writing 0x0" that push()'s comment describes. add() went without this
+				// check for its whole life because its only caller could not run the slab dry;
+				// Event's waiter index can, since it allocates one cell per parked task.
+				if (!mem) return false;
 				LNode<T>* node = new (mem) LNode<T>(key, item);
 				node->owner = &allocator;   // so slabDeleter can return it on retire
 				node->next.set(curr, false);
@@ -264,6 +295,7 @@ namespace JLib {
 			}
 		}
 		bool remove(uint64_t key) {
+			if (!head) return false;   // inert list -- see ok()
 			EpochGuard guard(CurrentEpochSlot());   // RAII: leaves on every return path
 			bool snip = false;
 			while (true) {
@@ -290,6 +322,7 @@ namespace JLib {
 		}
 		template <typename F>
 		void for_each(F func) {
+			if (!head) return;         // inert list -- see ok()
 
 			EpochGuard guard(CurrentEpochSlot());  // Ensure we are in an epoch for safe traversal
 			// Start after the sentinel head
@@ -309,6 +342,7 @@ namespace JLib {
 			}
 		}
 		bool contains(uint64_t key) {
+			if (!head) return false;   // inert list -- see ok()
 			EpochGuard guard(CurrentEpochSlot());  // Ensure we are in an epoch for safe traversal
 			LNodeBase* curr = head;
 

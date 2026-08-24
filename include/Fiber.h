@@ -22,6 +22,15 @@ namespace JLib {
 		uint64_t id;
 		void* stackBase;
 		size_t stackSize;
+		// DENSE, STABLE index into the global fiber pool: standard fibers occupy [0, standardCount),
+		// heavy fibers follow. The pool is leaked and its vectors are reserve()d so they never
+		// reallocate, so this is fixed for the life of the program.
+		//
+		// It is what makes Event's waiter index a PERFECT HASH rather than a hash table: a parked
+		// task always holds a fiber, and a fiber can be parked on at most one event at a time
+		// (parking is what the fiber is doing), so fiber index -> waiter slot has no collisions
+		// by construction. See Event::AddWaiter.
+		size_t poolIndex = SIZE_MAX;
 		Task* owningTask = nullptr; // The task currently running on this fiber
 		Context* homeCtx = nullptr; // Scheduler ctx to return to; the worker sets this before each switch-in
 		std::atomic<FiberStatus>  status;

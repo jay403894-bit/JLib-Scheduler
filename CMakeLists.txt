@@ -483,6 +483,10 @@ add_executable(SchedulerDagCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_can
 target_link_libraries(SchedulerDagCancelTest PRIVATE Scheduler)
 target_compile_features(SchedulerDagCancelTest PRIVATE cxx_std_17)
 
+add_executable(SchedulerDagBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/dag_scaling.cpp")
+target_link_libraries(SchedulerDagBench PRIVATE Scheduler)
+target_compile_features(SchedulerDagBench PRIVATE cxx_std_17)
+
 add_executable(SchedulerDagExternalTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_external_test.cpp")
 target_link_libraries(SchedulerDagExternalTest PRIVATE Scheduler)
 target_compile_features(SchedulerDagExternalTest PRIVATE cxx_std_17)
@@ -508,6 +512,10 @@ if(JLIBSCHED_COROUTINES)
     add_executable(SchedulerCoroBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/coroutine_bench.cpp")
     target_link_libraries(SchedulerCoroBench PRIVATE Scheduler)
     target_compile_features(SchedulerCoroBench PRIVATE cxx_std_20)
+
+    add_executable(SchedulerFrameClassBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/frame_class.cpp")
+    target_link_libraries(SchedulerFrameClassBench PRIVATE Scheduler)
+    target_compile_features(SchedulerFrameClassBench PRIVATE cxx_std_20)
 endif()
 
 # Records a histogram of real coroutine FRAME SIZES and live/peak counts. Exists to answer one
@@ -519,6 +527,15 @@ endif()
 #
 # INTERFACE, not PRIVATE: it changes code in Coroutine.h, which the library never includes and
 # consumers do. Putting it on the library's own compile line would do nothing at all.
+option(JLIBSCHED_ALLOC_STATS "Count slab refill/flush and shared-tier lock contention (diagnostic)" OFF)
+if(JLIBSCHED_ALLOC_STATS)
+    # PUBLIC, not INTERFACE. The library's OWN sources allocate and free (Thread.cpp returns every
+    # finished task to the slab), so an INTERFACE-only define counts the consumer half and silently
+    # misses the rest -- which is exactly what happened: allocs 292,565, frees 0.
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_ALLOC_STATS=1)
+    message(STATUS "JLib::Scheduler: allocator contention stats ENABLED (diagnostic)")
+endif()
+
 option(JLIBSCHED_CORO_STATS "Record coroutine frame-size histogram (diagnostic; see bench/coroutine_bench.cpp)" OFF)
 if(JLIBSCHED_CORO_STATS)
     target_compile_definitions(Scheduler INTERFACE JLIBSCHED_CORO_STATS=1)

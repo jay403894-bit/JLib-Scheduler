@@ -165,6 +165,14 @@ static JLib::Coro Ordered(std::atomic<bool>* wrongOrder) {
     co_return;
 }
 
+// A frame small enough for the 64-byte class -- named, not a lambda: a lambda-coroutine does
+// not own its closure, which is a trap this file already documents elsewhere.
+// Returns Coro, not Lazy<int>, and the distinction is the point: a Lazy carries the promise value
+// storage and lands in the <=128 bucket, so it is NOT eligible for the 64-byte class. An un-spawned
+// Coro is safe to destroy (its handle is null until spawned), which makes create-and-drop a clean
+// frame alloc+free.
+static JLib::Coro TinyFrame(int x) { (void)x; co_return; }
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Small on purpose -- see the slab-accounting section. The default 1M slots would swallow any
@@ -486,6 +494,37 @@ int main() {
                std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
         Check(ran.load() == kN * 11, "every coroutine completed its node exactly once");
         if (ran.load() != kN * 11) std::printf("      expected %d, got %d\n", kN * 11, ran.load());
+    }
+
+    // The 64-byte frame class is a MEMORY change with no measurable time effect (bench/frame_class.cpp
+    // A/B: the difference sits inside the A/A noise floor). That makes it exactly the kind of feature
+    // that can silently stop working -- nothing would slow down, nothing would break, small frames would
+    // just quietly go back to costing 256 bytes each. So it gets a positive control.
+    std::printf("coroutine frames use the 64-byte size class\n");
+    {
+        auto* alloc = JLib::TaskScheduler::Instance().GetAllocator();
+
+        const long long bigBase   = alloc->LiveCount();
+        const long long smallBase = alloc->SmallLiveCount();
+
+        // Held alive at once, so the counters reflect live frames rather than churn.
+        constexpr int kN = 200;
+        std::vector<JLib::Coro> held;
+        held.reserve(kN);
+        for (int i = 0; i < kN; ++i) held.push_back(TinyFrame(i));
+
+        const long long bigHeld   = alloc->LiveCount()      - bigBase;
+        const long long smallHeld = alloc->SmallLiveCount() - smallBase;
+        std::printf("    %d live frames -> %lld small slots, %lld 256-byte slots\n",
+                    kN, smallHeld, bigHeld);
+
+        Check(smallHeld >= kN, "every small frame came from the 64-byte class");
+        // The 256-byte pool should be untouched by these. Not asserted as exactly zero: the
+        // scheduler is running and may allocate a Task on another thread while this executes.
+        Check(bigHeld < kN, "they did not consume 256-byte slots");
+
+        held.clear();
+        Check(alloc->SmallLiveCount() - smallBase == 0, "and every one was returned on destruction");
     }
 
     std::printf("\n%s\n", g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");

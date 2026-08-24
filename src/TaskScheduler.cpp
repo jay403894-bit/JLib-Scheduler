@@ -1138,6 +1138,19 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	poolMutex.unlock();
 }
 
+WaitResult TaskScheduler::WaitOnEventCancellable(Event& event) {
+	// Already cancelled before parking: do not park at all. Otherwise this task would sit on the
+	// stack until the event fires, for a cancellation it could have observed immediately.
+	if (IsTaskCancelled(GetCurrentTask())) return WaitResult::Cancelled;
+
+	WaitOnEvent(event);
+
+	// Resumed. Whether that was an ordinary signal or a signal that arrived after CancelWaiters
+	// marked us is answered by the flag, not by anything the wake path had to carry -- which is
+	// what lets the Treiber stack stay exactly as it was.
+	return IsTaskCancelled(GetCurrentTask()) ? WaitResult::Cancelled : WaitResult::Ok;
+}
+
 void TaskScheduler::WaitOnEvent(Event& event) {
 	auto* thread = Thread::GetCurrent();
 	Task* myTask = thread->currentRunningTask;
@@ -1152,8 +1165,18 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 	// Order matters. Become parkable (WANTS_SUSPEND) BEFORE registering, so any signal
 	// that races in sees a resumable state (Resume() flips WANTS_SUSPEND->SUSPEND_SIGNALED
 	// and the worker wakes us after the switch). AddWaiter only inserts -- it no longer
-	// touches status. The event mutex serializes AddWaiter against Signal/SignalAll, so a
-	// signal that lands after we register is guaranteed to find and wake us.
+	// touches status. Registration is a single store plus a bit set in the fiber-indexed table, so a
+	// signal that begins after we register is guaranteed to find and wake us.
+	// RESERVE BEFORE BECOMING PARKABLE. Registering cannot be allowed to fail: once the
+	// fiber is WANTS_SUSPEND it is committed to suspending, and a waiter that fails to
+	// register is not merely uncancellable -- nothing holds it, so nothing ever wakes it and
+	// the task hangs. The table allocation is the only failable step, so it happens here,
+	// while failing is still an ordinary error.
+	if (!event.Reserve()) {
+		throw std::runtime_error("WaitOnEvent: could not allocate the event waiter table -- "
+			"refusing to park a fiber that could never be woken.");
+	}
+
 	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
 
@@ -1321,6 +1344,13 @@ void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& 
 			"Native tasks must never suspend.");
 	}
 
+	// RESERVE FIRST, for the reason spelled out in WaitOnEvent: registering must not be able
+	// to fail once this fiber is parkable, or the waiter is dropped and the task hangs.
+	if (!event.Reserve()) {
+		throw std::runtime_error("WaitOnEventArmed: could not allocate the event waiter table -- "
+			"refusing to park a fiber that could never be woken.");
+	}
+
 	// Same ordering as WaitOnEvent: become parkable, then register as a waiter, so a signal
 	// that races in is not lost (Resume flips WANTS_SUSPEND->SUSPEND_SIGNALED and the worker
 	// wakes us after the switch). Crucially, run 'arm' only AFTER both -- the arm callback
@@ -1376,6 +1406,44 @@ bool TaskScheduler::IsOnFiber() {
 	// WaitOnEvent*-style suspension is safe, so it must be false for a Native task.
 	return t != nullptr && t->currentRunningTask != nullptr && t->currentFiber != nullptr;
 }
+
+// Builds the waiter table on first use. Lives here rather than in Event.h because it needs the
+// global fiber pool, and Event.h deliberately depends only on Fiber.h -- see the include note at
+// the top of that header.
+//
+// SIZED BY THE POOL, not by a guess: one slot per fiber that exists, which is the exact upper
+// bound on tasks that can be parked at once, since a parked task holds a fiber. There is no load
+// factor to tune and no way to overflow it.
+//
+// The table is fully built -- both arrays allocated and zeroed -- BEFORE the single pointer that
+// publishes it, so a reader that acquires a non-null table always sees a complete one. The loser
+// of a creation race deletes its own and takes the winner's.
+Event::WaiterTable* Event::EnsureTable() {
+	if (WaiterTable* tb = table.load(std::memory_order_acquire)) return tb;
+
+	const size_t n = TaskScheduler::Instance().GetGlobalPool().TotalCount();
+	if (n == 0) return nullptr;
+
+	auto* fresh = new (std::nothrow) WaiterTable();
+	if (!fresh) return nullptr;                      // uncancellable waiters, not a crash
+	fresh->fiberCount = n;
+	fresh->words = (n + 63) / 64;
+	fresh->slots = new (std::nothrow) std::atomic<Task*>[n];
+	fresh->occupied = new (std::nothrow) std::atomic<std::uint64_t>[fresh->words];
+	if (!fresh->slots || !fresh->occupied) { delete fresh; return nullptr; }
+
+	for (size_t i = 0; i < n; ++i)            fresh->slots[i].store(nullptr, std::memory_order_relaxed);
+	for (size_t w = 0; w < fresh->words; ++w) fresh->occupied[w].store(0, std::memory_order_relaxed);
+
+	WaiterTable* expected = nullptr;
+	if (table.compare_exchange_strong(expected, fresh,
+			std::memory_order_release, std::memory_order_acquire)) {
+		return fresh;
+	}
+	delete fresh;          // lost the race; expected holds the winner
+	return expected;
+}
+
 
 Event& TaskScheduler::GetEvent(const std::string& name) {
 	registryMtx.lock();
@@ -1800,7 +1868,7 @@ bool JLib::CurrentTaskCancelled() {
 	// given a scope. Both answer the same way and for the same reason: nobody asked for this work
 	// to stop.
 	if (!t) return false;
-	return CancelToken(t->cancelToken).Cancelled();
+	return IsTaskCancelled(t);
 }
 
 void SchedulerMutex::Lock() {

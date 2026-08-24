@@ -4,15 +4,27 @@
 #pragma once
 #include "Task.h"
 #include "TaskAllocator.h"   // the node only needs the allocator, not the whole scheduler
-#include "LockFreeList.h"
 #include <stdexcept>
 #include <string>
 
 namespace JLib {
     class TaskDAG; // owner backpointer only -- no TaskDAG.h include (it includes this header)
 
+    struct TaskNode;
+
+    // One forward edge, dependency -> dependent. Nodes hold the HEAD of an intrusive
+    // singly-linked list of these; the cells themselves live in TaskDAG chunk storage and
+    // outlive every node, so walking them needs no reclamation of its own.
+    //
+    // The link is a POINTER, not an index into the chunk table, and that is deliberate: a
+    // reader never touches the table, so growing it can never invalidate a walk in progress.
+    // Chunks are individually stable, so the edges themselves never move.
+    struct DagEdge {
+        TaskNode* dep  = nullptr;
+        DagEdge*  next = nullptr;
+    };
+
     struct TaskNode {
-        TaskAllocator& alloc;                 // injected; the node's list allocates from this
         Task* task;                           // nullptr for a gate (see isGate)
 
         // Embedded completion context -- stamped by TaskDAG::Fire() when it repoints the
@@ -72,7 +84,15 @@ namespace JLib {
         enum : int { EXT_ARMED = 1, EXT_SIGNALLED = 2 };
         std::atomic<int> extBits{ 0 };
 
-        LockFreeList<TaskNode*>* dependents;
+        // Head of this node's forward-edge list. Was a LockFreeList<TaskNode*>* until
+        // 2026-08-24: graph construction is single-threaded by contract (CreateNode appends
+        // to a plain std::vector, so it cannot be otherwise) and nothing pushes after
+        // Submit, so the list was paying for lock-freedom that was unreachable in practice
+        // -- an EpochGuard per push, Harris marked pointers, remove/contains that no caller
+        // used, and FOUR slab slots per node before a single edge existed (the node, the
+        // list object, and its two sentinels). Now: one pointer, and edges come from the
+        // owning DAG's chunk allocator.
+        DagEdge* firstEdge = nullptr;
         std::atomic<int> dependencies_left;
         std::atomic<bool> submitted{ false };
         uint8_t cpuID = 0;
@@ -84,31 +104,14 @@ namespace JLib {
         // WaitForMain, not WaitFor -- see WaitForMain's declaration comment.
         bool isMain = false;
 
-        TaskNode(Task* t, TaskAllocator& allocator)
-            : alloc(allocator), task(t), dependencies_left(0)   // reference bound here
-        {
-            void* m = alloc.Alloc();
-            // CreateNode/CreateGate already checked THEIR OWN slot (the TaskNode itself), but
-            // this is a SECOND, separate allocation for the dependents list -- unchecked, this
-            // used to placement-new a LockFreeList at address nullptr when the pool was
-            // exhausted, writing through a null `this` inside LockFreeList's constructor
-            // (manifested as "Access violation writing location 0x0"). Throwing here at least
-            // turns silent memory corruption into a diagnosable, catchable failure with the
-            // live/capacity counts attached.
-            if (!m) {
-                throw std::runtime_error(
-                    "TaskAllocator exhausted while constructing a TaskNode's dependents list "
-                    "(live=" + std::to_string(allocator.LiveCount()) +
-                    ", capacity=" + std::to_string(allocator.Capacity()) + ")");
-            }
-            dependents = new (m) LockFreeList<TaskNode*>(alloc);
-        }
+        // Takes the allocator purely to keep the call sites unchanged; the node itself no
+        // longer allocates anything. It used to make a SECOND slab allocation here for the
+        // dependents list, which had its own null check because an exhausted pool
+        // placement-new'd a LockFreeList at address nullptr ("Access violation writing
+        // location 0x0"). That whole failure mode is gone with the allocation.
+        explicit TaskNode(Task* t, TaskAllocator&)
+            : task(t), dependencies_left(0) {}
 
-        ~TaskNode() {
-            if (dependents) {
-                dependents->~LockFreeList<TaskNode*>();
-                alloc.Free(dependents);
-            }
-        }
+        // No destructor: nothing here owns memory any more. Edges belong to the DAG.
     };
 }

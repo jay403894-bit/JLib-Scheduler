@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
-// A MODEL of include/Event.h -- the lock-free waiter stack -- for a stateless model checker.
+// A MODEL of the lock-free waiter STACK that Event.h used until 2026-08-24, for a stateless
+// model checker.
+//
+//   THE STACK IS RETIRED. Event now keeps waiters in a fiber-indexed slot table with an
+//   occupancy bitmap (modelled in event_table_model.c), and Task::nextWaiter is gone. This
+//   file is KEPT rather than deleted because the argument it verifies is the reason the
+//   replacement exists: the stack was correct, and still could not support SignalOne. Its
+//   links WERE the tasks, so a waiter could never leave early without the next drain walking
+//   a recycled slab slot. Retiring it was not a bug fix -- it was lifting that ceiling.
+//
+//   Do not resurrect this design without re-reading why it was replaced. What follows is the
+//   original header, unchanged.
+//
 // Companion to deque_model.c; see that file's header for what a model checker is and why running
 // the real thing is not a substitute.
 //

@@ -255,4 +255,20 @@ inline std::size_t PageSize() {
 #endif
 }
 
+
+// Index of the lowest set bit. UNDEFINED FOR ZERO, like every intrinsic underneath it -- callers
+// here always test the word first, since the whole point is to skip empty ones.
+//
+// Hand-rolled rather than std::countr_zero because the core of this library is C++17 and <bit> is
+// C++20. The MSVC path avoids <intrin.h>: LockFreeList.h used to include it, which broke every
+// non-MSVC build, so the rule since then is that intrinsics live behind this header or not at all.
+inline unsigned CountTrailingZeros64(std::uint64_t x) {
+#if defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward64(&i, x);
+    return (unsigned)i;
+#else
+    return (unsigned)__builtin_ctzll(x);
+#endif
+}
 }} // namespace JLib::platform

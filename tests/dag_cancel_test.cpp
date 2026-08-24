@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -172,6 +173,45 @@ int main() {
     // 8,192 slots; each iteration is a node (2 slots: TaskNode + its dependents list) plus a task.
     // 400 graphs of 4 cancelled nodes is 4,800 tasks and 9,600 node slots CHURNED -- far past the
     // slab -- so a single leaked task per cancelled node exhausts it and CreateTask starts failing.
+    // What the chunked-edge refactor was for. A TaskNode used to cost FOUR slab slots before a
+    // single edge existed -- the node, its LockFreeList object, and that list's two sentinels --
+    // plus one slot per edge. Now it is one slot for the node, and edges come from DAG-owned chunks
+    // that touch the slab not at all. Measured, because nothing behavioural would notice a
+    // regression here.
+    std::printf("DAG node and edge slab cost\n");
+    {
+        auto* alloc = JLib::TaskScheduler::Instance().GetAllocator();
+        const int kNodes = 64;
+
+        const long long base = alloc->LiveCount();
+        {
+            JLib::TaskDAG dag(sched);
+            JLib::WaitGroup wg;
+            JLib::TaskNode* prev = nullptr;
+            for (int i = 0; i < kNodes; ++i) {
+                auto* t = sched.CreateTask([] {});
+                t->waitGroup = &wg;
+                wg.n.fetch_add(1, std::memory_order_relaxed);
+                auto* n = dag.CreateNode(t);
+                if (!n) { Check(false, "CreateNode returned null"); break; }
+                if (prev) dag.AddDependency(n, prev);     // a chain: kNodes-1 edges
+                prev = n;
+            }
+
+            const long long held = alloc->LiveCount() - base;
+            std::printf("    slab slots for %d nodes + %d edges: %lld\n", kNodes, kNodes - 1, held);
+            // One slot per node, one per task, plus one CHUNK slot per 16 edges -- chunks are
+            // cut from the slab, not the heap, so the per-edge cost stays inside the single
+            // allocator. The old layout was 4 slots per node plus one per edge: 5*64 + 63 = 383.
+            const long long chunks = (kNodes - 1 + 15) / 16;   // ceil(edges / edges-per-slot)
+            Check(held <= 2 * kNodes + chunks,
+                  "a node costs one slab slot and 16 edges share one");
+            dag.Cancel();
+            dag.Submit();
+            sched.WaitFor(wg);
+        }
+    }
+
     std::printf("slab accounting across many cancelled graphs\n");
     {
         const int kGraphs = 400, kNodes = 4;
@@ -466,6 +506,121 @@ int main() {
         for (auto& th : ts) th.join();
         Check(invalid.load() == 0, "80,000 concurrent scope acquisitions all succeeded");
         Check(aliased.load() == 0, "no two live scopes ever shared a slot");
+    }
+
+    // ---- Event waiters can be cancelled, with the Treiber stack untouched ---------------------
+    // The mechanism: Event::CancelWaiters walks a SIDE INDEX of the same waiters and marks them.
+    // Nothing is removed from the stack, no node is disturbed, and the wake path is unchanged --
+    // the cancellation is delivered when SignalAll resumes the task, exactly like a normal signal.
+
+    // THE POINT OF THE FLAT WAITER INDEX. Event advertises itself as allocation-free on the wait
+    // path, and the LockFreeHashMap version quietly broke that -- one slab cell per suspend, freed
+    // per signal. Nothing behavioural would ever notice, so it gets measured directly: park N tasks
+    // and confirm the slab grew by N (the tasks themselves) and not by 2N.
+    std::printf("parking on an event allocates nothing beyond the tasks\n");
+    {
+        auto& ev = sched.GetEvent("alloc-probe");
+        auto* alloc = JLib::TaskScheduler::Instance().GetAllocator();
+        std::atomic<int> parked{ 0 };
+        JLib::WaitGroup wg;
+
+        const int kN = 64;
+        // Materialise the slot array BEFORE the baseline: it is one lazy array per event, not a
+        // per-waiter cost, and charging a one-time allocation to the per-wait path would be a
+        // misleading measurement either way it came out.
+        {
+            JLib::WaitGroup warm;
+            warm.n.fetch_add(1, std::memory_order_relaxed);
+            auto* w = sched.CreateTask([&] { sched.WaitOnEvent(ev); },
+                                       false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            w->waitGroup = &warm;
+            sched.Push(w);
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            ev.SignalAll();
+            sched.WaitFor(warm);
+        }
+
+        const long long base = alloc->LiveCount();
+
+        for (int i = 0; i < kN; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                parked.fetch_add(1, std::memory_order_relaxed);
+                sched.WaitOnEvent(ev);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        Check(WaitUntil(parked, kN), "all probes reached the event");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));   // let them park
+
+        const long long held = alloc->LiveCount() - base;
+        std::printf("    slab slots held while %d tasks are parked: %lld\n", kN, held);
+        // kN tasks are live and nothing else should be. The hash-map index made this 2*kN.
+        Check(held <= kN, "no per-waiter slab allocation on the wait path");
+
+        ev.SignalAll();
+        sched.WaitFor(wg);
+    }
+
+    std::printf("Event waiters cancelled through the side index\n");
+    {
+        auto& ev = sched.GetEvent("cancel-waiters-probe");
+        std::atomic<int> cancelled{ 0 }, normal{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+
+        // Large enough that 16 buckets must hold several entries each -- at kN=6 no two keys would
+        // share a bucket and the collision path would go untested.
+        const int kN = 128;
+        for (int i = 0; i < kN; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                parked.fetch_add(1, std::memory_order_relaxed);
+                if (sched.WaitOnEventCancellable(ev) == JLib::WaitResult::Cancelled)
+                    cancelled.fetch_add(1, std::memory_order_relaxed);
+                else
+                    normal.fetch_add(1, std::memory_order_relaxed);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+
+        Check(WaitUntil(parked, kN), "all waiters reached the event");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));   // let them actually park
+
+        ev.CancelWaiters();          // marks them; does NOT wake them
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        Check(cancelled.load() == 0 && normal.load() == 0,
+              "marking does not wake anyone -- the stack is untouched");
+
+        ev.SignalAll();              // the ordinary wake path, unchanged
+        sched.WaitFor(wg);
+
+        Check(cancelled.load() == kN, "every waiter reported Cancelled after the signal");
+        Check(normal.load() == 0, "none reported a normal wake");
+    }
+
+    // An uncancelled event wait must still behave exactly as before.
+    std::printf("uncancelled Event wait is unchanged\n");
+    {
+        auto& ev = sched.GetEvent("normal-wait-probe");
+        std::atomic<int> ok{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        for (int i = 0; i < 4; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                parked.fetch_add(1, std::memory_order_relaxed);
+                if (sched.WaitOnEventCancellable(ev) == JLib::WaitResult::Ok)
+                    ok.fetch_add(1, std::memory_order_relaxed);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        Check(WaitUntil(parked, 4), "all waiters parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ev.SignalAll();
+        sched.WaitFor(wg);
+        Check(ok.load() == 4, "all four woke normally with Ok");
     }
 
     // ---- the pool still works afterwards ------------------------------------------------------

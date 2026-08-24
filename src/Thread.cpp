@@ -457,8 +457,7 @@ void Thread::Worker() {
 			// abandons a live stack or frame rather than cancelling it -- see Task::started. A
 			// started task is let through to run, and observes the cancellation at its own next
 			// suspend point or poll, where it can unwind properly.
-			if (!task_to_run->started &&
-			    CancelToken(task_to_run->cancelToken).Cancelled()) {
+			if (!task_to_run->started && IsTaskCancelled(task_to_run)) {
 				// Same disposal the DAG uses for a node that never runs: release the WaitGroup first
 				// so nothing waiting on this work blocks forever on something abandoned.
 				if (task_to_run->waitGroup) {

@@ -158,9 +158,12 @@ bool TaskDAG::HasCycle() {
     while (!ready.empty()) {
         TaskNode* n = ready.back(); ready.pop_back();
         ++processed;
-        n->dependents->for_each([&](TaskNode* dep) {   // forward edges
+        // Raw walk, no epoch guard: this runs before Submit, when nothing else can see the
+        // graph and no node can be retired underneath us.
+        for (DagEdge* e = n->firstEdge; e; e = e->next) {
+            TaskNode* dep = e->dep;
             if (--indeg[dep] == 0) ready.push_back(dep);
-        });
+        }
     }
     return processed != nodes.size();
 }
@@ -226,9 +229,39 @@ void TaskDAG::AddDependency(TaskNode* dependent, TaskNode* dependency) {
     // not leave a phantom dependency behind, or the dependent waits forever for an edge that does
     // not exist. (Build is single-threaded -- see the note on TaskDAG::nodes -- so there is no race
     // between the push and the increment.)
-    if (dependency->dependents->push(dependent)) {
+    DagEdge* e = AllocEdge();
+    if (e) {
+        e->dep  = dependent;
+        e->next = dependency->firstEdge;   // prepend: order among dependents is irrelevant,
+        dependency->firstEdge = e;         // every one of them is fired
         dependent->dependencies_left.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+
+// Bump-allocate one edge cell from the current chunk, cutting a new chunk from the SLAB when it is
+// full. Single-threaded by the same contract as the rest of graph construction.
+//
+// A chunk is exactly one slab slot, so sizeof(DagEdge) divides into it evenly and no space is
+// wasted at the tail.
+JLib::DagEdge* JLib::TaskDAG::AllocEdge() {
+    if (edgeCursor == kEdgeChunk) {
+        void* mem = scheduler.GetAllocator()->Alloc();
+        if (!mem) return nullptr;                 // slab dry; caller must not count the edge
+        edgeChunks.push_back(static_cast<DagEdge*>(mem));
+        edgeCursor = 0;
+    }
+    DagEdge* e = &edgeChunks.back()[edgeCursor++];
+    e->dep = nullptr;
+    e->next = nullptr;
+    return e;
+}
+
+JLib::TaskDAG::~TaskDAG() {
+    // Raw slots holding trivially-destructible DagEdge cells, so there is nothing to destroy --
+    // just hand the memory back.
+    TaskAllocator* a = scheduler.GetAllocator();
+    for (DagEdge* chunk : edgeChunks) a->Free(chunk);
 }
 
 
@@ -244,7 +277,7 @@ void TaskDAG::OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome) {
     //          is a cancellation the gate is cancelled, and a later OK is a no-op.
     // The countdown is still decremented on the normal path only; once a cancel has fired the node,
     // any later completion is deduped by `submitted` regardless of what the counter says.
-    node->dependents->for_each([this, outcome](TaskNode* dep) {
+    ForEachDependent(node, [this, outcome](TaskNode* dep) {
         if (outcome == TaskNode::Outcome::Cancelled) {
             Fire(dep, TaskNode::Outcome::Cancelled);
             return;
@@ -255,15 +288,19 @@ void TaskDAG::OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome) {
         if (ready) Fire(dep);
         });
     // Retire (don't immediately free): an OR dependent fires on its FIRST predecessor and
-    // then runs + finishes, but LATER predecessors still hold this node in their dependents
-    // lists and read it inside their (epoch-guarded) for_each. EBR keeps it alive until no
-    // such reader can still see it. (AND is safe either way, but uniform retire is simplest.)
+    // then runs + finishes, but LATER predecessors still hold this node in their
+    // edge lists and dereference it inside their (epoch-guarded) ForEachDependent. EBR keeps
+    // it alive until no such reader can still see it. (AND is safe either way, but uniform
+    // retire is simplest.)
     EpochManager::Instance().RetirePtr(node, EpochManager::Instance().CurrentEpoch(), &TaskDAG::NodeDeleter);
 }
 
 void TaskDAG::NodeDeleter(void* p) {
     auto* n = static_cast<TaskNode*>(p);
-    TaskAllocator* a = &n->alloc;   // grab the allocator before destroying the node
+    // The node no longer carries an allocator reference -- it stopped allocating when the
+    // dependents list became DAG-owned chunk storage. This is the same allocator it was
+    // built with: CreateNode/CreateGate/CreateExternalNode all pass *scheduler.GetAllocator().
+    TaskAllocator* a = TaskScheduler::Instance().GetAllocator();
     n->~TaskNode();
     a->Free(n);
 }

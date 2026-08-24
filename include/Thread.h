@@ -253,4 +253,20 @@ namespace JLib {
         std::thread::native_handle_type nativeHandle;
 
     };
+
+    // Epoch slot for the current execution context: the running fiber's slot if we are on one,
+    // else this (bare) thread's fallback slot. The fiber branch is migration-proof -- the slot
+    // travels with the fiber across a context switch. Bare threads (e.g. the main thread building
+    // a DAG) do not migrate, so their per-thread fallback is correct.
+    //
+    // Lives HERE rather than in LockFreeList.h, where it was originally written, because it is an
+    // epoch concept and not a list one -- and TaskDAG needs it now that its dependent walk guards
+    // itself instead of borrowing LockFreeList::for_each's guard. Epochs.h cannot host it: it
+    // would have to include Fiber.h, which already includes Epochs.h. Thread.h already sees both.
+    inline std::atomic<size_t>* CurrentEpochSlot() {
+        if (Thread* w = Thread::GetCurrent())
+            if (Fiber* f = w->currentFiber)
+                return &f->localEpoch;
+        return EpochManager::Instance().ThreadSlot(thread_id);
+    }
 };

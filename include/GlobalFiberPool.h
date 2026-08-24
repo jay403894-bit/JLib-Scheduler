@@ -49,5 +49,9 @@ namespace JLib {
 
         // Query available fiber count (for diagnostics)
         size_t AvailableCount() const;
+
+        // TOTAL fibers, standard + heavy. This is the exact upper bound on tasks that can be parked
+        // anywhere at once, since a parked task holds a fiber -- Event sizes its waiter index by it.
+        size_t TotalCount() const { return size; }
     };
 }

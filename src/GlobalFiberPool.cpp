@@ -22,6 +22,7 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
 		Fiber& f = standardFibers.back();
 		f.stackBase = stackMem;
 		f.stackSize = kStandardStackSize;
+		f.poolIndex = i;                        // standard fibers occupy [0, standardCount)
 
 		// Register this fiber's EBR slot ONCE. Fibers live for the whole program (the
 		// pool is leaked, the vector is reserve()'d so it never reallocates), so the
@@ -42,6 +43,7 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
 		Fiber& f = heavyFibers.back();
 		f.stackBase = stackMem;
 		f.stackSize = kHeavyStackSize;
+		f.poolIndex = standardCount + i;        // heavy fibers follow them, one dense range
 
 		EpochManager::Instance().RegisterParticipant(&f.localEpoch);  // see standard loop
 

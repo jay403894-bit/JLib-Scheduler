@@ -12,6 +12,7 @@
 #include "TaskNode.h"
 #include "Epochs.h"
 #include "TaskAllocator.h"
+#include "Thread.h"   // CurrentEpochSlot, for the epoch-guarded dependent walk
 
 static constexpr uint8_t NONE = 255;
 
@@ -20,6 +21,9 @@ namespace JLib {
     class TaskDAG {
     public:
         TaskDAG(TaskScheduler& sched) : scheduler(sched) {};
+        // Returns the edge chunks to the slab. Nodes are NOT freed here -- they self-free through
+        // EBR as they complete, and the ones that never ran were reclaimed by Submit or Cancel.
+        ~TaskDAG();
         TaskNode* CreateNode(Task* t, uint8_t priority = NONE, uint8_t cpu_id = NONE);
         // Like CreateNode, but the task runs via TaskScheduler::PushMain (only progresses when
         // the main thread calls ProcessMainThread) instead of the worker pool. Use for anything
@@ -146,6 +150,56 @@ namespace JLib {
         // so it is cleared there and never iterated post-submit.
         std::vector<TaskNode*> nodes;
 
+        // ---- edge storage --------------------------------------------------------------------
+        //
+        // Forward edges live here, in CHUNKS CUT FROM THE SLAB, rather than one slab cell each.
+        // Graph construction is single-threaded by contract -- CreateNode appends to the plain
+        // `nodes` vector above, so it cannot be otherwise -- and nothing adds edges after Submit, so
+        // the lock-free list this replaced was paying for concurrency unreachable in practice.
+        //
+        // THE SLAB, NOT THE HEAP, and that is not incidental. An earlier revision of this used
+        // new DagEdge[] and quietly moved the per-edge cost onto the general allocator, which gives
+        // up the single-source-of-memory-truth property the slab exists for. A chunk is sized to
+        // exactly one slab slot, so 256 bytes holds 16 edges: still 16x better than the cell-per-edge
+        // list it replaced, with nothing handed to malloc.
+        //
+        // (The chunk TABLE below is a std::vector, like `nodes` beside it. Build-phase container
+        // growth was always on the heap; what matters is that the per-EDGE cost is not.)
+        //
+        // CHUNKED RATHER THAN ONE FLAT ARRAY, deliberately. A reallocating array is the one way
+        // flattening could foreclose a future in which a RUNNING node extends the graph. Chunks are
+        // individually stable and edges hold POINTERS to each other, so a walk in progress never
+        // touches the chunk table and growth can never invalidate it. That costs nothing today.
+        //
+        // Lifetime: chunks are freed by ~TaskDAG, which "must outlive the work it submitted" -- the
+        // same requirement the node pointers already impose. So edges need no reclamation of their
+        // own, unlike the nodes they point AT.
+        static constexpr size_t kEdgeChunk = TaskAllocator::SLOT / sizeof(DagEdge);
+        std::vector<DagEdge*> edgeChunks;
+        size_t edgeCursor = kEdgeChunk;      // forces a fresh chunk on the first edge
+        // Returns nullptr if the slab is exhausted -- AddDependency must then NOT count the edge,
+        // or a dependent waits forever on an edge that does not exist.
+        DagEdge* AllocEdge();
+
+    public:
+        // Walk one node's forward edges.
+        //
+        // THE EpochGuard IS LOAD-BEARING and is the whole reason this is not a bare for loop. It
+        // used to come for free from inside LockFreeList::for_each, and losing it in the switch to
+        // raw links would have been silent: an OR-gate dependent fires on its FIRST predecessor,
+        // then runs, finishes and is EBR-retired, while LATER predecessors are still walking their
+        // own edge lists and dereferencing that same node. The guard is what keeps it alive across
+        // this walk. See the retire comment at the end of OnTaskFinished.
+        //
+        // The EDGES need no protection -- they belong to the DAG and outlive every node. Only the
+        // TaskNode* each one points at does.
+        template <typename F>
+        void ForEachDependent(TaskNode* node, F fn) {
+            EpochGuard guard(CurrentEpochSlot());
+            for (DagEdge* e = node->firstEdge; e; e = e->next) fn(e->dep);
+        }
+
+    private:
         void Fire(TaskNode* node, TaskNode::Outcome outcome = TaskNode::Outcome::Completed);
         static void NodeDeleter(void* p);   // EBR deleter: ~TaskNode + return its slot to the slab
     };
