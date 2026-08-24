@@ -209,10 +209,19 @@ namespace JLib {
         // a fiber-indexed slot table: the intrusive link was what forbade removing one specific
         // waiter, and with it SignalOne. Nothing threads through a Task any more.
         //
-        // The space is left UNCLAIMED on purpose rather than absorbed by a new field, so the
-        // 64-byte budget stays visibly available and the next thing that needs room finds it.
-        // Anything put here must keep static_assert(sizeof(Task) == 64) true and must be added
-        // to the ABI fingerprint in TaskScheduler.h.
+        // THE SPACE IS LEFT UNCLAIMED ON PURPOSE, and since 3.0.0 that is a performance
+        // decision rather than a tidiness one. LambdaTask<F> stores F as a member after this
+        // base, and BOTH MSVC and GCC reuse the base tail padding -- measured, not assumed
+        // (bench/dag_scaling.cpp prints it). So a lambda capturing up to 8 bytes, which is one
+        // reference and by far the most common shape, costs NOTHING: sizeof(LambdaTask) stays
+        // 64 and it lands in the 64-byte slab class.
+        //
+        // Claim these bytes and every single-capture lambda jumps 64 -> 80, which moves it out
+        // of the 64-byte class into the 128-byte one. That is a 2x memory regression on the
+        // most common task in the system, paid for one field. Measure before taking them.
+        //
+        // Anything put here must keep static_assert(sizeof(Task) == 64) true, must be added to the
+        // ABI fingerprint in TaskScheduler.h, and must justify the size-class cost above.
 
         // Both constructors initialize EVERY bitfield -- see the C++17 note on the flag block.
         // Members are listed in declaration order so the initialization order is the written one.

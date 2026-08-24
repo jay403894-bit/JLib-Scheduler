@@ -141,6 +141,22 @@ int main() {
     std::printf("  fixed-size slab users: Task %zu B, TaskNode %zu B, DagEdge %zu B  (slot is %zu B)\n",
                 sizeof(JLib::Task), sizeof(JLib::TaskNode), sizeof(JLib::DagEdge),
                 JLib::TaskAllocator::SLOT);
+    // LambdaTask sizes for representative captures. Printed rather than asserted because the
+    // answer is COMPILER-DEPENDENT: F is a member after the Task base, and whether a small capture
+    // fits depends on reuse of the base class tail padding -- which MSVC and GCC do not treat
+    // identically. Task has 8 free bytes at 56-63 since the Treiber waiter stack was retired, so a
+    // single 8-byte capture may cost nothing at all. That is worth knowing per toolchain, not
+    // assuming.
+    {
+        int cap0 = 0; double cap1 = 0; char capBig[64]{};
+        auto lEmpty = []{};
+        auto lOne   = [&cap0]{ (void)cap0; };
+        auto lTwo   = [&cap0, &cap1]{ (void)cap0; (void)cap1; };
+        auto lBig   = [capBig]{ (void)capBig[0]; };
+        std::printf("  LambdaTask by capture: empty %zu B, 1 ref %zu B, 2 refs %zu B, 64 B capture %zu B\n",
+                    sizeof(JLib::LambdaTask<decltype(lEmpty)>), sizeof(JLib::LambdaTask<decltype(lOne)>),
+                    sizeof(JLib::LambdaTask<decltype(lTwo)>),   sizeof(JLib::LambdaTask<decltype(lBig)>));
+    }
 
     std::printf("\nread DOWN each block: if exec us/node is flat as fanout grows, walking dependents\n");
     std::printf("is invisible next to dispatch and edge layout is not worth reopening.\n");
