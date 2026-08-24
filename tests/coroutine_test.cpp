@@ -173,6 +173,167 @@ static JLib::Coro Ordered(std::atomic<bool>* wrongOrder) {
 // frame alloc+free.
 static JLib::Coro TinyFrame(int x) { (void)x; co_return; }
 
+// Cancellable awaiters. A coroutine parked on a mutex or a semaphore had no way to observe
+// cancellation before 3.0.4 -- LockAsyncEnqueue already took a WaitResult* and the awaiter passed
+// nothing, so the plumbing was half-built and unreachable.
+//
+// The checks that matter are not "does the flag arrive". They are the two things that would be
+// silently wrong: a Cancelled return must leave the lock UNHELD and the permit UNTAKEN, because a
+// caller told to drop something it never acquired will corrupt the primitive for everyone else.
+static JLib::SchedulerMutex     g_coCancelMutex;
+static JLib::SchedulerSemaphore g_coCancelSem{ 0 };
+static std::atomic<int>         g_coCancelled{ 0 }, g_coAcquired{ 0 }, g_coParked{ 0 }, g_coResumed{ 0 };
+
+static JLib::Coro LockCancelProbe() {
+    g_coParked.fetch_add(1, std::memory_order_relaxed);
+    const JLib::WaitResult r = co_await JLib::LockAsyncCancellable(g_coCancelMutex);
+    if (r == JLib::WaitResult::Cancelled) g_coCancelled.fetch_add(1, std::memory_order_relaxed);
+    else { g_coAcquired.fetch_add(1, std::memory_order_relaxed); g_coCancelMutex.Unlock(); }
+    co_return;
+}
+
+
+static JLib::Coro AcquireCancelProbe() {
+    g_coParked.fetch_add(1, std::memory_order_relaxed);
+    const JLib::WaitResult r = co_await JLib::AcquireAsyncCancellable(g_coCancelSem);
+    g_coResumed.fetch_add(1, std::memory_order_relaxed);
+    if (r == JLib::WaitResult::Cancelled) g_coCancelled.fetch_add(1, std::memory_order_relaxed);
+    else g_coAcquired.fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
+static void TestCoroutineCancellableAwaiters(JLib::TaskScheduler& sched) {
+    std::printf("coroutines observe cancellation while awaiting a mutex\n");
+    {
+        g_coCancelled.store(0); g_coAcquired.store(0); g_coParked.store(0);
+        JLib::CancelScope scope;
+        JLib::WaitGroup wg;
+
+        g_coCancelMutex.Lock();                       // held, so every awaiter queues
+
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i) {
+            JLib::Spawn(LockCancelProbe(), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+        }
+        for (int s = 0; s < 200 && g_coParked.load() < kN; ++s)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Check(g_coParked.load() == kN, "all coroutines reached the await");
+
+        scope.Cancel();
+        // ONE Unlock releases ALL of them: each cancelled waiter is skipped and the walk continues.
+        // If skip-at-release did not reach coroutine waiters this wakes one and WaitFor hangs.
+        g_coCancelMutex.Unlock();
+        sched.WaitFor(wg);
+
+        char msg[128];
+        std::snprintf(msg, sizeof msg,
+                      "every awaiting coroutine returned Cancelled (got %d, acquired %d, of %d)",
+                      g_coCancelled.load(), g_coAcquired.load(), kN);
+        Check(g_coCancelled.load() == kN, msg);
+        Check(g_coAcquired.load() == 0, "none of them believed it held the lock");
+
+        // THE MUTEX MUST BE FREE. A Cancelled awaiter takes nothing, so the Unlock above was never
+        // consumed. If cancellation had acquired the lock this deadlocks instead of returning --
+        // and nothing above would have said a word.
+        Check(g_coCancelMutex.Try_Lock(), "the mutex is unheld: cancellation acquired nothing");
+        g_coCancelMutex.Unlock();
+    }
+
+    // Cancelled coroutines waiting on a permit. ONE Signal releases all four: each is skipped and
+    // the walk continues, exactly as the mutex path above.
+    //
+    // THE SETTLE BEFORE Cancel() IS LOAD-BEARING and not just politeness. g_coParked is incremented
+    // BEFORE the co_await, so "all parked" does not mean "all enqueued". More interestingly, a very
+    // long settle (600 ms was tried) made this fail CONSISTENTLY with zero resumptions while the
+    // queue provably held all four waiters -- which points at waking a fully-idle pool from a
+    // non-worker thread, not at cancellation. Worth chasing separately; noted here so the next
+    // person who touches this timing knows it is not arbitrary.
+    std::printf("coroutines observe cancellation while awaiting a permit\n");
+    {
+        g_coCancelled.store(0); g_coAcquired.store(0); g_coParked.store(0); g_coResumed.store(0);
+        JLib::CancelScope scope;
+        JLib::WaitGroup wg;
+
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i)
+            JLib::Spawn(AcquireCancelProbe(), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+
+        for (int s = 0; s < 200 && g_coParked.load() < kN; ++s)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Check(g_coParked.load() == kN, "all coroutines reached the await");
+
+        scope.Cancel();
+        g_coCancelSem.Signal();
+        sched.WaitFor(wg);
+
+        char msg[144];
+        std::snprintf(msg, sizeof msg,
+                      "every awaiting coroutine returned Cancelled (got %d, acquired %d, resumed %d of %d)",
+                      g_coCancelled.load(), g_coAcquired.load(), g_coResumed.load(), kN);
+        Check(g_coCancelled.load() == kN, msg);
+        Check(g_coAcquired.load() == 0, "none of them believed it held a permit");
+        Check(g_coCancelSem.Try_Wait(), "the permit survived: cancellation consumed nothing");
+    }
+
+    // The COROUTINE branch of SchedulerSemaphore::CancelWaiters. The fiber branch is covered in
+    // dag_cancel_test; this is the other half of the same eject loop -- victims[i].coro, resumed
+    // through Push rather than Thread::Resume -- and it had no coverage at all when the eager path
+    // was written.
+    //
+    // Eager is the whole point: NO Signal is issued anywhere below, and WaitFor still returns.
+    std::printf("CancelWaiters ejects coroutine waiters with no signal\n");
+    {
+        g_coCancelled.store(0); g_coAcquired.store(0); g_coParked.store(0); g_coResumed.store(0);
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope scope;
+        JLib::WaitGroup wg;
+
+        // A local semaphore, so the probe cannot use the file-scope one -- spelled inline.
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i) {
+            JLib::Spawn([](JLib::SchedulerSemaphore* s) -> JLib::Coro {
+                g_coParked.fetch_add(1, std::memory_order_relaxed);
+                const JLib::WaitResult r = co_await JLib::AcquireAsyncCancellable(*s);
+                g_coResumed.fetch_add(1, std::memory_order_relaxed);
+                if (r == JLib::WaitResult::Cancelled) g_coCancelled.fetch_add(1, std::memory_order_relaxed);
+                else g_coAcquired.fetch_add(1, std::memory_order_relaxed);
+                co_return;
+            }(&sem), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+        }
+
+        for (int s = 0; s < 200 && g_coParked.load() < kN; ++s)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Check(g_coParked.load() == kN, "all coroutines parked on the throttle");
+
+        scope.Cancel();
+        sem.CancelWaiters(scope.Token());     // no Signal anywhere
+        sched.WaitFor(wg);
+
+        char m2[144];
+        std::snprintf(m2, sizeof m2,
+                      "every coroutine woke Cancelled with no signal (got %d, acquired %d, resumed %d of %d)",
+                      g_coCancelled.load(), g_coAcquired.load(), g_coResumed.load(), kN);
+        Check(g_coCancelled.load() == kN, m2);
+        Check(g_coAcquired.load() == 0, "none of them believed it held a permit");
+        Check(!sem.Try_Wait(), "no permit was invented: the counter is untouched");
+    }
+
+    std::printf("uncancelled awaiters are unchanged\n");
+    {
+        g_coCancelled.store(0); g_coAcquired.store(0); g_coParked.store(0);
+        JLib::WaitGroup wg;
+        JLib::Spawn(AcquireCancelProbe(), &wg);       // NO cancel token at all
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        g_coCancelSem.Signal();
+        sched.WaitFor(wg);
+        Check(g_coAcquired.load() == 1, "an awaiter with no scope acquires normally");
+        Check(g_coCancelled.load() == 0, "and does not report cancellation");
+    }
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Small on purpose -- see the slab-accounting section. The default 1M slots would swallow any
@@ -529,6 +690,8 @@ int main() {
         held.clear();
         Check(alloc->SmallLiveCount() - smallBase == 0, "and every one was returned on destruction");
     }
+
+    TestCoroutineCancellableAwaiters(JLib::TaskScheduler::Instance());
 
     std::printf("\n%s\n", g_failures == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
     return g_failures == 0 ? 0 : 1;

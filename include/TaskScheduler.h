@@ -761,7 +761,7 @@ namespace JLib {
 		// WaitOnEvent, but reports whether this task was cancelled while parked.
 		//
 		// DELIVERY IS AT THE WAKE, not at the cancel. Event::CancelWaiters marks the task through
-		// the waiter index and leaves it exactly where it is -- the Treiber stack is never touched,
+		// the waiter index and WAKES it -- an Event may be signalled by a condition that never occurs,
 		// so nothing is removed from it and its no-pop invariant holds. The task therefore stays
 		// parked until the event actually fires; SignalAll resumes it as usual, and this returns
 		// Cancelled instead of Ok.
@@ -1284,6 +1284,17 @@ namespace JLib {
 		// it holds a permit it does not hold; same rule as SchedulerMutex::LockCancellable.
 		[[nodiscard]] WaitResult WaitCancellable();
 
+		// EAGER cancellation, for a semaphore used as an I/O THROTTLE rather than a critical section.
+		// Ejects waiters and wakes them with Cancelled WITHOUT waiting for a Signal -- the point being
+		// that the release you would wait for is the work you are trying to abandon.
+		//
+		// tok selects whose waits to abort (the usual case: one player, one zone, one request). A
+		// default-constructed token means EVERYONE, for teardown.
+		//
+		// Waiters that used plain Wait() are never ejected: they have nowhere to report Cancelled, so
+		// waking one would hand its caller a permit it does not hold.
+		void CancelWaiters(CancelToken tok = CancelToken{});
+
 		bool Try_Wait();
 
 		void Signal();
@@ -1297,7 +1308,11 @@ namespace JLib {
 		// The ownership asymmetry documented on ScopedPermit applies here too and more sharply: a
 		// permit taken by a coroutine has no owner the scheduler can track, and a coroutine can be
 		// resumed on any worker, so nothing counts this as an acquisition for the helping guard.
-		bool WaitAsyncEnqueue(Task* coroTask);
+		// result: optional slot the releaser writes before resuming, so a coroutine can learn it was
+		// cancelled. Null means not cancellable and never skipped -- see the note on Waiter. The slot
+		// must outlive the suspension, which is why the awaiter holds it as a MEMBER: an awaiter lives
+		// in the coroutine frame, so a member of it is stable for exactly as long as the wait is.
+		bool WaitAsyncEnqueue(Task* coroTask, WaitResult* result = nullptr);
 
 		// RAII permit, and the ONLY way to hold one safely across a blocking call on a bare thread.
 		//

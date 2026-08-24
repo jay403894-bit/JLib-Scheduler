@@ -3,6 +3,89 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.1.0 - 2026-08-24
+
+**EAGER CANCELLATION where a wait may never end.** Until now every primitive was strictly
+skip-at-release: a cancelled waiter learned about it when somebody released, and a primitive nobody
+releases held its waiters indefinitely. That is correct for a mutex guarding a scene graph -- the
+holder releases promptly -- and wrong for the cases cancellation actually exists for.
+
+The split is by USE, not by primitive, so the caller chooses per call site:
+
+| spelling | behaviour |
+|---|---|
+| `Wait()` / `Lock()` | cannot be cancelled at all |
+| `WaitCancellable()` / `LockCancellable()` | learns at the next release |
+| `Event::CancelWaiters()`, `SchedulerSemaphore::CancelWaiters(tok)` | woken immediately |
+
+### `Event::CancelWaiters()` now wakes
+
+An `Event` is signalled by an outside condition -- an asset finishing, a socket completing, a level
+loading -- and if that condition never arrives, a skip-at-release waiter waits forever. It now
+claims each waiter and resumes it, so no signal is required. The test proves it the only convincing
+way: `WaitFor` returns with no `SignalAll` anywhere, and a later `SignalOne()` finds nobody.
+
+**[CRITICAL] This also fixes a latent race present in 3.0.0-3.0.3.** The marking-only version loaded
+the slot and then wrote `t->cancelledDirect`, while a concurrent `SignalAll` clears the slot BEFORE
+resuming -- so the cancelling thread could hold a stale pointer and write into a `Task` that had
+already completed and returned its slab slot. Claiming first (`fetch_and` the bit, then `exchange`
+the slot) makes the pointer exclusively ours: nothing else can resume or recycle it. Narrow, but a
+write through freed memory.
+
+### `SchedulerSemaphore::CancelWaiters(CancelToken)`
+
+For a semaphore used as an I/O **throttle** -- "at most eight concurrent asset streams" -- rather
+than as a critical section. A waiter there can sit for as long as the work ahead of it takes, and
+the reason to cancel is usually that nobody wants the result any more: the player disconnected,
+closed the menu, left the zone. Waiting for a release means waiting for exactly the work being
+abandoned.
+
+It takes a TOKEN rather than cancelling everything, because a disconnecting player must not abort
+another player's streams through the same throttle. A default-constructed token means everyone, for
+teardown.
+
+**A plain `Wait()` is never ejected**, whatever token it carries. It has nowhere to report
+`Cancelled`, so waking it would return its caller into a critical section holding a permit it does
+not hold -- the same rule that makes the cancellable spellings separate functions. Tested directly:
+a plain waiter under a cancelled scope stays parked through the cancel and leaves only on a real
+permit.
+
+Cheap because the queue is spinlock-protected rather than lock-free: the whole eject pass runs under
+the lock, the lock is dropped, and only then is anyone resumed -- the same discipline `Signal()`
+already uses, since a resumed task can be running on another worker before the call returns.
+
+### Coroutines can be cancelled while awaiting
+
+`co_await LockAsyncCancellable(m)` and `co_await AcquireAsyncCancellable(s)` return a `WaitResult`.
+`Cancelled` means **NOTHING WAS ACQUIRED** -- do not `Unlock`, do not `Signal`, do not proceed as
+though you hold it. The result lives as a MEMBER of the awaiter, which is what makes it stable: an
+awaiter lives in the coroutine frame for the whole `co_await`, so the releaser's write from another
+thread lands somewhere still alive. The awaiters are non-copyable to keep that true.
+
+`Spawn` gained a trailing `cancelToken` parameter. It CREATES the Task, so without it a caller had
+no `t` to stamp and the cancellable awaiters were unreachable for anything spawned -- which is
+everything. Typically `dag.Token().Raw()`, so work a graph starts but does not own is cancelled with
+it.
+
+**Fixed on the way:** `SchedulerSemaphore::WaitAsyncEnqueue` pushed `Waiter{nullptr, coroTask}` --
+no result slot and no token -- so a coroutine waiter was, by the contract on `Waiter`, "not
+cancellable, never skipped". `Signal()` handed it the permit regardless of its scope. The mutex's
+`LockAsyncEnqueue` had carried both since 2.14.0; the semaphore's never did.
+
+### Still not cancellable
+
+- `SchedulerMutex`, deliberately. A critical section that aborts mid-wait complicates every RAII
+  invariant around it, and its holder releases promptly anyway. `Lock()` versus `LockCancellable()`
+  keeps that a per-call-site decision rather than a library-wide one.
+- Fork-join fences (`WaitFor(WaitGroup)`). Waiting for 16 workers to finish a broadphase step should
+  run to completion; there is deliberately no cancellable spelling.
+- `SchedulerConditionVariable::Wait(mutex)`. The contract is that it returns holding the mutex,
+  cancelled or not, so the caller's unlock stays unconditional -- straightforward, just not done.
+- **Timers and timeouts, because no such primitive exists.** Two common wants -- an entity dying and
+  unwinding its queued delays, and `co_await Acquire(timeout)` -- need a deadline structure that
+  supports removal by construction. That is a new primitive rather than a retrofit, and it must not
+  put deadlines into the worker park path: timed waits there hide lost wakeups.
+
 ## 3.0.3 - 2026-08-24
 
 **`SchedulerSemaphore::WaitCancellable()`** -- a fiber parked on a semaphore now observes

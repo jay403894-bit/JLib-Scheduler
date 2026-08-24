@@ -345,6 +345,17 @@ namespace JLib {
             t->data = h.address();
             return t;
         }
+
+        // True if the task currently executing this coroutine has been cancelled. Uses the same
+        // single decision point as everything else (IsTaskCancelled), so a coroutine, a fiber and
+        // a worker at pickup all agree about what "cancelled" means.
+        //
+        // Off a task entirely -- a coroutine resumed on a bare thread -- this is false, matching
+        // TaskScheduler::CurrentTaskCancelled. Unscoped work is not cancelled work.
+        inline bool CurrentCoroTaskCancelled() noexcept {
+            if (!TaskScheduler::IsInitialized()) return false;
+            return IsTaskCancelled(TaskScheduler::Instance().GetCurrentTask());
+        }
     }
 
     // A coroutine that runs on the scheduler pool. Fire-and-forget: it reports completion through a
@@ -480,8 +491,14 @@ namespace JLib {
     // The WaitGroup is incremented HERE, before the push, and not inside the coroutine: incrementing
     // after the task is visible would let a waiter observe a count of zero and proceed while this
     // coroutine had not started.
+    // cancelToken: hand a spawned coroutine a scope so an abort reaches it. Spawn CREATES the
+    // Task, so a caller has no `t` to stamp afterwards -- without this parameter the
+    // cancellable awaiters are unreachable for anything spawned this way, which is everything.
+    //
+    // Typically dag.Token().Raw(), so work a graph starts but does not own is cancelled with it.
     inline bool Spawn(Coro&& c, WaitGroup* wg = nullptr,
-                      uint8_t hiPri = 0, CorePref pref = CorePref::Default) {
+                      uint8_t hiPri = 0, CorePref pref = CorePref::Default,
+                      uint32_t cancelToken = CancelToken::kNone) {
         Coro::Handle h = c.Release();
         if (!h) return false;
 
@@ -492,6 +509,7 @@ namespace JLib {
         if (!t) { h.destroy(); return false; }
 
         h.promise().task = t;
+        t->cancelToken = cancelToken;
         if (wg) {
             wg->n.fetch_add(1, std::memory_order_relaxed);
             t->waitGroup = wg;
@@ -520,8 +538,10 @@ namespace JLib {
     // NOTHING HERE MAKES THE DAG REQUIRE C++20. Only this header does, and only a translation unit
     // that spawns a coroutine includes it; `SignalExternal` is plain C++17 and an external node is
     // equally happy being completed by an IOCP callback, a fence, or any thread.
+    // See the note on the WaitGroup overload for why the token is a parameter here.
     inline bool Spawn(Coro&& c, TaskNode* node,
-                      uint8_t hiPri = 0, CorePref pref = CorePref::Default) {
+                      uint8_t hiPri = 0, CorePref pref = CorePref::Default,
+                      uint32_t cancelToken = CancelToken::kNone) {
         Coro::Handle h = c.Release();
         if (!h) return false;
 
@@ -532,6 +552,7 @@ namespace JLib {
         if (!t) { h.destroy(); return false; }
 
         h.promise().task    = t;
+        t->cancelToken = cancelToken;
         h.promise().dagNode = node;
 
         // Last line: once pushed, a worker may run this to completion -- signalling the node and
@@ -622,8 +643,95 @@ namespace JLib {
 
     // Free functions rather than members, so TaskScheduler.h never has to name a coroutine type and
     // stays compilable as C++17.
+
+    // ---- cancellable variants ------------------------------------------------------------------
+    //
+    // `co_await LockAsyncCancellable(m)` yields a WaitResult instead of nothing. Cancelled means
+    // THE LOCK WAS NOT ACQUIRED -- do not Unlock, and do not proceed as though you hold it. That is
+    // the same rule as the fiber-side LockCancellable, and it is the reason these are separate
+    // types rather than a flag on the existing ones: a caller who ignores the result of the plain
+    // awaiter cannot be wrong, because the plain awaiter cannot come back empty-handed.
+    //
+    // WHY THE RESULT IS A MEMBER and not a local in await_suspend. The releaser writes through this
+    // slot from another thread, at an arbitrary time, and the write must land somewhere that is
+    // still alive. An awaiter object lives IN THE COROUTINE FRAME for the whole co_await
+    // expression, so a member of it is stable for exactly as long as the suspension -- which is the
+    // property Waiter's contract requires and a stack local in await_suspend would not have.
+    //
+    // The awaiter is therefore NOT copyable and must be awaited where it is constructed. That is
+    // the normal spelling anyway (`co_await LockAsyncCancellable(m)`), and holding one across a
+    // suspension point would be a bug the type system now prevents.
+    class LockAwaiterCancellable {
+    public:
+        explicit LockAwaiterCancellable(SchedulerMutex& m) noexcept : m_(m) {}
+        LockAwaiterCancellable(const LockAwaiterCancellable&) = delete;
+        LockAwaiterCancellable& operator=(const LockAwaiterCancellable&) = delete;
+
+        // ALREADY CANCELLED: do not suspend and do not take the lock. Acquiring here would hand the
+        // caller something it is immediately going to be told to drop, and it would have to know to
+        // Unlock on a Cancelled return -- the exact confusion this API exists to avoid.
+        bool await_ready() noexcept {
+            if (detail::CurrentCoroTaskCancelled()) {
+                result_ = WaitResult::Cancelled;
+                return true;
+            }
+            return false;
+        }
+
+        template <typename P>
+        bool await_suspend(std::coroutine_handle<P> h) {
+            Task* t = detail::ArmResume(h);
+            // true  -> acquired, DO NOT suspend. false -> queued; touch nothing further, Unlock may
+            //          already have re-pushed this task onto another worker.
+            return !m_.LockAsyncEnqueue(t, &result_);
+        }
+
+        [[nodiscard]] WaitResult await_resume() const noexcept { return result_; }
+
+    private:
+        SchedulerMutex& m_;
+        WaitResult result_ = WaitResult::Ok;
+    };
+
+    // Same contract for a semaphore permit: Cancelled means NO PERMIT WAS TAKEN, so do not Signal()
+    // to "give it back" -- there is nothing to give back.
+    //
+    class AcquireAwaiterCancellable {
+    public:
+        explicit AcquireAwaiterCancellable(SchedulerSemaphore& s) noexcept : s_(s) {}
+        AcquireAwaiterCancellable(const AcquireAwaiterCancellable&) = delete;
+        AcquireAwaiterCancellable& operator=(const AcquireAwaiterCancellable&) = delete;
+
+        bool await_ready() noexcept {
+            if (detail::CurrentCoroTaskCancelled()) {
+                result_ = WaitResult::Cancelled;
+                return true;
+            }
+            return false;
+        }
+
+        template <typename P>
+        bool await_suspend(std::coroutine_handle<P> h) {
+            Task* t = detail::ArmResume(h);
+            return !s_.WaitAsyncEnqueue(t, &result_);
+        }
+
+        [[nodiscard]] WaitResult await_resume() const noexcept { return result_; }
+
+    private:
+        SchedulerSemaphore& s_;
+        WaitResult result_ = WaitResult::Ok;
+    };
+
+
     inline LockAwaiter    LockAsync(SchedulerMutex& m) noexcept     { return LockAwaiter{ m }; }
     inline AcquireAwaiter AcquireAsync(SchedulerSemaphore& s) noexcept { return AcquireAwaiter{ s }; }
+
+    // Cancellable spelling. `WaitResult r = co_await LockAsyncCancellable(m);` -- Cancelled means
+    // NOTHING WAS ACQUIRED: do not Unlock, do not Signal, do not proceed as though you hold it.
+    inline LockAwaiterCancellable    LockAsyncCancellable(SchedulerMutex& m) noexcept { return LockAwaiterCancellable{ m }; }
+
+    inline AcquireAwaiterCancellable AcquireAsyncCancellable(SchedulerSemaphore& s) noexcept { return AcquireAwaiterCancellable{ s }; }
 
     // ---- Lazy<T>: a coroutine that RETURNS something -------------------------------------------
     //

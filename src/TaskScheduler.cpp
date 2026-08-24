@@ -2348,15 +2348,19 @@ SchedulerSemaphore::ScopedPermit::~ScopedPermit() {
 	sem.Signal();
 }
 
-bool SchedulerSemaphore::WaitAsyncEnqueue(Task* coroTask) {
+bool SchedulerSemaphore::WaitAsyncEnqueue(Task* coroTask, WaitResult* result) {
 	while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 	if (permits > 0) {
 		--permits;
 		spinLock.clear(std::memory_order_release);
+		if (result) *result = WaitResult::Ok;   // acquired outright; nothing will resume us
 		return true;    // got a permit -- caller must not suspend
 	}
 	// Queued. Reachable by Signal() the instant spinLock clears; touch nothing after.
-	waiters.push(Waiter{ nullptr, coroTask });
+	// result AND token, or the waiter is by definition not cancellable -- a null result slot means
+	// "never skipped" and Signal() will hand it the permit no matter what its scope says.
+	waiters.push(Waiter{ nullptr, coroTask, result,
+	                     coroTask ? coroTask->cancelToken : CancelToken::kNone });
 	spinLock.clear(std::memory_order_release);
 	return false;
 }
@@ -2423,6 +2427,71 @@ void SchedulerSemaphore::Signal()
 		}
 		// 3. Release lock on this execution path
 		spinLock.clear(std::memory_order_release);
+	}
+}
+
+
+// EAGER cancellation for a semaphore used as an I/O gate.
+//
+// WHY THIS EXISTS WHEN Signal()'s SKIP-AT-RELEASE ALREADY HANDLES CANCELLATION. Skip-at-release
+// only delivers when somebody releases. That is right for a semaphore guarding a memory pool or a
+// short critical section, where a permit comes back promptly. It is wrong for a semaphore used as a
+// THROTTLE -- "at most eight concurrent asset streams" -- where a waiter can sit for as long as the
+// work in front of it takes, and where the reason to cancel is usually that nobody wants the result
+// any more: the player disconnected, closed the menu, or left the zone. Waiting for a release there
+// means waiting for exactly the work you are trying to abandon.
+//
+// So the primitive is unchanged and the CALLER chooses: Wait() cannot be cancelled at all,
+// WaitCancellable() learns at the next release, and this ejects a waiter immediately.
+//
+// A NULL RESULT SLOT IS NEVER EJECTED, and that is the same safety rule as everywhere else: a plain
+// Wait() has nowhere to report Cancelled, so waking it would return it to a caller that believes it
+// holds a permit. Those waiters stay queued no matter what token they carry.
+//
+// RESUMES OUTSIDE THE LOCK. Signal() takes the queue lock once per waiter for exactly this reason --
+// a resumed task can be running on another worker before the call returns, and touching the queue
+// while it does would be a lock held across a handoff. Here the whole eject pass happens under the
+// lock, the lock is dropped, and only then is anyone resumed.
+//
+// The kBuf pass limit is not a cap on how many can be cancelled: the outer loop repeats while a
+// pass fills the buffer, so an arbitrarily long queue drains in batches without allocating on what
+// is already an error/teardown path.
+void SchedulerSemaphore::CancelWaiters(CancelToken tok) {
+	constexpr size_t kBuf = 64;
+	Waiter victims[kBuf];
+
+	for (;;) {
+		size_t n = 0;
+		{
+			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+
+			std::queue<Waiter> keep;
+			while (!waiters.empty()) {
+				const Waiter w = waiters.front();
+				waiters.pop();
+
+				// Cancellable, matches the scope (or no scope given == everyone), and there is room
+				// in this pass. Anything else is put back in order.
+				const bool cancellable = (w.result != nullptr);
+				const bool matches = !tok.Valid() || (w.token == tok.Raw());
+				if (cancellable && matches && n < kBuf) victims[n++] = w;
+				else                                    keep.push(w);
+			}
+			waiters.swap(keep);
+
+			spinLock.clear(std::memory_order_release);
+		}
+
+		if (n == 0) return;
+
+		for (size_t i = 0; i < n; ++i) {
+			*victims[i].result = WaitResult::Cancelled;
+			if (victims[i].fiber) Thread::Resume(victims[i].fiber);
+			else if (victims[i].coro && TaskScheduler::IsInitialized())
+				TaskScheduler::Instance().Push(victims[i].coro);
+		}
+
+		if (n < kBuf) return;   // the pass did not fill, so the queue held no more matches
 	}
 }
 

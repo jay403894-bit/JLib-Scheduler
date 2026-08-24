@@ -177,25 +177,53 @@ namespace JLib {
                                           std::memory_order_release);
         }
 
-        // Marks every task currently waiting here as cancelled. DOES NOT WAKE THEM. Cancellation is
-        // an outcome observed where the task is next touched, not an unwind: the task stays parked,
-        // a later signal resumes it, and the worker sees the flag at pickup.
+        // Cancels every task waiting here AND WAKES THEM, rather than leaving them parked until
+        // somebody signals.
         //
-        // Reads the slot WITHOUT clearing it and WITHOUT clearing the bit -- this is the one walker
-        // that is not a claimer. The null check still matters: a concurrent take clears the bit and
-        // then the slot, so the two disagree for an instant.
+        // WHY EAGER, when every other primitive in this library is skip-at-release: an Event is the
+        // one place a wait may never end. A mutex or a semaphore is released by whoever holds it,
+        // usually soon; an Event is signalled by an outside condition -- an asset finishing, a
+        // socket completing, a level finishing loading -- and if that condition never comes, a
+        // skip-at-release waiter sits there forever. That is precisely the case cancellation exists
+        // for, so here it does not wait for a release.
+        //
+        // CLAIM BEFORE TOUCHING THE TASK, and that ordering is the whole safety argument. It also
+        // FIXES A LATENT RACE in the marking-only version this replaces: that one loaded the slot
+        // and then wrote t->cancelledDirect, while a concurrent SignalAll could clear the slot,
+        // resume that task, and let it finish and return its slab slot before the write landed --
+        // a write through a recycled Task. Winning the slot exchange makes the pointer exclusively
+        // ours, so nobody else can resume it and it cannot be completed underneath us.
+        //
+        // Losing either half of the claim is not a failure. It means SignalAll (or another
+        // CancelWaiters) owns that waiter and will resume it; the flag it observes at pickup is the
+        // one we set, or the one that thread set, and both say cancelled.
         void CancelWaiters() {
             WaiterTable* tb = table.load(std::memory_order_acquire);
             if (!tb) return;
+
+            constexpr std::size_t kBuf = 64;
+            Task* lo[kBuf]; std::size_t nlo = 0;
+            Task* hi[kBuf]; std::size_t nhi = 0;
+
             for (std::size_t w = 0; w < tb->words; ++w) {
                 std::uint64_t bits = tb->occupied[w].load(std::memory_order_acquire);
                 while (bits) {
                     const unsigned b = platform::CountTrailingZeros64(bits);
+                    const std::uint64_t m = std::uint64_t(1) << b;
                     bits &= bits - 1;
-                    if (Task* t = tb->slots[(w << 6) + b].load(std::memory_order_acquire))
-                        t->cancelledDirect = 1;
+
+                    // Claim the bit, then the slot. Both must be won; see above.
+                    const std::uint64_t old = tb->occupied[w].fetch_and(~m, std::memory_order_acq_rel);
+                    if (!(old & m)) continue;
+
+                    if (Task* t = TakeSlot(tb, (w << 6) + b)) {
+                        t->cancelledDirect = 1;   // exclusive now, so this cannot race a completion
+                        WakeOne(t, hi, nhi, lo, nlo, kBuf);
+                    }
                 }
             }
+            RequeueResumedBatch(hi, nhi, true);
+            RequeueResumedBatch(lo, nlo, false);
         }
 
         // Wake everyone waiting on this event.

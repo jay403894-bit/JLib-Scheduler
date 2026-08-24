@@ -358,6 +358,115 @@ int main() {
         Check(sem.Try_Wait(), "the permit survived: cancellation consumed nothing");
     }
 
+    // SchedulerSemaphore::CancelWaiters -- EAGER, for a semaphore used as an I/O throttle. The
+    // proof that it is eager is that NO Signal is issued anywhere below and WaitFor still returns.
+    std::printf("SchedulerSemaphore::CancelWaiters wakes without a signal\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope scope;
+        std::atomic<int> cancelled{ 0 }, acquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+
+        constexpr int kN = 4;
+        for (int i = 0; i < kN; ++i) {
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            auto* t = sched.CreateTask([&] {
+                parked.fetch_add(1, std::memory_order_relaxed);
+                if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                    cancelled.fetch_add(1, std::memory_order_relaxed);
+                else
+                    acquired.fetch_add(1, std::memory_order_relaxed);
+            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            t->cancelToken = scope.Token().Raw();
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+        Check(WaitUntil(parked, kN), "all waiters parked on the throttle");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        scope.Cancel();
+        sem.CancelWaiters(scope.Token());     // no Signal anywhere -- this is the whole point
+        sched.WaitFor(wg);
+
+        Check(cancelled.load() == kN, "every waiter woke Cancelled with no signal at all");
+        Check(acquired.load() == 0, "none of them believed it held a permit");
+        Check(!sem.Try_Wait(), "no permit was invented: the counter is untouched");
+    }
+
+    // THE ONE THAT WOULD BE A REAL BUG. A plain Wait() has nowhere to report Cancelled, so ejecting
+    // it would return its caller into a critical section holding a permit it does not have. Those
+    // waiters must stay queued no matter what token they carry.
+    std::printf("CancelWaiters never ejects a plain Wait()\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope scope;
+        std::atomic<int> acquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(1, std::memory_order_relaxed);
+
+        auto* t = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            sem.Wait();                                   // NOT the cancellable spelling
+            acquired.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        t->cancelToken = scope.Token().Raw();             // cancelled scope, uncancellable wait
+        t->waitGroup = &wg;
+        sched.Push(t);
+
+        Check(WaitUntil(parked, 1), "the plain waiter parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        scope.Cancel();
+        sem.CancelWaiters(scope.Token());
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Check(acquired.load() == 0, "a plain Wait() is not woken by cancellation");
+
+        sem.Signal();                                     // only a real permit releases it
+        sched.WaitFor(wg);
+        Check(acquired.load() == 1, "and it acquires normally when one arrives");
+    }
+
+    // Scope-selective: cancelling one scope must not disturb a waiter under another.
+    std::printf("CancelWaiters only ejects the scope it was given\n");
+    {
+        JLib::SchedulerSemaphore sem(0);
+        JLib::CancelScope doomed, kept;
+        std::atomic<int> doomedCancelled{ 0 }, keptAcquired{ 0 }, parked{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.fetch_add(2, std::memory_order_relaxed);
+
+        auto* a = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
+                doomedCancelled.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        a->cancelToken = doomed.Token().Raw();
+        a->waitGroup = &wg;
+        sched.Push(a);
+
+        auto* b = sched.CreateTask([&] {
+            parked.fetch_add(1, std::memory_order_relaxed);
+            if (sem.WaitCancellable() == JLib::WaitResult::Ok)
+                keptAcquired.fetch_add(1, std::memory_order_relaxed);
+        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        b->cancelToken = kept.Token().Raw();
+        b->waitGroup = &wg;
+        sched.Push(b);
+
+        Check(WaitUntil(parked, 2), "both waiters parked");
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        doomed.Cancel();
+        sem.CancelWaiters(doomed.Token());
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Check(doomedCancelled.load() == 1, "the cancelled scope's waiter woke Cancelled");
+        Check(keptAcquired.load() == 0, "the other scope's waiter is still parked");
+
+        sem.Signal();
+        sched.WaitFor(wg);
+        Check(keptAcquired.load() == 1, "and it got the permit when one arrived");
+    }
+
     // Cancelled BEFORE the wait, but reached from INSIDE a running task. That distinction is the
     // whole point of this section: a task cancelled before dispatch never runs at all -- the worker
     // discards it at pickup -- so cancelling the scope and then pushing the task tests the pickup
@@ -690,16 +799,18 @@ int main() {
         Check(WaitUntil(parked, kN), "all waiters reached the event");
         std::this_thread::sleep_for(std::chrono::milliseconds(120));   // let them actually park
 
-        ev.CancelWaiters();          // marks them; does NOT wake them
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        Check(cancelled.load() == 0 && normal.load() == 0,
-              "marking does not wake anyone -- the stack is untouched");
-
-        ev.SignalAll();              // the ordinary wake path, unchanged
+        // EAGER. No SignalAll is issued here and none is coming -- WaitFor returning at all is the
+        // proof. That is the whole point of eager wake on an Event: the condition it waits for may
+        // never occur, so a skip-at-release waiter would sit here forever.
+        ev.CancelWaiters();
         sched.WaitFor(wg);
 
-        Check(cancelled.load() == kN, "every waiter reported Cancelled after the signal");
+        Check(cancelled.load() == kN, "every waiter woke Cancelled with no signal at all");
         Check(normal.load() == 0, "none reported a normal wake");
+
+        // And they were REMOVED, not merely marked: a later signal must find nobody, or a waiter
+        // could be resumed a second time after its task has already completed and been recycled.
+        Check(!ev.SignalOne(), "cancelled waiters were taken out of the event");
     }
 
     // An uncancelled event wait must still behave exactly as before.
