@@ -3,6 +3,128 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 2.15.0 - 2026-08-24
+
+**`Event::SignalOne()` -- wake one waiter instead of all of them.** This could not be built before,
+and the reason was structural rather than missing work. `Event`'s waiter list was a Treiber stack
+whose links *were the tasks* (`Task::nextWaiter`), so a waiter could never leave early: a task freed
+back to the slab while the stack still held its address meant the next drain walked a recycled slot.
+There was nowhere to record "this entry is dead", because the entry had no storage of its own.
+
+Waiters now live in an **open table indexed by fiber**, with an occupancy bitmap beside it. The keys
+were never arbitrary, which is what makes this a perfect hash rather than a hash table:
+
+1. Events are fiber-only -- a waiter is resumed through `assignedFiber`, so every waiter has one.
+2. Fibers live in the global pool's `std::vector<Fiber>`, `reserve()`d and leaked, so each has a
+   dense index stable for the life of the process (`Fiber::poolIndex`).
+3. A fiber is parked on at most one event at a time, because parking is what the fiber is *doing*.
+
+Registering and taking a waiter are each one store to a known slot. No hashing, no probing, no
+chain, no tombstone, and **no reclamation at all** -- nothing is ever freed.
+
+**MODEL CHECKED** -- `tests/verify/event_table_model.c`, GenMC v0.17.0, two pushers plus a
+concurrent `SignalAll` and `SignalOne`, 36 complete executions, three negative controls that must
+fail. It found something worth stating loudly:
+
+> The **slot exchange**, not the bitmap claim, is what guarantees wake-once. Only one thread can
+> exchange a non-null `Task*` out of a slot, so every double claim degenerates into the loser
+> reading null. All three controls -- including one written specifically to force a double count --
+> land there. **The `if (t)` check after the exchange IS the arbitration, not defensive padding.**
+
+`tests/verify/event_model.c` is kept, headed as modelling the retired design, because the argument
+it verifies is the reason the replacement exists.
+
+**Behaviour change, and it is invisible until something leans on it.** The stack took every waiter
+in ONE exchange and so had a single linearization point. A word scan does not, so a waiter
+registering into an already-scanned word mid-scan is not woken by that signal. The guarantee callers
+actually rely on still holds -- *registered before the signal began implies woken* -- and that is
+exactly what `WaitOnEventArmed` needs and no more, since it registers before arming whatever can
+signal. Any caller depending on strict linearizability against an unsynchronised registration was
+already racing; the race is now shaped differently.
+
+**`Task::nextWaiter` is gone** and bytes 56-63 are free. Left deliberately **unclaimed** so the next
+thing that needs room in the 64-byte budget finds it. `sizeof(Task) == 64` still holds, and the
+field was removed from the ABI fingerprint -- a stale lib will say so at startup rather than
+silently disagreeing.
+
+**The wait path is allocation-free again.** An interim version indexed waiters with a hash map,
+which allocated a slab cell per suspend and quietly undid the property `Event.h`'s header exists to
+advertise ("this used to be a `std::mutex` around an `unordered_set`, so every suspend allocated a
+hash node"). Nothing behavioural would ever have noticed, so it is now measured: 64 parked tasks
+must hold 64 slab slots, not 128.
+
+---
+
+**SLAB SIZE CLASSES.** `TaskAllocator` is now a facade over `SlabPool<256>`, `SlabPool<128>` and
+`SlabPool<64>`. Coroutine frames were measured across 640,008 allocations -- 75% are <=64 bytes, 25%
+<=128, largest 224 -- and every one of them had been taking a 256-byte slot. That wasted about 69%
+of frame bytes and, worse, took slots a `Task` could not have, since frames and Tasks share the slab
+by design.
+
+The classes were chosen by arithmetic rather than taste. Average bytes saved per frame:
+
+| classes | saved |
+|---|---|
+| 64 + 256 | 144 B |
+| 128 + 256 | 128 B (*worse than 64 alone*) |
+| 64 + 128 + 256 | 176 B |
+
+**The pool is a template so that adding a class is one member rather than a copy**, and that is not
+cosmetic. Hand-duplicating the pool produced two bugs, both caught by measurement: a shared
+`std::atomic` live counter where the original was sharded (62% slower -- 11.7 ns vs 7.2 ns per frame
+alloc+free), and the standing hazard that two pools sharing one `static thread_local` cache hand out
+each other's slots. Distinct template instantiations get distinct caches and counters automatically,
+so neither is writable any more.
+
+Measured with arms interleaved in one process against an A/A control: A/A -2.7%, size class vs
+256-byte slot **+30.8%**. No regression on the `Task` path.
+
+---
+
+**TaskDAG edges move to slab-backed chunks.** Graph construction is single-threaded by contract --
+`CreateNode` appends to a plain `std::vector`, so it cannot be otherwise -- and nothing adds edges
+after `Submit`. The lock-free `dependents` list was paying for concurrency that was unreachable in
+practice, at **four slab slots per node before a single edge existed** (the node, the list object,
+and its two sentinels), plus one per edge.
+
+Edges are now pointer-linked cells bump-allocated from chunks cut to exactly one slab slot, so 16
+edges share a slot. Measured: a 64-node chain with 63 edges holds **132 slots, down from 383**.
+
+Links are **pointers, not indices into the chunk table**, so a walk in progress never touches that
+table and growing it cannot invalidate the walk -- which keeps runtime graph extension available
+later without forcing it now.
+
+**[CRITICAL]** `TaskDAG::ForEachDependent` takes its own `EpochGuard`. That guard used to come from
+inside `LockFreeList::for_each`, and losing it in the switch to raw links would have been silent: an
+`OR`-gate dependent fires on its first predecessor, runs, finishes and is EBR-retired while *later*
+predecessors are still walking their edge lists and dereferencing it. Anyone porting this change by
+hand must carry the guard across.
+
+---
+
+### Also
+
+- **`LockFreeList::add` and its constructor never null-checked `Alloc()`** before placement-new --
+  the "access violation writing 0x0" that its own `push()` comment describes. Reachable once a
+  caller could run the slab dry. Both fixed; a list that cannot get its sentinels is now inert and
+  reports it through `ok()` instead of crashing.
+- `platform::CountTrailingZeros64` -- hand-rolled because the core is C++17 and `<bit>` is C++20,
+  and kept behind `platform.h` per the rule that came out of `LockFreeList.h` including `<intrin.h>`
+  and breaking every non-MSVC build.
+- `CurrentEpochSlot()` moved from `LockFreeList.h` to `Thread.h`. It is an epoch concept, and
+  `Epochs.h` cannot host it without a cycle through `Fiber.h`.
+- `JLIBSCHED_ALLOC_STATS=ON` counts refills, flushes and -- via `try_lock` -- how often the shared
+  tier actually **blocked**. On a 31-worker DAG workload: 4 blocked acquisitions out of 17,870
+  (**0.02%**), with refills landing at exactly 1 per 32.1 allocations. So a lock-free free list is
+  not worth its ABA problem; if contention ever appears, shard the shared tier instead.
+- `bench/dag_scaling.cpp` -- separates build from execute across node counts and fan-outs. The DAG
+  is **dispatch-bound at 1.6-3.6 us/node**, and per-node cost *falls* as fan-out rises (wider layers
+  expose more parallelism), so edge layout is not the lever. Marginal edge cost is ~7 ns.
+- `bench/frame_class.cpp` -- interleaved A/B with an A/A control, for the size classes.
+- `LockFreeList` and `LockFreeHashMap` have **no production caller** and now say so in their
+  headers, with what replaced them and why, rather than leaving the next reader to assume they are
+  load-bearing.
+
 ## 2.14.0 - 2026-08-24
 
 **COOPERATIVE CANCELLATION.** `TaskDAG::Cancel()` aborts a graph, and tasks can be cancelled
