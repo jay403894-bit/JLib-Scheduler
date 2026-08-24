@@ -144,39 +144,70 @@ namespace JLib {
     struct IoReactor::Impl {
         HANDLE port = nullptr;
 
-        mutable IoMutex m;
-        IoRequest* head = nullptr;      // in-flight, newest first
-        std::size_t count = 0;
+        // SHARDED IN-FLIGHT LIST. The measured contention was submitter-side -- many workers calling
+        // Submit at once -- so the fix is to give them different locks rather than a cleverer one.
+        //
+        // WHY THIS AND NOT LOCK-FREE. The structure needs removal BY IDENTITY from the middle and a
+        // full traversal for cancel-by-scope, so no queue replaces it, and a lock-free doubly-linked
+        // list would need safe reclamation over COROUTINE FRAMES -- a walker can hold a request whose
+        // frame the resumed coroutine has already destroyed. Sharding leaves that invariant exactly
+        // as it was (unlink and resume still happen under one lock) and just makes the lock narrower.
+        //
+        // The shard is derived from the request's ADDRESS, not stored in it: no field, and the same
+        // request always lands in the same shard, so Unlink finds it without a lookup.
+        static constexpr std::size_t kShards = 16;
+
+        struct Shard {
+            mutable IoMutex m;
+            IoRequest* head = nullptr;      // in-flight, newest first
+            // Padded: two shards sharing a cache line would trade false sharing for lock contention,
+            // which is not the trade being made here.
+            char pad[platform::kCacheLine];
+        };
+
+        Shard shards[kShards];
+        std::atomic<std::size_t> total{ 0 };     // across all shards, for InFlight and the drain
+
+        // Addresses come from the task slab in size classes, so the low bits are regular; a multiply
+        // hash spreads them instead of clustering every request of one size onto one shard.
+        Shard& ShardFor(const IoRequest* r) noexcept {
+            const std::uintptr_t x = reinterpret_cast<std::uintptr_t>(r) >> 4;
+            return shards[(x * 2654435761u) % kShards];
+        }
 
         // MANY THREADS ON ONE PORT is what IOCP is built for, and the port's own concurrency limit
         // (set at creation) caps how many the kernel lets RUN at once -- so extra threads cost a
         // stack and nothing else while they are parked in GetQueuedCompletionStatus. The count comes
         // from TaskScheduler because the pool reserves one core for each, and the two must agree.
+        std::mutex life;                          // thread start/stop only; never on the I/O path
         std::vector<std::thread> workers;
-        bool running  = false;
-        bool stopping = false;
+        bool running = false;
+        std::atomic<bool> stopping{ false };      // read from every shard, so not under any one lock
 
-        // Both under `m`. Entries are owned by their CALLER -- a coroutine frame, suspended -- so the
-        // same rule as the condition variable applies: a request is unlinked BEFORE its task is
-        // pushed, never after, or a later cancel pass walks into a frame that has resumed and gone.
+        // Caller holds THE REQUEST'S SHARD LOCK. Entries are owned by their CALLER -- a coroutine
+        // frame, suspended -- so the same rule as the condition variable applies: a request is
+        // unlinked BEFORE its task is pushed, never after, or a later cancel pass walks into a frame
+        // that has resumed and gone.
         void Link(IoRequest* r) {
+            Shard& s = ShardFor(r);
             r->prev = nullptr;
-            r->next = head;
-            if (head) head->prev = r;
-            head = r;
-            ++count;
+            r->next = s.head;
+            if (s.head) s.head->prev = r;
+            s.head = r;
+            total.fetch_add(1, std::memory_order_relaxed);
         }
 
         void Unlink(IoRequest* r) {
+            Shard& s = ShardFor(r);
             if (r->prev) r->prev->next = r->next;
-            else if (head == r) head = r->next;
+            else if (s.head == r) s.head = r->next;
             if (r->next) r->next->prev = r->prev;
             r->prev = r->next = nullptr;
-            --count;
+            total.fetch_sub(1, std::memory_order_relaxed);
         }
 
-        // Caller holds `m`.
         void EnsureThreads() {
+            std::lock_guard<std::mutex> lk(life);
             if (running) return;
             running = true;
             const unsigned n = TaskScheduler::IoCompletionThreads();
@@ -218,8 +249,7 @@ namespace JLib {
                 if (ov == nullptr) {
                     // Not a completion: the port died, or Stop() posted the wake-up below.
                     if (!ok) return;
-                    std::lock_guard<IoMutex> lk(m);
-                    if (stopping && count == 0) {
+                    if (stopping.load(std::memory_order_acquire) && total.load(std::memory_order_acquire) == 0) {
                         // Cascade the exit: one more wake-up so the next thread also sees it. Stop
                         // posts one per thread, and this makes the shutdown robust if a thread
                         // consumed a wake-up while work was still draining.
@@ -254,11 +284,11 @@ namespace JLib {
                 Task* resume = nullptr;
                 bool  lastOne = false;
                 {
-                    std::lock_guard<IoMutex> lk(m);
+                    std::lock_guard<IoMutex> lk(ShardFor(r).m);
                     Unlink(r);                     // BEFORE the push; see the note on Link
                     if (r->out) *r->out = res;     // still safe: the owner is still suspended
                     resume = r->resume;
-                    lastOne = (stopping && count == 0);
+                    lastOne = false;
                 }
 
                 // THE HOOK RUNS HERE: after the lock is dropped, before the resume is pushed.
@@ -304,12 +334,12 @@ namespace JLib {
             req->handle = h;
 
             {
-                std::lock_guard<IoMutex> lk(m);
-                if (stopping) {
+                if (stopping.load(std::memory_order_acquire)) {
                     if (out) *out = IoResult{ IoStatus::Failed, 0, ERROR_SHUTDOWN_IN_PROGRESS };
                     return true;
                 }
                 EnsureThreads();
+                std::lock_guard<IoMutex> lk(ShardFor(req).m);
                 // LINKED BEFORE SUBMITTED, the same ordering rule as every parking path here: a fast
                 // operation can complete on the reactor thread while this one is still inside
                 // ReadFile, and the completion must find the request already discoverable.
@@ -321,7 +351,7 @@ namespace JLib {
                 if (err != ERROR_IO_PENDING) {
                     // Rejected outright: the kernel never took the buffer, so NO COMPLETION IS
                     // COMING and the caller must not suspend.
-                    std::lock_guard<IoMutex> lk(m);
+                    std::lock_guard<IoMutex> lk(ShardFor(req).m);
                     Unlink(req);
                     if (out) *out = IoResult{ IoStatus::Failed, 0, static_cast<std::int32_t>(err) };
                     return true;
@@ -383,8 +413,7 @@ namespace JLib {
         if (!IoLayerUsable()) return false;
         if (!handle || handle == INVALID_HANDLE_VALUE || !impl->port) return false;
         {
-            std::lock_guard<IoMutex> lk(impl->m);
-            if (impl->stopping) return false;
+            if (impl->stopping.load(std::memory_order_acquire)) return false;
             impl->EnsureThreads();
         }
         // Associating with an existing port returns the port itself; the completion key is unused
@@ -625,27 +654,30 @@ namespace JLib {
         // O(n) in the in-flight count, knowingly. A per-scope index is the obvious next step and the
         // moment to build it is a profile showing this hot -- the timer wheel's O(1) removal was
         // justified by a measured workload and this one has none yet.
-        std::lock_guard<IoMutex> lk(impl->m);
+        // EVERY SHARD, one at a time. Cancel-by-scope is the rare path -- it pays for the sharding
+        // that makes submit and complete cheap, which is the right way round.
         std::size_t asked = 0;
-        for (IoRequest* r = impl->head; r; r = r->next) {
-            if (token.Valid() && !CancelToken(r->token).IsWithin(token)) continue;
-            ::CancelIoEx(r->handle, Ov(r));
-            ++asked;
+        for (std::size_t i = 0; i < Impl::kShards; ++i) {
+            std::lock_guard<IoMutex> lk(impl->shards[i].m);
+            for (IoRequest* r = impl->shards[i].head; r; r = r->next) {
+                if (token.Valid() && !CancelToken(r->token).IsWithin(token)) continue;
+                ::CancelIoEx(r->handle, Ov(r));
+                ++asked;
+            }
         }
         return asked;
     }
 
     std::size_t IoReactor::InFlight() const noexcept {
-        std::lock_guard<IoMutex> lk(impl->m);
-        return impl->count;
+        return impl->total.load(std::memory_order_acquire);
     }
 
     void IoReactor::Stop() noexcept {
         bool needJoin = false;
         {
-            std::lock_guard<IoMutex> lk(impl->m);
-            if (impl->stopping) return;
-            impl->stopping = true;
+            std::lock_guard<std::mutex> lk(impl->life);
+            if (impl->stopping.load(std::memory_order_acquire)) return;
+            impl->stopping.store(true, std::memory_order_release);
             needJoin = impl->running;
         }
 
@@ -657,7 +689,7 @@ namespace JLib {
 
         if (needJoin) {
             std::vector<std::thread> ts;
-            { std::lock_guard<IoMutex> lk(impl->m); ts.swap(impl->workers); }
+            { std::lock_guard<std::mutex> lk(impl->life); ts.swap(impl->workers); }
             // ONE WAKE-UP PER THREAD. A null OVERLAPPED is how the drain loop tells a wake-up from a
             // completion; each thread also posts one more on its way out, so the exit cascades even
             // if a thread consumed a wake-up while work was still draining.
