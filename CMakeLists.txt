@@ -679,3 +679,17 @@ endif()
 add_executable(SchedulerIoOptInTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_optin_test.cpp")
 target_link_libraries(SchedulerIoOptInTest PRIVATE Scheduler)
 target_compile_features(SchedulerIoOptInTest PRIVATE cxx_std_17)
+
+# Does the reactor's per-operation mutex matter? Answers it with a number. The counters are OFF
+# unless JLIBSCHED_IO_LOCK_STATS is set, because counting means a try_lock before every real lock --
+# exactly the tax that perturbs what is being measured. Same rule as the steal and latency counters.
+option(JLIBSCHED_IO_LOCK_STATS "Count reactor mutex contention (diagnostic; perturbs the I/O path)" OFF)
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerIoLockBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/io_lock_contention.cpp")
+    target_link_libraries(SchedulerIoLockBench PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerIoLockBench PRIVATE cxx_std_20)
+endif()
+if(JLIBSCHED_IO_LOCK_STATS)
+    target_compile_definitions(Scheduler PRIVATE JLIBSCHED_IO_LOCK_STATS)
+    message(STATUS "JLib::Scheduler: reactor lock stats ENABLED (perturbs the I/O path)")
+endif()

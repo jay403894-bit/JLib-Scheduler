@@ -41,6 +41,47 @@ namespace JLib {
                       <= IoRequest::kNativeBytes,
                   "IoRequest::kNativeBytes cannot hold OVERLAPPED plus kMaxVectors WSABUFs");
 
+    // A std::mutex that counts how often an acquisition actually had to WAIT. Satisfies Lockable, so
+    // every std::lock_guard site is unchanged; only the type alias below moves.
+    //
+    // The try_lock-then-lock shape is what makes `contended` mean something: a plain counter would
+    // tell you how busy the lock is, not whether anyone queued behind it.
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+    static std::atomic<std::uint64_t> g_ioAcquires{ 0 };
+    static std::atomic<std::uint64_t> g_ioContended{ 0 };
+
+    struct CountingMutex {
+        std::mutex m;
+        void lock() {
+            if (!m.try_lock()) {
+                g_ioContended.fetch_add(1, std::memory_order_relaxed);
+                m.lock();
+            }
+            g_ioAcquires.fetch_add(1, std::memory_order_relaxed);
+        }
+        void unlock() { m.unlock(); }
+    };
+    using IoMutex = CountingMutex;
+#else
+    using IoMutex = std::mutex;
+#endif
+
+    IoLockStats ReadIoLockStats() noexcept {
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+        return IoLockStats{ g_ioAcquires.load(std::memory_order_relaxed),
+                            g_ioContended.load(std::memory_order_relaxed) };
+#else
+        return IoLockStats{};   // zeros: the counters are not compiled in
+#endif
+    }
+
+    void ResetIoLockStats() noexcept {
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+        g_ioAcquires.store(0, std::memory_order_relaxed);
+        g_ioContended.store(0, std::memory_order_relaxed);
+#endif
+    }
+
     static OVERLAPPED* Ov(IoRequest* r) { return reinterpret_cast<OVERLAPPED*>(r->native); }
 
     // The descriptor array lives immediately after the OVERLAPPED, inside the request, because
@@ -103,7 +144,7 @@ namespace JLib {
     struct IoReactor::Impl {
         HANDLE port = nullptr;
 
-        mutable std::mutex m;
+        mutable IoMutex m;
         IoRequest* head = nullptr;      // in-flight, newest first
         std::size_t count = 0;
 
@@ -177,7 +218,7 @@ namespace JLib {
                 if (ov == nullptr) {
                     // Not a completion: the port died, or Stop() posted the wake-up below.
                     if (!ok) return;
-                    std::lock_guard<std::mutex> lk(m);
+                    std::lock_guard<IoMutex> lk(m);
                     if (stopping && count == 0) {
                         // Cascade the exit: one more wake-up so the next thread also sees it. Stop
                         // posts one per thread, and this makes the shutdown robust if a thread
@@ -213,7 +254,7 @@ namespace JLib {
                 Task* resume = nullptr;
                 bool  lastOne = false;
                 {
-                    std::lock_guard<std::mutex> lk(m);
+                    std::lock_guard<IoMutex> lk(m);
                     Unlink(r);                     // BEFORE the push; see the note on Link
                     if (r->out) *r->out = res;     // still safe: the owner is still suspended
                     resume = r->resume;
@@ -263,7 +304,7 @@ namespace JLib {
             req->handle = h;
 
             {
-                std::lock_guard<std::mutex> lk(m);
+                std::lock_guard<IoMutex> lk(m);
                 if (stopping) {
                     if (out) *out = IoResult{ IoStatus::Failed, 0, ERROR_SHUTDOWN_IN_PROGRESS };
                     return true;
@@ -280,7 +321,7 @@ namespace JLib {
                 if (err != ERROR_IO_PENDING) {
                     // Rejected outright: the kernel never took the buffer, so NO COMPLETION IS
                     // COMING and the caller must not suspend.
-                    std::lock_guard<std::mutex> lk(m);
+                    std::lock_guard<IoMutex> lk(m);
                     Unlink(req);
                     if (out) *out = IoResult{ IoStatus::Failed, 0, static_cast<std::int32_t>(err) };
                     return true;
@@ -342,7 +383,7 @@ namespace JLib {
         if (!IoLayerUsable()) return false;
         if (!handle || handle == INVALID_HANDLE_VALUE || !impl->port) return false;
         {
-            std::lock_guard<std::mutex> lk(impl->m);
+            std::lock_guard<IoMutex> lk(impl->m);
             if (impl->stopping) return false;
             impl->EnsureThreads();
         }
@@ -584,7 +625,7 @@ namespace JLib {
         // O(n) in the in-flight count, knowingly. A per-scope index is the obvious next step and the
         // moment to build it is a profile showing this hot -- the timer wheel's O(1) removal was
         // justified by a measured workload and this one has none yet.
-        std::lock_guard<std::mutex> lk(impl->m);
+        std::lock_guard<IoMutex> lk(impl->m);
         std::size_t asked = 0;
         for (IoRequest* r = impl->head; r; r = r->next) {
             if (token.Valid() && !CancelToken(r->token).IsWithin(token)) continue;
@@ -595,14 +636,14 @@ namespace JLib {
     }
 
     std::size_t IoReactor::InFlight() const noexcept {
-        std::lock_guard<std::mutex> lk(impl->m);
+        std::lock_guard<IoMutex> lk(impl->m);
         return impl->count;
     }
 
     void IoReactor::Stop() noexcept {
         bool needJoin = false;
         {
-            std::lock_guard<std::mutex> lk(impl->m);
+            std::lock_guard<IoMutex> lk(impl->m);
             if (impl->stopping) return;
             impl->stopping = true;
             needJoin = impl->running;
@@ -616,7 +657,7 @@ namespace JLib {
 
         if (needJoin) {
             std::vector<std::thread> ts;
-            { std::lock_guard<std::mutex> lk(impl->m); ts.swap(impl->workers); }
+            { std::lock_guard<IoMutex> lk(impl->m); ts.swap(impl->workers); }
             // ONE WAKE-UP PER THREAD. A null OVERLAPPED is how the drain loop tells a wake-up from a
             // completion; each thread also posts one more on its way out, so the exit cascades even
             // if a thread consumed a wake-up while work was still draining.
@@ -836,6 +877,7 @@ namespace JLib {
             bool   repost = false;
             bool   keep   = false;              // did anyone take the socket?
             IoAcceptWaiter* handTo = nullptr;
+            IoAcceptWaiter* skipped = nullptr;   // cancelled waiters, woken with 0 below
             {
                 std::lock_guard<std::mutex> lk(m);
                 --outstanding;
@@ -846,14 +888,27 @@ namespace JLib {
                     // and then waking somebody to come and fetch it. Dequeued BEFORE the resume, the
                     // same rule as everywhere here: the waiter lives in a frame that dies when
                     // pushed.
-                    if (waitHead) {
-                        handTo = waitHead;
-                        waitHead = handTo->next;
+                    //
+                    // SKIP-AT-RELEASE, exactly as SchedulerSemaphore::Signal does. A waiter whose
+                    // scope was cancelled while it was parked must NOT be handed a live socket: it
+                    // is about to unwind and would drop it, leaking a connection per cancelled
+                    // acceptor. Those are woken with 0 and the socket goes to the next one that
+                    // still wants it.
+                    while (waitHead) {
+                        IoAcceptWaiter* w = waitHead;
+                        waitHead = w->next;
                         if (!waitHead) waitTail = nullptr;
-                        handTo->next = nullptr;
-                    } else {
-                        ready.push_back(accepted);
+                        w->next = nullptr;
+
+                        if (CancelToken(w->token).Cancelled()) {
+                            w->next = skipped;      // reuse `next` as the skipped-list link
+                            skipped = w;
+                            continue;
+                        }
+                        handTo = w;
+                        break;
                     }
+                    if (!handTo) ready.push_back(accepted);
                 }
             }
 
@@ -866,6 +921,15 @@ namespace JLib {
             if (handTo) {
                 if (handTo->out) *handTo->out = static_cast<IoSocket>(accepted);
                 Task* t = handTo->resume;
+                if (t && TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(t);
+            }
+
+            // Cancelled waiters, also outside the lock and also touched-then-forgotten.
+            while (skipped) {
+                IoAcceptWaiter* w = skipped;
+                skipped = w->next;
+                if (w->out) *w->out = 0;
+                Task* t = w->resume;
                 if (t && TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(t);
             }
 

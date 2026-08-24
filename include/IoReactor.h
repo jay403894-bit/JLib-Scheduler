@@ -232,6 +232,24 @@ namespace JLib {
         alignas(16) unsigned char bytes[kBytes] = {};
     };
 
+    // Contention on the reactor's internal mutex, for answering "should this be lock-free" with a
+    // measurement instead of an opinion.
+    //
+    // OFF UNLESS JLIBSCHED_IO_LOCK_STATS IS DEFINED, and off by design: counting acquisitions means
+    // a try_lock before every real lock and two atomic increments inside the critical section, which
+    // is exactly the kind of tax that perturbs the thing being measured. Same rule as the steal and
+    // latency counters.
+    //
+    // `contended` counts acquisitions where the try_lock FAILED -- an acquisition that actually had
+    // to wait. That is the number that matters; total acquisitions on their own say nothing about
+    // whether the lock is a bottleneck.
+    struct IoLockStats {
+        std::uint64_t acquires  = 0;
+        std::uint64_t contended = 0;
+    };
+    IoLockStats ReadIoLockStats() noexcept;
+    void        ResetIoLockStats() noexcept;
+
     class IoReactor {
     public:
         static IoReactor& Instance();

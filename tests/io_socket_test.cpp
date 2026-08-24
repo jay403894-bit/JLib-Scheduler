@@ -626,6 +626,100 @@ int main() {
         ::closesocket(lis4);
     }
 
+    // A PARKED AcceptAsync UNDER A CANCELLED SCOPE. Two distinct things have to work, and the second
+    // is the one that leaks if it does not.
+    std::printf("a cancelled AcceptAsync is ejected, and never handed a live socket\n");
+    {
+        SOCKET lis5 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a5b{};
+        a5b.sin_family = AF_INET;
+        a5b.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        a5b.sin_port = 0;
+        ::bind(lis5, reinterpret_cast<sockaddr*>(&a5b), sizeof a5b);
+        ::listen(lis5, SOMAXCONN);
+        int l5 = sizeof a5b;
+        ::getsockname(lis5, reinterpret_cast<sockaddr*>(&a5b), &l5);
+        io.RegisterSocket(lis5);
+
+        static JLib::IoAcceptor acc3;
+        Check(acc3.Start(static_cast<JLib::IoSocket>(lis5), 4), "acceptor started");
+
+        // (1) EAGER EJECTION. Cancelling the scope sets a flag; something must still eject, exactly
+        // as with SchedulerSemaphore::CancelWaiters. Nothing connects here, so the eject is the only
+        // thing that can end these waits.
+        {
+            JLib::CancelScope conn;
+            JLib::CancelScope op(conn.Token());     // nested, to exercise IsWithin selection
+            static std::atomic<int> woke{ 0 }, got{ 0 };
+            woke.store(0); got.store(0);
+            JLib::WaitGroup wg;
+
+            for (int i = 0; i < 3; ++i) {
+                JLib::Spawn([](JLib::IoAcceptor* a, JLib::CancelToken t) -> JLib::Coro {
+                    const JLib::IoSocket s = co_await JLib::AcceptAsync(*a, t);
+                    woke.fetch_add(1, std::memory_order_relaxed);
+                    if (s != 0) { got.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
+                    co_return;
+                }(&acc3, op.Token()), &wg, 0, JLib::CorePref::Default, op.Token().Raw());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            Check(woke.load() == 0, "three waiters parked under a nested scope");
+
+            conn.Cancel();
+            const size_t n = acc3.CancelWaiters(conn.Token());
+            sched.WaitFor(wg);
+
+            char m[128];
+            std::snprintf(m, sizeof m, "cancelling the OUTER scope ejected all three (%zu)", n);
+            Check(n == 3 && woke.load() == 3, m);
+            Check(got.load() == 0, "and none was handed a socket");
+        }
+
+        // (2) SKIP-AT-RELEASE, which is the one that leaks. A waiter cancelled while parked must not
+        // be handed a live connection when one arrives -- it is about to unwind and would drop the
+        // socket. It has to be woken with 0 and the connection given to somebody who still wants it.
+        {
+            JLib::CancelScope dead, live;
+            static std::atomic<int> deadGot{ 0 }, liveGot{ 0 }, deadWoke{ 0 };
+            deadGot.store(0); liveGot.store(0); deadWoke.store(0);
+            JLib::WaitGroup wg;
+
+            JLib::Spawn([](JLib::IoAcceptor* a, JLib::CancelToken t) -> JLib::Coro {
+                const JLib::IoSocket s = co_await JLib::AcceptAsync(*a, t);
+                deadWoke.fetch_add(1, std::memory_order_relaxed);
+                if (s != 0) { deadGot.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
+                co_return;
+            }(&acc3, dead.Token()), &wg, 0, JLib::CorePref::Default, dead.Token().Raw());
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+            JLib::Spawn([](JLib::IoAcceptor* a, JLib::CancelToken t) -> JLib::Coro {
+                const JLib::IoSocket s = co_await JLib::AcceptAsync(*a, t);
+                if (s != 0) { liveGot.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
+                co_return;
+            }(&acc3, live.Token()), &wg, 0, JLib::CorePref::Default, live.Token().Raw());
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+            // Cancel the FIRST waiter's scope but do NOT eject it -- leave it parked and cancelled,
+            // at the head of the queue, so the next connection meets it first.
+            dead.Cancel();
+
+            SOCKET c = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            ::connect(c, reinterpret_cast<sockaddr*>(&a5b), sizeof a5b);
+
+            sched.WaitFor(wg);
+            ::closesocket(c);
+
+            Check(deadWoke.load() == 1, "the cancelled waiter was woken");
+            Check(deadGot.load() == 0, "but NOT given the connection -- it would have dropped it");
+            Check(liveGot.load() == 1, "the live waiter behind it got it instead");
+        }
+
+        acc3.Stop();
+        ::closesocket(lis5);
+    }
+
     // ---- DisconnectEx and socket reuse ----------------------------------------------------------
     // Under a high connect rate the cost is not the transfer, it is the socket: every closesocket
     // tears down kernel structures and every socket() rebuilds them, and a connection that serves one
