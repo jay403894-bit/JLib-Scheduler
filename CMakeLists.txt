@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "3.4.1")
+set(JLIBSCHED_VERSION "3.5.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -650,4 +650,19 @@ if(JLIBSCHED_STANDALONE)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfig.cmake"
                   "${CMAKE_CURRENT_BINARY_DIR}/JLibSchedulerConfigVersion.cmake"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JLibScheduler")
+endif()
+
+# The reactor. TWO tests on purpose: the engine driven from PLAIN C++17 with a continuation task, and
+# the co_await surface at C++20. The first is what keeps IoReactor.h's "usable from C++17 in callback
+# form" claim honest -- it is the one that would silently stop being true.
+if(WIN32)
+    add_executable(SchedulerIoC17Test "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_c17_test.cpp")
+    target_link_libraries(SchedulerIoC17Test PRIVATE Scheduler)
+    target_compile_features(SchedulerIoC17Test PRIVATE cxx_std_17)
+
+    if(JLIBSCHED_COROUTINES)
+        add_executable(SchedulerIoAsyncTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_async_test.cpp")
+        target_link_libraries(SchedulerIoAsyncTest PRIVATE Scheduler)
+        target_compile_features(SchedulerIoAsyncTest PRIVATE cxx_std_20)
+    endif()
 endif()

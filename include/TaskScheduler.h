@@ -756,6 +756,15 @@ namespace JLib {
 		static void SetReserveTimerCore(bool reserve) noexcept;
 		static bool ReserveTimerCore() noexcept;
 
+		// The same, for IoReactor's completion thread. Both may be set; the pool loses one core per
+		// service thread in use, so an app doing timed async I/O runs hw-3 workers.
+		//
+		// TWO FLAGS RATHER THAN A COUNT, because the question an app can answer is "do I use
+		// deadlines" and "do I use async I/O" -- not "how many service threads does the library run",
+		// which is the library's business and has changed twice already.
+		static void SetReserveIoCore(bool reserve) noexcept;
+		static bool ReserveIoCore() noexcept;
+
 
 		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
 		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +

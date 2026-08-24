@@ -182,8 +182,12 @@ TaskScheduler::TaskScheduler(size_t poolSize) {
 // any thread exists, read while sizing the pool. Nothing races it.
 static bool g_reserveTimerCore = false;
 
+static bool g_reserveIoCore = false;
+
 void TaskScheduler::SetReserveTimerCore(bool reserve) noexcept { g_reserveTimerCore = reserve; }
 bool TaskScheduler::ReserveTimerCore() noexcept { return g_reserveTimerCore; }
+void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { g_reserveIoCore = reserve; }
+bool TaskScheduler::ReserveIoCore() noexcept { return g_reserveIoCore; }
 
 size_t TaskScheduler::GetSafeTC() {
 	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin
@@ -208,6 +212,7 @@ size_t TaskScheduler::GetSafeTC() {
 
 	unsigned int reserved = 1;                       // main
 	if (g_reserveTimerCore) reserved += 1;           // the timer thread
+	if (g_reserveIoCore)    reserved += 1;           // IoReactor.s completion thread
 	if (cores <= reserved) return 1;
 	return static_cast<size_t>(cores - reserved);
 }

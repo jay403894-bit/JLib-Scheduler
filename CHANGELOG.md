@@ -3,6 +3,89 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.5.0 - 2026-08-24
+
+**Asynchronous I/O.** `IoReactor` -- a completion-first engine, C++17, compiled into the core -- plus
+`IoAsync.h`, the `co_await` surface, which is the only C++20 in it.
+
+```cpp
+CancelScope op(connection.Token());
+Deadline d(2s, op.Token(), EjectIoReactor, &IoReactor::Instance());
+IoResult r = co_await ReadAsync(handle, buf, sizeof buf, 0, op.Token());
+// the buffer is yours again here, whatever r says
+```
+
+### Coroutines, and no fiber spelling at all
+
+A fiber front end was written, measured against the design, and **deleted**. A parked fiber costs a
+64 KB stack and one slot from a pool whose own header calls itself "the exact upper bound on tasks
+that can be parked"; a coroutine frame is 64 to 256 bytes from the task slab. Roughly 500x per
+in-flight operation, in the dimension a reactor lives on -- and the cap matters more than the memory,
+because a reactor's steady state IS thousands of parked operations. On fibers that does not degrade,
+it stops. The test below runs **512 concurrent reads**; the fiber pool could not have held them.
+
+It was not kept as a fallback, for a sharper reason: **it would not fail, it would get slow.** A
+missing C++20 compiler is a build error fixed in a minute; a fiber-backed reactor is a throughput
+wall found with a profiler weeks later. The deleted version proved how easy the trap is -- it
+identified its caller with `thread->currentFiber`, which is NULL for a coroutine, so a coroutine
+calling it fell into the bare-thread branch and SPUN A WORKER for the duration of the I/O. Silently,
+on exactly the caller it existed for.
+
+**The engine does not require coroutines**, and `tests/io_c17_test.cpp` exists so that cannot quietly
+stop being true: it drives a real overlapped read at `cxx_std_17`, with no `<coroutine>` and no
+fiber, using a plain Native continuation task. But that is a DIFFERENT DECOMPOSITION rather than
+uglier syntax -- the function has to be split by hand at the suspension point, with live state moved
+to the heap because no stack survives the gap. `co_await` is the compiler writing that split, which
+is why the reactor is built ON coroutines rather than merely offered through them.
+
+### Cancelling I/O is a REQUEST, not a wake
+
+The one place the library's usual cancellation shape does not apply, and getting it wrong corrupts
+memory rather than merely misbehaving.
+
+Every other primitive cancels by WAKING the waiter. An in-flight read cannot: **the kernel owns your
+buffer** until the operation completes, and `CancelIoEx` does not end the operation -- it asks for an
+earlier completion, which may arrive after the transfer finished anyway. Resuming then would hand
+back a buffer the kernel is still writing into.
+
+So the reactor asks the OS and resumes **nobody**; the operation ends when its completion arrives,
+cancelled or not. What cancellation changes is how long the wait is, not whether there is one --
+which is exactly why the buffer is safe the instant the result is in hand.
+
+**Exactly one completion means exactly one waker**, which makes this simpler than the in-process
+primitives rather than harder: the Event table, the semaphore queue and the CV queue each need an
+arbiter against a cancel racing a signal. Here the OS is the arbiter.
+
+### Lifetime
+
+`IoRequest` is **caller-owned** and lives in the coroutine frame as an awaiter member. The kernel
+holds a pointer into it until completion, and the frame is alive for exactly that long -- because the
+only thing that resumes it IS the completion. Zero allocation on the I/O path, no pool, no refcount.
+
+This is why there is no "abandon this operation" call, and why a timeout cancels the SCOPE rather
+than the wait. Any path that resumes early reintroduces precisely the corruption the shape prevents.
+
+### Also
+
+- `TaskScheduler::SetReserveIoCore(true)` before `Init` gives the completion thread a core, the same
+  arrangement as the timer. Both may be set; an app doing timed async I/O runs `hw-3` workers.
+- Nested scopes are honoured: `RequestCancel` asks `IsWithin`, so cancelling a connection reaches
+  operations registered under its requests.
+- End of stream is a **zero-byte completion**, not a failure -- otherwise every reader special-cases
+  a normal outcome.
+- POSIX is a deliberate STUB reporting `IsAvailable() == false`. It does not silently fall back to
+  blocking `read()`, which would block a worker and profile as "the scheduler is slow". io_uring,
+  epoll and kqueue are intended; the header records the rule they must obey -- readiness backends
+  COULD resume a cancelled waiter immediately and MUST NOT, or the same program races on Windows and
+  not on Linux.
+
+### Known scope
+
+`ReadFile`/`WriteFile` only: files, pipes, serial, console, mailslots. **Sockets are not usable yet**
+-- `AcceptEx`/`ConnectEx` have no `ReadFile` analogue and need runtime extension-function lookup, and
+there is no `WSARecv`/`WSASend` for flags or vectored buffers. That is the next piece; the completion
+protocol and `IoRequest` do not change for it.
+
 ## 3.4.1 - 2026-08-24
 
 **Eager cancellation ignored scope nesting.** 3.3.0 gave scopes a parent chain, but both eager

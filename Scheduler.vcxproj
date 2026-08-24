@@ -116,6 +116,7 @@
          names src\win32 and never mentions src\posix. -->
     <ClCompile Include="src\win32\Topology.cpp" />
     <ClCompile Include="src\win32\FiberInit.cpp" />
+    <ClCompile Include="src\win32\IoReactor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="src\win32\ContextSwitch.asm" />
