@@ -251,8 +251,24 @@ namespace JLib {
         static constexpr std::size_t kBatch = 32;
 
         void Run() {
-            Task* batch[kBatch];
-            std::size_t nBatch = 0;
+            // SPLIT BY PRIORITY. Push honours task->hiPri; PushBatch takes it as a PARAMETER and
+            // applies it to the whole batch -- so batching them together silently forced every
+            // resumption to low priority and threw away what the app chose at Spawn. Two runs, two
+            // flushes, priority preserved.
+            //
+            // The reactor deliberately does NOT impose a priority of its own. Whether an I/O
+            // resumption outranks other work is an application question -- a server usually wants
+            // it (finishing started work bounds latency and frees buffers and sockets), a game
+            // usually does not (the frame deadline is the hard one; a read can wait 16ms). And if
+            // everything is hiPri then nothing is.
+            Task* batchHi[kBatch]; std::size_t nHi = 0;
+            Task* batchLo[kBatch]; std::size_t nLo = 0;
+
+            const auto Flush = [](Task** hi, std::size_t& nh, Task** lo, std::size_t& nl) {
+                if (!TaskScheduler::IsInitialized()) { nh = 0; nl = 0; return; }
+                if (nh) { TaskScheduler::Instance().PushBatch(hi, nh, 0, 64, true);  nh = 0; }
+                if (nl) { TaskScheduler::Instance().PushBatch(lo, nl, 0, 64, false); nl = 0; }
+            };
 
             for (;;) {
                 DWORD bytes = 0;
@@ -263,15 +279,12 @@ namespace JLib {
                 // poll with a zero timeout: anything else ready RIGHT NOW joins this batch, and the
                 // moment the port is empty the batch goes out. No timer, no delay -- coalescing that
                 // waits would trade tail latency for tail latency.
-                const BOOL ok = (nBatch == 0)
+                const BOOL ok = (nHi == 0 && nLo == 0)
                     ? GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)
                     : GetQueuedCompletionStatus(port, &bytes, &key, &ov, 0);
 
-                if (nBatch != 0 && ov == nullptr && !ok) {
-                    // Port drained (WAIT_TIMEOUT) -- flush what we have and go back to blocking.
-                    if (TaskScheduler::IsInitialized())
-                        TaskScheduler::Instance().PushBatch(batch, nBatch);
-                    nBatch = 0;
+                if ((nHi || nLo) && ov == nullptr && !ok) {
+                    Flush(batchHi, nHi, batchLo, nLo);
                     continue;
                 }
 
@@ -335,19 +348,13 @@ namespace JLib {
                 // moment its task runs, so nothing below may touch `r` -- which is true whether the
                 // push happens now or at the flush, because collecting only copies the Task*.
                 if (resume) {
-                    batch[nBatch++] = resume;
-                    if (nBatch == kBatch && TaskScheduler::IsInitialized()) {
-                        TaskScheduler::Instance().PushBatch(batch, nBatch);
-                        nBatch = 0;
-                    }
+                    if (resume->hiPri) batchHi[nHi++] = resume;
+                    else               batchLo[nLo++] = resume;
+                    if (nHi == kBatch || nLo == kBatch) Flush(batchHi, nHi, batchLo, nLo);
                 }
 
-                if (lastOne || (nBatch && stopping.load(std::memory_order_acquire))) {
-                    if (nBatch && TaskScheduler::IsInitialized()) {
-                        TaskScheduler::Instance().PushBatch(batch, nBatch);
-                        nBatch = 0;
-                    }
-                }
+                if (lastOne || ((nHi || nLo) && stopping.load(std::memory_order_acquire)))
+                    Flush(batchHi, nHi, batchLo, nLo);
                 if (lastOne) {
                     ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
                     return;
