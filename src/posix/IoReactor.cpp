@@ -120,4 +120,8 @@ namespace JLib {
         if (ctx) static_cast<IoReactor*>(ctx)->RequestCancel(token);
     }
 
+    void EjectIoAcceptor(void* ctx, CancelToken token) {
+        if (ctx) static_cast<IoAcceptor*>(ctx)->CancelWaiters(token);
+    }
+
 } // namespace JLib

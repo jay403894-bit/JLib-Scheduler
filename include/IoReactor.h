@@ -629,4 +629,16 @@ namespace JLib {
     // which is exactly why TimerEject is a function pointer instead of the timer knowing primitives.
     void EjectIoReactor(void* ctx, CancelToken token);
 
+    // The TimerEject for a deadline on WAITING FOR A CONNECTION.
+    //
+    // SEPARATE FROM EjectIoReactor, and it has to be: that one cancels in-flight OPERATIONS, and a
+    // coroutine parked in AcceptAsync is not one -- it is an acceptor WAITER with nothing submitted
+    // to the kernel on its behalf. A Deadline pointed at the reactor would fire, set the cancel flag
+    // and eject nobody, leaving the wait parked until a connection happened to arrive. Same lost-wake
+    // family as Stop forgetting its waiters, arriving through the timer instead.
+    //
+    //     Deadline d(5s, op.Token(), EjectIoAcceptor, &acceptor);
+    //     IoSocket s = co_await AcceptAsync(acceptor, op.Token());   // 0 if it timed out
+    void EjectIoAcceptor(void* ctx, CancelToken token);
+
 } // namespace JLib

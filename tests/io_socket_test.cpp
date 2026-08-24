@@ -720,6 +720,53 @@ int main() {
         ::closesocket(lis5);
     }
 
+    // A DEADLINE ON WAITING FOR A CONNECTION. Needs EjectIoAcceptor, not EjectIoReactor: the
+    // reactor's eject cancels in-flight OPERATIONS, and a parked AcceptAsync is not one -- there is
+    // nothing submitted to the kernel on its behalf. Pointed at the reactor this would fire, set the
+    // flag, eject nobody, and leave the wait parked. Same lost-wake family as Stop forgetting its
+    // waiters, arriving through the timer instead.
+    std::printf("a Deadline times out a wait for a connection\n");
+    {
+        SOCKET lis6 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a6{};
+        a6.sin_family = AF_INET;
+        a6.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        a6.sin_port = 0;
+        ::bind(lis6, reinterpret_cast<sockaddr*>(&a6), sizeof a6);
+        ::listen(lis6, SOMAXCONN);
+        io.RegisterSocket(lis6);
+
+        static JLib::IoAcceptor acc4;
+        Check(acc4.Start(static_cast<JLib::IoSocket>(lis6), 4), "acceptor with nobody connecting");
+
+        JLib::CancelScope op;
+        static std::atomic<int> woke{ 0 }, got{ 0 };
+        woke.store(0); got.store(0);
+        JLib::WaitGroup wg;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        JLib::Deadline d(ms(120), op.Token(), JLib::EjectIoAcceptor, &acc4);
+        JLib::Spawn([](JLib::IoAcceptor* a, JLib::CancelToken t) -> JLib::Coro {
+            const JLib::IoSocket s = co_await JLib::AcceptAsync(*a, t);
+            woke.fetch_add(1, std::memory_order_relaxed);
+            if (s != 0) { got.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
+            co_return;
+        }(&acc4, op.Token()), &wg, 0, JLib::CorePref::Default, op.Token().Raw());
+
+        sched.WaitFor(wg);
+        const auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+
+        Check(woke.load() == 1, "the deadline ended the wait");
+        Check(got.load() == 0, "with no connection, as expected");
+        char m[128];
+        std::snprintf(m, sizeof m, "and not before its deadline (%lldms)", (long long)el);
+        Check(el >= 115, m);
+
+        acc4.Stop();
+        ::closesocket(lis6);
+    }
+
     // ---- DisconnectEx and socket reuse ----------------------------------------------------------
     // Under a high connect rate the cost is not the transfer, it is the socket: every closesocket
     // tears down kernel structures and every socket() rebuilds them, and a connection that serves one
