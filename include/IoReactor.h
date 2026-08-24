@@ -441,6 +441,25 @@ namespace JLib {
         // One permit per ready connection. Exposed so a waiter can use the ordinary cancellable
         // wait -- which is what makes deadlines and scopes work on "wait for a connection" without
         // this class knowing anything about either.
+        //
+        // THIS IS THE ONE SCHEDULER TYPE THE REACTOR USES BEYOND Push(Task*), and the choice was
+        // made deliberately rather than by accident, so here is the reasoning.
+        //
+        // The alternative considered was to drop the semaphore and cap outstanding accepts with a
+        // plain atomic instead -- no wait, no park, the acceptor touching nothing but Push. That is
+        // the right answer when the counter's job is only "do not flood AcceptEx". It is NOT this
+        // counter's job: the depth cap is already `slots.size()`, fixed at Start, so there is
+        // nothing to flood. What this counts is READY CONNECTIONS, and the thing waiting on it is a
+        // server's accept loop parking until one arrives.
+        //
+        // That is a real blocking wait by a real task, and turning it into a poll would mean either
+        // spinning a worker or inventing a second wake mechanism next to the one the library
+        // already has. Waiting for a connection is a job-level wait, so it uses the job-level
+        // primitive.
+        //
+        // The cost is honest and bounded: the reactor's dependency on the scheduler is now exactly
+        // Push(Task*), the core reservation, and this. If the I/O layer is ever split into its own
+        // package, those three are the whole seam -- and Push is the only one on a hot path.
         SchedulerSemaphore& Ready() noexcept;
 
         std::size_t Outstanding() const noexcept;   // accepts posted and not yet completed
