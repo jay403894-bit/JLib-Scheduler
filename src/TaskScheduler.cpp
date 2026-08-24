@@ -217,11 +217,28 @@ bool TaskScheduler::PushMain(Task* task) {
 	mainQ.push(task);
 	return true;
 }
+// Disposal must match what the completion paths do, minus the payload: release the WaitGroup FIRST
+// so nothing waiting on this work blocks forever on something abandoned, then clean up and free.
+bool TaskScheduler::DiscardIfCancelled(Task* task) {
+	if (!task || task->started || !IsTaskCancelled(task)) return false;
+
+	if (task->waitGroup) {
+		const int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+		if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+			task->waitGroup->WakeAll();
+	}
+	CleanupTaskMetadata(task);
+	DestroyTask(task);
+	taskAllocator.Free(task);
+	return true;
+}
+
 void TaskScheduler::ProcessMainThread() {
 	if (!poolActive) return;
 	Task* t;
 	while (mainQ.pop(t)) {
 		if (!t) continue;
+		if (DiscardIfCancelled(t)) continue;
 		t->Execute();
 		if (t->waitGroup) {
 			if (t->waitGroup) {
@@ -767,6 +784,10 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		if (myLane) {
 			if (auto opt = myLane->pop_bottom()) {
 				Task* t = *opt;
+				// A HELPER IS A TASK PICKUP AND OWES THE SAME CHECK. This drain races the workers
+				// for the very queue they are discarding cancelled tasks from, so without this a
+				// cancelled task caught here runs its payload.
+				if (DiscardIfCancelled(t)) continue;
 				// The same completion bookkeeping Worker()'s Native fast path does, in the same
 				// order. Not factored out into a shared helper only because that path also handles
 				// immediate-core release and epoch ticking, neither of which applies here.
@@ -1626,6 +1647,11 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// inside resume(), and completing frees both its frame and this Task -- so `task` may be dangling
 	// the moment Execute() returns, and reading ->type then to decide what to do about it is itself
 	// a use-after-free.
+	// Same pickup check the worker makes -- this is a task about to START, just on a helping thread
+	// rather than a worker. Returning true because a task WAS consumed: the caller's contract is
+	// "did I make progress", and removing a cancelled task from the queue is progress.
+	if (DiscardIfCancelled(task)) return true;
+
 	const bool isCoroutine = (task->type == TaskType::Coroutine);
 
 	task->Execute();

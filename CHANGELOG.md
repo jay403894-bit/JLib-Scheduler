@@ -3,6 +3,48 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.3.1 - 2026-08-24
+
+**A cancelled task could still run its payload.** Present since cancellation shipped; found by
+running the suite repeatedly rather than by any single failure.
+
+`Worker()` discards a cancelled, unstarted task at pickup. **Three other places execute tasks and
+had no such check:**
+
+- `TaskScheduler::ProcessMainThread()`
+- `TaskScheduler::WaitFor()`'s own lane drain
+- `TaskScheduler::TryRunStolenNativeTask()`
+
+A helper is a task pickup and owes the same check. `WaitFor`'s drain in particular **races the
+workers for the very queue they are discarding from**, so the handful the helper won ran anyway --
+which is why the symptom was 1 to 9 tasks out of 500 in roughly 7% of runs rather than
+all-or-nothing. Anything that cancels a graph and then waits on it was exposed.
+
+Fixed by `TaskScheduler::DiscardIfCancelled(Task*)` -- one function doing the check, the WaitGroup
+release, cleanup and free -- called from all three. **0 failures in 30 consecutive runs, against
+about 3 in 40 before.**
+
+### The same mistake, twice
+
+3.2.1 fixed the waiter queues bypassing `IsTaskCancelled`; this fixes the executors bypassing it.
+"One place cancellation is decided" is a property of the **call sites**, not of the function, and
+nothing enforces it. When adding a new way to be cancelled, grep every `Execute()` and every
+waiter-release path -- not the one being edited.
+
+### Note on the diagnosis
+
+Two plausible theories were wrong before the right one, and both were cheap to kill:
+
+- A probe on the pushing thread showed all 500 tasks reading as cancelled and unstarted at `Push`.
+  **The writer was innocent.**
+- The worker inbox turned out to be correctly ordered -- `exchange(acq_rel)` then a release store on
+  `next`, read with acquire -- so it was not a publication race.
+- A function-local `static` counter, at an address no stack frame can alias, was incremented by the
+  same lambdas. **Those tasks really ran**, rather than a straggler writing into a recycled frame.
+
+Only then was "the discard is being bypassed, not mis-evaluated" the obvious reading, and one grep
+for `Execute()` found it.
+
 ## 3.3.0 - 2026-08-24
 
 **Cancellation scopes nest.** A scope built with a parent token is cancelled when it is cancelled OR

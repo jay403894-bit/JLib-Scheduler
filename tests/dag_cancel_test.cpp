@@ -742,7 +742,9 @@ int main() {
         Check(allocFail == 0, "all 500 tasks allocated");
         if (allocFail) std::printf("      %d allocations failed -- slab pressure, raise it\n", allocFail);
         sched.WaitFor(wg);          // hangs if a discarded task failed to release the group
-        Check(ran.load() == 0, "none of the pushed cancelled tasks ran");
+        char rmsg[160];
+        std::snprintf(rmsg, sizeof rmsg, "none of the pushed cancelled tasks ran (ran=%d of %d; scope still cancelled=%d)", ran.load(), pushed, (int)scope.Cancelled());
+        Check(ran.load() == 0, rmsg);
         Check((wg.n.load() & JLib::WaitGroup::COUNT_MASK) == 0, "the group drained to zero");
     }
 

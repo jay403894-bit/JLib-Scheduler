@@ -128,6 +128,22 @@ namespace JLib {
 		void UnboostTaskPriority(Task* task);
 		void CleanupTaskMetadata(Task* task);
 
+		// Cancellation, observed wherever a task is about to RUN. True means the task was cancelled
+		// and has already been disposed of -- released its WaitGroup, destroyed, slot returned --
+		// so the caller must not touch it again and must not execute it.
+		//
+		// THIS EXISTS BECAUSE THE CHECK WAS IN ONE PLACE AND A TASK CAN START IN FOUR. Worker() had
+		// it; ProcessMainThread, WaitFor's own drain and TryRunStolenNativeTask did not, so a
+		// cancelled task picked up by a HELPER ran its payload -- reproducibly, a handful out of 500
+		// in about 7% of runs, because the helper is a race for the same queue the workers are
+		// discarding from. Same shape as the 3.2.1 bug where the waiter queues bypassed
+		// IsTaskCancelled: "one place cancellation is decided" only holds if every site calls it.
+		//
+		// ONLY AN UNSTARTED TASK IS DISCARDED, for the reason Worker() documents at length: a queued
+		// entry may be a RESUME, and discarding one of those abandons a live stack or coroutine
+		// frame instead of cancelling it.
+		bool DiscardIfCancelled(Task* task);
+
 		static TaskScheduler& Instance() {
 			if (!instance)
 				throw std::runtime_error("Call TaskScheduler::Init() before Instance()!");
@@ -714,6 +730,7 @@ namespace JLib {
 		// how many you actually spawn, not by anything the library controls.
 		static void SetSlabSizes(const SlabSizes& sizes);
 		static SlabSizes CurrentSlabSizes();
+
 
 		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
 		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +
