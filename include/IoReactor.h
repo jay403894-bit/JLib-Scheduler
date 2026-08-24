@@ -350,6 +350,17 @@ namespace JLib {
         //
         // Like every other operation here, it ends in a COMPLETION: the socket is not reusable when
         // this returns, it is reusable when the result is in hand.
+        //
+        // TWO THINGS A REUSED SOCKET STILL IS, both learned the hard way and neither obvious:
+        //
+        //   IT IS STILL BOUND. Binding it again is WSAEINVAL, and the failed bind then takes the
+        //   following ConnectEx down with it.
+        //
+        //   IT IS STILL BOUND TO THE SAME LOCAL PORT. Reconnecting to the SAME remote endpoint
+        //   therefore recreates an identical 4-tuple and collides with the previous connection in
+        //   TIME_WAIT -- ERROR_DUP_NAME, intermittently, depending on how fast that drains. A
+        //   connection pool reusing sockets against ONE server has to account for this; reuse is
+        //   straightforward when the next peer is a different one.
         bool SubmitDisconnect(IoSocket s, bool reuse,
                               IoRequest* req, IoResult* out, Task* resume, CancelToken token);
 

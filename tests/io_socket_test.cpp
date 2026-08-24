@@ -515,35 +515,57 @@ int main() {
         ::bind(c4, reinterpret_cast<sockaddr*>(&any), sizeof any);
         Check(io.RegisterSocket(c4), "a socket to connect, disconnect and connect again");
 
-        static sockaddr_in tgt;
+        // A SECOND LISTENER, on a different port, and this is the whole reason the test failed
+        // before. TF_REUSE_SOCKET returns the socket unconnected but leaves it BOUND to the same
+        // local port -- so reconnecting to the SAME remote endpoint recreates an identical 4-tuple
+        // and collides with the previous connection sitting in TIME_WAIT. That reports as
+        // ERROR_DUP_NAME (52), intermittently, depending on how fast the first one drains.
+        //
+        // Which is a real property of socket reuse and not a quirk of this test: a reused socket
+        // must go to a DIFFERENT peer, or the local port must be released. A connection pool that
+        // reuses sockets against one server has to keep that in mind.
+        SOCKET lis3 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a3{};
+        a3.sin_family = AF_INET;
+        a3.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        a3.sin_port = 0;
+        ::bind(lis3, reinterpret_cast<sockaddr*>(&a3), sizeof a3);
+        ::listen(lis3, SOMAXCONN);
+        int a3len = sizeof a3;
+        ::getsockname(lis3, reinterpret_cast<sockaddr*>(&a3), &a3len);
+
+        static sockaddr_in tgt, tgt2;
         tgt = addr;
+        tgt2 = a3;
         static std::atomic<int> phase1{ -1 }, disc{ -1 }, phase2{ -1 };
         phase1.store(-1); disc.store(-1); phase2.store(-1);
 
+        // EVERY STEP LOGGED, on the client side only, and labelled so it cannot be confused with
+        // anything the server thread prints. The point is to know WHICH step stops -- a missing
+        // print at the end is otherwise indistinguishable between "never got there" and "got there
+        // and hung", and those have completely different causes.
         JLib::WaitGroup wg;
         JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
             JLib::IoResult r = co_await JLib::ConnectAsync(s, &tgt, sizeof tgt);
+            std::printf("      [client] connect#1 status=%d err=%d\n", (int)r.status, (int)r.error);
             phase1.store(static_cast<int>(r.status), std::memory_order_release);
             if (r.status != JLib::IoStatus::Completed) co_return;
 
-            // Reuse: the socket is NOT reusable until this completes.
+            // Reuse: the socket is NOT reusable until this completes. Awaited, not fired-and-
+            // forgotten -- issuing the next operation before the disconnect's completion is the
+            // classic version of this race.
             r = co_await JLib::DisconnectAsync(s, true);
+            std::printf("      [client] disconnect status=%d err=%d\n", (int)r.status, (int)r.error);
             disc.store(static_cast<int>(r.status), std::memory_order_release);
             if (r.status != JLib::IoStatus::Completed) co_return;
 
-            // RE-BIND FIRST. TF_REUSE_SOCKET returns the socket to an unconnected state, but
-            // ConnectEx still requires a bound socket -- and a disconnected one is not bound any
-            // more. Omitting this is WSAEINVAL, and because ConnectEx never completes there is no
-            // completion either: the await simply never resumes, which is how this hung the suite.
-            sockaddr_in rebind{};
-            rebind.sin_family = AF_INET;
-            rebind.sin_addr.s_addr = ::htonl(INADDR_ANY);
-            rebind.sin_port = 0;
-            ::bind(static_cast<SOCKET>(s), reinterpret_cast<sockaddr*>(&rebind), sizeof rebind);
-
-            // THE PROOF. ConnectEx on a socket that was merely closed fails; succeeding here means
-            // it really came back reusable rather than just not erroring.
-            r = co_await JLib::ConnectAsync(s, &tgt, sizeof tgt);
+            // DO NOT RE-BIND. TF_REUSE_SOCKET returns the socket to an unconnected state but leaves
+            // it BOUND -- binding again is WSAEINVAL (10022), and the failed bind then takes the
+            // following ConnectEx down with it. A re-bind was added here while guessing at an
+            // earlier hang and was itself the bug; the sequence is disconnect, then connect.
+            std::printf("      [client] connecting again\n");
+            r = co_await JLib::ConnectAsync(s, &tgt2, sizeof tgt2);
+            std::printf("      [client] connect#2 status=%d err=%d\n", (int)r.status, (int)r.error);
             phase2.store(static_cast<int>(r.status), std::memory_order_release);
             co_return;
         }(static_cast<JLib::IoSocket>(c4)), &wg);
@@ -551,12 +573,20 @@ int main() {
         // BOUNDED, with select. A bare blocking accept here hangs the whole suite if the second
         // connect never lands -- which is exactly what happened, and a test that hangs on failure
         // tells you nothing about what failed.
+        // One accept per listener, each bounded. Logged SEPARATELY from the client so a stall can be
+        // attributed: "client never asked" and "server never accepted" look identical otherwise.
         std::thread acc([&] {
+            const SOCKET lis[2] = { listener, lis3 };
             for (int i = 0; i < 2; ++i) {
-                fd_set r; FD_ZERO(&r); FD_SET(listener, &r);
-                timeval tv{ 3, 0 };
-                if (::select(0, &r, nullptr, nullptr, &tv) <= 0) break;
-                SOCKET s = ::accept(listener, nullptr, nullptr);
+                fd_set r; FD_ZERO(&r); FD_SET(lis[i], &r);
+                timeval tv{ 5, 0 };
+                if (::select(0, &r, nullptr, nullptr, &tv) <= 0) {
+                    std::printf("      [server] accept#%d timed out\n", i + 1);
+                    break;
+                }
+                SOCKET s = ::accept(lis[i], nullptr, nullptr);
+                std::printf("      [server] accept#%d %s\n", i + 1,
+                            s == INVALID_SOCKET ? "FAILED" : "ok");
                 if (s == INVALID_SOCKET) break;
                 ::closesocket(s);
             }
@@ -567,19 +597,23 @@ int main() {
 
         Check(phase1.load() == static_cast<int>(JLib::IoStatus::Completed), "the first connect completed");
         Check(disc.load() == static_cast<int>(JLib::IoStatus::Completed), "the disconnect completed");
-        // REUSE-THEN-RECONNECT IS NOT ASSERTED, and that is deliberate rather than an oversight.
-        // DisconnectEx itself completes every time; driving the reused socket straight into another
-        // ConnectEx succeeded only about half the time here and the cause was not run down -- the
-        // coroutine does not even reach the second connect on a failing run. Asserting it would put
-        // a 50%-flaky check in the suite, and a suite that cries wolf is worse than one gap.
+        // ASSERTED, after the two bugs that made it look flaky were found and both were MINE:
         //
-        // So what ships is the operation, not the round trip. Reuse is an OPTIMISATION on top: the
-        // disconnect is what the reactor provides and what is verified.
-        if (phase2.load() != static_cast<int>(JLib::IoStatus::Completed))
-            std::printf("      note: reuse-then-reconnect did not complete this run (phase2=%d)"
-                        " -- see the comment above\n", phase2.load());
+        //   1. A re-bind between the disconnect and the reconnect. TF_REUSE_SOCKET leaves the socket
+        //      BOUND, so binding again is WSAEINVAL (10022) and takes the following ConnectEx down
+        //      with it. That step was added while guessing at an earlier hang.
+        //   2. Reconnecting to the SAME endpoint. Still bound to the same local port, so the second
+        //      connection recreates an identical 4-tuple and collides with the first one in
+        //      TIME_WAIT -- ERROR_DUP_NAME (52), intermittently, depending on how fast it drains.
+        //
+        // Neither was a reactor bug and neither was flakiness: with per-step logging it was 6 out of
+        // 6 identical. "Flaky" was a conclusion drawn from a STALE BINARY whose diagnostic had never
+        // compiled.
+        Check(phase2.load() == static_cast<int>(JLib::IoStatus::Completed),
+              "and the SAME socket connected again -- no closesocket, no socket()");
 
         ::closesocket(c4);
+        ::closesocket(lis3);
     }
 
     // ---- a PENDING ACCEPT, cancelled ------------------------------------------------------------
