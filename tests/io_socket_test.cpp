@@ -193,6 +193,137 @@ int main() {
     ::closesocket(client);
     ::closesocket(accepted);
 
+    // A SECOND connection, established synchronously. The async accept/connect path is already
+    // proven above; this section is about what crosses the wire, so it uses the boring way to get a
+    // socket pair and keeps the interesting part uncluttered.
+    SOCKET accepted2 = INVALID_SOCKET, client2 = INVALID_SOCKET;
+    {
+        client2 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ::connect(client2, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
+        accepted2 = ::accept(listener, nullptr, nullptr);
+        Check(accepted2 != INVALID_SOCKET && client2 != INVALID_SOCKET,
+              "a second connection for the payload tests");
+        Check(io.RegisterSocket(accepted2) && io.RegisterSocket(client2), "both registered");
+    }
+
+    // ---- scatter/gather -------------------------------------------------------------------------
+    // A header and a body from separate allocations, sent in ONE syscall with no copy to join them.
+    // That is most of what a protocol implementation does, and the reason vectored I/O exists.
+    std::printf("SendVAsync writes a header and body without joining them\n");
+    {
+        std::memset(g_rxbuf, 0, sizeof g_rxbuf);
+        g_recvStatus.store(-1); g_recvBytes.store(-1); g_sendBytes.store(-1);
+        JLib::WaitGroup wg;
+
+        JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
+            const JLib::IoResult r = co_await JLib::RecvAsync(s, g_rxbuf, sizeof g_rxbuf);
+            g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
+            g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
+            co_return;
+        }(accepted2), &wg);
+
+        JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
+            // Separate allocations, never concatenated anywhere.
+            static const char hdr[]  = "LEN=5|";
+            static const char body[] = "hello";
+            const JLib::IoBuffer v[2] = { { (void*)hdr, 6 }, { (void*)body, 5 } };
+            const JLib::IoResult r = co_await JLib::SendVAsync(s, v, 2);
+            g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
+            co_return;
+        }(client2), &wg);
+
+        sched.WaitFor(wg);
+        Check(g_sendBytes.load() == 11, "the send reported both segments as one transfer");
+        Check(g_recvBytes.load() == 11, "the receiver got both");
+        Check(std::memcmp(g_rxbuf, "LEN=5|hello", 11) == 0,
+              "and they arrived contiguous and in order");
+    }
+
+    // Refused rather than truncated: a short write that reports success is the worst outcome a
+    // protocol can be handed.
+    std::printf("too many segments is refused, not truncated\n");
+    {
+        JLib::WaitGroup wg;
+        static std::atomic<int> st{ -1 };
+        st.store(-1);
+        JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
+            static char scratch[8];
+            JLib::IoBuffer v[JLib::IoRequest::kMaxVectors + 1];
+            for (auto& b : v) { b.data = scratch; b.len = 1; }
+            const JLib::IoResult r = co_await JLib::SendVAsync(
+                s, v, JLib::IoRequest::kMaxVectors + 1);
+            st.store(static_cast<int>(r.status), std::memory_order_release);
+            co_return;
+        }(client2), &wg);
+        sched.WaitFor(wg);
+        Check(st.load() == static_cast<int>(JLib::IoStatus::Failed),
+              "more than kMaxVectors segments failed cleanly");
+    }
+
+    ::closesocket(client2);
+    ::closesocket(accepted2);
+
+    // ---- UDP ------------------------------------------------------------------------------------
+    // Separate calls because an unconnected datagram socket has no peer: every datagram carries one,
+    // and WSARecv on such a socket fails outright.
+    std::printf("SendToAsync and RecvFromAsync carry a datagram and its sender\n");
+    {
+        SOCKET a = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        SOCKET b = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+        sockaddr_in aAddr{}, bAddr{};
+        aAddr.sin_family = bAddr.sin_family = AF_INET;
+        aAddr.sin_addr.s_addr = bAddr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        aAddr.sin_port = bAddr.sin_port = 0;
+        Check(::bind(a, reinterpret_cast<sockaddr*>(&aAddr), sizeof aAddr) == 0 &&
+              ::bind(b, reinterpret_cast<sockaddr*>(&bAddr), sizeof bAddr) == 0,
+              "both datagram sockets bound");
+
+        int alen = sizeof aAddr, blen = sizeof bAddr;
+        ::getsockname(a, reinterpret_cast<sockaddr*>(&aAddr), &alen);
+        ::getsockname(b, reinterpret_cast<sockaddr*>(&bAddr), &blen);
+        Check(io.RegisterSocket(a) && io.RegisterSocket(b), "both registered with the reactor");
+
+        static JLib::IoAddress from;         // must outlive the await
+        static sockaddr_in dest;
+        dest = aAddr;
+        std::memset(g_rxbuf, 0, sizeof g_rxbuf);
+        g_recvBytes.store(-1);
+        JLib::WaitGroup wg;
+
+        JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
+            const JLib::IoResult r = co_await JLib::RecvFromAsync(s, g_rxbuf, sizeof g_rxbuf, &from);
+            g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
+            g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
+            co_return;
+        }(a), &wg);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+        JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
+            static const char dgram[] = "one datagram";
+            const JLib::IoResult r = co_await JLib::SendToAsync(s, dgram, 12, &dest, sizeof dest);
+            g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
+            co_return;
+        }(b), &wg);
+
+        sched.WaitFor(wg);
+        Check(g_recvStatus.load() == static_cast<int>(JLib::IoStatus::Completed), "the datagram arrived");
+        Check(g_recvBytes.load() == 12, "whole, in one message");
+        Check(std::memcmp(g_rxbuf, "one datagram", 12) == 0, "with its bytes intact");
+
+        // The sender's address came back through IoAddress, which is the entire reason RecvFrom is
+        // a separate call -- and its length was written by the kernel on completion, which is why
+        // IoAddress carries its own rather than taking one by pointer.
+        const sockaddr_in* peer = reinterpret_cast<const sockaddr_in*>(from.bytes);
+        Check(from.len == static_cast<std::int32_t>(sizeof(sockaddr_in)),
+              "the address length was filled in on completion");
+        Check(peer->sin_port == bAddr.sin_port, "and it names the socket that actually sent it");
+
+        ::closesocket(a);
+        ::closesocket(b);
+    }
+
     // ---- a PENDING ACCEPT, cancelled ------------------------------------------------------------
     // Nobody connects, so this accept never completes on its own -- the socket equivalent of a pipe
     // with no writer, and the only honest way to test cancellation on a socket.

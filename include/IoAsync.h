@@ -163,4 +163,79 @@ namespace JLib {
         });
     }
 
+    // ---- scatter/gather -------------------------------------------------------------------------
+    //
+    // A header and a body from separate allocations, in one syscall, with no copy to join them:
+    //
+    //     IoBuffer v[2] = { { hdr, hdrLen }, { body, bodyLen } };
+    //     IoResult r = co_await SendVAsync(s, v, 2);
+    //
+    // The ARRAY is copied during submit and may be a local. THE MEMORY IT POINTS AT MAY NOT -- that
+    // is the transfer, and it belongs to the kernel until the completion.
+    [[nodiscard]] inline auto RecvVAsync(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+                                         std::uint32_t flags = 0,
+                                         CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitRecvV(s, bufs, count, flags, r, o, t, token);
+        });
+    }
+
+    [[nodiscard]] inline auto SendVAsync(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+                                         std::uint32_t flags = 0,
+                                         CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitSendV(s, bufs, count, flags, r, o, t, token);
+        });
+    }
+
+    // ---- datagrams ------------------------------------------------------------------------------
+    //
+    // `from` receives the sender's address and must outlive the await -- declare it beside the
+    // co_await, in the coroutine frame, never in a caller.
+    //
+    // A DATAGRAM IS A MESSAGE. `bytes` is the whole thing; a buffer too small loses the remainder
+    // and reports WSAEMSGSIZE rather than returning a partial read. That is UDP, not a wart here.
+    [[nodiscard]] inline auto RecvFromAsync(IoSocket s, void* buf, std::uint32_t len,
+                                            IoAddress* from, std::uint32_t flags = 0,
+                                            CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitRecvFrom(s, buf, len, flags, from, r, o, t, token);
+        });
+    }
+
+    [[nodiscard]] inline auto SendToAsync(IoSocket s, const void* buf, std::uint32_t len,
+                                          const void* addr, std::uint32_t addrLen,
+                                          std::uint32_t flags = 0,
+                                          CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitSendTo(s, buf, len, flags, addr, addrLen,
+                                                      r, o, t, token);
+        });
+    }
+
+    // ================================================================================================
+    // ONE OPERATION PER DIRECTION PER STREAM SOCKET. THIS IS THE CALLER'S JOB.
+    //
+    // Two SendAsync calls in flight on the same TCP socket are two independent operations, and the
+    // kernel does not promise to complete them in the order they were submitted. Their bytes can
+    // INTERLEAVE, which for a stream protocol is silent corruption -- a header from one message
+    // followed by the body of another, with nothing reporting an error anywhere.
+    //
+    // The reactor deliberately does not serialise them. Doing so would mean a per-socket queue,
+    // taken on every send, on the hot path of every connection -- a cost paid by every correct
+    // caller to protect an incorrect one. And "correct" here is easy: one coroutine owns the write
+    // side of a connection, and it awaits each send before starting the next, which is what a
+    // sequential-looking coroutine does naturally.
+    //
+    // If several producers must share a socket, put a SchedulerMutex or a queue in front of it. That
+    // is a protocol decision -- a strict order, a fair one, per-message or per-batch -- and this
+    // layer has no basis for making it.
+    //
+    // Reads have the same shape and the same rule. Concurrent recv on one stream socket delivers
+    // arbitrary slices to arbitrary callers.
+    //
+    // DATAGRAMS ARE THE EXCEPTION: each SendTo is one message, so concurrent sends cannot corrupt
+    // each other. Only their relative ORDER is unspecified, which UDP does not promise anyway.
+    // ================================================================================================
+
 } // namespace JLib

@@ -33,7 +33,34 @@ namespace JLib {
     static_assert(IoAcceptBuffer::kBytes >= 2 * (sizeof(sockaddr_in6) + 16),
                   "IoAcceptBuffer is too small for AcceptEx: it needs sizeof(sockaddr)+16 per address");
 
+    static_assert(IoAddress::kBytes >= sizeof(sockaddr_storage),
+                  "IoAddress is too small for sockaddr_storage");
+    static_assert(sizeof(OVERLAPPED) + IoRequest::kMaxVectors * sizeof(WSABUF)
+                      <= IoRequest::kNativeBytes,
+                  "IoRequest::kNativeBytes cannot hold OVERLAPPED plus kMaxVectors WSABUFs");
+
     static OVERLAPPED* Ov(IoRequest* r) { return reinterpret_cast<OVERLAPPED*>(r->native); }
+
+    // The descriptor array lives immediately after the OVERLAPPED, inside the request, because
+    // Windows requires it to stay valid for the DURATION of the operation and not merely the call.
+    // OVERLAPPED is 32 bytes and `native` is 16-aligned, so this lands aligned for WSABUF.
+    static WSABUF* Bufs(IoRequest* r) {
+        return reinterpret_cast<WSABUF*>(r->native + sizeof(OVERLAPPED));
+    }
+
+    // Converts, rather than casting: WSABUF is { ULONG len; CHAR* buf; } and IoBuffer is
+    // { void* data; uint32_t len; } -- the opposite order, and iovec on POSIX is different again.
+    // A struct ABI-identical to both does not exist, and pretending otherwise would be a silent
+    // reinterpretation of a length as a pointer.
+    static bool FillBufs(IoRequest* r, const IoBuffer* bufs, std::uint32_t count) {
+        if (count == 0 || count > IoRequest::kMaxVectors) return false;
+        WSABUF* w = Bufs(r);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            w[i].len = static_cast<ULONG>(bufs[i].len);
+            w[i].buf = static_cast<CHAR*>(bufs[i].data);
+        }
+        return true;
+    }
 
     // AcceptEx and ConnectEx have NO IMPORT LIBRARY. They are provider-specific and must be fetched
     // at runtime through WSAIoctl, which is why InitSockets exists at all and why a socket has to be
@@ -321,24 +348,99 @@ namespace JLib {
                                IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
         const SOCKET sock = static_cast<SOCKET>(s);
         HANDLE h = reinterpret_cast<HANDLE>(sock);
-        return impl->Submit(h, 0, req, out, resume, token, [&](OVERLAPPED* ov) {
-            // WSABUF built here rather than stored in the request: WSARecv COPIES the descriptor
-            // array before returning, so it only has to survive the call, not the operation. The
-            // BUFFER it points at must survive, and that is the caller's, as always.
-            WSABUF b{ static_cast<ULONG>(len), static_cast<CHAR*>(buf) };
-            DWORD f = flags, got = 0;
-            return ::WSARecv(sock, &b, 1, &got, &f, ov, nullptr) == 0;
-        });
+        const IoBuffer one{ buf, len };
+        return SubmitRecvV(s, &one, 1, flags, req, out, resume, token);
     }
 
     bool IoReactor::SubmitSend(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
                                IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
         const SOCKET sock = static_cast<SOCKET>(s);
         HANDLE h = reinterpret_cast<HANDLE>(sock);
-        return impl->Submit(h, 0, req, out, resume, token, [&](OVERLAPPED* ov) {
-            WSABUF b{ static_cast<ULONG>(len), static_cast<CHAR*>(const_cast<void*>(buf)) };
-            DWORD sent = 0;
-            return ::WSASend(sock, &b, 1, &sent, static_cast<DWORD>(flags), ov, nullptr) == 0;
+        const IoBuffer one{ const_cast<void*>(buf), len };
+        return SubmitSendV(s, &one, 1, flags, req, out, resume, token);
+    }
+
+    bool IoReactor::SubmitRecvV(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+                                std::uint32_t flags, IoRequest* req, IoResult* out,
+                                Task* resume, CancelToken token) {
+        if (!FillBufs(req, bufs, count)) {
+            // Too many segments, or none. Refused rather than truncated: a short write that looks
+            // successful is the worst possible outcome for a protocol.
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSAEMSGSIZE };
+            return true;
+        }
+        const SOCKET sock = static_cast<SOCKET>(s);
+        req->flags = flags;
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            // BOTH POINTERS BELOW MUST OUTLIVE THE CALL. `flags` is [in, out] -- the kernel reports
+            // MSG_PARTIAL and friends through it on completion -- so it lives in the request, not on
+            // this stack. And the byte count is passed as NULL deliberately: MSDN says to do that
+            // whenever lpOverlapped is non-null, because the value is only meaningful for a
+            // synchronous completion and reading it otherwise gives erroneous results. The real
+            // count comes from the completion packet.
+            return ::WSARecv(sock, Bufs(req), count, nullptr,
+                             reinterpret_cast<LPDWORD>(&req->flags), ov, nullptr) == 0;
+        });
+    }
+
+    bool IoReactor::SubmitSendV(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+                                std::uint32_t flags, IoRequest* req, IoResult* out,
+                                Task* resume, CancelToken token) {
+        if (!FillBufs(req, bufs, count)) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSAEMSGSIZE };
+            return true;
+        }
+        const SOCKET sock = static_cast<SOCKET>(s);
+        req->flags = flags;
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            return ::WSASend(sock, Bufs(req), count, nullptr,
+                             static_cast<DWORD>(flags), ov, nullptr) == 0;
+        });
+    }
+
+    bool IoReactor::SubmitRecvFrom(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
+                                   IoAddress* from, IoRequest* req, IoResult* out,
+                                   Task* resume, CancelToken token) {
+        const IoBuffer one{ buf, len };
+        if (!FillBufs(req, &one, 1) || !from) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSAEINVAL };
+            return true;
+        }
+        const SOCKET sock = static_cast<SOCKET>(s);
+        req->flags = flags;
+        from->len = static_cast<std::int32_t>(IoAddress::kBytes);   // capacity going in
+
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            // `from` and `from->len` are both written by the kernel ON COMPLETION, so both must
+            // outlive this call -- which is why IoAddress carries its own length rather than taking
+            // one by pointer. Passing a local int here is the classic version of this bug.
+            return ::WSARecvFrom(sock, Bufs(req), 1, nullptr,
+                                 reinterpret_cast<LPDWORD>(&req->flags),
+                                 reinterpret_cast<sockaddr*>(from->bytes),
+                                 reinterpret_cast<LPINT>(&from->len), ov, nullptr) == 0;
+        });
+    }
+
+    bool IoReactor::SubmitSendTo(IoSocket s, const void* buf, std::uint32_t len,
+                                 std::uint32_t flags, const void* addr, std::uint32_t addrLen,
+                                 IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        const IoBuffer one{ const_cast<void*>(buf), len };
+        if (!FillBufs(req, &one, 1) || !addr) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSAEINVAL };
+            return true;
+        }
+        const SOCKET sock = static_cast<SOCKET>(s);
+        req->flags = flags;
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            // The DESTINATION address is read at call time and not retained, unlike RecvFrom's
+            // source -- so this one may legitimately be a caller's local.
+            return ::WSASendTo(sock, Bufs(req), 1, nullptr, static_cast<DWORD>(flags),
+                               static_cast<const sockaddr*>(addr), static_cast<int>(addrLen),
+                               ov, nullptr) == 0;
         });
     }
 

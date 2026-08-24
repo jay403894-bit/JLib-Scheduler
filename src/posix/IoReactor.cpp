@@ -72,6 +72,28 @@ namespace JLib {
         return true;
     }
 
+    bool IoReactor::SubmitRecvV(IoSocket, const IoBuffer*, std::uint32_t, std::uint32_t,
+                                IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    bool IoReactor::SubmitSendV(IoSocket, const IoBuffer*, std::uint32_t, std::uint32_t,
+                                IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    bool IoReactor::SubmitRecvFrom(IoSocket, void*, std::uint32_t, std::uint32_t, IoAddress*,
+                                   IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    bool IoReactor::SubmitSendTo(IoSocket, const void*, std::uint32_t, std::uint32_t,
+                                 const void*, std::uint32_t,
+                                 IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+
     std::size_t IoReactor::RequestCancel(CancelToken) noexcept { return 0; }
     std::size_t IoReactor::InFlight() const noexcept { return 0; }
     void IoReactor::Stop() noexcept {}

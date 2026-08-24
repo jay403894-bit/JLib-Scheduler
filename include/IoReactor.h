@@ -122,8 +122,32 @@ namespace JLib {
     //
     // The native part is an opaque block so this header never needs windows.h. Its size is checked
     // against the real thing by a static_assert in the backend.
+    // One segment of a scatter/gather transfer. Maps to WSABUF on Windows and iovec on POSIX; the
+    // field ORDER differs between those two, so this is converted rather than cast -- a struct that
+    // is ABI-identical to both does not exist.
+    struct IoBuffer {
+        void*         data = nullptr;
+        std::uint32_t len  = 0;
+    };
+
+    // A socket address, for datagrams. Caller-owned and must outlive the operation, like everything
+    // else the kernel is given a pointer to. Big enough for sockaddr_storage, checked in the backend.
+    struct IoAddress {
+        static constexpr std::size_t kBytes = 128;
+
+        alignas(16) unsigned char bytes[kBytes] = {};
+        // IN: capacity. OUT: the length actually written. The kernel needs the address of this for
+        // the whole operation, which is why it lives here rather than being an out-parameter.
+        std::int32_t len = static_cast<std::int32_t>(kBytes);
+    };
+
     struct IoRequest {
-        static constexpr std::size_t kNativeBytes = 64;
+        // Holds the platform's overlapped structure AND the converted segment descriptors, because
+        // Windows requires the descriptor array to stay valid for the DURATION of the operation --
+        // not just the call. Building it on the submitting stack would be a use-after-free the
+        // moment the operation went pending, and it would usually work, which is worse.
+        static constexpr std::size_t kMaxVectors = 8;
+        static constexpr std::size_t kNativeBytes = 192;
 
         alignas(16) unsigned char native[kNativeBytes] = {};
 
@@ -142,6 +166,12 @@ namespace JLib {
         enum class Kind : std::uint8_t { Generic, Accept, Connect };
         Kind          kind = Kind::Generic;
         std::uintptr_t aux = 0;
+
+        // LIVES HERE BECAUSE THE KERNEL WRITES TO IT ON COMPLETION. WSARecv's flags parameter is
+        // [in, out] -- it reports things like MSG_PARTIAL when the operation finishes -- so a stack
+        // local in the submitting function is a write into a dead frame once the operation goes
+        // pending. It usually appears to work, which is exactly the problem.
+        std::uint32_t flags = 0;
 
         IoRequest*    prev = nullptr;     // in-flight list; doubly linked so removal is O(1)
         IoRequest*    next = nullptr;
@@ -230,6 +260,41 @@ namespace JLib {
                         IoRequest* req, IoResult* out, Task* resume, CancelToken token);
         bool SubmitSend(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
                         IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
+        // SCATTER/GATHER. The point is a server writing a header and a body from separate
+        // allocations in ONE syscall with no copy to join them -- which is most of what a protocol
+        // implementation does.
+        //
+        // `bufs` is COPIED into the request during submit, so the array itself may be a local. THE
+        // MEMORY IT POINTS AT MAY NOT: that is the transfer, and it belongs to the kernel until the
+        // completion, same as every other buffer here.
+        //
+        // At most IoRequest::kMaxVectors segments; more returns Failed rather than silently
+        // truncating. Header/body/trailer is three, so eight is generous -- and it is bounded
+        // because the descriptors have to live in the request, which has to have a size.
+        bool SubmitRecvV(IoSocket s, const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                         IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+        bool SubmitSendV(IoSocket s, const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                         IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
+        // ---- datagrams ---------------------------------------------------------------------------
+        //
+        // Separate from Recv/Send because an unconnected UDP socket has no peer: every datagram
+        // carries one. WSARecv on such a socket fails, so this is not an ergonomic wrapper -- it is
+        // the only way to do it.
+        //
+        // `from` receives the sender's address and MUST OUTLIVE THE OPERATION -- the kernel holds a
+        // pointer to it and to its length field, so it belongs beside the request in the frame.
+        //
+        // A DATAGRAM IS A MESSAGE, not a stream. `bytes` is the whole datagram; a buffer too small
+        // loses the remainder and reports WSAEMSGSIZE rather than returning a partial read, which is
+        // UDP's semantics and not something this layer papers over.
+        bool SubmitRecvFrom(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
+                            IoAddress* from,
+                            IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+        bool SubmitSendTo(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
+                          const void* addr, std::uint32_t addrLen,
+                          IoRequest* req, IoResult* out, Task* resume, CancelToken token);
 
         // AcceptEx. `accepted` must already be a created, UNBOUND socket of the same family and type
         // as `listener` -- Windows requires the socket to exist before the accept starts, which is
