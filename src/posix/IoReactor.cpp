@@ -93,10 +93,28 @@ namespace JLib {
         if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
         return true;
     }
+    bool IoReactor::SubmitDisconnect(IoSocket, bool, IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
 
     std::size_t IoReactor::RequestCancel(CancelToken) noexcept { return 0; }
     std::size_t IoReactor::InFlight() const noexcept { return 0; }
     void IoReactor::Stop() noexcept {}
+
+    // IoAcceptor: nothing to pre-post without a backend. Start fails, so a caller finds out at
+    // startup rather than by waiting forever for a connection that can never be accepted.
+    struct IoAcceptor::Impl { int unused = 0; };
+    IoAcceptor::~IoAcceptor() { delete impl; }
+    bool IoAcceptor::Start(IoSocket, unsigned) { return false; }
+    void IoAcceptor::Stop() noexcept {}
+    IoSocket IoAcceptor::TryTake() noexcept { return 0; }
+    std::size_t IoAcceptor::Outstanding() const noexcept { return 0; }
+    std::size_t IoAcceptor::Available() const noexcept { return 0; }
+    SchedulerSemaphore& IoAcceptor::Ready() noexcept {
+        static SchedulerSemaphore never{ 0 };
+        return never;
+    }
 
     void EjectIoReactor(void* ctx, CancelToken token) {
         if (ctx) static_cast<IoReactor*>(ctx)->RequestCancel(token);

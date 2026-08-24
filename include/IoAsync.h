@@ -163,6 +163,18 @@ namespace JLib {
         });
     }
 
+    // Next ready connection from a pre-posted acceptor. Returns 0 if cancelled or shutting down.
+    //
+    // The wait is an ORDINARY cancellable semaphore acquire, which is what makes scopes and
+    // deadlines work on "wait for a connection" without IoAcceptor knowing either exists.
+    [[nodiscard]] inline Lazy<IoSocket> AcceptAsync(IoAcceptor& acc,
+                                                    CancelToken token = CancelToken{}) {
+        if (co_await AcquireAsyncCancellable(acc.Ready()) == WaitResult::Cancelled)
+            co_return 0;
+        (void)token;
+        co_return acc.TryTake();
+    }
+
     // ---- scatter/gather -------------------------------------------------------------------------
     //
     // A header and a body from separate allocations, in one syscall, with no copy to join them:
@@ -185,6 +197,19 @@ namespace JLib {
                                          CancelToken token = CancelToken{}) noexcept {
         return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
             return IoReactor::Instance().SubmitSendV(s, bufs, count, flags, r, o, t, token);
+        });
+    }
+
+    // Close a connection and, with `reuse`, hand the SOCKET back ready for another accept or connect
+    // -- skipping a closesocket/socket pair, which under a high connect rate is the actual cost.
+    //
+    // THE SOCKET IS NOT REUSABLE WHEN THIS IS CALLED, only when the result is in hand: like every
+    // operation here it ends in a completion. Handing it to an accept before then hands the kernel a
+    // socket it is still tearing down.
+    [[nodiscard]] inline auto DisconnectAsync(IoSocket s, bool reuse = true,
+                                              CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitDisconnect(s, reuse, r, o, t, token);
         });
     }
 

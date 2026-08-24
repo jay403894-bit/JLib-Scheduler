@@ -21,6 +21,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <chrono>
 
 namespace JLib {
 
@@ -69,6 +70,7 @@ namespace JLib {
     // practice for TCP.
     static LPFN_ACCEPTEX      g_acceptEx  = nullptr;
     static LPFN_CONNECTEX     g_connectEx = nullptr;
+    static LPFN_DISCONNECTEX  g_disconnectEx = nullptr;
     static std::mutex         g_extMutex;
 
     static bool ResolveExtensions() {
@@ -87,6 +89,13 @@ namespace JLib {
                              &g_acceptEx, sizeof g_acceptEx, &got, nullptr, nullptr) == 0;
         ok = ok && ::WSAIoctl(probe, SIO_GET_EXTENSION_FUNCTION_POINTER, &gConnect, sizeof gConnect,
                               &g_connectEx, sizeof g_connectEx, &got, nullptr, nullptr) == 0;
+
+        // DisconnectEx is resolved on the same trip but NOT required: a provider without it is
+        // perfectly usable, it just cannot reuse sockets. Failing InitSockets over an optional
+        // optimisation would take accept and connect down with it.
+        GUID gDisc = WSAID_DISCONNECTEX;
+        ::WSAIoctl(probe, SIO_GET_EXTENSION_FUNCTION_POINTER, &gDisc, sizeof gDisc,
+                   &g_disconnectEx, sizeof g_disconnectEx, &got, nullptr, nullptr);
         ::closesocket(probe);
         return ok && g_acceptEx && g_connectEx;
     }
@@ -515,6 +524,26 @@ namespace JLib {
         });
     }
 
+    bool IoReactor::SubmitDisconnect(IoSocket s, bool reuse, IoRequest* req, IoResult* out,
+                                     Task* resume, CancelToken token) {
+        if (!g_disconnectEx && !ResolveExtensions()) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSANOTINITIALISED };
+            return true;
+        }
+        if (!g_disconnectEx) {
+            // Provider has no DisconnectEx. Reported rather than silently degraded to closesocket:
+            // a caller that thinks it reused a socket and did not would then use a closed one.
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSAEOPNOTSUPP };
+            return true;
+        }
+
+        const SOCKET sock = static_cast<SOCKET>(s);
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            return g_disconnectEx(sock, ov, reuse ? TF_REUSE_SOCKET : 0, 0) != FALSE;
+        });
+    }
+
     std::size_t IoReactor::RequestCancel(CancelToken token) noexcept {
         // NESTED SCOPES COUNT. An operation registered under a request scope belongs to the
         // connection scope above it, so this asks IsWithin rather than comparing tokens -- matching
@@ -573,6 +602,188 @@ namespace JLib {
 
     void EjectIoReactor(void* ctx, CancelToken token) {
         if (ctx) static_cast<IoReactor*>(ctx)->RequestCancel(token);
+    }
+
+    // ---- IoAcceptor ------------------------------------------------------------------------------
+
+    struct IoAcceptor::Impl {
+        // One pre-posted accept. The acceptor owns all of it -- see the ownership note in the header:
+        // a pre-posted accept has no awaiting frame to bound its lifetime, so this class is the
+        // bound, and Stop() is where it is enforced.
+        struct Slot {
+            IoRequest      req{};
+            IoAcceptBuffer addrs{};
+            IoResult       result{};
+            SOCKET         sock = INVALID_SOCKET;
+            Impl*          owner = nullptr;
+            unsigned       index = 0;
+        };
+
+        SOCKET listener = INVALID_SOCKET;
+        int    family = AF_INET, type = SOCK_STREAM, proto = IPPROTO_TCP;
+
+        std::vector<Slot>   slots;
+        mutable std::mutex  m;
+        std::vector<SOCKET> ready;          // accepted, not yet taken
+        std::size_t         outstanding = 0;
+        bool                stopping = false;
+
+        SchedulerSemaphore  sem{ 0 };
+        CancelScope         scope;          // cancels every accept this acceptor posted, and only those
+
+        // Creates the socket AcceptEx will fill. Matching the listener's family/protocol matters:
+        // a mismatch fails inside AcceptEx with an error that does not say which argument was wrong.
+        SOCKET MakeSocket() const {
+            return ::WSASocketW(family, type, proto, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        }
+
+        // Caller must NOT hold `m`: this pushes a task and submits to the kernel.
+        void Post(unsigned i) {
+            Slot& s = slots[i];
+            s.sock = MakeSocket();
+            if (s.sock == INVALID_SOCKET) return;
+
+            if (!IoReactor::Instance().RegisterSocket(static_cast<IoSocket>(s.sock))) {
+                ::closesocket(s.sock);
+                s.sock = INVALID_SOCKET;
+                return;
+            }
+
+            // The completion handler is an ordinary Native task. The reactor only knows how to push
+            // a Task*, which is exactly the type erasure that lets this work without the reactor
+            // knowing an acceptor exists.
+            Task* t = TaskScheduler::IsInitialized()
+                        ? TaskScheduler::Instance().CreateTask([&s] { s.owner->OnComplete(s.index); })
+                        : nullptr;
+            if (!t) {
+                ::closesocket(s.sock);
+                s.sock = INVALID_SOCKET;
+                return;
+            }
+
+            { std::lock_guard<std::mutex> lk(m); ++outstanding; }
+
+            if (IoReactor::Instance().SubmitAccept(static_cast<IoSocket>(listener),
+                                                   static_cast<IoSocket>(s.sock), &s.addrs,
+                                                   &s.req, &s.result, t, scope.Token())) {
+                // Answered immediately -- refused, or the scope was already cancelled. The task was
+                // never handed to the reactor, so nothing will run it and this must clean up itself.
+                { std::lock_guard<std::mutex> lk(m); --outstanding; }
+                ::closesocket(s.sock);
+                s.sock = INVALID_SOCKET;
+            }
+        }
+
+        void OnComplete(unsigned i) {
+            Slot& s = slots[i];
+            SOCKET accepted = s.sock;
+            s.sock = INVALID_SOCKET;
+
+            bool repost = false;
+            {
+                std::lock_guard<std::mutex> lk(m);
+                --outstanding;
+                if (s.result.status == IoStatus::Completed && !stopping) {
+                    ready.push_back(accepted);
+                    accepted = INVALID_SOCKET;      // handed over
+                    repost = true;
+                }
+            }
+
+            // Cancelled, failed, or shutting down: the socket was never handed to anyone.
+            if (accepted != INVALID_SOCKET) ::closesocket(accepted);
+            else sem.Signal();                      // outside the lock: Signal can resume a waiter
+
+            // RE-POST IMMEDIATELY, so the depth is restored before the next connection arrives. That
+            // is the entire point of the class -- an accept that is posted only after the previous
+            // one is consumed is just AcceptAsync with extra steps.
+            if (repost) Post(i);
+        }
+    };
+
+    IoAcceptor::~IoAcceptor() {
+        Stop();
+        delete impl;
+        impl = nullptr;
+    }
+
+    bool IoAcceptor::Start(IoSocket listener, unsigned depth) {
+        if (impl || depth == 0) return false;
+        if (!IoReactor::IsAvailable()) return false;
+
+        impl = new Impl();
+        impl->listener = static_cast<SOCKET>(listener);
+
+        // Ask the LISTENER what it is rather than making the caller repeat it -- one fewer thing to
+        // get subtly wrong, and the failure mode for getting it wrong is opaque.
+        WSAPROTOCOL_INFOW info{};
+        int len = sizeof info;
+        if (::getsockopt(impl->listener, SOL_SOCKET, SO_PROTOCOL_INFOW,
+                         reinterpret_cast<char*>(&info), &len) == 0) {
+            impl->family = info.iAddressFamily;
+            impl->type   = info.iSocketType;
+            impl->proto  = info.iProtocol;
+        }
+
+        impl->slots.resize(depth);
+        for (unsigned i = 0; i < depth; ++i) {
+            impl->slots[i].owner = impl;
+            impl->slots[i].index = i;
+        }
+        for (unsigned i = 0; i < depth; ++i) impl->Post(i);
+
+        std::lock_guard<std::mutex> lk(impl->m);
+        return impl->outstanding > 0;
+    }
+
+    void IoAcceptor::Stop() noexcept {
+        if (!impl) return;
+        {
+            std::lock_guard<std::mutex> lk(impl->m);
+            if (impl->stopping) return;
+            impl->stopping = true;
+        }
+
+        // CANCEL, THEN DRAIN. The kernel holds pointers into every slot's request and address
+        // buffer, so releasing them before the completions arrive is the corruption this whole file
+        // is arranged to prevent. Cancelling by SCOPE reaches exactly this acceptor's accepts and
+        // nothing else -- which is why it owns a CancelScope rather than cancelling globally.
+        impl->scope.Cancel();
+        IoReactor::Instance().RequestCancel(impl->scope.Token());
+
+        for (int spins = 0; spins < 5000; ++spins) {
+            { std::lock_guard<std::mutex> lk(impl->m); if (impl->outstanding == 0) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Anything accepted but never claimed is closed: nobody is coming for it, and leaking a
+        // socket per unclaimed connection is worse than refusing one.
+        std::vector<SOCKET> leftovers;
+        { std::lock_guard<std::mutex> lk(impl->m); leftovers.swap(impl->ready); }
+        for (SOCKET s : leftovers) ::closesocket(s);
+    }
+
+    IoSocket IoAcceptor::TryTake() noexcept {
+        if (!impl) return 0;
+        std::lock_guard<std::mutex> lk(impl->m);
+        if (impl->ready.empty()) return 0;
+        const SOCKET s = impl->ready.back();
+        impl->ready.pop_back();
+        return static_cast<IoSocket>(s);
+    }
+
+    SchedulerSemaphore& IoAcceptor::Ready() noexcept { return impl->sem; }
+
+    std::size_t IoAcceptor::Outstanding() const noexcept {
+        if (!impl) return 0;
+        std::lock_guard<std::mutex> lk(impl->m);
+        return impl->outstanding;
+    }
+
+    std::size_t IoAcceptor::Available() const noexcept {
+        if (!impl) return 0;
+        std::lock_guard<std::mutex> lk(impl->m);
+        return impl->ready.size();
     }
 
 } // namespace JLib

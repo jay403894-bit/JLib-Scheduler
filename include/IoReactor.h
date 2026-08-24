@@ -66,6 +66,25 @@
 // on something outside the scheduler can absorb a lost wakeup. Call
 // TaskScheduler::SetReserveIoCore(true) before Init so the pool leaves it a core.
 //
+// == WHERE THIS STOPS ==
+//
+// IN SCOPE, and now complete for Windows: the completion thread(s), Register, read/write,
+// accept/connect, UDP, vectored transfers, Cancel and Stop, plus the optional accept pool and
+// DisconnectEx -- the two things you only want if you already paid for a listen server.
+//
+// NOT IN SCOPE, and deliberately never: HTTP, TLS, framing, reliability, NAT traversal, lobbies,
+// replication. Nor "the networking driver" in the engine sense -- sockets plus protocol plus game
+// tick is a different library with a different lifecycle.
+//
+// THE EXTENSION POINT IS Submit*, NOT MORE OPCODES HERE. Anything protocol-shaped belongs in a
+// JLib::Net built ON this: it gets IoRequest, the completion protocol, cancellation and deadlines
+// for free, and this file keeps the property that makes it maintainable -- it knows about handles
+// and completions and nothing about what the bytes mean.
+//
+// The line matters because it is easy to drift across. Every one of the operations above is a
+// mechanism the OS exposes; the moment something here needs to know what a message IS, it has
+// stopped being a reactor and started being a server, and this stops looking like a scheduler.
+
 // == BACKENDS, AND THE ONE RULE THEY ALL HAVE TO OBEY ==
 //
 // Windows/IOCP is implemented. io_uring, epoll and kqueue are intended and not written. POSIX is a
@@ -84,6 +103,7 @@
 // faster on Linux while leaving the same program racing on Windows.
 
 #include "CancelToken.h"
+#include "TaskScheduler.h"   // SchedulerSemaphore: IoAcceptor queues ready connections behind one
 
 #include <cstddef>
 #include <cstdint>
@@ -315,6 +335,24 @@ namespace JLib {
         bool SubmitConnect(IoSocket s, const void* sockaddr, std::uint32_t sockaddrLen,
                            IoRequest* req, IoResult* out, Task* resume, CancelToken token);
 
+        // DisconnectEx. Closes the connection and, with `reuse`, hands the SOCKET back in a state
+        // where it can be given to AcceptEx or ConnectEx again.
+        //
+        // WHAT THIS IS FOR. Under a high connect rate, socket creation and teardown become the cost:
+        // every closesocket walks kernel structures and every socket() rebuilds them, and a
+        // connection that lasts one request pays both. Reuse skips the pair entirely, which is why a
+        // pre-posted acceptor and this belong together -- the acceptor needs a fresh socket per
+        // accept, and this is where fresh ones come from without asking the kernel.
+        //
+        // `reuse` is TF_REUSE_SOCKET. A socket disconnected with it MUST NOT be closed and re-created
+        // -- that would waste the whole point -- and must not be used for anything else until it is
+        // handed to an accept or a connect.
+        //
+        // Like every other operation here, it ends in a COMPLETION: the socket is not reusable when
+        // this returns, it is reusable when the result is in hand.
+        bool SubmitDisconnect(IoSocket s, bool reuse,
+                              IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
         // Ask the OS to cancel every in-flight operation under `token`, INCLUDING those under scopes
         // nested inside it. Returns how many were asked about -- not how many were cancelled, which
         // is decided by whether the transfer had already finished and is not knowable here.
@@ -342,6 +380,64 @@ namespace JLib {
         IoReactor& operator=(const IoReactor&) = delete;
 
         Impl* impl;
+    };
+
+    // ================================================================================================
+    // IoAcceptor -- ACCEPTS THAT ARE ALREADY POSTED WHEN THE CONNECTION ARRIVES.
+    //
+    // WHAT IT FIXES. Bare AcceptAsync starts its AcceptEx only once somebody awaits it, and the
+    // caller must have created the accept socket first. Under a burst, connections sit in the
+    // listen backlog while the server gets round to asking for them -- and each one then waits on a
+    // socket() call. The whole point of AcceptEx is that the socket exists BEFORE the connection
+    // does; using it one-at-a-time throws that away.
+    //
+    // So this keeps `depth` accepts outstanding at all times. A connection arriving finds a posted
+    // accept and a ready socket, and the slot re-posts itself immediately afterwards.
+    //
+    // THE OWNERSHIP INVERSION, and it is the one place this library breaks its own rule. Everywhere
+    // else the CALLER owns the IoRequest, because the awaiting frame bounds its lifetime. A
+    // pre-posted accept has no awaiting frame -- that is the entire idea -- so the acceptor owns the
+    // requests, the sockets and the address buffers, and its destructor is what bounds them. Stop()
+    // cancels every outstanding accept and DRAINS the completions before releasing anything, for
+    // the same reason IoReactor::Stop does: the kernel is holding pointers into that storage.
+    //
+    // Ready connections queue behind a semaphore, one permit each. That makes waiting for a
+    // connection an ordinary cancellable wait, with scopes and deadlines working on it unchanged.
+    // ================================================================================================
+    class IoAcceptor {
+    public:
+        IoAcceptor() noexcept = default;
+        ~IoAcceptor();
+
+        IoAcceptor(const IoAcceptor&) = delete;
+        IoAcceptor& operator=(const IoAcceptor&) = delete;
+
+        // `listener` must already be bound, listening and registered with the reactor. The accept
+        // sockets are created to match its family and protocol, queried from the listener itself
+        // rather than passed in -- a mismatch there fails inside AcceptEx with a bad-argument error
+        // that says nothing about which argument.
+        bool Start(IoSocket listener, unsigned depth = 8);
+
+        // Cancels every outstanding accept, waits for their completions, and closes the unused
+        // sockets. Idempotent. Ready-but-unclaimed connections are closed too -- nobody is coming
+        // for them, and leaking a socket per unclaimed connection is worse than refusing it.
+        void Stop() noexcept;
+
+        // Non-blocking. Returns 0 when nothing is ready. Normally reached through AcceptAsync in
+        // IoAsync.h, which waits on the semaphore below first.
+        IoSocket TryTake() noexcept;
+
+        // One permit per ready connection. Exposed so a waiter can use the ordinary cancellable
+        // wait -- which is what makes deadlines and scopes work on "wait for a connection" without
+        // this class knowing anything about either.
+        SchedulerSemaphore& Ready() noexcept;
+
+        std::size_t Outstanding() const noexcept;   // accepts posted and not yet completed
+        std::size_t Available() const noexcept;     // accepted, waiting to be taken
+
+    private:
+        struct Impl;
+        Impl* impl = nullptr;
     };
 
     // The TimerEject for a deadline on I/O:
