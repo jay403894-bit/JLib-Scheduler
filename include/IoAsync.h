@@ -239,106 +239,46 @@ namespace JLib {
     }
 
 
-    // ================================================================================================
-    // IoStream -- A STREAM SOCKET THAT CANNOT CORRUPT ITSELF.
+    // ---- IoStream: the same operations, serialised per direction --------------------------------
     //
-    // Two sends in flight on one TCP socket are two independent operations. MSDN warns that some
-    // Winsock providers split a large send into several transmissions, "and this may cause
-    // unintended data interleaving from multiple concurrent send requests on the same
-    // stream-oriented socket" -- silent corruption, no crash and no error code.
+    //     IoStream conn{ sock };
+    //     IoResult r = co_await SendVAsync(conn, v, 2);
     //
-    // HONESTY ABOUT THE EVIDENCE: that was NOT reproduced here. The negative control in
-    // io_socket_test -- the same concurrent-writer test on the raw unserialised overload, at 96 KB
-    // frames with SO_SNDBUF squeezed to 4 KB -- never interleaved on the default Windows TCP
-    // provider. So this guard rests on the documented warning and on portability across providers,
-    // not on an observed failure.
+    // At most one transfer per direction is ever in flight; a second arriving while one runs is
+    // linked into the stream and started by the first one's completion. The full reasoning, and why
+    // this replaced a pair of SchedulerMutexes, is on IoStream in IoReactor.h.
     //
-    // THE READ DIRECTION IS THE STRONGER CASE and does not depend on any of that: two outstanding
-    // receives on one stream socket are filled in completion order, and which bytes land in which
-    // buffer is arbitrary. That is inherent, not provider-specific.
-    //
-    // The first version of this file documented that and left it to the caller. That was wrong. The
-    // rule "one coroutine owns the write side" is easy to state and nothing enforces it, while
-    // multiple writers on one connection -- a request handler and a keepalive, say -- is a design
-    // anyone might reach for. A hazard that severe should not be guarded by a comment.
-    //
-    // WHY THIS SHAPE, and not a queue inside the reactor. Serialising centrally means a socket ->
-    // state map and a hash lookup on the hot path of every send, paid by everyone. Here the state
-    // lives WHERE THE CONNECTION STATE ALREADY LIVES: the caller owns an IoStream per connection,
-    // exactly as it owns an IoRequest per operation. No map, no allocation, and the cost is one
-    // uncontended SchedulerMutex acquire -- which suspends rather than blocks, so a second writer
-    // waits without occupying anything.
-    //
-    // Read and write have SEPARATE locks. They are independent directions and a full-duplex protocol
-    // must be able to send while a receive is outstanding; one lock would deadlock exactly the
-    // request/response pattern this exists to support.
-    //
-    // The raw IoSocket overloads above remain, for a caller that has its own ordering guarantee and
-    // does not want to pay for a second one. They are the escape hatch, not the default.
-    // ================================================================================================
-    class IoStream {
-    public:
-        explicit IoStream(IoSocket s) noexcept : sock_(s) {}
+    // These are PLAIN AWAITERS, not Lazy coroutines. The mutex version had to be a Lazy because it
+    // was genuinely two suspension points -- take the lock, then transfer. Chaining removes the
+    // first one: a queued transfer does not wait and then start, it simply starts later. So this is
+    // one suspension, one frame, and no slab allocation per send.
 
-        IoStream(const IoStream&) = delete;
-        IoStream& operator=(const IoStream&) = delete;
-
-        IoSocket Socket() const noexcept { return sock_; }
-
-        // Exposed so a caller can hold the write side across SEVERAL sends -- a framed message
-        // written as a burst, where the ordering guarantee has to span more than one call.
-        SchedulerMutex& WriteLock() noexcept { return write_; }
-        SchedulerMutex& ReadLock()  noexcept { return read_; }
-
-    private:
-        IoSocket       sock_;
-        SchedulerMutex write_;
-        SchedulerMutex read_;
-    };
-
-    // Serialised send. Acquires the stream's write side, sends, releases.
-    //
-    // A Lazy rather than a plain awaiter because this is genuinely TWO suspension points -- the lock
-    // and then the transfer -- and hand-rolling a two-phase awaiter to save one slab frame would be
-    // trading a correctness-critical path for an unmeasured micro-optimisation. Lazy awaits inline;
-    // it does not spawn.
-    //
-    // A CANCELLED LOCK SENDS NOTHING and reports Cancelled, which is the same rule as everywhere
-    // else: Cancelled means no bytes moved.
-    [[nodiscard]] inline Lazy<IoResult> SendAsync(IoStream& s, const void* buf, std::uint32_t len,
-                                                  std::uint32_t flags = 0,
-                                                  CancelToken token = CancelToken{}) {
-        if (co_await LockAsyncCancellable(s.WriteLock()) == WaitResult::Cancelled)
-            co_return IoResult{ IoStatus::Cancelled, 0, 0 };
-
-        const IoResult r = co_await SendAsync(s.Socket(), buf, len, flags, token);
-        s.WriteLock().Unlock();
-        co_return r;
+    [[nodiscard]] inline auto SendAsync(IoStream& s, const void* buf, std::uint32_t len,
+                                        std::uint32_t flags = 0,
+                                        CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([&s, buf, len, flags, token](IoRequest* r, IoResult* o, Task* t) {
+            const IoBuffer one{ const_cast<void*>(buf), len };
+            return s.SubmitSend(&one, 1, flags, r, o, t, token);
+        });
     }
 
-    [[nodiscard]] inline Lazy<IoResult> SendVAsync(IoStream& s, const IoBuffer* bufs,
-                                                   std::uint32_t count, std::uint32_t flags = 0,
-                                                   CancelToken token = CancelToken{}) {
-        if (co_await LockAsyncCancellable(s.WriteLock()) == WaitResult::Cancelled)
-            co_return IoResult{ IoStatus::Cancelled, 0, 0 };
-
-        const IoResult r = co_await SendVAsync(s.Socket(), bufs, count, flags, token);
-        s.WriteLock().Unlock();
-        co_return r;
+    [[nodiscard]] inline auto SendVAsync(IoStream& s, const IoBuffer* bufs, std::uint32_t count,
+                                         std::uint32_t flags = 0,
+                                         CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([&s, bufs, count, flags, token](IoRequest* r, IoResult* o, Task* t) {
+            return s.SubmitSend(bufs, count, flags, r, o, t, token);
+        });
     }
 
-    // Serialised receive. Concurrent receives on one stream socket deliver arbitrary slices to
-    // arbitrary callers, which is the same hazard in the other direction.
-    [[nodiscard]] inline Lazy<IoResult> RecvAsync(IoStream& s, void* buf, std::uint32_t len,
-                                                  std::uint32_t flags = 0,
-                                                  CancelToken token = CancelToken{}) {
-        if (co_await LockAsyncCancellable(s.ReadLock()) == WaitResult::Cancelled)
-            co_return IoResult{ IoStatus::Cancelled, 0, 0 };
-
-        const IoResult r = co_await RecvAsync(s.Socket(), buf, len, flags, token);
-        s.ReadLock().Unlock();
-        co_return r;
+    [[nodiscard]] inline auto RecvAsync(IoStream& s, void* buf, std::uint32_t len,
+                                        std::uint32_t flags = 0,
+                                        CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([&s, buf, len, flags, token](IoRequest* r, IoResult* o, Task* t) {
+            const IoBuffer one{ buf, len };
+            return s.SubmitRecv(&one, 1, flags, r, o, t, token);
+        });
     }
+
     // ================================================================================================
     // ONE OPERATION PER DIRECTION PER STREAM SOCKET -- WHICH IoStream ABOVE ENFORCES FOR YOU.
     //

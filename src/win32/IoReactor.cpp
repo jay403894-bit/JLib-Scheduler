@@ -220,6 +220,11 @@ namespace JLib {
                     lastOne = (stopping && count == 0);
                 }
 
+                // THE HOOK RUNS HERE: after the lock is dropped, before the resume is pushed.
+                // After the lock, because it submits the next queued transfer and Submit takes the
+                // same mutex. Before the push, because the push can let this request.s frame die.
+                if (r->onComplete) r->onComplete(r);
+
                 // OUTSIDE THE LOCK. Pushing can run the task on another worker immediately, and its
                 // frame -- which is where `r` lives -- may be gone before Push returns. NOTHING below
                 // may touch `r`.
@@ -544,6 +549,28 @@ namespace JLib {
         });
     }
 
+    bool IoReactor::SubmitPrepared(IoRequest* req) {
+        const SOCKET sock = reinterpret_cast<SOCKET>(req->handle);
+
+        // The cancellation pre-check inside Submit still applies and is wanted: a transfer that
+        // waited its turn in a chain may have had its scope cancelled while queued, and submitting
+        // it then would hand the kernel a buffer nobody wants.
+        const CancelToken tok(req->token);
+
+        if (req->kind == IoRequest::Kind::Send) {
+            return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, req->out, req->resume, tok,
+                                [&](OVERLAPPED* ov) {
+                return ::WSASend(sock, Bufs(req), req->bufCount, nullptr,
+                                 static_cast<DWORD>(req->flags), ov, nullptr) == 0;
+            });
+        }
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, req->out, req->resume, tok,
+                            [&](OVERLAPPED* ov) {
+            return ::WSARecv(sock, Bufs(req), req->bufCount, nullptr,
+                             reinterpret_cast<LPDWORD>(&req->flags), ov, nullptr) == 0;
+        });
+    }
+
     std::size_t IoReactor::RequestCancel(CancelToken token) noexcept {
         // NESTED SCOPES COUNT. An operation registered under a request scope belongs to the
         // connection scope above it, so this asks IsWithin rather than comparing tokens -- matching
@@ -602,6 +629,132 @@ namespace JLib {
 
     void EjectIoReactor(void* ctx, CancelToken token) {
         if (ctx) static_cast<IoReactor*>(ctx)->RequestCancel(token);
+    }
+
+    // ---- IoStream: serialised by chaining, not by locking ---------------------------------------
+
+    namespace {
+        struct SpinGuard {
+            std::atomic_flag& f;
+            explicit SpinGuard(std::atomic_flag& x) : f(x) {
+                while (f.test_and_set(std::memory_order_acquire)) platform::CpuRelax();
+            }
+            ~SpinGuard() { f.clear(std::memory_order_release); }
+        };
+    }
+
+    // Submits `req` if the direction is idle, otherwise QUEUES it. Either way the caller suspends
+    // unless the answer is already final.
+    bool IoStream::SubmitChained(Chain& c, IoRequest::Kind kind,
+                                 const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                                 IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        // Descriptors are filled NOW, even when the transfer is only queued -- the caller's `bufs`
+        // array is allowed to be a local and will be gone by the time this is submitted.
+        if (!FillBufs(req, bufs, count)) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSAEMSGSIZE };
+            return true;
+        }
+
+        // Already cancelled: answer now, and do NOT take a place in the queue. A cancelled transfer
+        // that queued would hold the direction until its turn came, delaying live work behind
+        // something nobody wants.
+        if (CancelToken(token.Raw()).Cancelled()) {
+            if (out) *out = IoResult{ IoStatus::Cancelled, 0, 0 };
+            return true;
+        }
+
+        req->kind      = kind;
+        req->bufCount  = count;
+        req->flags     = flags;
+        req->out       = out;
+        req->resume    = resume;
+        req->token     = token.Raw();
+        req->handle    = reinterpret_cast<void*>(static_cast<SOCKET>(sock_));
+        req->aux       = reinterpret_cast<std::uintptr_t>(this);
+        req->onComplete = (kind == IoRequest::Kind::Send) ? &IoStream::OnSendComplete
+                                                          : &IoStream::OnRecvComplete;
+        req->next = nullptr;
+
+        {
+            SpinGuard g(lock_);
+            if (c.busy) {
+                // QUEUED, NOT SUBMITTED. This is the whole mechanism: the direction stays
+                // single-threaded because only one transfer is ever handed to the kernel.
+                if (c.tail) c.tail->next = req; else c.head = req;
+                c.tail = req;
+                ++c.queued;
+                return false;                  // suspend; the chain will start it
+            }
+            c.busy = true;
+        }
+
+        return SubmitOne(req);
+    }
+
+    // Hands one already-prepared request to the kernel. Shared by the first submit and by every
+    // chained one, so a queued transfer takes exactly the same path as an immediate one.
+    bool IoStream::SubmitOne(IoRequest* req) {
+        const bool immediate = IoReactor::Instance().SubmitPrepared(req);
+
+        if (immediate) {
+            // Never queued with the kernel, so no completion is coming and the hook will not run.
+            // The chain has to be advanced here instead or the direction stays busy forever.
+            Chain& c = (req->kind == IoRequest::Kind::Send) ? send_ : recv_;
+            Advance(c, req->kind);
+        }
+        return immediate;
+    }
+
+    // Called from the completion thread, outside every lock. Starts the next queued transfer.
+    void IoStream::Advance(Chain& c, IoRequest::Kind kind) {
+        IoRequest* next = nullptr;
+        {
+            SpinGuard g(lock_);
+            if (c.head) {
+                next = c.head;
+                c.head = next->next;
+                if (!c.head) c.tail = nullptr;
+                --c.queued;
+                next->next = nullptr;
+                // busy STAYS true: the direction is handing off, not going idle.
+            } else {
+                c.busy = false;
+            }
+        }
+        if (next) SubmitOne(next);
+        (void)kind;
+    }
+
+    void IoStream::OnSendComplete(IoRequest* r) {
+        IoStream* s = reinterpret_cast<IoStream*>(r->aux);
+        if (s) s->Advance(s->send_, IoRequest::Kind::Send);
+    }
+
+    void IoStream::OnRecvComplete(IoRequest* r) {
+        IoStream* s = reinterpret_cast<IoStream*>(r->aux);
+        if (s) s->Advance(s->recv_, IoRequest::Kind::Recv);
+    }
+
+    bool IoStream::SubmitSend(const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                              IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        return SubmitChained(send_, IoRequest::Kind::Send, bufs, count, flags,
+                             req, out, resume, token);
+    }
+
+    bool IoStream::SubmitRecv(const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                              IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        return SubmitChained(recv_, IoRequest::Kind::Recv, bufs, count, flags,
+                             req, out, resume, token);
+    }
+
+    std::size_t IoStream::QueuedSends() const noexcept {
+        SpinGuard g(lock_);
+        return send_.queued;
+    }
+
+    std::size_t IoStream::QueuedRecvs() const noexcept {
+        SpinGuard g(lock_);
+        return recv_.queued;
     }
 
     // ---- IoAcceptor ------------------------------------------------------------------------------

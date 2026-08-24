@@ -363,6 +363,76 @@ int main() {
         ::closesocket(a3);
     }
 
+    // The chain is OBSERVABLE, which is what distinguishes this from "the sends happened to not
+    // overlap". Many writers are started at once against one stream; at least one of them has to
+    // find the direction busy and be queued rather than submitted, or the serialisation is not
+    // actually being exercised and the interleaving check above proves nothing.
+    std::printf("concurrent sends are queued on the stream, not handed to the kernel together\n");
+    {
+        SOCKET c5 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ::connect(c5, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
+        SOCKET a5 = ::accept(listener, nullptr, nullptr);
+        Check(a5 != INVALID_SOCKET && io.RegisterSocket(a5) && io.RegisterSocket(c5),
+              "a connection for the queue-depth check");
+
+        int snd5 = 4096;
+        ::setsockopt(c5, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd5), sizeof snd5);
+
+        static JLib::IoStream st5{ 0 };
+        st5.~IoStream();
+        new (&st5) JLib::IoStream(c5);
+
+        constexpr int kW = 8, kSz = 64 * 1024;
+        static std::vector<char> pay[kW];
+        for (int i = 0; i < kW; ++i) pay[i].assign(kSz, static_cast<char>('a' + i));
+
+        static std::atomic<size_t> peakQueued{ 0 };
+        peakQueued.store(0);
+        std::atomic<bool> stop{ false };
+        std::thread watch([&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                const size_t q = st5.QueuedSends();
+                size_t seen = peakQueued.load(std::memory_order_relaxed);
+                while (q > seen && !peakQueued.compare_exchange_weak(seen, q)) {}
+                std::this_thread::yield();
+            }
+        });
+
+        std::vector<char> sink(static_cast<size_t>(kW) * kSz);
+        std::atomic<int> got{ 0 };
+        std::thread drain([&] {
+            int n = 0, want = kW * kSz;
+            while (n < want) {
+                const int k = ::recv(a5, sink.data() + n, want - n, 0);
+                if (k <= 0) break;
+                n += k;
+            }
+            got.store(n, std::memory_order_release);
+        });
+
+        JLib::WaitGroup wg;
+        for (int i = 0; i < kW; ++i) {
+            JLib::Spawn([](JLib::IoStream* s, int id) -> JLib::Coro {
+                co_await JLib::SendAsync(*s, pay[id].data(), kSz);
+                co_return;
+            }(&st5, i), &wg);
+        }
+        sched.WaitFor(wg);
+        stop.store(true, std::memory_order_release);
+        watch.join();
+        drain.join();
+
+        char m[144];
+        std::snprintf(m, sizeof m, "at least one send was queued behind another (peak depth %zu)",
+                      peakQueued.load());
+        Check(peakQueued.load() >= 1, m);
+        Check(got.load() == kW * kSz, "and every byte still arrived");
+        Check(st5.QueuedSends() == 0, "the chain drained empty");
+
+        ::closesocket(c5);
+        ::closesocket(a5);
+    }
+
     // ---- UDP ------------------------------------------------------------------------------------
     // Separate calls because an unconnected datagram socket has no peer: every datagram carries one,
     // and WSARecv on such a socket fails outright.

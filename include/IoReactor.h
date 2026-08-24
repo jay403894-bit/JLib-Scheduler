@@ -105,6 +105,7 @@
 #include "CancelToken.h"
 #include "TaskScheduler.h"   // SchedulerSemaphore: IoAcceptor queues ready connections behind one
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -183,9 +184,21 @@ namespace JLib {
         // Kept here rather than inferred from the handle because by completion time there is nothing
         // left to infer from -- and a socket that skipped its fixup does not fail, it misbehaves
         // later, which is the worst way to find out.
-        enum class Kind : std::uint8_t { Generic, Accept, Connect };
+        enum class Kind : std::uint8_t { Generic, Accept, Connect, Send, Recv };
         Kind          kind = Kind::Generic;
         std::uintptr_t aux = 0;
+
+        // Segment count, so a QUEUED transfer can be submitted later without the caller's argument
+        // list still being alive. The descriptors themselves are already in `native`.
+        std::uint32_t bufCount = 0;
+
+        // Called on the completion thread, OUTSIDE every lock, BEFORE `resume` is pushed. It is how
+        // IoStream starts the next queued transfer the instant the current one finishes -- which is
+        // what replaces a per-connection lock with an ordering that falls out of the completions.
+        //
+        // MUST NOT BLOCK and must not touch this request after it hands work on: by the time it
+        // returns, `resume` is pushed and the frame this request lives in can be gone.
+        void (*onComplete)(IoRequest*) = nullptr;
 
         // LIVES HERE BECAUSE THE KERNEL WRITES TO IT ON COMPLETION. WSARecv's flags parameter is
         // [in, out] -- it reports things like MSG_PARTIAL when the operation finishes -- so a stack
@@ -364,6 +377,15 @@ namespace JLib {
         bool SubmitDisconnect(IoSocket s, bool reuse,
                               IoRequest* req, IoResult* out, Task* resume, CancelToken token);
 
+        // Submit an ALREADY-PREPARED request -- one whose kind, descriptors, flags, handle and
+        // resume are set. For a chained submitter like IoStream, which prepares a transfer when the
+        // caller asks and hands it to the kernel later, possibly from the completion thread.
+        //
+        // Deliberately narrow: it does NOT fill descriptors, check cancellation or set a hook,
+        // because at the point it runs the caller's argument list is long gone. Everything it needs
+        // is in the request, which is the entire reason IoRequest carries bufCount and kind.
+        bool SubmitPrepared(IoRequest* req);
+
         // Ask the OS to cancel every in-flight operation under `token`, INCLUDING those under scopes
         // nested inside it. Returns how many were asked about -- not how many were cancelled, which
         // is decided by whether the transfer had already finished and is not knowable here.
@@ -391,6 +413,88 @@ namespace JLib {
         IoReactor& operator=(const IoReactor&) = delete;
 
         Impl* impl;
+    };
+
+    // ================================================================================================
+    // IoStream -- A STREAM SOCKET WHOSE TRANSFERS CANNOT INTERLEAVE.
+    //
+    // Two sends in flight on one TCP socket are two independent operations. MSDN warns that some
+    // Winsock providers split a large send into several transmissions, "and this may cause unintended
+    // data interleaving from multiple concurrent send requests on the same stream-oriented socket".
+    // Concurrent RECEIVES are worse and not provider-dependent: two outstanding reads are filled in
+    // completion order, so which bytes land in which buffer is arbitrary.
+    //
+    // HOW THIS SERIALISES: BY CHAINING ON COMPLETION, NOT BY LOCKING.
+    //
+    // At most one transfer per direction is ever in flight. A send arriving while one is running is
+    // LINKED INTO THE STREAM and not submitted; when the running one completes, its completion hook
+    // submits the next. The ordering falls out of the completions themselves -- there is no lock to
+    // take, nothing parks, and no waiter queue exists.
+    //
+    // WHY NOT A MUTEX, WHICH IS WHAT THIS WAS FIRST. A SchedulerMutex is 64 bytes and holds a
+    // std::queue that HEAP-ALLOCATES on first contention; two of them made an IoStream ~136 bytes
+    // per connection with a latent allocation each. That contradicts the property the rest of this
+    // file is built on -- caller-owned state, no allocation on the I/O path -- and it charged every
+    // connection for fiber-waiter machinery that can never fire, since nothing in the socket path
+    // parks a fiber. It also paid for the CONTENDED case on a path where a well-behaved connection
+    // has one writer and never contends at all.
+    //
+    // Chaining costs a spinlock and four pointers, allocates nothing, and removes a suspension point
+    // rather than adding one: a queued send does not wait on a lock and then start, it simply starts
+    // later.
+    //
+    // Read and write chain SEPARATELY. They are independent directions and a full-duplex protocol
+    // must send while a receive is outstanding.
+    //
+    // THE RAW IoSocket OVERLOADS DO NOT CHAIN, and remain for a caller with its own ordering
+    // guarantee. This is the default; those are the escape hatch.
+    // ================================================================================================
+    class IoStream {
+    public:
+        explicit IoStream(IoSocket s) noexcept : sock_(s) {}
+
+        IoStream(const IoStream&) = delete;
+        IoStream& operator=(const IoStream&) = delete;
+
+        IoSocket Socket() const noexcept { return sock_; }
+
+        // Same return polarity as every other Submit: TRUE means the answer is already final and the
+        // caller must not suspend; FALSE means it is queued or in flight and the caller stays
+        // suspended until its completion.
+        bool SubmitSend(const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                        IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+        bool SubmitRecv(const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                        IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
+        // Diagnostics; racy by nature.
+        std::size_t QueuedSends() const noexcept;
+        std::size_t QueuedRecvs() const noexcept;
+
+    private:
+        // Called by the reactor's completion thread through IoRequest::onComplete.
+        static void OnSendComplete(IoRequest* r);
+        static void OnRecvComplete(IoRequest* r);
+
+        struct Chain {
+            IoRequest* head = nullptr;      // singly linked through IoRequest::next
+            IoRequest* tail = nullptr;
+            bool       busy = false;
+            std::size_t queued = 0;
+        };
+
+        bool SubmitChained(Chain& c, IoRequest::Kind kind,
+                           const IoBuffer* bufs, std::uint32_t count, std::uint32_t flags,
+                           IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+        bool SubmitOne(IoRequest* req);
+        void Advance(Chain& c, IoRequest::Kind kind);
+
+        IoSocket sock_;
+        // A raw spinlock rather than a SchedulerMutex: the critical section is a handful of pointer
+        // writes, it is taken by the completion thread as well as by submitters, and nothing here
+        // may suspend.
+        mutable std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+        Chain send_;
+        Chain recv_;
     };
 
     // ================================================================================================
