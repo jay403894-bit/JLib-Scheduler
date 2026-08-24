@@ -56,6 +56,24 @@ fits from a **compile-time constant** -- `sizeof(Task)` for the function-pointer
 on knowing the size distribution in advance: a big lambda still lands in the 256-byte class.
 
   - A capture-free task is **64 bytes instead of 256**.
+  - Measured `sizeof(LambdaTask<F>)`, on both MSVC and GCC (printed by `bench/dag_scaling.cpp`):
+
+    | capture | size | class |
+    |---|---|---|
+    | function pointer (plain `Task`) | 64 | 64 |
+    | empty closure | 64 | 64 |
+    | one reference (8 B) | **64** | 64 |
+    | two refs / `int`+`double` (16 B) | 80 | 128 |
+    | 64-byte array | 128 | 128 |
+
+    An 8-byte capture is FREE. `LambdaTask` stores `F` after the `Task` base and both toolchains
+    reuse the base tail padding -- which is exactly the 8 bytes `nextWaiter` vacated when the
+    Treiber waiter stack was retired in 2.15.0. An unintended dividend, and the reason `Task.h`
+    now says those bytes must stay unclaimed: taking them pushes every single-capture lambda from
+    64 to 80, out of the 64-byte class into the 128-byte one.
+
+    This is also what justifies the 128-byte class on the TASK path. It had only been argued for
+    coroutine frames, and there only at ~22% over `64 + 256`.
   - **`TaskNode` was packed from 72 bytes to 56** so it fits the 64-byte class. Its `LogicType` was
     stored as a full `int` and five separate `bool`s plus two `uint8_t`s sat scattered with padding
     between them; they are now one bitfield block, the same shape `Task`'s flags already used. A
