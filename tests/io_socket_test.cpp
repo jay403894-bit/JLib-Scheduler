@@ -33,9 +33,20 @@
 #include <new>
 
 static int g_fail = 0;
+
+// FAILED CHECKS ARE REMEMBERED AND REPRINTED AT THE END, not just logged where they happen. A
+// failure two hundred lines up scrolls away, so an intermittent one gets sampled by looking at the
+// tail and comes back "no FAILED found" -- which is how a real failure got mislabelled as a
+// mystery. The summary makes any failure catchable with `tail`.
+static const char* g_failed[32];
+static int g_failedCount = 0;
+
 static void Check(bool c, const char* what) {
     std::printf("  %-64s %s\n", what, c ? "ok" : "FAILED");
-    if (!c) ++g_fail;
+    if (!c) {
+        ++g_fail;
+        if (g_failedCount < 32) g_failed[g_failedCount++] = what;
+    }
 }
 
 template <typename F>
@@ -568,6 +579,53 @@ int main() {
         ::closesocket(lis2);
     }
 
+    // THE LOST WAKE THAT SHUTDOWN CAUSES. A coroutine parked in AcceptAsync when Stop() runs has to
+    // be released, or it waits forever for a connection that can no longer arrive. No race is
+    // involved -- there is simply no code path that wakes it -- which is what makes this half of the
+    // lost-wake family easy to miss. It hung the suite before Stop learned to eject waiters.
+    std::printf("Stop releases coroutines parked waiting for a connection\n");
+    {
+        SOCKET lis4 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a4{};
+        a4.sin_family = AF_INET;
+        a4.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        a4.sin_port = 0;
+        ::bind(lis4, reinterpret_cast<sockaddr*>(&a4), sizeof a4);
+        ::listen(lis4, SOMAXCONN);
+        io.RegisterSocket(lis4);
+
+        static JLib::IoAcceptor acc2;
+        Check(acc2.Start(static_cast<JLib::IoSocket>(lis4), 4), "an acceptor with nobody connecting");
+
+        static std::atomic<int> woke{ 0 }, gotSocket{ 0 };
+        woke.store(0); gotSocket.store(0);
+        JLib::WaitGroup wg;
+
+        constexpr int kWaiters = 3;
+        for (int i = 0; i < kWaiters; ++i) {
+            JLib::Spawn([](JLib::IoAcceptor* a) -> JLib::Coro {
+                const JLib::IoSocket s = co_await JLib::AcceptAsync(*a);
+                woke.fetch_add(1, std::memory_order_relaxed);
+                if (s != 0) { gotSocket.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
+                co_return;
+            }(&acc2), &wg);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        Check(woke.load() == 0, "all three are parked -- nobody has connected");
+
+        // If Stop does not eject them, WaitFor never returns and this test hangs rather than fails.
+        acc2.Stop();
+        sched.WaitFor(wg);
+
+        char m[128];
+        std::snprintf(m, sizeof m, "Stop woke all %d of them (%d)", kWaiters, woke.load());
+        Check(woke.load() == kWaiters, m);
+        Check(gotSocket.load() == 0, "and each was handed 0 rather than a socket");
+
+        ::closesocket(lis4);
+    }
+
     // ---- DisconnectEx and socket reuse ----------------------------------------------------------
     // Under a high connect rate the cost is not the transfer, it is the socket: every closesocket
     // tears down kernel structures and every socket() rebuilds them, and a connection that serves one
@@ -759,6 +817,10 @@ int main() {
     ::closesocket(listener);
     ::WSACleanup();
 
+    if (g_fail != 0) {
+        std::printf("\n%d CHECK(S) FAILED:\n", g_fail);
+        for (int i = 0; i < g_failedCount; ++i) std::printf("  * %s\n", g_failed[i]);
+    }
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
     return g_fail == 0 ? 0 : 1;
 }

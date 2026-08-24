@@ -670,7 +670,7 @@ namespace JLib {
         req->resume    = resume;
         req->token     = token.Raw();
         req->handle    = reinterpret_cast<void*>(static_cast<SOCKET>(sock_));
-        req->aux       = reinterpret_cast<std::uintptr_t>(this);
+        req->hookCtx   = reinterpret_cast<std::uintptr_t>(this);
         req->onComplete = (kind == IoRequest::Kind::Send) ? &IoStream::OnSendComplete
                                                           : &IoStream::OnRecvComplete;
         req->next = nullptr;
@@ -726,12 +726,12 @@ namespace JLib {
     }
 
     void IoStream::OnSendComplete(IoRequest* r) {
-        IoStream* s = reinterpret_cast<IoStream*>(r->aux);
+        IoStream* s = reinterpret_cast<IoStream*>(r->hookCtx);
         if (s) s->Advance(s->send_, IoRequest::Kind::Send);
     }
 
     void IoStream::OnRecvComplete(IoRequest* r) {
-        IoStream* s = reinterpret_cast<IoStream*>(r->aux);
+        IoStream* s = reinterpret_cast<IoStream*>(r->hookCtx);
         if (s) s->Advance(s->recv_, IoRequest::Kind::Recv);
     }
 
@@ -777,11 +777,12 @@ namespace JLib {
 
         std::vector<Slot>   slots;
         mutable std::mutex  m;
-        std::vector<SOCKET> ready;          // accepted, not yet taken
+        std::vector<SOCKET> ready;          // accepted, nobody waiting yet
+        IoAcceptWaiter*     waitHead = nullptr;   // parked, no connection yet
+        IoAcceptWaiter*     waitTail = nullptr;
         std::size_t         outstanding = 0;
         bool                stopping = false;
 
-        SchedulerSemaphore  sem{ 0 };
         CancelScope         scope;          // cancels every accept this acceptor posted, and only those
 
         // Creates the socket AcceptEx will fill. Matching the listener's family/protocol matters:
@@ -802,50 +803,71 @@ namespace JLib {
                 return;
             }
 
-            // The completion handler is an ordinary Native task. The reactor only knows how to push
-            // a Task*, which is exactly the type erasure that lets this work without the reactor
-            // knowing an acceptor exists.
-            Task* t = TaskScheduler::IsInitialized()
-                        ? TaskScheduler::Instance().CreateTask([&s] { s.owner->OnComplete(s.index); })
-                        : nullptr;
-            if (!t) {
-                ::closesocket(s.sock);
-                s.sock = INVALID_SOCKET;
-                return;
-            }
+            // NO TASK IS ALLOCATED PER ACCEPT. The slot's completion is delivered through
+            // IoRequest::onComplete -- the same hook IoStream uses to chain transfers -- so `resume`
+            // stays null and nothing is pushed for the harvest itself. Only a WAITING caller gets
+            // pushed, and that Task is the caller's own.
+            s.req.onComplete = &Impl::AcceptCompleted;
+            s.req.hookCtx    = reinterpret_cast<std::uintptr_t>(&s);
 
             { std::lock_guard<std::mutex> lk(m); ++outstanding; }
 
             if (IoReactor::Instance().SubmitAccept(static_cast<IoSocket>(listener),
                                                    static_cast<IoSocket>(s.sock), &s.addrs,
-                                                   &s.req, &s.result, t, scope.Token())) {
-                // Answered immediately -- refused, or the scope was already cancelled. The task was
-                // never handed to the reactor, so nothing will run it and this must clean up itself.
+                                                   &s.req, &s.result, nullptr, scope.Token())) {
+                // Answered immediately -- refused, or the scope was already cancelled. No completion
+                // is coming, so the hook will not run and this must clean up itself.
                 { std::lock_guard<std::mutex> lk(m); --outstanding; }
                 ::closesocket(s.sock);
                 s.sock = INVALID_SOCKET;
             }
         }
 
+        static void AcceptCompleted(IoRequest* r) {
+            Slot* s = reinterpret_cast<Slot*>(r->hookCtx);
+            if (s && s->owner) s->owner->OnComplete(s->index);
+        }
+
         void OnComplete(unsigned i) {
             Slot& s = slots[i];
-            SOCKET accepted = s.sock;
+            const SOCKET accepted = s.sock;     // the connection this slot just produced
             s.sock = INVALID_SOCKET;
 
-            bool repost = false;
+            bool   repost = false;
+            bool   keep   = false;              // did anyone take the socket?
+            IoAcceptWaiter* handTo = nullptr;
             {
                 std::lock_guard<std::mutex> lk(m);
                 --outstanding;
                 if (s.result.status == IoStatus::Completed && !stopping) {
-                    ready.push_back(accepted);
-                    accepted = INVALID_SOCKET;      // handed over
                     repost = true;
+                    keep   = true;
+                    // HAND IT STRAIGHT TO A PARKED WAITER if there is one, rather than queueing it
+                    // and then waking somebody to come and fetch it. Dequeued BEFORE the resume, the
+                    // same rule as everywhere here: the waiter lives in a frame that dies when
+                    // pushed.
+                    if (waitHead) {
+                        handTo = waitHead;
+                        waitHead = handTo->next;
+                        if (!waitHead) waitTail = nullptr;
+                        handTo->next = nullptr;
+                    } else {
+                        ready.push_back(accepted);
+                    }
                 }
             }
 
-            // Cancelled, failed, or shutting down: the socket was never handed to anyone.
-            if (accepted != INVALID_SOCKET) ::closesocket(accepted);
-            else sem.Signal();                      // outside the lock: Signal can resume a waiter
+            // Cancelled, failed, or shutting down: nobody took it.
+            if (!keep && accepted != INVALID_SOCKET) ::closesocket(accepted);
+
+            // OUTSIDE THE LOCK. Push can run the waiter on another worker immediately, and its frame
+            // -- which is where the waiter lives -- may be gone before Push returns, so the socket is
+            // written first and nothing below touches `handTo`.
+            if (handTo) {
+                if (handTo->out) *handTo->out = static_cast<IoSocket>(accepted);
+                Task* t = handTo->resume;
+                if (t && TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(t);
+            }
 
             // RE-POST IMMEDIATELY, so the depth is restored before the next connection arrives. That
             // is the entire point of the class -- an accept that is posted only after the previous
@@ -897,6 +919,14 @@ namespace JLib {
             impl->stopping = true;
         }
 
+        // RELEASE PARKED WAITERS FIRST, and this was missing: a coroutine sitting in AcceptAsync
+        // when Stop ran was never resumed and hung forever. A LOST WAKE arriving through shutdown
+        // rather than through a race, which is the easier half of that class to overlook because no
+        // concurrency is involved at all -- there is simply no code path that wakes them.
+        //
+        // `stopping` is already set above, so TakeOrQueue will not admit a new waiter behind this.
+        CancelWaiters(CancelToken{});
+
         // CANCEL, THEN DRAIN. The kernel holds pointers into every slot's request and address
         // buffer, so releasing them before the completions arrive is the corruption this whole file
         // is arranged to prevent. Cancelling by SCOPE reaches exactly this acceptor's accepts and
@@ -925,7 +955,69 @@ namespace JLib {
         return static_cast<IoSocket>(s);
     }
 
-    SchedulerSemaphore& IoAcceptor::Ready() noexcept { return impl->sem; }
+    bool IoAcceptor::TakeOrQueue(IoAcceptWaiter* w, IoSocket* out, Task* resume, CancelToken token) {
+        if (!impl || !w || !out) { if (out) *out = 0; return true; }
+
+        // Already cancelled: answer now rather than queueing. A cancelled waiter in the queue would
+        // take the next connection and drop it.
+        if (CancelToken(token.Raw()).Cancelled()) { *out = 0; return true; }
+
+        std::lock_guard<std::mutex> lk(impl->m);
+        if (!impl->ready.empty()) {
+            *out = static_cast<IoSocket>(impl->ready.back());
+            impl->ready.pop_back();
+            return true;                       // answer is final; do not suspend
+        }
+        if (impl->stopping) { *out = 0; return true; }
+
+        w->resume = resume;
+        w->out    = out;
+        w->token  = token.Raw();
+        w->next   = nullptr;
+        if (impl->waitTail) impl->waitTail->next = w; else impl->waitHead = w;
+        impl->waitTail = w;
+        return false;                          // parked; an accept completion will resume it
+    }
+
+    std::size_t IoAcceptor::CancelWaiters(CancelToken token) noexcept {
+        if (!impl) return 0;
+
+        // REMOVED UNDER THE LOCK, RESUMED OUTSIDE IT -- each waiter lives in a frame that dies the
+        // moment it is pushed, so leaving one linked while waking it dangles the list.
+        IoAcceptWaiter* taken = nullptr;
+        IoAcceptWaiter* takenTail = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(impl->m);
+            IoAcceptWaiter* keepHead = nullptr;
+            IoAcceptWaiter* keepTail = nullptr;
+            for (IoAcceptWaiter* w = impl->waitHead; w; ) {
+                IoAcceptWaiter* next = w->next;
+                w->next = nullptr;
+                const bool match = !token.Valid() || CancelToken(w->token).IsWithin(token);
+                if (match) {
+                    if (takenTail) takenTail->next = w; else taken = w;
+                    takenTail = w;
+                } else {
+                    if (keepTail) keepTail->next = w; else keepHead = w;
+                    keepTail = w;
+                }
+                w = next;
+            }
+            impl->waitHead = keepHead;
+            impl->waitTail = keepTail;
+        }
+
+        std::size_t n = 0;
+        while (taken) {
+            IoAcceptWaiter* next = taken->next;
+            if (taken->out) *taken->out = 0;
+            Task* t = taken->resume;
+            if (t && TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(t);
+            ++n;
+            taken = next;
+        }
+        return n;
+    }
 
     std::size_t IoAcceptor::Outstanding() const noexcept {
         if (!impl) return 0;

@@ -200,6 +200,11 @@ namespace JLib {
         // returns, `resume` is pushed and the frame this request lives in can be gone.
         void (*onComplete)(IoRequest*) = nullptr;
 
+        // Context for the hook. SEPARATE from `aux`, which already means "the accepted socket" for
+        // an accept -- one field cannot carry two meanings for the same request, and an accept
+        // posted by IoAcceptor needs both.
+        std::uintptr_t hookCtx = 0;
+
         // LIVES HERE BECAUSE THE KERNEL WRITES TO IT ON COMPLETION. WSARecv's flags parameter is
         // [in, out] -- it reports things like MSG_PARTIAL when the operation finishes -- so a stack
         // local in the submitting function is a write into a dead frame once the operation goes
@@ -497,6 +502,17 @@ namespace JLib {
         Chain recv_;
     };
 
+    // A task parked waiting for a connection. CALLER-OWNED, like IoRequest, and for the same reason:
+    // it lives in the awaiter, in the coroutine frame, which is alive for exactly as long as the
+    // wait. No allocation, and no wait primitive -- the thing that resumes it is Push, the same call
+    // the reactor already makes for every completion.
+    struct IoAcceptWaiter {
+        Task*           resume = nullptr;
+        IoSocket*       out    = nullptr;   // receives the socket, or 0 if cancelled
+        std::uint32_t   token  = 0xFFFFFFFFu;
+        IoAcceptWaiter* next   = nullptr;
+    };
+
     // ================================================================================================
     // IoAcceptor -- ACCEPTS THAT ARE ALREADY POSTED WHEN THE CONNECTION ARRIVES.
     //
@@ -542,29 +558,39 @@ namespace JLib {
         // IoAsync.h, which waits on the semaphore below first.
         IoSocket TryTake() noexcept;
 
-        // One permit per ready connection. Exposed so a waiter can use the ordinary cancellable
-        // wait -- which is what makes deadlines and scopes work on "wait for a connection" without
-        // this class knowing anything about either.
+        // Take a ready connection, or QUEUE this waiter until one arrives.
         //
-        // THIS IS THE ONE SCHEDULER TYPE THE REACTOR USES BEYOND Push(Task*), and the choice was
-        // made deliberately rather than by accident, so here is the reasoning.
+        // Same return polarity as every Submit here: TRUE means `*out` is final and the caller must
+        // not suspend; FALSE means the waiter is queued and will be resumed by an accept completion.
         //
-        // The alternative considered was to drop the semaphore and cap outstanding accepts with a
-        // plain atomic instead -- no wait, no park, the acceptor touching nothing but Push. That is
-        // the right answer when the counter's job is only "do not flood AcceptEx". It is NOT this
-        // counter's job: the depth cap is already `slots.size()`, fixed at Start, so there is
-        // nothing to flood. What this counts is READY CONNECTIONS, and the thing waiting on it is a
-        // server's accept loop parking until one arrives.
+        // THERE IS NO SEMAPHORE HERE, AND THAT IS THE POINT. This used to expose a
+        // SchedulerSemaphore for callers to wait on, justified as "waiting for a connection is a
+        // job-level wait". That answered the wrong question -- of course something has to park; the
+        // question is WHAT TYPE parks it. The answer was already in this file: park the same Task*
+        // the reactor knows how to resume, in caller-owned state, exactly as every I/O operation
+        // does. The waiter lives in the awaiter, in the coroutine frame; there is no wait primitive,
+        // no queue that allocates, and the acceptor's only scheduler call is Push.
+        // NO LOST WAKE, AND THE REASON IS THAT THIS IS NOT LOCK-FREE. The classic failure here is a
+        // waiter checking a count, seeing zero, and installing itself AFTER a completer checked for
+        // waiters, found none, and recorded a ready connection -- the connection is consumed by
+        // nobody and the waiter sleeps forever. That is real, and it is what a split between an
+        // atomic count and a separate waiter pointer buys you.
         //
-        // That is a real blocking wait by a real task, and turning it into a poll would mean either
-        // spinning a worker or inventing a second wake mechanism next to the one the library
-        // already has. Waiting for a connection is a job-level wait, so it uses the job-level
-        // primitive.
+        // Here the take-or-park decision and the hand-off-or-queue decision are made under THE SAME
+        // mutex, so one of them is always second and sees the other. The mutex is doing the job a
+        // single successful CAS would have to do in a lock-free version.
         //
-        // The cost is honest and bounded: the reactor's dependency on the scheduler is now exactly
-        // Push(Task*), the core reservation, and this. If the I/O layer is ever split into its own
-        // package, those three are the whole seam -- and Push is the only one on a hot path.
-        SchedulerSemaphore& Ready() noexcept;
+        // NO DOUBLE RESUME either: a waiter is REMOVED from the list under that mutex before it is
+        // pushed, and it is only ever in the list once, so exactly one completer can claim it.
+        // Resuming it while await_suspend is still running is legal and expected -- the suspend
+        // point is established before await_suspend is entered -- which is why the awaiter does
+        // nothing after this call returns.
+        bool TakeOrQueue(IoAcceptWaiter* w, IoSocket* out, Task* resume, CancelToken token);
+
+        // Eject queued waiters whose scope is `token` (or all, for an invalid token), handing each a
+        // socket value of 0. Removes before resuming, the same rule as everywhere else -- the waiter
+        // lives in a frame that dies the moment it is pushed.
+        std::size_t CancelWaiters(CancelToken token) noexcept;
 
         std::size_t Outstanding() const noexcept;   // accepts posted and not yet completed
         std::size_t Available() const noexcept;     // accepted, waiting to be taken

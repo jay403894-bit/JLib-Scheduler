@@ -167,12 +167,34 @@ namespace JLib {
     //
     // The wait is an ORDINARY cancellable semaphore acquire, which is what makes scopes and
     // deadlines work on "wait for a connection" without IoAcceptor knowing either exists.
-    [[nodiscard]] inline Lazy<IoSocket> AcceptAsync(IoAcceptor& acc,
-                                                    CancelToken token = CancelToken{}) {
-        if (co_await AcquireAsyncCancellable(acc.Ready()) == WaitResult::Cancelled)
-            co_return 0;
-        (void)token;
-        co_return acc.TryTake();
+    class AcceptAwaiter {
+    public:
+        AcceptAwaiter(IoAcceptor& a, CancelToken t) noexcept : acc_(a), token_(t) {}
+        AcceptAwaiter(const AcceptAwaiter&) = delete;
+        AcceptAwaiter& operator=(const AcceptAwaiter&) = delete;
+
+        bool await_ready() const noexcept { return false; }
+
+        template <typename P>
+        bool await_suspend(std::coroutine_handle<P> h) {
+            Task* t = detail::ArmResume(h);
+            return !acc_.TakeOrQueue(&w_, &sock_, t, token_);
+        }
+
+        [[nodiscard]] IoSocket await_resume() const noexcept { return sock_; }
+
+    private:
+        IoAcceptor&    acc_;
+        CancelToken    token_;
+        // MEMBERS, so the parked waiter lives in the coroutine frame -- alive for exactly as long as
+        // the wait, with nothing allocated and no wait primitive involved.
+        IoAcceptWaiter w_{};
+        IoSocket       sock_ = 0;
+    };
+
+    [[nodiscard]] inline AcceptAwaiter AcceptAsync(IoAcceptor& acc,
+                                                   CancelToken token = CancelToken{}) noexcept {
+        return AcceptAwaiter(acc, token);
     }
 
     // ---- scatter/gather -------------------------------------------------------------------------
