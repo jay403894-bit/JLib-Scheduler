@@ -3,6 +3,107 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 3.0.0 - 2026-08-24
+
+**A MAJOR because public API was REMOVED, not because the internals changed.** Downstream will not
+compile until it moves to `SetSlabSizes`, and that is the intended outcome -- see the first item.
+
+### [CRITICAL] `SetTaskSlabSize` / `TaskSlabSize` are gone. Use `SetSlabSizes`.
+
+The slab is now three pools -- 256, 128 and 64 bytes -- and a setter named for "the task slab" that
+configures **one of them** is worse than no setter at all, because it looks like it worked. It was
+removed rather than deprecated or shimmed on purpose: a removed symbol is a compile error at every
+call site, which is exactly the review this change wants, while a shim would have silently left two
+pools at their defaults.
+
+```cpp
+// before
+JLib::TaskScheduler::SetTaskSlabSize(1 << 20);
+
+// after -- state all three
+JLib::TaskScheduler::SetSlabSizes({ /*big*/ 1 << 20, /*mid*/ 1 << 17, /*small*/ 1 << 17 });
+```
+
+The sizes used to be derived from one number by fixed divisors (`slots / 8`). That was defensible
+while coroutine frames were the only user of the small classes and stopped being defensible the
+moment anything else used them. **It is not hypothetical: routing Tasks and TaskNodes into the
+64-byte class immediately evicted coroutine frames from it** -- the pool sized `slots / 8` for
+frames could not also hold the tasks, so frames quietly fell back to 256-byte slots and the class
+stopped doing the job it was built for. Nothing failed. It just silently undid itself.
+
+One number cannot size three pools, because memory in one pool cannot serve a request from another.
+That is the price of size classes, and the right response is to let the caller state the split.
+
+**Which pool to size against what:** a coroutine frame FALLS BACK -- to a larger class, then to
+global `new` -- so an undersized `small` costs memory and never fails. A `Task` returns `nullptr`
+and a `TaskNode`'s constructor THROWS. Size `big` for the work that must not fail.
+
+### [CRITICAL] `TaskAllocator::Capacity()` now reports the TOTAL across all three pools
+
+It returned `big` alone, which had the same flaw as the setter above: a name that says "the
+allocator's capacity" while answering for a third of it. A `Task` can be served by any pool, so the
+bound on how many can exist is their sum. `BigCapacity()`, `MidCapacity()` and `SmallCapacity()`
+give the split.
+
+This was caught by the slab-size test asserting the wrong contract -- it compared against 37 while
+the allocator could legitimately hand out 111.
+
+### Tasks and TaskNodes use the size classes
+
+`CreateTask` and `CreateNode` allocate through `AllocSized`, which picks the smallest class that
+fits from a **compile-time constant** -- `sizeof(Task)` for the function-pointer overload,
+`sizeof(LambdaTask<F>)` for the template. There is no runtime type discrimination and no dependence
+on knowing the size distribution in advance: a big lambda still lands in the 256-byte class.
+
+  - A capture-free task is **64 bytes instead of 256**.
+  - **`TaskNode` was packed from 72 bytes to 56** so it fits the 64-byte class. Its `LogicType` was
+    stored as a full `int` and five separate `bool`s plus two `uint8_t`s sat scattered with padding
+    between them; they are now one bitfield block, the same shape `Task`'s flags already used. A
+    `static_assert(sizeof(TaskNode) <= 64)` holds it there.
+    **Shaping the struct was preferred over adding a 96-byte class.** Adding a class is cheap now
+    that the pool is a template, but it is not free -- each class is its own reservation sized for
+    its own peak. Fitting an existing one costs nothing at all.
+  - A 64-node DAG chain holds **21.5 KB instead of 33.8 KB** for the same structure.
+
+Defaults are unchanged, so **no workload loses capacity**: small-fitting tasks opportunistically use
+the 64-byte pool and everything beyond it falls through exactly as before. Applications that know
+their profile can now claim the rest with `SetSlabSizes`.
+
+**[CRITICAL] `TaskAllocator::Free` now routes by ADDRESS.** Tasks and nodes can live in any pool, and
+returning one to the wrong pool's free list is immediate heap corruption -- the failure class this
+allocator already has history with. Doing it centrally rather than at each call site is deliberate:
+an audit found **nine task-free sites across four files** (`Thread.cpp` x3, `TaskScheduler.cpp` x4,
+`TaskDAG.cpp`, `Coroutine.h`), several of which a first pass missed, and any `Free(task)` added later
+would have been a silent corruption waiting to happen. Correct by construction beats correct by
+vigilance on a path that crashes days away from its cause. Measured: no throughput change.
+
+### `JLIBSCHED_TASK_STATS=ON` -- task-size histogram
+
+Records `sizeof` at every `CreateTask` in 32-byte buckets and prints the class-boundary arithmetic
+for candidate class sets. The arithmetic is in the report rather than left to the reader because
+doing it by hand is where the earlier frame-class decision nearly went wrong: `128 + 256` looks like
+the obvious "cover everything" split and is measurably **worse** than `64 + 256`, which is invisible
+until the numbers are lined up.
+
+**Run it on a real application, not the benches.** Every task in `bench/` is a capture-free function
+pointer, so a bench-derived histogram is maximally flattering and says nothing about whether real
+`LambdaTask<F>` sizes cluster near 64 or sprawl toward 256.
+
+### Measurements
+
+No regression on any path this touched:
+
+| | 2.15.0 | 3.0.0 |
+|---|---|---|
+| throughput/1p | 0.88 M/s | 1.19 M/s |
+| throughput/bt | 14.56 M/s | 15.16 M/s |
+| throughput/mp | 6.33 M/s | 6.49 M/s |
+| frame DAG | 22.13 us/graph | 22.15 us/graph |
+| DAG build | 6.7 ns/edge | 6.3 ns/edge |
+| DAG exec (2048x64) | 1.575 us/node | 1.558 us/node |
+
+Cross-binary, so read them as "no regression" rather than as wins.
+
 ## 2.15.0 - 2026-08-24
 
 **`Event::SignalOne()` -- wake one waiter instead of all of them.** This could not be built before,

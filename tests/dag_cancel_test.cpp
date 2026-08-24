@@ -45,7 +45,7 @@ int main() {
     // Raised from 8,192: the sections below churn 400 DAGs whose nodes are EBR-RETIRED, so
     // reclamation lags allocation and 8,192 ran genuinely dry partway through. Still small enough
     // that a leaked task per cancelled node exhausts it, which is what the slab check needs.
-    JLib::TaskScheduler::SetTaskSlabSize(32768);
+    JLib::TaskScheduler::SetSlabSizes({ 32768, 4096, 4096 });
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
     std::printf("TaskDAG cancellation -- workers=%zu\n\n", sched.GetWorkerCount());
@@ -184,6 +184,7 @@ int main() {
         const int kNodes = 64;
 
         const long long base = alloc->LiveCount();
+        const long long smallBase = alloc->SmallLiveCount();
         {
             JLib::TaskDAG dag(sched);
             JLib::WaitGroup wg;
@@ -198,7 +199,11 @@ int main() {
                 prev = n;
             }
 
-            const long long held = alloc->LiveCount() - base;
+            // BOTH pools: the node lives in the 64-byte class and its task in the 256-byte one,
+            // so a single-pool number would silently under-report and the check would pass for
+            // the wrong reason.
+            const long long held = (alloc->LiveCount() - base)
+                                 + (alloc->SmallLiveCount() - smallBase);
             std::printf("    slab slots for %d nodes + %d edges: %lld\n", kNodes, kNodes - 1, held);
             // One slot per node, one per task, plus one CHUNK slot per 16 edges -- chunks are
             // cut from the slab, not the heap, so the per-edge cost stays inside the single
@@ -541,6 +546,7 @@ int main() {
         }
 
         const long long base = alloc->LiveCount();
+        const long long smallBase = alloc->SmallLiveCount();
 
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);

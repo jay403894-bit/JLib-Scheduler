@@ -1644,9 +1644,13 @@ static bool g_lazyTaskSlab = false;
 void TaskScheduler::SetLazyTaskSlab(bool on) { g_lazyTaskSlab = on; }
 bool TaskScheduler::LazyTaskSlabEnabled()    { return g_lazyTaskSlab; }
 
-static size_t g_taskSlabSize = 1024 * 1024;
-void TaskScheduler::SetTaskSlabSize(size_t slots) { g_taskSlabSize = slots; }
-size_t TaskScheduler::TaskSlabSize()              { return g_taskSlabSize; }
+// SetTaskSlabSize/TaskSlabSize were REMOVED in 3.0.0 rather than kept as shims. A setter named for
+// "the task slab" that configures ONE of three pools is worse than no setter at all -- it looks
+// like it worked. A removed symbol is a compile error at every call site, which is exactly the
+// review this change wants; a shim would have silently left two pools at defaults.
+static JLib::TaskScheduler::SlabSizes g_slabSizes{};
+void TaskScheduler::SetSlabSizes(const SlabSizes& s) { g_slabSizes = s; }
+JLib::TaskScheduler::SlabSizes TaskScheduler::CurrentSlabSizes() { return g_slabSizes; }
 
 // Defaults match what StartPool always computed inline (coreCount * 64, coreCount * 8) before this
 // existed. Not validated against zero or anything else -- same trust-the-caller stance every other
@@ -1660,9 +1664,74 @@ void TaskScheduler::SetFiberBudget(size_t standardPerWorker, size_t heavyPerWork
 }
 size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWorker; }
 size_t TaskScheduler::HeavyFibersPerWorker()    { return g_heavyFibersPerWorker; }
+#if defined(JLIBSCHED_TASK_STATS)
+// Prints the task-size histogram AND the class-boundary arithmetic.
+//
+// The arithmetic is here rather than left to the reader because doing it by hand is where the
+// frame-class decision nearly went wrong: 128+256 LOOKS like the obvious "cover everything" split
+// and is actually WORSE than 64+256, which is not visible until the numbers are lined up. Anything
+// that has to be recomputed by hand every time will eventually be recomputed wrong.
+//
+// CONSERVATIVE BY CONSTRUCTION: each bucket is charged at its UPPER bound, so a task somewhere
+// inside a bucket is treated as the largest it could be. That understates the saving rather than
+// overstating it -- the reported win is a floor, not a hope.
+void JLib::detail::ReportTaskSizes() {
+	uint64_t bucket[kTaskSizeBuckets] = {};
+	uint64_t total = 0, maxSize = 0, totalBytes = 0;
+	for (size_t s = 0; s < kTaskSizeShards; ++s) {
+		for (size_t b = 0; b < kTaskSizeBuckets; ++b) {
+			const uint64_t v = g_taskSizeShards[s].bucket[b].load(std::memory_order_relaxed);
+			bucket[b] += v;
+			total += v;
+		}
+		totalBytes += g_taskSizeShards[s].totalBytes.load(std::memory_order_relaxed);
+		const uint64_t m = g_taskSizeShards[s].maxSize.load(std::memory_order_relaxed);
+		if (m > maxSize) maxSize = m;
+	}
+	if (!total) { std::printf("  task sizes: nothing recorded\n"); return; }
+
+	std::printf("  tasks created: %llu, largest %llu bytes, mean %.1f bytes\n",
+		(unsigned long long)total, (unsigned long long)maxSize, double(totalBytes) / double(total));
+	static const char* kLabel[kTaskSizeBuckets] = {
+		"  <=64", "  <=96", " <=128", " <=160", " <=192", " <=224", " <=256", "  >256" };
+	for (size_t b = 0; b < kTaskSizeBuckets; ++b) {
+		if (!bucket[b]) continue;
+		std::printf("    %s  %10llu  (%5.1f%%)\n", kLabel[b],
+			(unsigned long long)bucket[b], 100.0 * double(bucket[b]) / double(total));
+	}
+
+	// Candidate class sets. A task is charged the smallest class that fits its bucket's upper bound;
+	// anything that fits no class is charged 256 (today's behaviour).
+	struct Candidate { const char* name; size_t cls[4]; size_t n; };
+	static const Candidate kCandidates[] = {
+		{ "256 only (today)",   { 256, 0, 0, 0 },     1 },
+		{ "64 + 256",           { 64, 256, 0, 0 },    2 },
+		{ "128 + 256",          { 128, 256, 0, 0 },   2 },
+		{ "64 + 128 + 256",     { 64, 128, 256, 0 },  3 },
+		{ "64 + 96 + 128 + 256",{ 64, 96, 128, 256 }, 4 },
+	};
+	std::printf("  bytes per task, by class set (charged at each bucket's upper bound):\n");
+	for (const Candidate& c : kCandidates) {
+		double bytes = 0;
+		for (size_t b = 0; b < kTaskSizeBuckets; ++b) {
+			if (!bucket[b]) continue;
+			const size_t sz = kTaskSizeEdge[b] ? kTaskSizeEdge[b] : 256;
+			size_t charged = 256;
+			for (size_t i = 0; i < c.n; ++i)
+				if (sz <= c.cls[i]) { charged = c.cls[i]; break; }
+			bytes += double(charged) * double(bucket[b]);
+		}
+		const double per = bytes / double(total);
+		std::printf("    %-22s %6.1f B/task   (%.2fx of today)\n", c.name, per, per / 256.0);
+	}
+	std::printf("  NOTE: bench tasks are capture-free, so this is only meaningful run on a REAL app.\n");
+}
+#endif
+
 Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, TaskType type, CorePref corePref) {
-	void* mem = taskAllocator.Alloc();
+	void* mem = taskAllocator.AllocSized(sizeof(Task));   // a bare Task is exactly 64 B
 	if (!mem) return nullptr;
+	detail::RecordTaskSize(sizeof(Task));   // exactly 64 -- a quarter of the slot it just took
 	Task* t = ::new (mem) Task(fn, data, hipri, size);
 	t->type = type;
 	t->corePref = corePref;

@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "2.15.0")
+set(JLIBSCHED_VERSION "3.0.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -527,6 +527,14 @@ endif()
 #
 # INTERFACE, not PRIVATE: it changes code in Coroutine.h, which the library never includes and
 # consumers do. Putting it on the library's own compile line would do nothing at all.
+option(JLIBSCHED_TASK_STATS "Record a task-size histogram at CreateTask (diagnostic; run it on a real app)" OFF)
+if(JLIBSCHED_TASK_STATS)
+    # PUBLIC: CreateTask's function-pointer overload lives in the library's own TaskScheduler.cpp,
+    # so an INTERFACE-only define would count the template half and silently miss the rest.
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_TASK_STATS=1)
+    message(STATUS "JLib::Scheduler: task-size histogram ENABLED (diagnostic)")
+endif()
+
 option(JLIBSCHED_ALLOC_STATS "Count slab refill/flush and shared-tier lock contention (diagnostic)" OFF)
 if(JLIBSCHED_ALLOC_STATS)
     # PUBLIC, not INTERFACE. The library's OWN sources allocate and free (Thread.cpp returns every

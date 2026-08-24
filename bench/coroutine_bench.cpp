@@ -186,7 +186,7 @@
 // The 16-thread regression is accepted knowingly, and the escape hatch is runtime rather than
 // compile-time: SetCoroFramePooling(false). The cost that needs documenting louder than the
 // regression is CAPACITY -- each spawned coroutine now takes TWO slab slots, so a slab sized for N
-// tasks holds N/2 concurrent coroutines. See TaskScheduler::SetTaskSlabSize.
+// tasks holds N/2 concurrent coroutines. See TaskScheduler::SetSlabSizes.
 
 #include "TaskScheduler.h"
 #include "Coroutine.h"

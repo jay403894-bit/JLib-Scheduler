@@ -37,6 +37,73 @@ namespace JLib {
 	class Thread;
 
 	// How a cancellable wait ended.
+	namespace detail {
+		// TASK SIZE HISTOGRAM -- opt-in, -DJLIBSCHED_TASK_STATS=ON.
+		//
+		// THE QUESTION. TaskAllocator::SLOT is 256 because it must fit the LARGEST LambdaTask<F>
+		// (see the static_assert in CreateTask). But sizeof(Task) is 64, and a capture-free task is
+		// exactly that -- so it occupies a quarter of the slot it is given. Coroutine frames had the
+		// same shape and a 64-byte class turned out to be worth 4x the memory on 75% of them; the
+		// task path is the same question on a far higher volume (292,565 tasks vs 0 frames in the
+		// DAG scaling bench).
+		//
+		// WHY THIS CANNOT BE ANSWERED FROM THE BENCHES. Every task in bench/ is a capture-free
+		// function pointer or an empty lambda, so a bench-derived histogram is maximally flattering
+		// and would argue for a 64-byte class on evidence that says nothing about real code. The
+		// distribution that matters comes from an APPLICATION -- Game01, the physics step, the
+		// renderer's per-cell submits -- where lambdas actually capture. Run it there before
+		// choosing anything.
+		//
+		// 32-byte buckets rather than the coroutine histogram's octaves, because the decision here
+		// is exactly WHERE to put a class boundary, and 64/128/256 would beg that question.
+		//
+		// Sharded per thread for the same reason every other counter in this library is: a shared
+		// atomic on the creation path would manufacture contention and perturb the thing being
+		// measured. This one is on the HOT path -- every CreateTask -- so it matters more here than
+		// anywhere else.
+#if defined(JLIBSCHED_TASK_STATS)
+		inline constexpr size_t kTaskSizeBuckets = 8;
+		inline constexpr size_t kTaskSizeShards = 64;
+
+		struct alignas(platform::kCacheLine) TaskSizeShard {
+			std::atomic<uint64_t> bucket[kTaskSizeBuckets]{};
+			std::atomic<uint64_t> maxSize{ 0 };
+			std::atomic<uint64_t> totalBytes{ 0 };
+		};
+		inline TaskSizeShard g_taskSizeShards[kTaskSizeShards];
+		inline std::atomic<size_t> g_taskSizeNext{ 0 };
+
+		inline TaskSizeShard& TaskSizeSlot() {
+			static thread_local TaskSizeShard* s = [] {
+				const size_t n = g_taskSizeNext.fetch_add(1, std::memory_order_relaxed);
+				return &g_taskSizeShards[n % kTaskSizeShards];
+			}();
+			return *s;
+		}
+
+		// Upper bound of each bucket, so bucket i covers (kTaskSizeEdge[i-1], kTaskSizeEdge[i]].
+		inline constexpr size_t kTaskSizeEdge[kTaskSizeBuckets] = { 64, 96, 128, 160, 192, 224, 256, 0 };
+
+		inline void RecordTaskSize(size_t n) {
+			TaskSizeShard& s = TaskSizeSlot();
+			size_t b = kTaskSizeBuckets - 1;                       // last bucket is "> 256"
+			for (size_t i = 0; i + 1 < kTaskSizeBuckets; ++i)
+				if (n <= kTaskSizeEdge[i]) { b = i; break; }
+			// Sole writer per shard in the common case, so load/store rather than fetch_add -- the
+			// same trick TaskAllocator::liveAdd uses, and for the same measured reason.
+			s.bucket[b].store(s.bucket[b].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			s.totalBytes.store(s.totalBytes.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+			uint64_t prev = s.maxSize.load(std::memory_order_relaxed);
+			while (n > prev && !s.maxSize.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {}
+		}
+
+		void ReportTaskSizes();
+#else
+		inline void RecordTaskSize(size_t) {}
+		inline void ReportTaskSizes() {}
+#endif
+	}
+
 	enum class WaitResult : uint8_t {
 		Ok,          // acquired the lock / took the permit
 		Cancelled,   // the scope was cancelled; NOTHING WAS ACQUIRED -- do not Unlock or Signal
@@ -583,8 +650,39 @@ namespace JLib {
 		// look after themselves.
 		//
 		// JLib::SetCoroFramePooling(false) opts frames back out to global new entirely.
-		static void SetTaskSlabSize(size_t slots);
-		static size_t TaskSlabSize();
+
+		// ---- per-class slab sizing ---------------------------------------------------------------
+		//
+		// The slab is THREE pools -- 256, 128 and 64 bytes -- and their sizes used to be derived from
+		// the one task-slab number by fixed divisors (`slots / 8` each). That was defensible while
+		// coroutine frames were the only user of the small classes, and it stops being defensible the
+		// moment anything else uses them: a divisor chosen for one consumer silently starves the next.
+		//
+		// It is not hypothetical. Routing Tasks and TaskNodes into the 64-byte class was tried and
+		// immediately evicted coroutine frames from it -- the pool sized `slots / 8` for frames could
+		// not also hold the tasks, so frames quietly fell back to 256-byte slots and the class stopped
+		// doing the job it was built for. Nothing failed; it just silently undid itself.
+		//
+		// So the sizes are EXPLICIT. One number cannot size three pools, because memory in one pool
+		// cannot serve a request from another -- that is the price of size classes, and the right
+		// response is to let the caller state the split rather than to guess a divisor.
+		struct SlabSizes {
+			size_t big   = 1024 * 1024;   // 256-byte slots: Tasks, TaskNodes, DAG edge chunks
+			size_t mid   = 1024 * 1024 / 8;   // 128-byte slots: larger coroutine frames
+			size_t small = 1024 * 1024 / 8;   // 64-byte slots:  most coroutine frames
+		};
+
+		// PRE-INIT ONLY: the allocator is constructed with these
+		// when the scheduler is, so a call after Init() does nothing.
+		//
+		// THE FAILURE MODES STILL DIFFER PER CLASS, and that is what to size against. A coroutine
+		// frame FALLS BACK -- to a larger class, then to global new -- so an undersized `small`
+		// costs memory and never fails. A Task returns nullptr and a TaskNode's constructor THROWS,
+		// so `big` is the one whose exhaustion is a real error. Size `big` for tasks and nodes; size
+		// `small` and `mid` for the peak number of coroutine frames live at once, which is bounded by
+		// how many you actually spawn, not by anything the library controls.
+		static void SetSlabSizes(const SlabSizes& sizes);
+		static SlabSizes CurrentSlabSizes();
 
 		// Fibers PER WORKER available to be held by a SUSPENDED task at once -- not a cap on tasks
 		// in flight, since only a task that actually suspends holds one. Defaults to 64 standard +
@@ -709,8 +807,15 @@ namespace JLib {
 		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			static_assert(sizeof(L) <= TaskAllocator::SLOT, "lambda too big for a slot");
+			// Concrete size is a compile-time constant here, which is also why size-classing the
+			// task path would be nearly free: the class could be picked at compile time.
+			detail::RecordTaskSize(sizeof(L));
 			static_assert(alignof(L) <= 16, "lambda over-aligned for the slot");
-			void* mem = taskAllocator.Alloc();
+
+			// sizeof(L) is a compile-time constant, so the class is chosen at compile time and is correct
+			// for ANY capture size -- a big lambda still lands in the 256-byte class. Nothing here
+			// depends on knowing the size distribution in advance.
+			void* mem = taskAllocator.AllocSized(sizeof(L));
 			if (!mem) return static_cast<L*>(nullptr);
 			L* t = ::new (mem) L(std::forward<F>(f));
  			t->hiPri = hipri;
@@ -900,9 +1005,11 @@ namespace JLib {
 		// -----------------------------------------------
 
 		static TaskScheduler* instance;
-		// 1M tasks by default; see SetTaskSlabSize to change it. Eager unless SetLazyTaskSlab(true)
+		// 1M tasks by default; see SetSlabSizes to change it. Eager unless SetLazyTaskSlab(true)
 		// was called before Init -- see that setter for why the default is the expensive one.
-		TaskAllocator taskAllocator{ TaskSlabSize(), LazyTaskSlabEnabled() };
+		// Built from the per-class sizes -- see SlabSizes.
+		TaskAllocator taskAllocator{ CurrentSlabSizes().big, CurrentSlabSizes().mid,
+		                             CurrentSlabSizes().small, LazyTaskSlabEnabled() };
 
 	public:
 		// ABI LAYOUT CANARY. Not used by anything at runtime; its OFFSET is the payload.

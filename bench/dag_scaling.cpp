@@ -103,7 +103,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Big enough for the widest shape below: nodes + tasks + edge chunks, with headroom for the
     // EBR lag that retires completed nodes rather than freeing them immediately.
-    JLib::TaskScheduler::SetTaskSlabSize(1 << 20);
+    JLib::TaskScheduler::SetSlabSizes({ 1 << 20, 1 << 17, 1 << 17 });
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
 
@@ -133,6 +133,14 @@ int main() {
 
     std::printf("\nslab shared-tier contention (needs -DJLIBSCHED_ALLOC_STATS=ON):\n");
     JLib::TaskAllocator::ReportStats();
+    std::printf("\ntask sizes (needs -DJLIBSCHED_TASK_STATS=ON):\n");
+    JLib::detail::ReportTaskSizes();
+    // Fixed-size slab consumers, printed because the histogram above only covers CreateTask.
+    // The allocator counter reports far more allocations than tasks created: the rest are these,
+    // and they take a full 256-byte slot each just as a bare Task does.
+    std::printf("  fixed-size slab users: Task %zu B, TaskNode %zu B, DagEdge %zu B  (slot is %zu B)\n",
+                sizeof(JLib::Task), sizeof(JLib::TaskNode), sizeof(JLib::DagEdge),
+                JLib::TaskAllocator::SLOT);
 
     std::printf("\nread DOWN each block: if exec us/node is flat as fanout grows, walking dependents\n");
     std::printf("is invisible next to dispatch and edge layout is not worth reopening.\n");

@@ -467,7 +467,7 @@ void Thread::Worker() {
 				}
 				scheduler->CleanupTaskMetadata(task_to_run);
 				DestroyTask(task_to_run);
-				scheduler->GetAllocator()->Free(task_to_run);
+				scheduler->GetAllocator()->FreeSized(task_to_run);
 				task_to_run = nullptr;
 				if (EpochManager::Instance().ShouldSelfReclaim()) EpochManager::Instance().Tick();
 				ready.store(true, std::memory_order_release);
@@ -520,7 +520,7 @@ void Thread::Worker() {
 
 					scheduler->CleanupTaskMetadata(task_to_run);
 					DestroyTask(task_to_run);
-					scheduler->GetAllocator()->Free(task_to_run);
+					scheduler->GetAllocator()->FreeSized(task_to_run);
 				}
 				else {
 					// Coroutine: the task may already be freed, so nothing below may touch it.
@@ -624,7 +624,7 @@ void Thread::Worker() {
 
 				scheduler->CleanupTaskMetadata(task_to_run);
 				DestroyTask(task_to_run);
-				scheduler->GetAllocator()->Free(task_to_run);
+				scheduler->GetAllocator()->FreeSized(task_to_run);
 
 				// No core release here: the is_handling_fork clear below this whole block covers the
 				// fiber path for PushImmediate. The isForked clear that used to sit here went with

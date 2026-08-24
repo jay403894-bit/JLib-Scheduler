@@ -138,7 +138,7 @@ namespace JLib {
     //
     // CAPACITY, AND IT IS THE THING TO ACTUALLY WATCH: each spawned coroutine now consumes TWO slab
     // slots -- its Task and its frame. A slab sized for N tasks holds N/2 concurrent coroutines. See
-    // TaskScheduler::SetTaskSlabSize. Oversized frames (>256 bytes) fall through to global new rather
+    // TaskScheduler::SetSlabSizes. Oversized frames (>256 bytes) fall through to global new rather
     // than failing, so an unusually fat coroutine is slower, never broken.
     //
     // WHY IT IS RUNTIME-SWITCHABLE RATHER THAN A BUILD FLAG: SlotInSlab tells a pooled pointer from a

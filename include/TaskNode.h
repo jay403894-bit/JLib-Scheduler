@@ -55,13 +55,13 @@ namespace JLib {
         // How this node decides it's ready, given its direct predecessors:
         //   AND -> fire once ALL predecessors finish (dependencies_left counts down to 0)
         //   OR  -> fire on the FIRST predecessor (the `submitted` exchange dedups the rest)
-        enum LogicType { AND, OR };
-        LogicType gateType = AND;
+        enum LogicType : uint8_t { AND, OR };
+        LogicType gateType   : 1;
 
         // A gate has no task: when its trigger fires it propagates INSTANTLY (runs its own
         // OnTaskFinished) instead of scheduling work. Compose gates to build arbitrary
         // boolean expressions, e.g. (A && B) || C.
-        bool isGate = false;
+        uint8_t   isGate     : 1;
 
         // An EXTERNAL node also has no task, but unlike a gate it does NOT complete when fired --
         // it waits to be told, by TaskDAG::SignalExternal, from whatever finishes the outside work
@@ -71,7 +71,7 @@ namespace JLib {
         // 64KB stack for the whole wait. A thousand pending I/O operations that way is 64 MB of
         // stacks and a blown fiber budget; as external nodes it is a few hundred bytes and no
         // fibers at all. It also works from the MAIN thread, where suspension is impossible.
-        bool isExternal = false;
+        uint8_t   isExternal : 1;
 
         // Arm/signal rendezvous for an external node. Fire() sets ARMED when the node's
         // dependencies are satisfied; SignalExternal sets SIGNALLED when the outside work
@@ -95,23 +95,43 @@ namespace JLib {
         DagEdge* firstEdge = nullptr;
         std::atomic<int> dependencies_left;
         std::atomic<bool> submitted{ false };
-        uint8_t cpuID = 0;
-        uint8_t priority = 0;
-        bool isLocal = true;
-        bool isFork = false;
+        uint8_t cpuID    : 8;
+        uint8_t priority : 8;
+        uint8_t isLocal  : 1;
+        uint8_t isFork   : 1;
         // Runs via TaskScheduler::PushMain (drained by ProcessMainThread) instead of the
         // worker pool. Whoever waits on a WaitGroup covering this node's completion MUST use
         // WaitForMain, not WaitFor -- see WaitForMain's declaration comment.
-        bool isMain = false;
+        uint8_t isMain   : 1;
 
         // Takes the allocator purely to keep the call sites unchanged; the node itself no
         // longer allocates anything. It used to make a SECOND slab allocation here for the
         // dependents list, which had its own null check because an exhausted pool
         // placement-new'd a LockFreeList at address nullptr ("Access violation writing
         // location 0x0"). That whole failure mode is gone with the allocation.
+        // BITFIELDS ARE INITIALIZED HERE, NOT AT THE DECLARATION. C++17 does not allow a default
+        // member initializer on a bitfield (that arrived in C++20), and the core of this library
+        // is C++17 -- Task.h carries the same note on its flag block for the same reason.
+        //
+        // Listed in DECLARATION ORDER so the initialization order is the written one.
         explicit TaskNode(Task* t, TaskAllocator&)
-            : task(t), dependencies_left(0) {}
+            : task(t)
+            , gateType(AND), isGate(0), isExternal(0)
+            , dependencies_left(0)
+            , cpuID(0), priority(0), isLocal(1), isFork(0), isMain(0) {}
 
         // No destructor: nothing here owns memory any more. Edges belong to the DAG.
     };
+
+    // Packed to fit the 64-byte class. It was 72 bytes -- a LogicType stored as a full int plus
+    // five separate bools and two uint8_t members, scattered across the struct with padding
+    // between them -- so it took a 256-byte slot and used 28% of it. The DAG scaling bench
+    // allocates roughly as many nodes as tasks, so this was not a rounding error.
+    //
+    // Fitting the EXISTING class was preferred over adding a 96-byte one. Adding a size class is
+    // cheap now that the pool is a template, but it is not free: each class is its own
+    // reservation sized for its own peak, and memory in one cannot serve a request from another.
+    // Shaping a struct to fit a class costs nothing at all.
+    static_assert(sizeof(TaskNode) <= 64,
+        "TaskNode must fit the 64-byte slab class -- see the packing note above");
 }

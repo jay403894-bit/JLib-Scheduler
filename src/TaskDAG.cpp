@@ -43,7 +43,12 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
     if (t && t->cancelToken == CancelToken::kNone) t->cancelToken = scope.Token().Raw();
 
     // Allocate the node memory from the scheduler's allocator
-    void* mem = scheduler.GetAllocator()->Alloc();
+
+
+    // TaskNode is 56 bytes -- the 64-byte class, not a 256-byte slot. It falls through to a
+    // larger class if the small pool is dry, so an undersized pool costs memory, not failure.
+    // AllocEdge keeps plain Alloc(): a chunk is deliberately one FULL slot, 16 edges wide.
+    void* mem = scheduler.GetAllocator()->AllocSized(sizeof(TaskNode));
     if (!mem) return nullptr;
 
     // Use placement new
@@ -90,7 +95,12 @@ TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
 }
 
 TaskNode* TaskDAG::CreateGate(TaskNode::LogicType type) {
-    void* mem = scheduler.GetAllocator()->Alloc();
+
+
+    // TaskNode is 56 bytes -- the 64-byte class, not a 256-byte slot. It falls through to a
+    // larger class if the small pool is dry, so an undersized pool costs memory, not failure.
+    // AllocEdge keeps plain Alloc(): a chunk is deliberately one FULL slot, 16 edges wide.
+    void* mem = scheduler.GetAllocator()->AllocSized(sizeof(TaskNode));
     if (!mem) return nullptr;
     // A gate carries no task; it just propagates readiness. Same allocator/list as a node.
     TaskNode* node = new (mem) TaskNode(nullptr, *scheduler.GetAllocator());
@@ -101,7 +111,12 @@ TaskNode* TaskDAG::CreateGate(TaskNode::LogicType type) {
 }
 
 TaskNode* TaskDAG::CreateExternalNode() {
-    void* mem = scheduler.GetAllocator()->Alloc();
+
+
+    // TaskNode is 56 bytes -- the 64-byte class, not a 256-byte slot. It falls through to a
+    // larger class if the small pool is dry, so an undersized pool costs memory, not failure.
+    // AllocEdge keeps plain Alloc(): a chunk is deliberately one FULL slot, 16 edges wide.
+    void* mem = scheduler.GetAllocator()->AllocSized(sizeof(TaskNode));
     if (!mem) return nullptr;
     // Taskless like a gate, and allocated from the same slab -- but Fire() arms it instead of
     // completing it. See the declaration for the contract and TaskNode::extBits for the rendezvous.
@@ -181,7 +196,10 @@ bool TaskDAG::Submit() {
         for (auto* n : nodes) {
             Task* t = n->task;
             n->~TaskNode();
-            scheduler.GetAllocator()->Free(n);
+            // FreeSized, NOT Free: the node may have come from the 64-byte pool, and returning it
+            // to the 256-byte pool's free list is immediate heap corruption. Routed by ADDRESS, so
+            // it is correct wherever AllocSized actually placed it.
+            scheduler.GetAllocator()->FreeSized(n);
             if (t) {
                 if (t->waitGroup) {
                     const int old = t->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
@@ -189,7 +207,7 @@ bool TaskDAG::Submit() {
                         t->waitGroup->WakeAll();
                 }
                 t->~Task();
-                scheduler.GetAllocator()->Free(t);
+                scheduler.GetAllocator()->FreeSized(t);
             }
         }
         nodes.clear();
@@ -302,7 +320,8 @@ void TaskDAG::NodeDeleter(void* p) {
     // built with: CreateNode/CreateGate/CreateExternalNode all pass *scheduler.GetAllocator().
     TaskAllocator* a = TaskScheduler::Instance().GetAllocator();
     n->~TaskNode();
-    a->Free(n);
+    // FreeSized for the same reason as the cycle path above -- see there.
+    a->FreeSized(n);
 }
 
 
@@ -334,7 +353,7 @@ void TaskDAG::DisposeUnexecutedTask(TaskNode* node) {
     }
     scheduler.CleanupTaskMetadata(t);
     DestroyTask(t);
-    scheduler.GetAllocator()->Free(t);
+    scheduler.GetAllocator()->FreeSized(t);
 }
 
 void TaskDAG::Fire(TaskNode* node, TaskNode::Outcome outcome) {

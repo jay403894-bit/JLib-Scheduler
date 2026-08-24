@@ -177,7 +177,10 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Small on purpose -- see the slab-accounting section. The default 1M slots would swallow any
     // leak this test could produce, so the test would pass whether or not the design is correct.
-    JLib::TaskScheduler::SetTaskSlabSize(4096);
+    // small is task-scale, not frame-scale: TaskNodes live in the 64-byte class too now, and this
+    // suite builds DAGs as well as coroutines. 512 was sized for frames alone and the two consumers
+    // crowded each other -- 45 of 200 frames were pushed out to 256-byte slots.
+    JLib::TaskScheduler::SetSlabSizes({ 4096, 512, 4096 });
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
     std::printf("coroutine mode -- workers=%zu\n\n", sched.GetWorkerCount());

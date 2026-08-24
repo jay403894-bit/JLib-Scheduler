@@ -55,26 +55,50 @@ namespace JLib {
         SlabPool<SMALL_SLOT> small;
 
     public:
-        // The auxiliary classes are sized off the task slab rather than given their own tunables:
-        // one number to reason about. An eighth each is far above anything measured -- peak 20,000
-        // live frames in the coroutine bench against 128,000 here at the default 1M task slots -- and
-        // exhaustion is not a failure anyway, since AllocSized falls through to the next class up.
-        explicit TaskAllocator(std::size_t slots, bool lazy = false)
-            : big(slots, lazy)
-            , mid(slots / 8, lazy)
-            , small(slots / 8, lazy) {
+        // EXPLICIT PER-CLASS SIZES rather than divisors off one number. Memory in one pool
+        // cannot serve a request from another, so a single figure cannot size three pools
+        // without either wasting memory or starving a consumer -- see TaskScheduler::SlabSizes
+        // for the case that proved it (tasks routed into the 64-byte class silently evicted
+        // coroutine frames from a pool sized `slots / 8` for frames alone).
+        explicit TaskAllocator(std::size_t bigSlots, std::size_t midSlots,
+                               std::size_t smallSlots, bool lazy = false)
+            : big(bigSlots, lazy)
+            , mid(midSlots, lazy)
+            , small(smallSlots, lazy) {
         }
 
-        TaskAllocator(const TaskAllocator&) = delete;
+        // Convenience for callers with one number, preserving the historical derivation.
+        explicit TaskAllocator(std::size_t slots, bool lazy = false)
+            : TaskAllocator(slots, slots / 8, slots / 8, lazy) {
+        }
         TaskAllocator& operator=(const TaskAllocator&) = delete;
 
         // ---- the Task path, unchanged --------------------------------------------------------
         // Always the 256-byte class. Tasks are a fixed size and there is nothing to choose.
         void* Alloc()                     { return big.Alloc(); }
-        void  Free(void* slot)            { big.Free(slot); }
+        // ROUTES BY ADDRESS, and this is a safety requirement rather than a convenience.
+        // Tasks and TaskNodes come from AllocSized, so they may live in ANY of the three
+        // pools, and returning one to the wrong pool's free list is immediate heap
+        // corruption -- the failure class this allocator already has history with.
+        //
+        // Doing it here rather than at each call site is deliberate. There are nine task-free
+        // sites across four files (Thread.cpp x3, TaskScheduler.cpp x4, TaskDAG.cpp, and
+        // Coroutine.h), an audit found several that a first pass missed, and any Free(task)
+        // added later would be a silent corruption waiting to happen. Correct by construction
+        // beats correct by vigilance on a path that crashes days away from its cause.
+        //
+        // Small pool is checked first: Tasks and TaskNodes are the common case and both fit
+        // the 64-byte class, so the common path is a single range check.
+        void  Free(void* slot)            { if (!FreeSized(slot)) big.Free(slot); }
         bool  SlotInSlab(const void* p) const { return big.SlotInSlab(p); }
         long long LiveCount() const       { return big.LiveCount(); }
-        std::size_t Capacity() const      { return big.Capacity(); }
+        // TOTAL across all three pools, because that is what bounds how many Tasks can exist:
+        // AllocSized falls through 64 -> 128 -> 256, so a task can come from any of them.
+        // Reporting `big` alone here would be the same trap SetTaskSlabSize was -- a name that
+        // says "the allocator's capacity" while answering for a third of it. Per-class figures
+        // are available separately for anyone who needs the split.
+        std::size_t Capacity() const      { return big.Capacity() + mid.Capacity() + small.Capacity(); }
+        std::size_t BigCapacity() const   { return big.Capacity(); }
         void Prefault(std::size_t slots)  { big.Prefault(slots); }
 
         // ---- size-classed path, for callers whose objects vary ---------------------------------
