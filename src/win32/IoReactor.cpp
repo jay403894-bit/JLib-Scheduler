@@ -237,15 +237,43 @@ namespace JLib {
             return res;
         }
 
+        // COALESCED PUSH. Completions that are already queued are drained without blocking and their
+        // resumes handed to the scheduler in ONE PushBatch rather than one Push each.
+        //
+        // This is interrupt coalescing, in user space and for the same reason: the expensive part of
+        // waking a parked worker is paid per SCHEDULER INTERACTION, not per completion, so a burst
+        // of ready operations should cost one wake rather than N. PushBatch already exists and
+        // replacing a requeue loop with it measured 7.5-8.2x in 2.2.0.
+        //
+        // IT CANNOT HELP A LONE COMPLETION, and that limit is worth stating: with nothing else
+        // queued the batch is one entry and this is exactly the old path. It buys the BURST tail,
+        // not the idle p50.
+        static constexpr std::size_t kBatch = 32;
+
         void Run() {
+            Task* batch[kBatch];
+            std::size_t nBatch = 0;
+
             for (;;) {
                 DWORD bytes = 0;
                 ULONG_PTR key = 0;
                 LPOVERLAPPED ov = nullptr;
 
-                // A BLOCKING WAIT, and this thread is one of only two places in the library allowed
-                // one -- the other being the timer -- for the same reason: it has no work to lose.
-                const BOOL ok = GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE);
+                // Block only when nothing is already collected. Once the batch has something in it,
+                // poll with a zero timeout: anything else ready RIGHT NOW joins this batch, and the
+                // moment the port is empty the batch goes out. No timer, no delay -- coalescing that
+                // waits would trade tail latency for tail latency.
+                const BOOL ok = (nBatch == 0)
+                    ? GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)
+                    : GetQueuedCompletionStatus(port, &bytes, &key, &ov, 0);
+
+                if (nBatch != 0 && ov == nullptr && !ok) {
+                    // Port drained (WAIT_TIMEOUT) -- flush what we have and go back to blocking.
+                    if (TaskScheduler::IsInitialized())
+                        TaskScheduler::Instance().PushBatch(batch, nBatch);
+                    nBatch = 0;
+                    continue;
+                }
 
                 if (ov == nullptr) {
                     // Not a completion: the port died, or Stop() posted the wake-up below.
@@ -303,12 +331,23 @@ namespace JLib {
 
                 if (r->onComplete) r->onComplete(r);
 
-                // OUTSIDE THE LOCK. Pushing can run the task on another worker immediately, and its
-                // frame -- which is where `r` lives -- may be gone before Push returns. NOTHING below
-                // may touch `r`.
-                if (resume && TaskScheduler::IsInitialized())
-                    TaskScheduler::Instance().Push(resume);
+                // OUTSIDE THE LOCK, and COLLECTED rather than pushed. The frame `r` lives in dies the
+                // moment its task runs, so nothing below may touch `r` -- which is true whether the
+                // push happens now or at the flush, because collecting only copies the Task*.
+                if (resume) {
+                    batch[nBatch++] = resume;
+                    if (nBatch == kBatch && TaskScheduler::IsInitialized()) {
+                        TaskScheduler::Instance().PushBatch(batch, nBatch);
+                        nBatch = 0;
+                    }
+                }
 
+                if (lastOne || (nBatch && stopping.load(std::memory_order_acquire))) {
+                    if (nBatch && TaskScheduler::IsInitialized()) {
+                        TaskScheduler::Instance().PushBatch(batch, nBatch);
+                        nBatch = 0;
+                    }
+                }
                 if (lastOne) {
                     ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
                     return;
