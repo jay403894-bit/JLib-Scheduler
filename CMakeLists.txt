@@ -693,3 +693,11 @@ if(JLIBSCHED_IO_LOCK_STATS)
     target_compile_definitions(Scheduler PRIVATE JLIBSCHED_IO_LOCK_STATS)
     message(STATUS "JLib::Scheduler: reactor lock stats ENABLED (perturbs the I/O path)")
 endif()
+
+# The dispatch seam: reactor-done to coroutine-running. Needs JLIBSCHED_IO_LOCK_STATS for the
+# completion timestamp; without it the bench says so rather than printing a flattering zero.
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerIoLatencyBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/io_dispatch_latency.cpp")
+    target_link_libraries(SchedulerIoLatencyBench PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerIoLatencyBench PRIVATE cxx_std_20)
+endif()

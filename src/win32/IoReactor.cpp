@@ -6,6 +6,7 @@
 #include "../../include/IoReactor.h"
 #include "../../include/TaskScheduler.h"
 #include "../../include/platform.h"      // the ONLY place windows.h comes from
+#include "../../include/Timer.h"         // MonotonicNs, for the dispatch-latency stamp
 
 // AFTER platform.h, and that ordering is safe only because platform.h defines WIN32_LEAN_AND_MEAN
 // before windows.h -- which is what keeps the ancient winsock.h out. Including winsock2.h after a
@@ -294,6 +295,12 @@ namespace JLib {
                 // THE HOOK RUNS HERE: after the lock is dropped, before the resume is pushed.
                 // After the lock, because it submits the next queued transfer and Submit takes the
                 // same mutex. Before the push, because the push can let this request.s frame die.
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+                // Stamped AFTER the result is stored and BEFORE the push, so the measured interval
+                // is exactly "reactor finished" to "coroutine running".
+                if (r->out) r->out->completedAtNs = MonotonicNs();
+#endif
+
                 if (r->onComplete) r->onComplete(r);
 
                 // OUTSIDE THE LOCK. Pushing can run the task on another worker immediately, and its

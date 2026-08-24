@@ -128,6 +128,15 @@ namespace JLib {
         std::uint32_t bytes  = 0;
         std::int32_t  error  = 0;      // platform error code; 0 unless status == Failed
 
+        // When the completion thread finished with this operation, in MonotonicNs, written just
+        // before the resume is pushed. ZERO unless JLIBSCHED_IO_LOCK_STATS is on -- a clock read on
+        // every completion is not free, and this is instrumenting a microsecond-scale measurement.
+        //
+        // Subtracting it in the resumed coroutine gives the DISPATCH SEAM alone: reactor-done to
+        // coroutine-running, with the syscall and the kernel excluded. That is the number a hybrid
+        // design actually fails on, and it is invisible in a throughput figure.
+        std::int64_t  completedAtNs = 0;
+
         bool Ok() const noexcept { return status == IoStatus::Completed; }
     };
 
