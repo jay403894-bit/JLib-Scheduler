@@ -263,9 +263,19 @@ namespace JLib {
             // everything is hiPri then nothing is.
             Task* batchHi[kBatch]; std::size_t nHi = 0;
             Task* batchLo[kBatch]; std::size_t nLo = 0;
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+            IoResult* outHi[kBatch]; IoResult* outLo[kBatch];
+#endif
 
-            const auto Flush = [](Task** hi, std::size_t& nh, Task** lo, std::size_t& nl) {
+            const auto Flush = [&](Task** hi, std::size_t& nh, Task** lo, std::size_t& nl) {
                 if (!TaskScheduler::IsInitialized()) { nh = 0; nl = 0; return; }
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+                // Stamp BEFORE the push: the push can let the coroutine frame -- and the IoResult
+                // living in it -- die immediately.
+                const std::int64_t now = MonotonicNs();
+                for (std::size_t i = 0; i < nh; ++i) if (outHi[i]) outHi[i]->flushedAtNs = now;
+                for (std::size_t i = 0; i < nl; ++i) if (outLo[i]) outLo[i]->flushedAtNs = now;
+#endif
                 if (nh) { TaskScheduler::Instance().PushBatch(hi, nh, 0, 64, true);  nh = 0; }
                 if (nl) { TaskScheduler::Instance().PushBatch(lo, nl, 0, 64, false); nl = 0; }
             };
@@ -348,6 +358,9 @@ namespace JLib {
                 // moment its task runs, so nothing below may touch `r` -- which is true whether the
                 // push happens now or at the flush, because collecting only copies the Task*.
                 if (resume) {
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+                    if (resume->hiPri) outHi[nHi] = r->out; else outLo[nLo] = r->out;
+#endif
                     if (resume->hiPri) batchHi[nHi++] = resume;
                     else               batchLo[nLo++] = resume;
                     if (nHi == kBatch || nLo == kBatch) Flush(batchHi, nHi, batchLo, nLo);

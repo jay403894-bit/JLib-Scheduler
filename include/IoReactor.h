@@ -137,6 +137,16 @@ namespace JLib {
         // design actually fails on, and it is invisible in a throughput figure.
         std::int64_t  completedAtNs = 0;
 
+        // When this completion was actually handed to the scheduler, in MonotonicNs. Same zero-unless
+        // -DJLIBSCHED_IO_LOCK_STATS caveat.
+        //
+        // WHY A SECOND STAMP: it splits the dispatch seam into the two things that could be blamed
+        // for the tail -- (flushed - completed) is time the REACTOR held it in a batch, and
+        // (resumed - flushed) is time the SCHEDULER took to get a worker onto it. Only the first is
+        // something a flush timer could ever bound, so this is what decides whether one is worth
+        // having. Measured 8-24: the first is ~0 and the tail is entirely the second.
+        std::int64_t  flushedAtNs = 0;
+
         bool Ok() const noexcept { return status == IoStatus::Completed; }
     };
 

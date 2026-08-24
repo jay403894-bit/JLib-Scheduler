@@ -54,6 +54,8 @@ char g_tx[8] = { 'p','i','n','g','!','!','!','!' };
 char g_rx[8];
 
 std::vector<long long> g_samples;
+std::vector<long long> g_hold;   // flushed - completed: time the REACTOR held it in a batch
+std::vector<long long> g_disp;   // resumed - flushed:   time the SCHEDULER took to run it
 std::atomic<int> g_done{ 0 };
 
 // One operation, timed across the dispatch seam only. `completedAtNs` is stamped by the reactor
@@ -69,14 +71,21 @@ std::vector<std::array<char, 8>> g_brx;
 JLib::Coro BurstOp(int slot, int sample) {
     const JLib::IoResult r = co_await JLib::RecvAsync(g_bs[slot], g_brx[slot].data(), 8);
     const long long now = JLib::MonotonicNs();
-    if (r.completedAtNs != 0) g_samples[sample * kBurst + slot] = now - r.completedAtNs;
+    if (r.completedAtNs != 0) {
+        const int k = sample * kBurst + slot;
+        g_samples[k] = now - r.completedAtNs;
+        if (r.flushedAtNs != 0) { g_hold[k] = r.flushedAtNs - r.completedAtNs; g_disp[k] = now - r.flushedAtNs; }
+    }
     co_return;
 }
 
 JLib::Coro OneOp(int i) {
     const JLib::IoResult r = co_await JLib::RecvAsync(g_server, g_rx, sizeof g_rx);
     const long long now = JLib::MonotonicNs();
-    if (r.completedAtNs != 0) g_samples[i] = now - r.completedAtNs;
+    if (r.completedAtNs != 0) {
+        g_samples[i] = now - r.completedAtNs;
+        if (r.flushedAtNs != 0) { g_hold[i] = r.flushedAtNs - r.completedAtNs; g_disp[i] = now - r.flushedAtNs; }
+    }
     g_done.fetch_add(1, std::memory_order_release);
     co_return;
 }
@@ -88,6 +97,17 @@ void Report(const char* label, std::vector<long long> s) {
     std::printf("  %-6s n=%-5zu  p50 %7.2f us   p90 %7.2f us   p99 %7.2f us   max %8.2f us\n",
                 label, s.size(), pick(0.50) / 1000.0, pick(0.90) / 1000.0,
                 pick(0.99) / 1000.0, double(s.back()) / 1000.0);
+}
+
+// The decomposition that decides whether a flush timer is worth having: HOLD is time the reactor
+// kept the completion in a batch, DISPATCH is time the scheduler took to get a worker onto it. A
+// flush timer can only ever bound HOLD.
+void ReportSplit() {
+    std::vector<long long> h, d;
+    for (size_t i = 0; i < g_hold.size(); ++i) if (g_hold[i] || g_disp[i]) { h.push_back(g_hold[i]); d.push_back(g_disp[i]); }
+    if (h.empty()) return;
+    Report("  hold", std::move(h));
+    Report("  disp", std::move(d));
 }
 
 } // namespace
@@ -131,7 +151,7 @@ int main(int argc, char** argv) {
 
     for (int pass = 0; pass < 2; ++pass) {
         const bool cold = (pass == 1);
-        g_samples.assign(samples, 0);
+        g_samples.assign(samples, 0); g_hold.assign(samples, 0); g_disp.assign(samples, 0);
 
         for (int i = 0; i < samples; ++i) {
             g_done.store(0, std::memory_order_release);
@@ -162,6 +182,7 @@ int main(int argc, char** argv) {
                         cold ? "COLD" : "HOT");
         } else {
             Report(cold ? "COLD" : "HOT", std::move(valid));
+            ReportSplit();
         }
     }
 
@@ -183,7 +204,8 @@ int main(int argc, char** argv) {
             g_bs[i] = static_cast<JLib::IoSocket>(bs);
         }
 
-        g_samples.assign(size_t(rounds) * kBurst, 0);
+        const size_t n = size_t(rounds) * kBurst;
+        g_samples.assign(n, 0); g_hold.assign(n, 0); g_disp.assign(n, 0);
         for (int rd = 0; rd < rounds; ++rd) {
             std::this_thread::sleep_for(std::chrono::milliseconds(coldMs));
             JLib::WaitGroup wg;
@@ -198,7 +220,7 @@ int main(int argc, char** argv) {
         std::vector<long long> valid;
         for (long long v : g_samples) if (v > 0) valid.push_back(v);
         if (valid.empty()) std::printf("  BURST  NO TIMESTAMPS -- needs -DJLIBSCHED_IO_LOCK_STATS=ON.\n");
-        else Report("BURST", std::move(valid));
+        else { Report("BURST", std::move(valid)); ReportSplit(); }
 
         for (int i = 0; i < kBurst; ++i) {
             ::closesocket(static_cast<SOCKET>(g_bc[i]));
