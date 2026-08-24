@@ -132,8 +132,36 @@ namespace JLib {
         std::uint32_t token  = 0xFFFFFFFFu;
         void*         handle = nullptr;
 
+        // Accept and connect need a fixup applied to the socket AFTER the completion arrives
+        // (SO_UPDATE_ACCEPT_CONTEXT / SO_UPDATE_CONNECT_CONTEXT), so the completion has to know
+        // which kind of operation it is draining. `aux` carries the listener for an accept.
+        //
+        // Kept here rather than inferred from the handle because by completion time there is nothing
+        // left to infer from -- and a socket that skipped its fixup does not fail, it misbehaves
+        // later, which is the worst way to find out.
+        enum class Kind : std::uint8_t { Generic, Accept, Connect };
+        Kind          kind = Kind::Generic;
+        std::uintptr_t aux = 0;
+
         IoRequest*    prev = nullptr;     // in-flight list; doubly linked so removal is O(1)
         IoRequest*    next = nullptr;
+    };
+
+    // A socket, as an integer rather than a pointer, because that is what both platforms actually
+    // use: Windows' SOCKET is a UINT_PTR and a POSIX fd is an int. uintptr_t holds either without a
+    // cast at the call site and keeps winsock2.h out of this header.
+    using IoSocket = std::uintptr_t;
+
+    // Scratch space AcceptEx writes the local and remote addresses into. THE CALLER PROVIDES IT and
+    // it must outlive the operation, same rule as IoRequest -- so it belongs beside the request, in
+    // the coroutine frame.
+    //
+    // The size is not arbitrary: AcceptEx demands at least sizeof(sockaddr) + 16 for EACH address,
+    // and the +16 is a Windows requirement rather than padding anyone chose. 128 covers IPv6 twice
+    // over, and the backend static_asserts it against the real structures.
+    struct IoAcceptBuffer {
+        static constexpr std::size_t kBytes = 128;
+        alignas(16) unsigned char bytes[kBytes] = {};
     };
 
     class IoReactor {
@@ -174,6 +202,53 @@ namespace JLib {
                          IoRequest* req, IoResult* out, Task* resume, CancelToken token);
         bool SubmitWrite(void* handle, const void* buf, std::uint32_t len, std::uint64_t offset,
                          IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
+        // ---- sockets ---------------------------------------------------------------------------
+        //
+        // WHY THESE ARE NOT JUST Read/Write. On Windows ReadFile does work on a socket, so it was
+        // tempting to stop at the file API -- but it cannot carry flags (MSG_PEEK, MSG_OOB), cannot
+        // do vectored buffers, and, decisively, ACCEPT AND CONNECT HAVE NO ReadFile ANALOGUE AT ALL.
+        // A reactor that cannot accept a connection is not a reactor.
+        //
+        // Sockets are the app's to create, bind and listen -- this is a reactor, not a networking
+        // library. It takes a socket the same way it takes a handle.
+
+        // Once per process, before any socket operation. Resolves AcceptEx and ConnectEx, which are
+        // WINSOCK EXTENSIONS with no import library: they are fetched at runtime through WSAIoctl
+        // and the pointers differ per provider, so there is no way to call them without this.
+        //
+        // Does NOT call WSAStartup -- that is process-global policy an application usually already
+        // has an opinion about, and a library quietly initialising Winsock behind an app that
+        // shuts it down is a hard bug to find. Call WSAStartup yourself first; this returns false
+        // if Winsock is not up.
+        bool InitSockets();
+
+        bool RegisterSocket(IoSocket s);
+
+        // Same return polarity as SubmitRead: TRUE = answer already final, do NOT suspend.
+        bool SubmitRecv(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
+                        IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+        bool SubmitSend(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
+                        IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
+        // AcceptEx. `accepted` must already be a created, UNBOUND socket of the same family and type
+        // as `listener` -- Windows requires the socket to exist before the accept starts, which is
+        // the point of the design: it is what removes the syscall from the completion path.
+        //
+        // On success the reactor applies SO_UPDATE_ACCEPT_CONTEXT for you. Without it the accepted
+        // socket does not inherit the listener's properties and getpeername fails on it -- a
+        // documented Windows requirement that is very easy to omit and produces a socket that looks
+        // connected and misbehaves.
+        bool SubmitAccept(IoSocket listener, IoSocket accepted, IoAcceptBuffer* addrs,
+                          IoRequest* req, IoResult* out, Task* resume, CancelToken token);
+
+        // ConnectEx. `s` MUST ALREADY BE BOUND -- to INADDR_ANY:0 if you have no preference. That is
+        // ConnectEx's rule, not this library's, and an unbound socket fails with WSAEINVAL rather
+        // than binding itself.
+        //
+        // On success the reactor applies SO_UPDATE_CONNECT_CONTEXT, for the same reason as accept.
+        bool SubmitConnect(IoSocket s, const void* sockaddr, std::uint32_t sockaddrLen,
+                           IoRequest* req, IoResult* out, Task* resume, CancelToken token);
 
         // Ask the OS to cancel every in-flight operation under `token`, INCLUDING those under scopes
         // nested inside it. Returns how many were asked about -- not how many were cancelled, which

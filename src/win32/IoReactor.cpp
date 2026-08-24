@@ -7,6 +7,15 @@
 #include "../../include/TaskScheduler.h"
 #include "../../include/platform.h"      // the ONLY place windows.h comes from
 
+// AFTER platform.h, and that ordering is safe only because platform.h defines WIN32_LEAN_AND_MEAN
+// before windows.h -- which is what keeps the ancient winsock.h out. Including winsock2.h after a
+// windows.h that HAD pulled in winsock.h is the classic redefinition wall; here there is nothing to
+// collide with. Do not "tidy" this above the platform.h include.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
+#pragma comment(lib, "ws2_32.lib")
+
 #include <cstddef>
 #include <cstdio>
 #include <mutex>
@@ -21,7 +30,38 @@ namespace JLib {
     static_assert(alignof(OVERLAPPED) <= 16,
                   "IoRequest::native is not aligned enough for OVERLAPPED");
 
+    static_assert(IoAcceptBuffer::kBytes >= 2 * (sizeof(sockaddr_in6) + 16),
+                  "IoAcceptBuffer is too small for AcceptEx: it needs sizeof(sockaddr)+16 per address");
+
     static OVERLAPPED* Ov(IoRequest* r) { return reinterpret_cast<OVERLAPPED*>(r->native); }
+
+    // AcceptEx and ConnectEx have NO IMPORT LIBRARY. They are provider-specific and must be fetched
+    // at runtime through WSAIoctl, which is why InitSockets exists at all and why a socket has to be
+    // available to ask. Resolved once; the pointers are per-provider in theory and universal in
+    // practice for TCP.
+    static LPFN_ACCEPTEX      g_acceptEx  = nullptr;
+    static LPFN_CONNECTEX     g_connectEx = nullptr;
+    static std::mutex         g_extMutex;
+
+    static bool ResolveExtensions() {
+        std::lock_guard<std::mutex> lk(g_extMutex);
+        if (g_acceptEx && g_connectEx) return true;
+
+        // A throwaway socket purely to ask. It is closed before returning -- the function pointers
+        // outlive it, which is the whole reason this is a one-time bootstrap rather than per-socket.
+        SOCKET probe = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (probe == INVALID_SOCKET) return false;   // usually WSANOTINITIALISED: no WSAStartup
+
+        GUID gAccept  = WSAID_ACCEPTEX;
+        GUID gConnect = WSAID_CONNECTEX;
+        DWORD got = 0;
+        bool ok = ::WSAIoctl(probe, SIO_GET_EXTENSION_FUNCTION_POINTER, &gAccept, sizeof gAccept,
+                             &g_acceptEx, sizeof g_acceptEx, &got, nullptr, nullptr) == 0;
+        ok = ok && ::WSAIoctl(probe, SIO_GET_EXTENSION_FUNCTION_POINTER, &gConnect, sizeof gConnect,
+                              &g_connectEx, sizeof g_connectEx, &got, nullptr, nullptr) == 0;
+        ::closesocket(probe);
+        return ok && g_acceptEx && g_connectEx;
+    }
 
     struct IoReactor::Impl {
         HANDLE port = nullptr;
@@ -111,6 +151,24 @@ namespace JLib {
                 IoRequest* r = reinterpret_cast<IoRequest*>(
                     reinterpret_cast<unsigned char*>(ov) - offsetof(IoRequest, native));
                 const IoResult res = Classify(ok, ok ? ERROR_SUCCESS : ::GetLastError(), bytes);
+
+                // THE FIXUP WINDOWS REQUIRES, and it has to happen here rather than in the caller:
+                // until it runs, an accepted socket has not inherited the listener's properties and
+                // a connected one has no idea it is connected -- getpeername, shutdown and the
+                // socket options all misbehave. Nothing FAILS, which is what makes omitting it such
+                // a bad bug.
+                if (res.status == IoStatus::Completed && r->kind != IoRequest::Kind::Generic) {
+                    if (r->kind == IoRequest::Kind::Accept) {
+                        // handle = listener (where the I/O lives), aux = accepted (what to fix up).
+                        const SOCKET listener = reinterpret_cast<SOCKET>(r->handle);
+                        const SOCKET accepted = static_cast<SOCKET>(r->aux);
+                        ::setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                                     reinterpret_cast<const char*>(&listener), sizeof listener);
+                    } else {
+                        const SOCKET s = reinterpret_cast<SOCKET>(r->handle);
+                        ::setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
+                    }
+                }
 
                 Task* resume = nullptr;
                 bool  lastOne = false;
@@ -233,6 +291,92 @@ namespace JLib {
         HANDLE h = static_cast<HANDLE>(handle);
         return impl->Submit(h, offset, req, out, resume, token, [&](OVERLAPPED* ov) {
             return ::WriteFile(h, buf, len, nullptr, ov) != FALSE;
+        });
+    }
+
+    // ---- sockets ---------------------------------------------------------------------------------
+
+    bool IoReactor::InitSockets() { return ResolveExtensions(); }
+
+    bool IoReactor::RegisterSocket(IoSocket s) {
+        // A SOCKET associates with a completion port exactly like a file handle -- on Windows it IS
+        // a kernel handle. Same call, so no separate path.
+        return Register(reinterpret_cast<void*>(static_cast<SOCKET>(s)));
+    }
+
+    bool IoReactor::SubmitRecv(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
+                               IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        const SOCKET sock = static_cast<SOCKET>(s);
+        HANDLE h = reinterpret_cast<HANDLE>(sock);
+        return impl->Submit(h, 0, req, out, resume, token, [&](OVERLAPPED* ov) {
+            // WSABUF built here rather than stored in the request: WSARecv COPIES the descriptor
+            // array before returning, so it only has to survive the call, not the operation. The
+            // BUFFER it points at must survive, and that is the caller's, as always.
+            WSABUF b{ static_cast<ULONG>(len), static_cast<CHAR*>(buf) };
+            DWORD f = flags, got = 0;
+            return ::WSARecv(sock, &b, 1, &got, &f, ov, nullptr) == 0;
+        });
+    }
+
+    bool IoReactor::SubmitSend(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
+                               IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        const SOCKET sock = static_cast<SOCKET>(s);
+        HANDLE h = reinterpret_cast<HANDLE>(sock);
+        return impl->Submit(h, 0, req, out, resume, token, [&](OVERLAPPED* ov) {
+            WSABUF b{ static_cast<ULONG>(len), static_cast<CHAR*>(const_cast<void*>(buf)) };
+            DWORD sent = 0;
+            return ::WSASend(sock, &b, 1, &sent, static_cast<DWORD>(flags), ov, nullptr) == 0;
+        });
+    }
+
+    bool IoReactor::SubmitAccept(IoSocket listener, IoSocket accepted, IoAcceptBuffer* addrs,
+                                 IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        if (!g_acceptEx && !ResolveExtensions()) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSANOTINITIALISED };
+            return true;
+        }
+
+        const SOCKET lis = static_cast<SOCKET>(listener);
+        const SOCKET acc = static_cast<SOCKET>(accepted);
+
+        // `handle` IS THE LISTENER, and getting this backwards is a hang rather than an error.
+        // AcceptEx is issued ON the listening socket -- that is where the pending I/O lives, so that
+        // is what CancelIoEx has to be aimed at. Aiming it at the accepted socket cancels nothing (it
+        // has no I/O of its own yet), no completion is ever posted, and the awaiting coroutine stays
+        // suspended forever holding its request. Found exactly that way.
+        //
+        // The ACCEPTED socket goes in `aux`, because it is the one the post-completion fixup applies
+        // to. The two sockets have different jobs here and neither can stand in for the other.
+        req->kind = IoRequest::Kind::Accept;
+        req->aux  = static_cast<std::uintptr_t>(acc);
+
+        return impl->Submit(reinterpret_cast<HANDLE>(lis), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            // Receive length ZERO, deliberately. AcceptEx can also wait for the first chunk of data
+            // before completing, which sounds efficient and is a denial-of-service: a client that
+            // connects and sends nothing holds the accept -- and the pre-created socket -- open
+            // indefinitely. Accepting first and reading second is the safe order.
+            constexpr DWORD kAddrLen = sizeof(sockaddr_in6) + 16;
+            DWORD got = 0;
+            return g_acceptEx(lis, acc, addrs->bytes, 0, kAddrLen, kAddrLen, &got, ov) != FALSE;
+        });
+    }
+
+    bool IoReactor::SubmitConnect(IoSocket s, const void* addr, std::uint32_t addrLen,
+                                  IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+        if (!g_connectEx && !ResolveExtensions()) {
+            if (out) *out = IoResult{ IoStatus::Failed, 0, WSANOTINITIALISED };
+            return true;
+        }
+
+        const SOCKET sock = static_cast<SOCKET>(s);
+        req->kind = IoRequest::Kind::Connect;
+
+        return impl->Submit(reinterpret_cast<HANDLE>(sock), 0, req, out, resume, token,
+                            [&](OVERLAPPED* ov) {
+            DWORD sent = 0;
+            return g_connectEx(sock, static_cast<const struct sockaddr*>(addr),
+                               static_cast<int>(addrLen), nullptr, 0, &sent, ov) != FALSE;
         });
     }
 

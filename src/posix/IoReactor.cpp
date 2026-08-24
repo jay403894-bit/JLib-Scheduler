@@ -45,6 +45,33 @@ namespace JLib {
         return true;
     }
 
+    // Sockets: same story as the rest of this file -- fail cleanly rather than pretend. When the
+    // io_uring and kqueue backends land these become real; until then a caller gets ENOSYS at the
+    // first call instead of a mysterious hang.
+    bool IoReactor::InitSockets() { return false; }
+    bool IoReactor::RegisterSocket(IoSocket) { return false; }
+
+    bool IoReactor::SubmitRecv(IoSocket, void*, std::uint32_t, std::uint32_t,
+                               IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    bool IoReactor::SubmitSend(IoSocket, const void*, std::uint32_t, std::uint32_t,
+                               IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    bool IoReactor::SubmitAccept(IoSocket, IoSocket, IoAcceptBuffer*,
+                                 IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    bool IoReactor::SubmitConnect(IoSocket, const void*, std::uint32_t,
+                                  IoRequest*, IoResult* out, Task*, CancelToken) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+
     std::size_t IoReactor::RequestCancel(CancelToken) noexcept { return 0; }
     std::size_t IoReactor::InFlight() const noexcept { return 0; }
     void IoReactor::Stop() noexcept {}

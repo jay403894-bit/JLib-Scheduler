@@ -4,12 +4,12 @@
 
 // `co_await` for asynchronous I/O. C++20 -- and the ONLY C++20 in the reactor.
 //
-//     JLib::Spawn([](void* h, JLib::CancelToken tok) -> JLib::Coro {
+//     JLib::Spawn([](JLib::IoSocket s, JLib::CancelToken tok) -> JLib::Coro {
 //         char buf[4096];
-//         JLib::IoResult r = co_await JLib::ReadAsync(h, buf, sizeof buf, 0, tok);
+//         JLib::IoResult r = co_await JLib::RecvAsync(s, buf, sizeof buf, 0, tok);
 //         if (r.status == JLib::IoStatus::Cancelled) co_return;   // buffer is ours again
 //         Consume(buf, r.bytes);
-//     }(handle, scope.Token()), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+//     }(sock, scope.Token()), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
 //
 // EVERYTHING UNDERNEATH IS C++17. The engine -- completion port, in-flight list, backends -- is
 // compiled into the core library and never sees <coroutine>; it pushes a `Task*` and does not know
@@ -45,23 +45,25 @@
 #include "Coroutine.h"
 
 #include <cstdint>
+#include <utility>
 
 namespace JLib {
 
     namespace detail {
 
-        // Read and write differ only in which Submit to call, so the awaiter is shared and the
-        // direction is a template parameter -- no virtual, no function pointer, nothing to indirect
-        // through on a path that already costs a syscall.
-        template <bool kWrite>
-        class IoAwaiter {
+        // ONE awaiter for all six operations. They differ only in which Submit to call and what to
+        // pass it, so the difference is captured in a stored callable rather than in six near-copies
+        // of the suspend protocol -- which is where a divergence would eventually hide.
+        //
+        // The callable is stored BY VALUE, so it lives in the coroutine frame alongside the request.
+        // It is a few words of captured arguments; there is no allocation and no std::function.
+        template <typename Fn>
+        class IoOpAwaiter {
         public:
-            IoAwaiter(IoReactor& r, void* handle, void* buf, std::uint32_t len,
-                      std::uint64_t offset, CancelToken token) noexcept
-                : r_(r), handle_(handle), buf_(buf), len_(len), offset_(offset), token_(token) {}
+            explicit IoOpAwaiter(Fn fn) noexcept : fn_(std::move(fn)) {}
 
-            IoAwaiter(const IoAwaiter&) = delete;
-            IoAwaiter& operator=(const IoAwaiter&) = delete;
+            IoOpAwaiter(const IoOpAwaiter&) = delete;
+            IoOpAwaiter& operator=(const IoOpAwaiter&) = delete;
 
             // ALWAYS false, deliberately. The "already cancelled" short-circuit lives inside Submit
             // rather than here, so there is ONE place that decides whether an operation reaches the
@@ -76,25 +78,14 @@ namespace JLib {
             template <typename P>
             bool await_suspend(std::coroutine_handle<P> h) {
                 Task* t = detail::ArmResume(h);
-                if constexpr (kWrite) {
-                    return !r_.SubmitWrite(handle_, buf_, len_, offset_,
-                                           &req_, &result_, t, token_);
-                } else {
-                    return !r_.SubmitRead(handle_, buf_, len_, offset_,
-                                          &req_, &result_, t, token_);
-                }
+                return !fn_(&req_, &result_, t);
             }
 
             // By value: small, and the caller usually wants to keep it past this frame.
             [[nodiscard]] IoResult await_resume() const noexcept { return result_; }
 
         private:
-            IoReactor&    r_;
-            void*         handle_;
-            void*         buf_;
-            std::uint32_t len_;
-            std::uint64_t offset_;
-            CancelToken   token_;
+            Fn fn_;
 
             // MEMBERS, so they live in the coroutine frame. See the note at the top -- this is the
             // whole reason the awaiter exists rather than a free function returning IoResult.
@@ -102,32 +93,74 @@ namespace JLib {
             IoResult  result_{};
         };
 
+        template <typename Fn>
+        IoOpAwaiter<Fn> MakeIoAwaiter(Fn fn) noexcept { return IoOpAwaiter<Fn>(std::move(fn)); }
+
     } // namespace detail
 
-    // `IoResult r = co_await ReadAsync(handle, buf, len, offset, token);`
+    // ---- files, pipes, anything with a handle --------------------------------------------------
     //
-    // `token` is the scope the operation belongs to; cancelling it (directly, or by cancelling any
-    // scope it is nested inside) asks the OS to cancel, and the await resumes when the COMPLETION
+    // `token` is the scope the operation belongs to; cancelling it -- directly, or by cancelling any
+    // scope it is nested inside -- asks the OS to cancel, and the await resumes when the COMPLETION
     // arrives. The buffer is yours again the moment the result is in hand, whatever it says.
     //
-    // Passing no token means the operation is unscoped and cannot be cancelled -- the same "unscoped
+    // Passing no token means the operation is unscoped and cannot be cancelled, the same "unscoped
     // work is not cancelled work" rule as everywhere else in the library.
     //
     // `offset` is ignored by handles that do not have one (pipes, sockets); pass 0.
-    [[nodiscard]] inline detail::IoAwaiter<false>
-    ReadAsync(void* handle, void* buf, std::uint32_t len, std::uint64_t offset = 0,
-              CancelToken token = CancelToken{}) noexcept {
-        return detail::IoAwaiter<false>(IoReactor::Instance(), handle, buf, len, offset, token);
+
+    [[nodiscard]] inline auto ReadAsync(void* handle, void* buf, std::uint32_t len,
+                                        std::uint64_t offset = 0,
+                                        CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitRead(handle, buf, len, offset, r, o, t, token);
+        });
     }
 
-    // The const_cast is confined here rather than pushed into the awaiter: WriteFile takes a const
-    // buffer and the awaiter stores one `void*` for both directions, so exactly one place has to
-    // launder it and the backend's signature stays honest about not writing to it.
-    [[nodiscard]] inline detail::IoAwaiter<true>
-    WriteAsync(void* handle, const void* buf, std::uint32_t len, std::uint64_t offset = 0,
-               CancelToken token = CancelToken{}) noexcept {
-        return detail::IoAwaiter<true>(IoReactor::Instance(), handle,
-                                       const_cast<void*>(buf), len, offset, token);
+    [[nodiscard]] inline auto WriteAsync(void* handle, const void* buf, std::uint32_t len,
+                                         std::uint64_t offset = 0,
+                                         CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitWrite(handle, buf, len, offset, r, o, t, token);
+        });
+    }
+
+    // ---- sockets --------------------------------------------------------------------------------
+
+    [[nodiscard]] inline auto RecvAsync(IoSocket s, void* buf, std::uint32_t len,
+                                        std::uint32_t flags = 0,
+                                        CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitRecv(s, buf, len, flags, r, o, t, token);
+        });
+    }
+
+    [[nodiscard]] inline auto SendAsync(IoSocket s, const void* buf, std::uint32_t len,
+                                        std::uint32_t flags = 0,
+                                        CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitSend(s, buf, len, flags, r, o, t, token);
+        });
+    }
+
+    // `accepted` must already exist, unbound, same family and type as the listener; `addrs` must
+    // outlive the await, so declare it beside the co_await and not in a caller. Both are AcceptEx's
+    // requirements rather than this library's -- see SubmitAccept.
+    [[nodiscard]] inline auto AcceptAsync(IoSocket listener, IoSocket accepted,
+                                          IoAcceptBuffer* addrs,
+                                          CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitAccept(listener, accepted, addrs, r, o, t, token);
+        });
+    }
+
+    // `s` must already be BOUND -- ConnectEx's rule; bind to INADDR_ANY:0 if you have no preference.
+    [[nodiscard]] inline auto ConnectAsync(IoSocket s, const void* sockaddr,
+                                           std::uint32_t sockaddrLen,
+                                           CancelToken token = CancelToken{}) noexcept {
+        return detail::MakeIoAwaiter([=](IoRequest* r, IoResult* o, Task* t) {
+            return IoReactor::Instance().SubmitConnect(s, sockaddr, sockaddrLen, r, o, t, token);
+        });
     }
 
 } // namespace JLib

@@ -31,7 +31,7 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-set(JLIBSCHED_VERSION "3.5.0")
+set(JLIBSCHED_VERSION "3.6.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -665,4 +665,11 @@ if(WIN32)
         target_link_libraries(SchedulerIoAsyncTest PRIVATE Scheduler)
         target_compile_features(SchedulerIoAsyncTest PRIVATE cxx_std_20)
     endif()
+endif()
+
+# Sockets need the co_await surface, so this one is C++20-only like the async test.
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerIoSocketTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_socket_test.cpp")
+    target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerIoSocketTest PRIVATE cxx_std_20)
 endif()
