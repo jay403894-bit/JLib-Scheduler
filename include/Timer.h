@@ -37,6 +37,7 @@
 
 #include "CancelToken.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace JLib {
@@ -97,7 +98,7 @@ namespace JLib {
         bool Disarm(TimerHandle h) noexcept;
 
         // Armed and not yet fired. Diagnostics and tests; racy by nature.
-        size_t PendingCount() const noexcept;
+        std::size_t PendingCount() const noexcept;
 
         // The thread starts on the first Arm and is stopped at exit. Stop is idempotent, and safe to
         // call explicitly by a process that wants the thread gone before its own teardown.

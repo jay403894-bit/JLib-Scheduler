@@ -4,6 +4,7 @@
 #include "../include/Thread.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
+#include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
 #include "../include/platform.h"
 #include "../include/Topology.h"
 #include <stdexcept>
@@ -268,6 +269,14 @@ bool TaskScheduler::PushMain(Task* task) {
 // so nothing waiting on this work blocks forever on something abandoned, then clean up and free.
 bool TaskScheduler::DiscardIfCancelled(Task* task) {
 	if (!task || task->started || !IsTaskCancelled(task)) return false;
+
+	// WHAT THIS TASK STILL OWES, before it is thrown away. A subsystem that wrapped fn/data gets its
+	// completion hook run BY fn, and fn is exactly what discarding skips -- so without this a
+	// cancelled TaskDAG node never fires its dependents and the graph, plus anyone in WaitFor on it,
+	// stops forever. Runs BEFORE the waitGroup decrement, matching the order the executed path uses
+	// (fn -> completion -> waitGroup), so nothing observes this task as finished ahead of the work it
+	// releases.
+	TaskDAG::OnTaskDiscarded(task);
 
 	if (task->waitGroup) {
 		const int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
@@ -1248,6 +1257,17 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
 
+	// PARK-PUBLISH RE-CHECK. A cancel that landed between the caller's check and the AddWaiter above
+	// scanned a table this waiter was not in yet, so nothing holds it and nothing would ever wake it.
+	// Re-reading here and claiming our own slot closes that window; SelfRemove's return value decides
+	// which side owns the resume -- see the long note on it in Event.h.
+	if (IsTaskCancelled(myTask) && event.SelfRemove(myTask)) {
+		// We are the exclusive owner of this waiter, so no wake is coming and none is needed.
+		// Cancellation is delivered at the wake as always -- here the wake is simply not suspending.
+		myFiber->status.store(FiberStatus::RUNNING, std::memory_order_release);
+		return;
+	}
+
 	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEvent");
 	// Return via the fiber's homeCtx (the worker stamps it before each switch-in),
 	// not thread_local schedulerCtx -- the waiter resumes on whatever worker the
@@ -1426,6 +1446,14 @@ void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& 
 	// before this fiber is a discoverable, resumable waiter.
 	myFiber->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 	event.AddWaiter(myTask);
+
+	// Same park-publish re-check as WaitOnEvent, and it goes BEFORE arm() on purpose: arm hooks an
+	// external wakeup, and there is no reason to hook one for a fiber that is not going to park. A
+	// cancel arriving after arm() is the ordinary case -- the external signal wakes us normally.
+	if (IsTaskCancelled(myTask) && event.SelfRemove(myTask)) {
+		myFiber->status.store(FiberStatus::RUNNING, std::memory_order_release);
+		return;
+	}
 
 	if (arm) arm();
 
@@ -2385,6 +2413,22 @@ WaitResult SchedulerSemaphore::WaitCancellable() {
 				spinLock.clear(std::memory_order_release);
 				return WaitResult::Ok;
 			}
+			// THE PARK-PUBLISH RACE. The check at the top of this function is not enough on its own:
+			// a cancel can land between it and the push below, and CancelWaiters would then walk a
+			// list this waiter is not on yet -- after which the waiter parks and nothing ever wakes
+			// it. Windows hid this because SwitchToFiber usually finished inside the test's sleep;
+			// on POSIX the ContextSwitch path made the window wide enough to hang 5 runs out of 5.
+			//
+			// Re-reading the flag HERE, under the same acquisition that publishes, closes it: the
+			// spin lock orders this against CancelWaiters' walk, so either we observe the cancel and
+			// never publish, or our push happens-before any later walk and the walk finds us. This is
+			// the same rule Thread.cpp already applies to SUSPEND_SIGNALED -- a cancel arriving during
+			// "about to park" must not depend on a later walk to be seen.
+			if (IsTaskCancelled(callerTask)) {
+				spinLock.clear(std::memory_order_release);
+				return WaitResult::Cancelled;
+			}
+
 			// Parkable BEFORE discoverable, exactly as Wait() does -- see the long note there; the
 			// reverse order is the 1.3.5 lost wakeup.
 			current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
@@ -2437,6 +2481,15 @@ bool SchedulerSemaphore::WaitAsyncEnqueue(Task* coroTask, WaitResult* result) {
 		if (result) *result = WaitResult::Ok;   // acquired outright; nothing will resume us
 		return true;    // got a permit -- caller must not suspend
 	}
+	// Same park-publish re-check as WaitCancellable -- see the long note there. A coroutine suspends
+	// after this returns false, so a cancel landing between the caller's check and this push would
+	// leave it suspended with nothing on any list to find it.
+	if (IsTaskCancelled(coroTask)) {
+		spinLock.clear(std::memory_order_release);
+		if (result) *result = WaitResult::Cancelled;
+		return true;    // answer is settled -- caller must NOT suspend
+	}
+
 	// Queued. Reachable by Signal() the instant spinLock clears; touch nothing after.
 	// result AND token, or the waiter is by definition not cancellable -- a null result slot means
 	// "never skipped" and Signal() will hand it the permit no matter what its scope says.
@@ -2676,6 +2729,13 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
 		SchedulerSemaphore localWaitSemaphore(0, 1);
 
 		LockQueue();
+		// Park-publish re-check, under the queue lock that orders this against CancelWaiters' walk --
+		// the same rule as SchedulerSemaphore::WaitCancellable. Returning here still holds the mutex,
+		// which is what the cancelled-return contract requires.
+		if (IsTaskCancelled(callerTask)) {
+			UnlockQueue();
+			return WaitResult::Cancelled;
+		}
 		waitingQueue.push(CvWaiter{ &localWaitSemaphore, tok });
 		UnlockQueue();
 
@@ -2684,6 +2744,23 @@ WaitResult SchedulerConditionVariable::WaitCancellable(SchedulerMutex& mutex) {
 		// Cancellable, so a Notify that skips this waiter at release reports Cancelled rather than
 		// handing it a permit -- and CancelWaiters can eject it outright.
 		const WaitResult r = localWaitSemaphore.WaitCancellable();
+
+		// THE ENTRY MAY STILL BE QUEUED. A cancel landing between the push above and the semaphore's
+		// own re-check makes that re-check return Cancelled WITHOUT this waiter ever parking -- so
+		// CancelWaiters never ejected it and the entry survives, pointing at a stack local that dies
+		// the moment this frame returns. Remove it here. Only on the cancelled path, and the queue is
+		// short by construction.
+		if (r == WaitResult::Cancelled) {
+			LockQueue();
+			std::queue<CvWaiter> keep;
+			while (!waitingQueue.empty()) {
+				const CvWaiter w = waitingQueue.front();
+				waitingQueue.pop();
+				if (w.sem != &localWaitSemaphore) keep.push(w);
+			}
+			waitingQueue.swap(keep);
+			UnlockQueue();
+		}
 
 		// UNCONDITIONAL. See the invariant above.
 		mutex.Lock();

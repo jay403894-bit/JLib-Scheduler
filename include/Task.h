@@ -204,6 +204,7 @@ namespace JLib {
         uint32_t cancelToken = 0xFFFFFFFFu;   // CancelToken::kNone, spelled out to avoid the include
 
 
+
         // 8 BYTES OF DELIBERATE TAIL PADDING. Event's waiter list used to be an intrusive Treiber
         // stack linked through a Task* nextWaiter field here. It was retired when Event moved to
         // a fiber-indexed slot table: the intrusive link was what forbade removing one specific

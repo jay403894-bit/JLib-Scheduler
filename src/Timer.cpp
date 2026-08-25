@@ -513,7 +513,7 @@ namespace JLib {
         return true;
     }
 
-    size_t TimerQueue::PendingCount() const noexcept {
+    std::size_t TimerQueue::PendingCount() const noexcept {
         std::lock_guard<std::mutex> lk(impl->m);
         return impl->armedCount;
     }

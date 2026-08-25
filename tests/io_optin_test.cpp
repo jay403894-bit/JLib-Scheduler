@@ -54,13 +54,21 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
         Check(!s.Cancelled(), "and nothing was scheduled behind it");
     }
+#if defined(_WIN32)
     {
         // Register is the gate every submit path goes through, so one refusal covers the surface.
+        //
+        // WINDOWS ONLY, because the reactor itself is: src/win32/IoReactor.cpp is the only backend,
+        // so IoReactor::Instance() does not link elsewhere. The OPT-IN property being tested is not
+        // Windows-specific though -- the timer half above runs everywhere, and that is the half that
+        // would regress silently. Gating the whole test out of the POSIX builds would have cost that
+        // coverage to fix a link error.
         Check(!JLib::IoReactor::Instance().Register(reinterpret_cast<void*>(uintptr_t(1))),
               "IoReactor::Register refused");
         Check(!JLib::IoReactor::Instance().InitSockets(), "IoReactor::InitSockets refused");
         Check(JLib::IoReactor::Instance().InFlight() == 0, "nothing is in flight");
     }
+#endif
 
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
     return g_fail == 0 ? 0 : 1;

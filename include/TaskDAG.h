@@ -82,6 +82,32 @@ namespace JLib {
              // here at all -- it is never dispatched, so its payload never runs.
              owner->OnTaskFinished(node, TaskNode::Outcome::Completed);
          }
+
+         // DISCARDING A DAG TASK IS A CANCELLED COMPLETION, NOT A SILENT FREE. Call this before
+         // freeing any task that is being thrown away instead of executed; it is a no-op for a task
+         // that is not part of a graph.
+         //
+         // The comment above says a CANCELLED node never reaches the wrapper because it is never
+         // dispatched. That holds for a graph-wide Cancel(), which Fire() intercepts -- but NOT for
+         // a node already dispatched and then cancelled through its SCOPE before a worker picked it
+         // up. Its fn never runs, so the trampoline never fires, so its dependents are never told:
+         // an AND countdown that can no longer reach zero, a graph that never finishes, and a
+         // WaitFor that never returns. Windows almost always won that race (the body was already
+         // running when Cancel landed, so the normal finish path notified the graph); POSIX
+         // discards at pickup often enough to hang.
+         //
+         // COSTS NOTHING IN Task. `fn` already IS the marker -- Fire() installs the trampoline and
+         // sets data to the node -- so no extra field is needed. That matters: Task's bytes 56-63
+         // are tail padding that LambdaTask packs captures into, so a field here would quietly shrink
+         // the capture budget and push the measured 64/80 size classes up one.
+         //
+         // Does not touch node->task -- OnTaskFinished only walks dependents and retires the node,
+         // and the discarding side still owns freeing the task itself.
+         static void OnTaskDiscarded(Task* t) {
+             if (!t || t->fn != &OnTaskFinishedWrapper || !t->data) return;
+             auto* node = static_cast<TaskNode*>(t->data);
+             node->owner->OnTaskFinished(node, TaskNode::Outcome::Cancelled);
+         }
         // Offline cycle check (Kahn's). MUST be called before any node is submitted --
         // it walks every tracked node, which self-free once running. Returns true if the
         // graph has a cycle (some node's dependencies_left can never reach 0).

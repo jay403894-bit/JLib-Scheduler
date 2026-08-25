@@ -177,6 +177,36 @@ namespace JLib {
                                           std::memory_order_release);
         }
 
+        // Take yourself back out, for a waiter that registered and then found itself cancelled
+        // before it parked. THE PARK-PUBLISH WINDOW: a cancel landing between the caller's check and
+        // AddWaiter above leaves CancelWaiters scanning a table this waiter is not in yet, after
+        // which it parks and nothing ever wakes it.
+        //
+        // BIT THEN SLOT -- the exact inverse of AddWaiter, and the same claim every other remover
+        // makes. Clearing the advertisement first stops a new scanner starting on us; TakeSlot is
+        // then the single arbiter, exactly as it is for CancelWaiters and SignalAll.
+        //
+        // THE RETURN VALUE DECIDES WHETHER YOU PARK, and both answers are load-bearing:
+        //   true  -- we won our own slot, so nobody else holds this task and nobody will resume it.
+        //            The caller MUST NOT suspend; parking here is the same forever-wait the window
+        //            creates in the first place.
+        //   false -- another claimer took the slot first. IT owns the resume, so the caller MUST
+        //            still park and let that wake arrive (or let SUSPEND_SIGNALED refuse the park).
+        //
+        // Deliberately does NOT write cancelledDirect. That stays with CancelWaiters, written only
+        // after it wins the slot -- writing it here after a lost claim could touch a Task that has
+        // already been resumed, completed and recycled, which is the race the class comment retired.
+        bool SelfRemove(Task* t) {
+            WaiterTable* tb = table.load(std::memory_order_acquire);
+            if (!tb || !t->assignedFiber) return false;
+            const std::size_t i = t->assignedFiber->poolIndex;
+            if (i >= tb->fiberCount) return false;
+
+            tb->occupied[i >> 6].fetch_and(~(std::uint64_t(1) << (i & 63)),
+                                           std::memory_order_acq_rel);
+            return TakeSlot(tb, i) != nullptr;
+        }
+
         // Cancels every task waiting here AND WAKES THEM, rather than leaving them parked until
         // somebody signals.
         //

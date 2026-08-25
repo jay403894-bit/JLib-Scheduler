@@ -16,7 +16,14 @@
 // models and could resume a cancelled waiter immediately, and must not -- an operation ends on a
 // completion on every platform, even where the completion has to be synthesised.
 
-#include "../../include/IoReactor.h"
+// NOT under src/posix/ or src/darwin/, deliberately. Those two diverge wholesale, so a stub placed
+// in one of them has to be duplicated into the other -- and the copies drift. That is exactly what
+// happened: the src/posix/ copy kept an IoAcceptor::Ready() long after the acceptor stopped using a
+// semaphore, and macOS had no copy at all, so Linux broke on a signature and macOS on missing
+// symbols. ONE stub, guarded, compiled from the common glob on every platform.
+#if !defined(_WIN32)
+
+#include "../include/IoReactor.h"
 
 #include <cerrno>
 
@@ -111,10 +118,13 @@ namespace JLib {
     IoSocket IoAcceptor::TryTake() noexcept { return 0; }
     std::size_t IoAcceptor::Outstanding() const noexcept { return 0; }
     std::size_t IoAcceptor::Available() const noexcept { return 0; }
-    SchedulerSemaphore& IoAcceptor::Ready() noexcept {
-        static SchedulerSemaphore never{ 0 };
-        return never;
+    // Nothing can ever be queued, so the waiter never parks -- TRUE means "your answer is ready",
+        // and the answer is "no socket". Returning false here would suspend a caller forever.
+    bool IoAcceptor::TakeOrQueue(IoAcceptWaiter*, IoSocket* out, Task*, CancelToken) {
+        if (out) *out = 0;
+        return true;
     }
+    std::size_t IoAcceptor::CancelWaiters(CancelToken) noexcept { return 0; }
 
     void EjectIoReactor(void* ctx, CancelToken token) {
         if (ctx) static_cast<IoReactor*>(ctx)->RequestCancel(token);
@@ -125,3 +135,5 @@ namespace JLib {
     }
 
 } // namespace JLib
+
+#endif // !_WIN32

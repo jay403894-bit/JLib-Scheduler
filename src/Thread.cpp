@@ -457,17 +457,19 @@ void Thread::Worker() {
 			// abandons a live stack or frame rather than cancelling it -- see Task::started. A
 			// started task is let through to run, and observes the cancellation at its own next
 			// suspend point or poll, where it can unwind properly.
-			if (!task_to_run->started && IsTaskCancelled(task_to_run)) {
-				// Same disposal the DAG uses for a node that never runs: release the WaitGroup first
-				// so nothing waiting on this work blocks forever on something abandoned.
-				if (task_to_run->waitGroup) {
-					const int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-						task_to_run->waitGroup->WakeAll();
-				}
-				scheduler->CleanupTaskMetadata(task_to_run);
-				DestroyTask(task_to_run);
-				scheduler->GetAllocator()->FreeSized(task_to_run);
+			// THROUGH DiscardIfCancelled, NOT AN INLINE COPY. This site used to open-code the
+			// disposal -- waitGroup down, cleanup, destroy, free -- which made it a FOURTH discard
+			// path that the shared one knew nothing about. The copy was missing the step added when
+			// the DAG stopped being notified by fn alone: a discarded graph node still has to tell
+			// its dependents, or an AND countdown can never reach zero and the graph, plus anyone
+			// in WaitFor on it, stops forever.
+			//
+			// That is exactly what hung dag_cancel_test on POSIX: the worker discarded a cancelled
+			// node here, released only its own WaitGroup slot, and the sink was never fired.
+			// Windows almost always ran the body before the cancel landed and never reached this
+			// branch at all. "One place cancellation is decided" is a property of the CALL SITES,
+			// and this is the third time a copy of it has drifted.
+			if (scheduler->DiscardIfCancelled(task_to_run)) {
 				task_to_run = nullptr;
 				if (EpochManager::Instance().ShouldSelfReclaim()) EpochManager::Instance().Tick();
 				ready.store(true, std::memory_order_release);
