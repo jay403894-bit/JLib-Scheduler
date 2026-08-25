@@ -323,6 +323,8 @@ namespace JLib {
 		// workers only catch K/N of them, and the answer is to STEER work at them rather than to
 		// raise K. Measure before choosing a number.
 		static void   SetHotWorkers(size_t k);
+		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
+		void ClampHotWorkersToPool();
 		static size_t GetHotWorkers();
 
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox

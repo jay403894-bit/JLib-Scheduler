@@ -467,8 +467,33 @@ TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.l
 // a job-system-only user must not pay for something they never asked for. A spinning core is a real
 // cost to every other thread in the process, so it is opt-in like the reactor is.
 static std::atomic<size_t> g_hotWorkers{ 0 };
-void   TaskScheduler::SetHotWorkers(size_t k) { g_hotWorkers.store(k, std::memory_order_relaxed); }
+// CLAMPED SO AT LEAST ONE ORDINARY WORKER ALWAYS EXISTS. K >= pool size makes every worker hot,
+// and ordinary work then has no legal destination at all: PickNextWorker skips every index, falls
+// through to its fallback, and hands the task to a hot worker that will not serve it. That is a
+// guaranteed hang, and it is reachable by a plausible configuration -- Init(2) with K=2, or any
+// K chosen from a core count larger than the pool the app actually asked for.
+//
+// Clamped at BOTH ends because the setter is legal before and after Init: before, workers.size() is
+// 0 and there is nothing to clamp against, so StartPool re-applies it once the pool exists.
+static std::atomic<size_t> g_hotWorkersRequested{ 0 };
+
+void TaskScheduler::SetHotWorkers(size_t k) {
+	g_hotWorkersRequested.store(k, std::memory_order_relaxed);
+	size_t eff = k;
+	if (instance) {
+		const size_t n = instance->workers.size();
+		if (n && eff >= n) eff = n - 1;
+	}
+	g_hotWorkers.store(eff, std::memory_order_relaxed);
+}
 size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
+
+// Re-apply the clamp once the pool size is known -- see SetHotWorkers.
+void TaskScheduler::ClampHotWorkersToPool() {
+	const size_t k = g_hotWorkersRequested.load(std::memory_order_relaxed);
+	const size_t n = workers.size();
+	g_hotWorkers.store((n && k >= n) ? n - 1 : k, std::memory_order_relaxed);
+}
 
 // Read by the hot workers themselves and by the reactor's completion threads, each of which raises
 // its OWN priority. Off by default -- see the header.
@@ -556,7 +581,10 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 	if (end <= start) return;
 	if (workers.empty()) { func(start, end); return; }   // no pool: just run it
 
-	const int W = (int)workers.size();
+	// EXCLUDES THE HOT WORKERS. W drives the grain floor and the split count, and a hot worker will
+	// never run a slice -- it does not steal. Counting them over-splits the range into pieces that
+	// have fewer runners than the arithmetic assumed. Clamped so this is at least 1.
+	const int W = (int)(workers.size() - GetHotWorkers());
 
 	// GRAIN FLOOR, and it must scale with the range -- a flat floor is a trap.
 	//
@@ -800,7 +828,13 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 			// together diverge immediately.
 			static std::atomic<size_t> s_wakeSeed{ 0 };
 			static thread_local size_t wakeCursor = s_wakeSeed.fetch_add(7919, std::memory_order_relaxed);
-			const size_t w = wakeCursor++ % workers.size();
+			// SKIP THE HOT WORKERS. They do not steal, so they can never take a lazy split -- a
+			// wake aimed at one is not merely wasted, it dirties the state of the very threads the
+			// lane exists to leave undisturbed. Hot workers are 0..K-1, and SetHotWorkers is clamped
+			// so at least one ordinary worker always exists, which is what makes this modulus safe.
+			const size_t hotN = GetHotWorkers();
+			const size_t eligible = workers.size() - hotN;
+			const size_t w = hotN + (wakeCursor++ % eligible);
 			workers[w]->MarkQueuedWork();
 			workers[w]->NotifyWorker();
 		}
@@ -1245,6 +1279,10 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// floors at 2 below, so this only has to be sane, not exact.
 	const size_t fairShare = standardFiberCount / (num_workers ? num_workers : 1);
 	const size_t fiberCacheCapacity = (fairShare / 2 < 16) ? 16 : fairShare / 2;
+
+	// K is clamped against the ACTUAL pool size here -- it may have been set before Init, when there
+	// was nothing to clamp against. Must precede the hot-CPU publish below, which reads it.
+	ClampHotWorkersToPool();
 
 	// PUBLISH THE HOT CPU SET BEFORE ANY WORKER STARTS. Every other thread masks these bits off as
 	// it comes up, so the set has to be complete first -- a non-hot worker that started earlier
