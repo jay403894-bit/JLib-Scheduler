@@ -352,6 +352,24 @@ namespace JLib {
 		static void SetHotWorkerPin(bool on);
 		static bool GetHotWorkerPin();
 
+		// EXCLUSIVE AFFINITY: the hot workers own their cores and EVERY OTHER THREAD masks those
+		// bits off. Pinning ALONE measured worse than doing nothing, because it confines the hot
+		// worker without excluding anyone else from its core -- so when another thread lands there
+		// the hot worker cannot migrate away and waits. This is the other half. Set before Init,
+		// implies pinning for the hot workers, OFF BY DEFAULT.
+		//
+		// The userspace approximation of isolcpus -- and it cannot exclude OTHER PROCESSES, which is
+		// exactly where it stops being equivalent to the real thing.
+		static void SetHotWorkerExclusive(bool on);
+		static bool GetHotWorkerExclusive();
+		static void SetHotCpuMask(unsigned long long m);
+		static unsigned long long GetHotCpuMask();
+
+		// Called BY a thread ON ITSELF to stay off the hot cores. Ordinary workers and the reactor's
+		// completion threads do this automatically; an application thread that wants the same can
+		// call it directly. No-op unless exclusive mode is on.
+		static void ExcludeCurrentThreadFromHotCpus();
+
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
 		// dispatch+join overhead, and an unoptimized build pays roughly an order of magnitude more of it.

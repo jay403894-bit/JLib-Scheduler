@@ -262,6 +262,11 @@ namespace JLib {
             if (TaskScheduler::GetHotWorkerRealtime())
                 ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
+            // And in exclusive mode, off the hot cores. The completion thread is a PRODUCER for the
+            // hot workers, so sharing a core with one is the single worst placement available: it
+            // would preempt exactly the thread it is trying to hand work to.
+            TaskScheduler::ExcludeCurrentThreadFromHotCpus();
+
             // SPLIT BY PRIORITY. Push honours task->hiPri; PushBatch takes it as a PARAMETER and
             // applies it to the whole batch -- so batching them together silently forced every
             // resumption to low priority and threw away what the app chose at Spawn. Two runs, two

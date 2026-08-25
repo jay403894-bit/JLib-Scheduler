@@ -141,6 +141,16 @@ int main(int argc, char** argv) {
     // the same on Linux/macOS -- so the question is how close pin-without-RT gets to RT.
     const bool hotPin = (argc > 7) ? (std::atoi(argv[7]) != 0) : false;
 
+    // EXCLUSIVE: hot workers own their cores AND everyone else is masked off them. The userspace
+    // approximation of isolcpus, and the only affinity arrangement that has not been refuted.
+    const bool hotExcl = (argc > 8) ? (std::atoi(argv[8]) != 0) : false;
+
+    // Pool size, 0 = auto. EXISTS FOR ONE REASON: exclusive affinity reserves K cores without
+    // shrinking the pool, so the remaining workers plus main plus the IOCP thread get crammed onto
+    // fewer CPUs than before. Measuring that and calling it "exclusion" would be measuring
+    // OVERSUBSCRIPTION. Sizing the pool to cores-K is the only way to tell them apart.
+    const int workers = (argc > 9) ? std::atoi(argv[9]) : 0;
+
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
 
@@ -153,10 +163,11 @@ int main(int argc, char** argv) {
     // ALSO before Init, and for a second reason: StartWorker decides placement as each worker
     // starts, so the hot COUNT must already be known there for pinning to select the right ones.
     if (hot) JLib::TaskScheduler::SetHotWorkers(hot);
-    JLib::TaskScheduler::SetHotWorkerPin(hotPin);
+    JLib::TaskScheduler::SetHotWorkerPin(hotPin || hotExcl);   // exclusive implies pinning the hots
+    JLib::TaskScheduler::SetHotWorkerExclusive(hotExcl);
 
     JLib::TaskScheduler::EnableIoReactor(true, th);
-    JLib::TaskScheduler::Init(0);
+    JLib::TaskScheduler::Init(workers);
     auto& sched = JLib::TaskScheduler::Instance();
     auto& io = JLib::IoReactor::Instance();
     io.InitSockets();
@@ -165,8 +176,14 @@ int main(int argc, char** argv) {
         JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
 
     std::printf("io_dispatch_latency -- %d samples, cold pause %dms, %u completion thread(s), "
-                "%zu workers, idle=%s, hot=%zu, hotRT=%d, hotPin=%d\n\n", samples, coldMs, th,
-                sched.GetWorkerCount(), noSleep ? "NoSleep" : "Sleep", hot, (int)hotRt, (int)hotPin);
+                "%zu workers, idle=%s, hot=%zu, hotRT=%d, hotPin=%d, hotExcl=%d\n\n", samples,
+                coldMs, th, sched.GetWorkerCount(), noSleep ? "NoSleep" : "Sleep", hot,
+                (int)hotRt, (int)hotPin, (int)hotExcl);
+
+    // MAIN MUST GET OFF THE HOT CORES TOO -- it is the thread running ::send, so it is a producer
+    // for exactly those workers. Leaving it eligible for a hot core would leave the arrangement
+    // half-done, and half-done is the configuration that measured WORSE than doing nothing.
+    JLib::TaskScheduler::ExcludeCurrentThreadFromHotCpus();
 
     // One loopback pair. Concurrency is deliberately ONE: this measures the seam, not the pipe.
     SOCKET lis = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

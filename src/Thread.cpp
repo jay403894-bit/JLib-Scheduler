@@ -450,6 +450,12 @@ void Thread::Worker() {
 	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
 	// on a genuine change. Meaningless unless hotPriorityRaised.
 	bool atCriticalPriority = false;
+
+	// EXCLUSIVE MODE: an ORDINARY worker gets off the hot cores. The hot workers themselves are
+	// already pinned to them by StartWorker. Done here, at loop entry, because by now every worker's
+	// CPU is assigned and the hot mask was published before any of them started.
+	if (!(TaskScheduler::GetHotWorkers() > (size_t)qIndex))
+		TaskScheduler::ExcludeCurrentThreadFromHotCpus();
 	while (running.load(std::memory_order_acquire)) {
 
 		ready.store(true, std::memory_order_release);

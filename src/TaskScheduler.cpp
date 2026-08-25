@@ -481,6 +481,41 @@ static std::atomic<bool> g_hotPin{ false };
 void TaskScheduler::SetHotWorkerPin(bool on) { g_hotPin.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::GetHotWorkerPin() { return g_hotPin.load(std::memory_order_relaxed); }
 
+// EXCLUSIVE AFFINITY. Pinning alone measured WORSE than doing nothing, because it CONFINES the hot
+// worker without EXCLUDING anyone else from its core -- so whenever another thread lands there, the
+// hot worker cannot migrate away and just waits. Exclusive mode is the other half: the hot workers
+// own cores 0..K-1, and every other thread in the process masks those bits off.
+//
+// This is the userspace approximation of isolcpus. It cannot exclude OTHER PROCESSES, which is
+// exactly where it stops being equivalent.
+static std::atomic<bool> g_hotExclusive{ false };
+static std::atomic<unsigned long long> g_hotCpuMask{ 0 };
+void TaskScheduler::SetHotWorkerExclusive(bool on) { g_hotExclusive.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetHotWorkerExclusive() { return g_hotExclusive.load(std::memory_order_relaxed); }
+void TaskScheduler::SetHotCpuMask(unsigned long long m) { g_hotCpuMask.store(m, std::memory_order_relaxed); }
+unsigned long long TaskScheduler::GetHotCpuMask() { return g_hotCpuMask.load(std::memory_order_relaxed); }
+
+// Called BY a thread ON ITSELF -- ordinary workers at loop entry, the reactor's completion threads
+// at Run() entry, and the application's own thread if it wants to stay off the hot cores. Each
+// thread masking itself avoids plumbing native handles around, and means a thread the scheduler does
+// not own can opt in with one call.
+//
+// Takes the PROCESS mask as the starting point rather than "all CPUs", so it composes with an
+// application that has already restricted the process. No-op unless exclusive mode is on and a hot
+// mask has been published, and never masks a thread down to nothing.
+void TaskScheduler::ExcludeCurrentThreadFromHotCpus() {
+#if JLIB_PLATFORM_WINDOWS
+	if (!g_hotExclusive.load(std::memory_order_relaxed)) return;
+	const unsigned long long hot = g_hotCpuMask.load(std::memory_order_relaxed);
+	if (!hot) return;
+
+	DWORD_PTR procMask = 0, sysMask = 0;
+	if (!::GetProcessAffinityMask(::GetCurrentProcess(), &procMask, &sysMask)) return;
+	const DWORD_PTR keep = (DWORD_PTR)(procMask & ~(DWORD_PTR)hot);
+	if (keep) ::SetThreadAffinityMask(::GetCurrentThread(), keep);
+#endif
+}
+
 // The stale-library guard's other half. Compiled INTO the library, so it reports the signature as
 // the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
 // the including translation unit's view; a mismatch means somebody rebuilt one and not the other.
@@ -1210,6 +1245,24 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// floors at 2 below, so this only has to be sane, not exact.
 	const size_t fairShare = standardFiberCount / (num_workers ? num_workers : 1);
 	const size_t fiberCacheCapacity = (fairShare / 2 < 16) ? 16 : fairShare / 2;
+
+	// PUBLISH THE HOT CPU SET BEFORE ANY WORKER STARTS. Every other thread masks these bits off as
+	// it comes up, so the set has to be complete first -- a non-hot worker that started earlier
+	// would otherwise exclude an incomplete set and land on a hot core anyway. Same CPU-selection
+	// formula as the loop below, deliberately duplicated rather than reordered, because the loop's
+	// order is load-bearing for the Ready() handshake underneath it.
+	if (GetHotWorkerExclusive()) {
+		const size_t hotN = GetHotWorkers();
+		unsigned long long mask = 0;
+		for (size_t i = 0; i < hotN && i < num_workers; ++i) {
+			size_t cpu;
+			if (!physicalCpus.empty())                   cpu = (size_t)physicalCpus[i + 1];
+			else if (logicalCpus.size() > (size_t)i + 1) cpu = (size_t)logicalCpus[i + 1];
+			else                                         cpu = i + 1;
+			if (cpu < 64) mask |= (1ULL << cpu);
+		}
+		SetHotCpuMask(mask);
+	}
 
 	for (unsigned int i = 0; i < num_workers; ++i) {
 		// Default scheme: worker i takes the (i+1)'th logical CPU that EXISTS, main keeps the first.
