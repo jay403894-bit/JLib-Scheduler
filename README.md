@@ -710,12 +710,78 @@ in practice, which is why it is still treated as "meaningful" rather than as `No
 real gap between "hint" and "guarantee," not just boilerplate hedging -- know it before building a
 design that assumes a `P` task always lands on a P-core.
 
+### Hot workers: how many, and when none
+
+`SetHotWorkers(K)` reserves K workers that **never park**, and the reactor steers I/O completions at
+them. It is **off by default (K = 0)** and it is the difference between async I/O being usable in a
+hybrid pool and not.
+
+**The problem it solves.** Compute wants the pool to park when idle -- 31 threads spinning between
+frames is unacceptable. I/O wants the pool never to park, because a completion arrives *precisely*
+when the pool is idle; that is what awaiting means. Those are mutually exclusive as a global policy,
+and the measured cost of choosing wrong is not subtle:
+
+| | I/O dispatch p50 | p99 | cost |
+|---|---|---|---|
+| `Sleep` (default) | 10.5 us | ~300 us | none |
+| `NoSleep` (whole pool) | 2.7 us | ~25 us | every core spins |
+| **`SetHotWorkers(1)`** | **1.2 us** | **~7 us** | one core |
+
+Parking is ~300 us of that; the residue between NoSleep and K-hot is contention between 31 spinners.
+K-hot makes the idle policy a property of the **worker** rather than the pool, which is what lets one
+scheduler serve compute that must not spin and I/O that must not wait.
+
+**Picking K.** Two different rules, and which applies depends on what you are building.
+
+*For an application with deadlines* -- a game, an audio pipeline -- **K is the number of independent
+deadline paths that must not block each other**, not a measure of I/O volume. One hot worker serves
+its lane strictly in order, so an audio refill in progress delays a network packet that completes
+behind it. That coupling is visible at a concurrency of two:
+
+    N=2    K=1: p50 1.30 us      K=2: p50 0.80 us
+    N=4    K=1: p50 9.10 us      K=2: p50 2.50 us
+
+So: **K=1** for one deadline path (audio, or netcode). **K=2** when two can collide. Bulk work --
+asset streaming, background loads -- does not need its own hot worker and should share: queueing is
+free when nothing is waiting on it, and a level load is exactly when no frame deadline exists.
+
+*For a server*, where throughput matters more than a frame budget, K tracks concurrent in-flight
+depth -- roughly **one hot worker per 2-4 concurrent operations**, because past that the worker
+saturates and latency grows linearly:
+
+    N          1     2     4      8      16      32      64
+    K=1 p50 1.20  1.30  9.10  19.20   65.20  144.40  133.10 us   (~59k ops/s ceiling)
+    K=2 p50 0.60  0.80  2.50   5.10   13.10   31.20   69.50 us   (~220k)
+    K=4 p50 0.60  0.80  1.20   2.70    6.80   13.80   26.20 us   (491k, still climbing)
+
+Note those are 8-byte loopback datagrams that complete instantly, so N in flight means N completions
+arriving at once -- a saturating source. Real I/O spends its life in the kernel, so in-flight depth
+and completion *rate* decouple: 16 concurrent asset reads do not produce 16 simultaneous
+completions. For scale, K=1's ceiling is ~980 completions per frame at 60 fps.
+
+**What it costs.** Each hot worker is removed from general placement -- at least K/N of throughput,
+3.2% per worker on a 31-worker pool, and more on an SMT machine where a spinning worker also degrades
+its sibling core. On a 16-core machine K=4 is over a quarter of the pool; treat K>=2 as a server
+configuration and K=1 as the game one.
+
+**Use K=0 -- the default -- if you have no latency-critical I/O.** Pure compute gains nothing from a
+hot worker and pays a core for it. K=0 costs nothing: the lane collapses and the worker loop is
+*cheaper* than a pool without the feature, because a worker that serves no lane checks one inbox, one
+deque and one steal probe per victim instead of two.
+
+**`SetHotThreadPolicy(Elevated)`** additionally raises the hot workers and the reactor's completion
+threads to `THREAD_PRIORITY_TIME_CRITICAL` (Windows; a no-op elsewhere). It raises **only** those
+threads, never the process -- raising the whole process measured *5x worse*, because the spinning
+workers then preempt the completion thread feeding them. Untested beside a live audio or present
+thread; if you see stutter rather than an I/O win, drop it and keep `SetHotWorkers` alone, which is
+where most of the measured benefit is.
+
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.
 
 ## Versioning
 
-2.5.0. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
+4.0.0-beta. The supported API is `TaskScheduler.h`, `Task.h` and `TaskDAG.h`; those follow semver and do
 not break without a 2.0. Every header is installed because the supported ones need them to compile,
 but the rest are implementation detail and may change in any release. If you need something only
 reachable through one of those, that is a missing feature -- open an issue rather than depend on it.
