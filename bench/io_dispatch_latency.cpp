@@ -91,6 +91,54 @@ JLib::Coro OneOp(int i) {
     co_return;
 }
 
+// ---- CONCURRENT SOAK ------------------------------------------------------------------------
+//
+// THE ONE SHAPE NOTHING ELSE HERE MEASURES. Every other pass has ~ONE lane operation in flight:
+// HOT/COLD are strictly one-at-a-time, and BURST is a synchronised WAVE -- fire kBurst, wait for
+// all, repeat. So every number this file has produced describes a lane with no CONCURRENCY, and
+// the two open questions are exactly about what happens when it has some:
+//
+//   * optimal K only matters once ONE hot worker can saturate. At one op in flight it never can,
+//     which is why K=1 has trivially sufficed so far.
+//   * hot->hot stealing (and a ring buffer to make it cheap) only matters if hot workers back up
+//     UNEVENLY. With one op in flight there is nothing to rebalance -- which is why it measured as
+//     20.6M probes of pure cost. That result is honest for that workload and says nothing about a
+//     loaded lane.
+//
+// N INDEPENDENT COROUTINES, each looping on its own socket pair, never synchronised with each
+// other. That is a real steady-state offered load rather than a wave, so the lane can genuinely
+// back up. Sweeping N answers "at what arrival rate does one hot worker saturate" and "do the hot
+// workers share the load or does one starve".
+struct SoakPair { JLib::IoSocket tx{}, rx{}; sockaddr_in dst{}; };
+std::vector<SoakPair> g_soak;
+std::vector<std::array<char, 8>> g_soakBuf;
+std::atomic<int> g_soakLive{ 0 };
+std::vector<long long> g_soakLat;      // one slot per op, flat
+std::atomic<size_t> g_soakNext{ 0 };
+
+JLib::Coro SoakOp(int slot, int iters) {
+    char tx[8] = { 's','o','a','k','!','!','!','!' };
+    for (int i = 0; i < iters; ++i) {
+        const JLib::IoResult w = co_await JLib::SendToAsync(
+            g_soak[slot].tx, tx, sizeof tx, &g_soak[slot].dst, sizeof(sockaddr_in));
+        if (!w.Ok()) break;
+
+        JLib::IoAddress from{};
+        const JLib::IoResult r = co_await JLib::RecvFromAsync(
+            g_soak[slot].rx, g_soakBuf[slot].data(), 8, &from);
+        if (!r.Ok()) break;
+
+        // Only the RECV half is timed: it is the completion that had to find a worker. The send
+        // completes on the same path but its latency is not what the lane exists to protect.
+        if (r.completedAtNs != 0) {
+            const size_t k = g_soakNext.fetch_add(1, std::memory_order_relaxed);
+            if (k < g_soakLat.size()) g_soakLat[k] = JLib::MonotonicNs() - r.completedAtNs;
+        }
+    }
+    g_soakLive.fetch_sub(1, std::memory_order_release);
+    co_return;
+}
+
 void Report(const char* label, std::vector<long long> s) {
     if (s.empty()) { std::printf("  %-6s no samples\n", label); return; }
     std::sort(s.begin(), s.end());
@@ -289,6 +337,73 @@ int main(int argc, char** argv) {
         for (int i = 0; i < kBurst; ++i) {
             ::closesocket(static_cast<SOCKET>(g_bc[i]));
             ::closesocket(static_cast<SOCKET>(g_bs[i]));
+        }
+    }
+
+    // ---- CONCURRENT SOAK SWEEP ----------------------------------------------------------------
+    // Sweeps the offered load. Look for the N where p50 starts climbing: below it the lane is
+    // keeping up, at it one hot worker is saturating, above it operations are queueing. THAT is
+    // the number that decides whether K>1 and hot-worker rebalancing are live questions.
+    {
+        std::printf("\n  concurrent soak -- N independent coroutines, steady state (not a wave)\n");
+        std::printf("    recv-completion -> coroutine resumed, us\n");
+        std::printf("      N     ops     p50      p90      p99      max     ops/sec\n");
+
+        for (int n : { 1, 2, 4, 8, 16, 32, 64 }) {
+            const int iters = (n <= 8) ? 200 : 100;
+
+            g_soak.assign(n, SoakPair{});
+            g_soakBuf.assign(n, {});
+            g_soakLat.assign((size_t)n * iters, 0);
+            g_soakNext.store(0, std::memory_order_relaxed);
+            g_soakLive.store(n, std::memory_order_relaxed);
+
+            for (int i = 0; i < n; ++i) {
+                SOCKET t = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                SOCKET r = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                sockaddr_in ra{};
+                ra.sin_family = AF_INET;
+                ra.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+                ra.sin_port = 0;
+                ::bind(r, reinterpret_cast<sockaddr*>(&ra), sizeof ra);
+                int rl = sizeof ra;
+                ::getsockname(r, reinterpret_cast<sockaddr*>(&ra), &rl);
+                io.RegisterSocket(t);
+                io.RegisterSocket(r);
+                g_soak[i].tx = static_cast<JLib::IoSocket>(t);
+                g_soak[i].rx = static_cast<JLib::IoSocket>(r);
+                g_soak[i].dst = ra;
+            }
+
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; ++i) JLib::Spawn(SoakOp(i, iters), static_cast<JLib::WaitGroup*>(nullptr), (uint8_t)1);
+
+            // No WaitGroup: these are long-lived loops, and a WaitFor from main would spin-help and
+            // perturb the very dispatch being measured. Poll the live count instead.
+            while (g_soakLive.load(std::memory_order_acquire) > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const double secs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+
+            std::vector<long long> v;
+            for (long long x : g_soakLat) if (x > 0) v.push_back(x);
+            if (!v.empty()) {
+                std::sort(v.begin(), v.end());
+                const auto pk = [&](double p) {
+                    return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                };
+                std::printf("    %3d  %6zu  %7.2f  %7.2f  %7.2f  %7.2f  %10.0f\n",
+                            n, v.size(), pk(0.50), pk(0.90), pk(0.99),
+                            double(v.back()) / 1000.0, secs > 0 ? v.size() / secs : 0.0);
+            }
+            else {
+                std::printf("    %3d  no samples (needs -DJLIBSCHED_IO_LOCK_STATS=ON)\n", n);
+            }
+
+            for (int i = 0; i < n; ++i) {
+                ::closesocket(static_cast<SOCKET>(g_soak[i].tx));
+                ::closesocket(static_cast<SOCKET>(g_soak[i].rx));
+            }
         }
     }
 
