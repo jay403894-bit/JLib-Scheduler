@@ -956,11 +956,23 @@ int main(int argc, char** argv) {
     auto   idle = JLib::TaskScheduler::IdlePolicy::Sleep;
     const char* idleName = "sleep";
     bool   runBoth = false;
+    size_t hotWorkers = 0;               // hot=N: dedicated low-latency-lane workers, 0 = off
     for (int a = 2; a < argc; ++a) {
         if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
         if (JLIB_STRICMP(argv[a], "sleep") == 0) { continue; }
         if (JLIB_STRICMP(argv[a], "nosleep") == 0)      { idle = JLib::TaskScheduler::IdlePolicy::NoSleep;       idleName = "nosleep";   continue; }
         if (JLIB_STRICMP(argv[a], "both") == 0) { runBoth = true; continue; }
+        // hot=N: dedicate N workers to the low-latency lane. EXISTS TO PRICE THEM.
+        //
+        // A hot worker is removed from general placement, so worker-bound work loses K/N of the
+        // pool -- 3.2% per worker on a 32-thread box. That cost is arithmetic, but it is invisible
+        // in a DISPATCH benchmark: at ~60ns/task the producer is the bottleneck and the workers are
+        // not saturated, so removing one changes nothing. The `heavy` ParallelFor row is genuinely
+        // worker-bound and is where the ratio should actually show up.
+        if (JLIB_STRNICMP(argv[a], "hot=", 4) == 0) {
+            hotWorkers = (size_t)strtoul(argv[a] + 4, nullptr, 10);
+            continue;
+        }
         poolSize = (size_t)strtoul(argv[a], nullptr, 10);
     }
 
@@ -1021,8 +1033,17 @@ int main(int argc, char** argv) {
     // so it reports in three minutes instead of the thirty a job timeout takes.
     StartSectionWatchdog(180);
 
+    // BEFORE Init: StartPool clamps K against the real pool size and publishes the hot CPU set as
+    // the workers come up, so the count has to be known by then.
+    if (hotWorkers) JLib::TaskScheduler::SetHotWorkers(hotWorkers);
+
     JLib::TaskScheduler::Init(poolSize);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
+
+    // Say what was actually configured -- a run pasted without this is unattributable, and K
+    // changes what the numbers mean.
+    printf("config: workers=%zu  hot=%zu  affinity=%s  idle=%s\n",
+           sched.GetWorkerCount(), JLib::TaskScheduler::GetHotWorkers(), policyName, idleName);
 
     // Warmup: get every worker spun up and fibers touched before measuring anything.
     {
