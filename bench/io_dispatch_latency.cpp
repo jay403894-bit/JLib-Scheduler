@@ -128,6 +128,11 @@ int main(int argc, char** argv) {
     // (~3.5% on an idle pool against a memory-bound main thread), which is why the default is Sleep.
     const bool noSleep = (argc > 4) ? (std::atoi(argv[4]) != 0) : false;
 
+    // K-hot: how many workers never park. 0 is the control. Sweeping this is what says whether a
+    // small number of landing spots is enough, or whether completions have to be STEERED at them --
+    // a curve that stays flat until K is a large fraction of the pool means steering, not K.
+    const std::size_t hot = (argc > 5) ? std::size_t(std::atoi(argv[5])) : 0u;
+
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
     JLib::TaskScheduler::EnableIoReactor(true, th);
@@ -138,10 +143,12 @@ int main(int argc, char** argv) {
 
     if (noSleep)
         JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
+    if (hot)
+        JLib::TaskScheduler::SetHotWorkers(hot);
 
     std::printf("io_dispatch_latency -- %d samples, cold pause %dms, %u completion thread(s), "
-                "%zu workers, idle=%s\n\n", samples, coldMs, th, sched.GetWorkerCount(),
-                noSleep ? "NoSleep" : "Sleep");
+                "%zu workers, idle=%s, hot=%zu\n\n", samples, coldMs, th, sched.GetWorkerCount(),
+                noSleep ? "NoSleep" : "Sleep", hot);
 
     // One loopback pair. Concurrency is deliberately ONE: this measures the seam, not the pipe.
     SOCKET lis = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

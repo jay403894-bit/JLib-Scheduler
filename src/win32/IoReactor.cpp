@@ -267,6 +267,7 @@ namespace JLib {
             IoResult* outHi[kBatch]; IoResult* outLo[kBatch];
 #endif
 
+            std::size_t steer = 0;   // rotates completions across the hot set; see Flush
             const auto Flush = [&](Task** hi, std::size_t& nh, Task** lo, std::size_t& nl) {
                 if (!TaskScheduler::IsInitialized()) { nh = 0; nl = 0; return; }
 #if defined(JLIBSCHED_IO_LOCK_STATS)
@@ -276,8 +277,24 @@ namespace JLib {
                 for (std::size_t i = 0; i < nh; ++i) if (outHi[i]) outHi[i]->flushedAtNs = now;
                 for (std::size_t i = 0; i < nl; ++i) if (outLo[i]) outLo[i]->flushedAtNs = now;
 #endif
-                if (nh) { TaskScheduler::Instance().PushBatch(hi, nh, 0, 64, true);  nh = 0; }
-                if (nl) { TaskScheduler::Instance().PushBatch(lo, nl, 0, 64, false); nl = 0; }
+                // STEER COMPLETIONS AT THE HOT WORKERS, when there are any.
+                //
+                // Without this, K-hot measurably does nothing: PushBatch spreads round-robin, so
+                // with K=2 of 29 workers only ~7% of completions land on a worker that is awake,
+                // and the other 93% pay the full wake anyway. Measured 8-24 -- p50 stayed flat at
+                // 9-11us for K = 0, 1, 2 and 8 alike, against 3us for NoSleep-all. Hot workers that
+                // nothing is aimed at just burn cores.
+                //
+                // cpuaffinity is 1-BASED and selects the worker directly, so 1..K is exactly the
+                // hot set. Rotated so a burst spreads across them instead of queueing behind one.
+                // Zero when K is 0, which is the ordinary spread-across-the-pool behaviour.
+                const std::size_t hotN = TaskScheduler::GetHotWorkers();
+                std::uint8_t aff = 0;
+                if (hotN) {
+                    aff = std::uint8_t(1 + (steer++ % hotN));
+                }
+                if (nh) { TaskScheduler::Instance().PushBatch(hi, nh, aff, 64, true);  nh = 0; }
+                if (nl) { TaskScheduler::Instance().PushBatch(lo, nl, aff, 64, false); nl = 0; }
             };
 
             for (;;) {

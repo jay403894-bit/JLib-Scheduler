@@ -463,6 +463,13 @@ static std::atomic<TaskScheduler::IdlePolicy> g_idlePolicy{ TaskScheduler::IdleP
 void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy.store(p, std::memory_order_relaxed); }
 TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.load(std::memory_order_relaxed); }
 
+// K-HOT. DEFAULT IS ZERO, and that is not timidity -- it is the same rule the I/O layer follows:
+// a job-system-only user must not pay for something they never asked for. A spinning core is a real
+// cost to every other thread in the process, so it is opt-in like the reactor is.
+static std::atomic<size_t> g_hotWorkers{ 0 };
+void   TaskScheduler::SetHotWorkers(size_t k) { g_hotWorkers.store(k, std::memory_order_relaxed); }
+size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
+
 // The stale-library guard's other half. Compiled INTO the library, so it reports the signature as
 // the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
 // the including translation unit's view; a mismatch means somebody rebuilt one and not the other.

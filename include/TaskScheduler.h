@@ -311,6 +311,22 @@ namespace JLib {
 		static void       SetIdlePolicy(IdlePolicy p);
 		static IdlePolicy GetIdlePolicy();
 
+		// K-HOT: keep the first K workers from ever parking, while the rest obey IdlePolicy.
+		//
+		// The bounded-cost middle between Sleep and NoSleep. NoSleep's penalty lands in p90 and
+		// scales with how many cores spin, so a handful of hot workers is a different trade from
+		// spinning the whole pool. A hot worker also costs a PUSHER nothing: it never advertises
+		// WS_GOING_TO_SLEEP, so pushes to it take the awake-preference skip instead of a notify.
+		//
+		// DEFAULT 0 -- off. A spinning core taxes every other thread in the process, so this is
+		// opt-in exactly like the I/O layer is; a job-system-only user must not pay for it.
+		//
+		// WHETHER IT HELPS DEPENDS ON WHERE WORK LANDS. If pushes are spread round-robin, K hot
+		// workers only catch K/N of them, and the answer is to STEER work at them rather than to
+		// raise K. Measure before choosing a number.
+		static void   SetHotWorkers(size_t k);
+		static size_t GetHotWorkers();
+
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
 		// dispatch+join overhead, and an unoptimized build pays roughly an order of magnitude more of it.

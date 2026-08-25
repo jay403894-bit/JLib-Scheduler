@@ -1009,7 +1009,16 @@ void Thread::Worker() {
 			{
 				// Shutdown and Pause both override the policy. Pausing means "stop using the CPU",
 				// and a policy that spun through it would defeat the only thing Pause exists for.
-				const bool mayspin = TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep
+				// K-HOT: the same decision, taken per worker instead of pool-wide. Workers below
+				// the hot count never park; everyone else obeys the global policy. It is the
+				// bounded-cost version of NoSleep -- whose penalty lands in p90 and scales with how
+				// many cores spin, so 2-of-31 is a different question from 31-of-31.
+				//
+				// The spin ALSO removes the producer's notify, because a spinning worker never
+				// advertises WS_GOING_TO_SLEEP (see the note above). So a hot worker is a landing
+				// spot that costs a pusher nothing, which is the actual hypothesis being tested.
+				const bool hot = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
+				const bool mayspin = (hot || TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep)
 					&& running.load(std::memory_order_acquire)
 					&& !scheduler->paused.load(std::memory_order_seq_cst);
 
