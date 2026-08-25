@@ -449,7 +449,14 @@ int main(int argc, char** argv) {
 
     size_t pool = 0;
     bool noSleep = false;
+    // hot=N: dedicate N workers to the low-latency lane. Included here to answer a specific
+    // question -- whether K-hot changes FIBER WAKE latency. It should not: a wake preserves the
+    // task's own hiPri tag (Event::WakeOne batches by t->hiPri), and every fiber in this harness is
+    // untagged, so they wake on the ordinary lane no matter what K is. Measuring it is how that
+    // claim stops being an assertion.
+    size_t hot = 0;
     for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "hot=", 4) == 0)     { hot = (size_t)strtoul(argv[i] + 4, nullptr, 10); continue; }
         if (strcmp(argv[i], "nosleep") == 0)      { noSleep = true; continue; }
         if (strcmp(argv[i], "--only=jlib") == 0)  { g_doM = false; continue; }
         if (strcmp(argv[i], "--only=marl") == 0)  { g_doJ = false; continue; }
@@ -462,6 +469,11 @@ int main(int argc, char** argv) {
     }
     if (noSleep)
         JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
+
+    if (hot) {
+        JLib::TaskScheduler::SetHotWorkers(hot);
+        JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
+    }
 
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
     JLib::TaskScheduler::Init(pool);
@@ -505,6 +517,29 @@ int main(int argc, char** argv) {
            (unsigned long long)g_sink.load());
 
     if (g_doM) marl::Scheduler::unbind();
-    if (g_doJ) jl.Join();
+
+    // WATCHDOG AROUND Join(). This harness has been observed to hang HERE -- after every result has
+    // printed, so all work is finished and nothing is racing. That makes the pool STATIC at hang
+    // time, and a dump readable rather than a smear: it prints per-worker queue sizes, sleep states
+    // and the non-worker lane, which is precisely what a stack trace cannot tell you.
+    //
+    // Lives in the harness rather than the library because it is a diagnostic for one known bug, and
+    // because a scheduler that watchdogs its own shutdown would be hiding the failure it should be
+    // reporting.
+    if (g_doJ) {
+        std::atomic<bool> joined{ false };
+        std::thread watchdog([&] {
+            for (int i = 0; i < 100 && !joined.load(std::memory_order_acquire); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!joined.load(std::memory_order_acquire)) {
+                printf("\n!!! Join() has not returned after 10s -- pool state follows !!!\n");
+                jl.DumpPoolState("Join watchdog");
+                fflush(stdout);
+            }
+            });
+        jl.Join();
+        joined.store(true, std::memory_order_release);
+        watchdog.join();
+    }
     return 0;
 }
