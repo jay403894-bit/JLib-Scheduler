@@ -545,6 +545,10 @@ if(JLIBSCHED_COROUTINES)
     add_executable(SchedulerFutureTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/future_test.cpp")
     target_link_libraries(SchedulerFutureTest PRIVATE Scheduler)
     target_compile_features(SchedulerFutureTest PRIVATE cxx_std_20)
+
+    add_executable(SchedulerCoroEpochTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/coro_epoch_test.cpp")
+    target_link_libraries(SchedulerCoroEpochTest PRIVATE Scheduler)
+    target_compile_features(SchedulerCoroEpochTest PRIVATE cxx_std_20)
     message(STATUS "JLib::Scheduler: C++20 coroutine tests ENABLED (core still builds as C++17)")
 
     add_executable(SchedulerCoroBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/coroutine_bench.cpp")

@@ -9,6 +9,7 @@
 #include <cstdio>    // fprintf -- the debug-only EpochGuard suspend tripwire below
 #include <cassert>   // assert   -- ditto
 #include "Task.h"
+#include "platform.h"   // kCacheLine, for the counted-epoch ring below
 #include "concurrentqueue.h"
 
 namespace JLib {
@@ -68,6 +69,14 @@ namespace JLib {
 			std::atomic<size_t> localEpoch{ SIZE_MAX };   // SIZE_MAX == not in an epoch
 		};
 		std::vector<ThreadEpoch*> threadEpochs;
+
+		// The counted-epoch ring. NOT registered as `participants` -- these are not slots and the
+		// scan reads them separately, which is what keeps the participant vector frozen and its
+		// lock-free read valid. Cache-line separated: every reader in an epoch hits one counter, so
+		// false sharing here would be self-inflicted contention.
+		struct alignas(platform::kCacheLine) EpochCounter { std::atomic<int> n{ 0 }; };
+		EpochCounter epochCounters[8];   // == kEpochSlots; declared before it for member ordering
+
 		EpochManager() = default;
 	public:
 		EpochManager(const EpochManager&) = delete;
@@ -281,6 +290,22 @@ namespace JLib {
 				size_t e = slot->load(std::memory_order_acquire);
 				if (e != SIZE_MAX && e < minEpoch) minEpoch = e;
 			}
+
+			// AND THE COUNTED READERS. Two mechanisms are live at once -- slots for fibers and bare
+			// threads, counters for coroutines -- and reclamation must respect BOTH, so this is a
+			// minimum over their union. Getting this wrong in the safe direction stalls reclamation;
+			// getting it wrong the other way frees memory a coroutine is still reading.
+			//
+			// ATTRIBUTING A COUNTER TO AN EPOCH is what the advance gate buys. Because advancement
+			// refuses to enter an occupied slot, at most kEpochSlots epochs are live, so each ring
+			// slot corresponds to exactly ONE epoch in [cur - kEpochSlots + 1, cur] and a nonzero
+			// count can be pinned to it. Without the gate this arithmetic is a lie -- see the model.
+			const size_t cur = globalEpoch.load(std::memory_order_acquire);
+			for (size_t k = 0; k < kEpochSlots; ++k) {
+				if (epochCounters[k].n.load(std::memory_order_seq_cst) == 0) continue;
+				const size_t e = cur - ((cur - k) & (kEpochSlots - 1));   // the live epoch for slot k
+				if (e < minEpoch) minEpoch = e;
+			}
 			return minEpoch;
 		}
 	
@@ -315,7 +340,65 @@ namespace JLib {
 
 	
 	private:
-		void AdvanceEpoch() { globalEpoch.fetch_add(1, std::memory_order_acq_rel); }
+		// ================================================================================================
+		// COUNTED EPOCHS -- the second reader mechanism, for readers with no stable identity.
+		//
+		// The slot scheme above asks WHERE EVERY READER IS and needs one stable slot per reader.
+		// Fibers have that (fixed pool, registered once); coroutines cannot, and any fixed pool for
+		// them reintroduces the exact ceiling coroutines exist to escape. So this asks a different
+		// question -- HOW MANY READERS ARE IN EACH EPOCH -- and identity disappears:
+		//
+		//     enter:  e = globalEpoch;  counters[e % N]++     the token IS `e`
+		//     leave:  counters[token % N]--
+		//
+		// A coroutine holds `e` in its own frame, migrates freely, and shares nothing with any
+		// worker. Unbounded readers, no registration, nothing to clobber. SRCU in shape.
+		//
+		// MODEL-CHECKED: tests/verify/counted_epoch_model.c, GenMC 0.17.0. Read its RESULTS block
+		// before changing anything here -- two of the decisions below are load-bearing and one of
+		// them is proven so.
+		//
+		// NO RE-VALIDATION, and that is deliberate rather than an omission. The obvious hazard is a
+		// reader loading the epoch, the reclaimer advancing and freeing, then the reader incrementing
+		// a counter nobody will look at again. GenMC says it cannot happen HERE, for a structural
+		// reason: the reclaimer unlinks BEFORE it checks counters, and a reader announces BEFORE it
+		// traverses -- so a reader whose increment lands after the check has necessarily loaded the
+		// pointer after the unlink and finds nothing. The window closes itself.
+		//
+		//   THAT MAKES announce-then-traverse A REQUIREMENT, not a convention. Any path that reads a
+		//   protected pointer BEFORE entering an epoch breaks this silently. The RAII guard is what
+		//   enforces it: construct, then traverse. If a call site ever cannot, restore the
+		//   re-validation (load, increment, re-load, retry) rather than reasoning about the case.
+		static constexpr size_t kEpochSlots = 8;               // power of two: the modulo is a mask
+		static size_t EpochRing(size_t e) { return e & (kEpochSlots - 1); }
+
+		// Returns the epoch entered; pass it back to LeaveCounted unchanged.
+	public:
+		size_t EnterCounted() {
+			const size_t e = globalEpoch.load(std::memory_order_seq_cst);
+			epochCounters[EpochRing(e)].n.fetch_add(1, std::memory_order_seq_cst);
+			return e;
+		}
+		void LeaveCounted(size_t token) {
+			epochCounters[EpochRing(token)].n.fetch_sub(1, std::memory_order_seq_cst);
+		}
+
+		// GATED, and GenMC proves the gate is necessary -- removing it is the one control that
+		// FAILS. Advancing into an occupied ring slot makes that slot ambiguous: a reader parked
+		// kEpochSlots epochs back becomes indistinguishable from one entering now, and the reclaimer
+		// attributes its count to the wrong epoch. Refusing to advance keeps every live slot mapped
+		// to exactly one epoch, at the price of stalling reclamation while somebody is parked --
+		// which is a LEAK, bounded by the park, and precisely what a parked fiber already costs.
+		//
+		// Returns false when it declined. Nothing needs to care; Tick simply does not advance this
+		// time, which is the stall doing its job.
+		bool AdvanceEpoch() {
+			size_t e = globalEpoch.load(std::memory_order_acquire);
+			const size_t next = e + 1;
+			if (epochCounters[EpochRing(next)].n.load(std::memory_order_seq_cst) != 0) return false;
+			return globalEpoch.compare_exchange_strong(e, next, std::memory_order_seq_cst,
+			                                           std::memory_order_relaxed);
+		}
 
 
 	};
@@ -454,6 +537,27 @@ namespace JLib {
 #define JLIB_EPOCH_CHECK_NO_GUARD(where) ((void)0)
 #define JLIB_EPOCH_CHECK_NO_GUARD_CORO() ((void)0)
 #endif
+
+// THE COUNTED GUARD -- for a reader with no stable slot, i.e. a coroutine. Announces by
+// incrementing the current epoch's counter rather than by writing a slot, so the protection travels
+// with the token in the coroutine's own frame and survives a suspension and a migration.
+//
+// Use CoroSafeEpochGuard() in Thread.h rather than constructing this directly; it picks between the
+// two mechanisms. Constructing this on a FIBER would work but is pure loss -- a fiber already owns a
+// slot, and a counter is contended where a slot is not.
+struct CountedEpochGuard {
+	size_t token;
+
+	CountedEpochGuard() : token(JLib::EpochManager::Instance().EnterCounted()) {
+		JLIB_EPOCH_GUARD_ENTER();
+	}
+	~CountedEpochGuard() {
+		JLib::EpochManager::Instance().LeaveCounted(token);
+		JLIB_EPOCH_GUARD_LEAVE();
+	}
+	CountedEpochGuard(const CountedEpochGuard&) = delete;
+	CountedEpochGuard& operator=(const CountedEpochGuard&) = delete;
+};
 
 struct EpochGuard {
 	std::atomic<size_t>* slot;

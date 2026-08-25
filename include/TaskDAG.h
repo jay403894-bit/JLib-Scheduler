@@ -221,7 +221,7 @@ namespace JLib {
         // TaskNode* each one points at does.
         template <typename F>
         void ForEachDependent(TaskNode* node, F fn) {
-            EpochGuard guard(CurrentEpochSlot());
+            CoroSafeEpochGuard guard;
             for (DagEdge* e = node->firstEdge; e; e = e->next) fn(e->dep);
         }
 

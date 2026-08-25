@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #pragma once
+#include <optional>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -328,4 +329,47 @@ namespace JLib {
                 return &f->localEpoch;
         return EpochManager::Instance().ThreadSlot(thread_id);
     }
+
+    // TRUE when the caller is a coroutine task: on a worker, but with no fiber, which is what a
+    // Coroutine-type task looks like (they ride the Native path and never take one).
+    //
+    // A bare thread also has no fiber and deliberately answers FALSE -- its thread slot is genuinely
+    // its own and stable for the guard's whole life, so the slot mechanism is correct and cheaper
+    // for it. The case this separates is the coroutine's, where the slot would be BORROWED from
+    // whichever worker happens to be running it and stops being the right place the instant it
+    // suspends.
+    inline bool OnCoroutineTask() {
+        Thread* w = Thread::GetCurrent();
+        if (!w || w->currentFiber) return false;
+        Task* t = w->currentRunningTask;
+        return t && t->type == TaskType::Coroutine;
+    }
+
+    // ================================================================================================
+    // THE GUARD EVERY COROUTINE-REACHABLE CALL SITE SHOULD TAKE.
+    //
+    // Picks the mechanism by who is asking. A fiber or bare thread gets the slot guard, unchanged
+    // and uncontended. A COROUTINE gets the counted guard, because a slot would be borrowed from a
+    // worker it is not bound to -- and a guard held across a co_await would then be un-announced by
+    // that worker's next guard while the traversal is still live. For a fiber that is a leak; for a
+    // coroutine it is a use-after-free.
+    //
+    // BOTH MECHANISMS ARE LIVE AT ONCE and MinActiveEpoch takes the minimum over their union, so
+    // reclamation respects whichever readers exist. See EpochManager's counted-epoch block and
+    // tests/verify/counted_epoch_model.c.
+    //
+    // Returns by value into an `auto` at the call site; the two guards are different types and that
+    // is deliberate -- there is nothing a caller should ever want to do with one that is not RAII.
+    class CoroSafeEpochGuard {
+    public:
+        CoroSafeEpochGuard() {
+            if (OnCoroutineTask()) counted_.emplace();
+            else                   slotted_.emplace(CurrentEpochSlot());
+        }
+        CoroSafeEpochGuard(const CoroSafeEpochGuard&) = delete;
+        CoroSafeEpochGuard& operator=(const CoroSafeEpochGuard&) = delete;
+    private:
+        std::optional<CountedEpochGuard> counted_;
+        std::optional<EpochGuard>        slotted_;
+    };
 };
