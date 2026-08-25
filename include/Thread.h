@@ -61,6 +61,65 @@ namespace JLib {
     inline constexpr bool kStealStatsEnabled = false;
 #endif
 
+    // ============================ HOT-WORKER OCCUPANCY WITNESS (opt-in) =========================
+    // Answers exactly one question, and it is the question that decides whether hot->hot stealing
+    // has a job at all: WHEN A HOT WORKER IS LATE, IS A SIBLING HOT WORKER IDLE AT THAT MOMENT?
+    //
+    // Latency numbers alone cannot answer it. A bad p99 on the lane is equally consistent with
+    // "every hot worker is saturated" (a capacity problem -- raise K, stealing changes nothing) and
+    // with "one hot worker is buried behind a long task while its sibling spins on an empty deque"
+    // (a balance problem -- exactly what stealing fixes). Those two demand opposite responses, so
+    // measuring the tail and guessing which one produced it is how a mechanism gets built on a
+    // coin flip.
+    //
+    // So each hot worker, on each pass where IT has nothing to run, looks at its siblings:
+    //     idlePasses     -- passes where this hot worker had an empty lane and empty inbox
+    //     idleWithSib    -- ... of those, passes where SOME sibling hot worker had a backlog
+    //     sibDepthSum    -- summed sibling depth over those passes, for a mean queue length
+    //
+    //     idleWithSib / idlePasses  ~ 0   ->  steering already balances; hot->hot is dead weight
+    //     idleWithSib / idlePasses  >> 0  ->  work is sitting still next to an idle core
+    //
+    // This scans the hot deques from the idle side, which is precisely the traffic the design
+    // avoids -- that is why it is opt-in and never compiled into a shipping build. It perturbs what
+    // it measures in BOTH directions, so neither result is free: the scan slows the idle worker
+    // (making it less likely to look idle) but it also reads endpoints the busy worker is writing,
+    // costing that worker exclusive state and making it more likely to look backlogged. Hence the
+    // 1-in-64 sampling, and hence the rule that this instrument decides a DIRECTION, not a
+    // magnitude -- a ratio near zero and a ratio near one mean different things; 0.04 versus 0.07
+    // does not.
+    //
+    // Enable with -DJLIBSCHED_HOT_OCCUPANCY_STATS=ON at configure time.
+#ifdef JLIBSCHED_HOT_OCCUPANCY_STATS
+    struct alignas(platform::kCacheLine) HotOccCounters {
+        std::atomic<long long> idlePasses{ 0 };
+        std::atomic<long long> idleWithSib{ 0 };
+        std::atomic<long long> sibDepthSum{ 0 };
+    };
+    inline constexpr size_t kHotOccSlots = 256;
+    inline HotOccCounters g_hotOcc[kHotOccSlots];
+    inline void HotOccStatsReset() {
+        for (size_t i = 0; i < kHotOccSlots; ++i) {
+            g_hotOcc[i].idlePasses.store(0, std::memory_order_relaxed);
+            g_hotOcc[i].idleWithSib.store(0, std::memory_order_relaxed);
+            g_hotOcc[i].sibDepthSum.store(0, std::memory_order_relaxed);
+        }
+    }
+    inline void HotOccStatsRead(long long& idlePasses, long long& idleWithSib, long long& sibDepthSum) {
+        idlePasses = idleWithSib = sibDepthSum = 0;
+        for (size_t i = 0; i < kHotOccSlots; ++i) {
+            idlePasses  += g_hotOcc[i].idlePasses.load(std::memory_order_relaxed);
+            idleWithSib += g_hotOcc[i].idleWithSib.load(std::memory_order_relaxed);
+            sibDepthSum += g_hotOcc[i].sibDepthSum.load(std::memory_order_relaxed);
+        }
+    }
+    inline constexpr bool kHotOccStatsEnabled = true;
+#else
+    inline void HotOccStatsReset() {}
+    inline void HotOccStatsRead(long long& a, long long& b, long long& c) { a = b = c = 0; }
+    inline constexpr bool kHotOccStatsEnabled = false;
+#endif
+
     // ============================== LATENCY BREAKDOWN INSTRUMENTATION (opt-in) ===================
     // Built to answer one question: where does the 4.3 us push->run->wait round-trip (README's
     // Sleep-mode figure) actually go -- the OS kernel wake, or Worker()'s own loop order? A parked

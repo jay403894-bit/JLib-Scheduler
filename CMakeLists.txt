@@ -38,6 +38,7 @@ set(JLIBSCHED_VERSION "4.0.0")
 # they exist to measure. Turn on only for an experiment, and do not compare its numbers against a
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
+option(JLIBSCHED_HOT_OCCUPANCY_STATS "Witness whether an idle hot worker has a backlogged sibling (diagnostic; scans hot deques)" OFF)
 
 # Latency breakdown: where a push->run->wait round trip actually spends its time -- OS wake vs
 # Worker()'s own loop order (local deque + steal scan run before the inbox a cold wake was FOR).
@@ -347,7 +348,13 @@ add_library(JLib::Scheduler ALIAS Scheduler)
 # would give two different Thread.h and a silently wrong answer.
 if(JLIBSCHED_STEAL_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_STEAL_STATS=1)
+endif()
+if(JLIBSCHED_STEAL_STATS)
     message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+if(JLIBSCHED_HOT_OCCUPANCY_STATS)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_HOT_OCCUPANCY_STATS=1)
+    message(STATUS "JLib::Scheduler: hot-occupancy witness ON (diagnostic build, not for perf numbers)")
 endif()
 
 if(JLIBSCHED_LATENCY_STATS)

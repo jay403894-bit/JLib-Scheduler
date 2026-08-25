@@ -1228,6 +1228,28 @@ void Thread::Worker() {
 					atCriticalPriority = true;
 				}
 #endif
+#ifdef JLIBSCHED_HOT_OCCUPANCY_STATS
+				// THE WITNESS. Reaching here means this worker's whole search came up empty, so for
+				// a hot worker this is by definition an idle pass. Sampled 1-in-64 rather than every
+				// pass: the scan reads deque endpoints the sibling OWNER is writing, so at spin rate
+				// it would steal exclusive state from the very worker it is trying to catch being
+				// late. Both populations are sampled by the same counter, so the ratio is unaffected.
+				if (hot && ((idleSpins & 0x3F) == 0)) {
+					const std::size_t hotN = TaskScheduler::GetHotWorkers();
+					long long deepest = 0;
+					for (std::size_t v = 0; v < hotN && v < scheduler->hiPri.size(); ++v) {
+						if (v == (std::size_t)qIndex) continue;
+						const long long d = (long long)scheduler->hiPri[v]->size();
+						if (d > deepest) deepest = d;
+					}
+					auto& slot = g_hotOcc[(std::size_t)qIndex < kHotOccSlots ? (std::size_t)qIndex : 0];
+					slot.idlePasses.fetch_add(1, std::memory_order_relaxed);
+					if (deepest > 0) {
+						slot.idleWithSib.fetch_add(1, std::memory_order_relaxed);
+						slot.sibDepthSum.fetch_add(deepest, std::memory_order_relaxed);
+					}
+				}
+#endif
 				const bool mayspin = (hot || TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep)
 					&& running.load(std::memory_order_acquire)
 					&& !scheduler->paused.load(std::memory_order_seq_cst);

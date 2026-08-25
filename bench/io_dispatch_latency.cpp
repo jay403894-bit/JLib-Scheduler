@@ -116,6 +116,32 @@ std::atomic<int> g_soakLive{ 0 };
 std::vector<long long> g_soakLat;      // one slot per op, flat
 std::atomic<size_t> g_soakNext{ 0 };
 
+// THE SKEW. Every op in the symmetric soak is the same size, so it cannot separate the two
+// explanations for a bad lane tail: every hot worker saturated (capacity -- raise K) versus one hot
+// worker buried while a sibling spins (balance -- what stealing fixes). Only the second is possible
+// when all work is uniform and steering round-robins it, so the symmetric soak structurally CANNOT
+// produce the condition it is being asked about.
+//
+// So a minority of resumptions burn CPU for a while. That is not an artificial stressor: it is what
+// a real completion handler looks like the moment anyone does work in one -- parse a packet, hash a
+// block, decompress an asset chunk. The burn happens INSIDE the resumed coroutine, i.e. on the hot
+// worker, occupying it exactly as a real handler would, and blocking every completion steered
+// behind it. A running task cannot be preempted, so that is the whole mechanism.
+//
+// g_skewEveryNth = 0 disables it, which is the A/A control against the symmetric soak.
+int  g_skewEveryNth = 0;
+long long g_skewBurnNs = 0;
+std::atomic<long long> g_skewBurns{ 0 };
+
+// Spin, not sleep: sleeping releases the worker, which is the opposite of what a busy handler does.
+// Volatile sink so the optimiser cannot delete the loop.
+static void BurnNs(long long ns) {
+    const long long end = JLib::MonotonicNs() + ns;
+    volatile double sink = 0.0;
+    while (JLib::MonotonicNs() < end) { for (int i = 0; i < 64; ++i) sink = sink + 1.0; }
+    (void)sink;
+}
+
 JLib::Coro SoakOp(int slot, int iters) {
     char tx[8] = { 's','o','a','k','!','!','!','!' };
     for (int i = 0; i < iters; ++i) {
@@ -134,9 +160,68 @@ JLib::Coro SoakOp(int slot, int iters) {
             const size_t k = g_soakNext.fetch_add(1, std::memory_order_relaxed);
             if (k < g_soakLat.size()) g_soakLat[k] = JLib::MonotonicNs() - r.completedAtNs;
         }
+
+        // TIMED FIRST, BURNED SECOND, deliberately. This op's own latency must record when it was
+        // resumed, not when it finished -- the burn is what this op does TO THE OTHERS, and folding
+        // it into this op's own sample would bury the effect in the population that causes it. The
+        // signal being hunted lives in the latency of the SHORT ops queued behind this one.
+        if (g_skewEveryNth > 0 && ((slot + i) % g_skewEveryNth) == 0) {
+            g_skewBurns.fetch_add(1, std::memory_order_relaxed);
+            BurnNs(g_skewBurnNs);
+        }
     }
     g_soakLive.fetch_sub(1, std::memory_order_release);
     co_return;
+}
+
+// One soak run: N coroutines, `iters` round trips each, sockets set up and torn down. Extracted so
+// the skewed sweep and the symmetric sweep are literally the same code path -- two copies of this
+// would drift, and a skew-vs-no-skew comparison across two drifted harnesses measures the drift.
+static std::vector<long long> SoakRun(int n, int iters, double& secsOut) {
+    auto& io = JLib::IoReactor::Instance();
+
+    g_soak.assign(n, SoakPair{});
+    g_soakBuf.assign(n, {});
+    g_soakLat.assign((size_t)n * iters, 0);
+    g_soakNext.store(0, std::memory_order_relaxed);
+    g_soakLive.store(n, std::memory_order_relaxed);
+
+    for (int i = 0; i < n; ++i) {
+        SOCKET t = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        SOCKET r = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in ra{};
+        ra.sin_family = AF_INET;
+        ra.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        ra.sin_port = 0;
+        ::bind(r, reinterpret_cast<sockaddr*>(&ra), sizeof ra);
+        int rl = sizeof ra;
+        ::getsockname(r, reinterpret_cast<sockaddr*>(&ra), &rl);
+        io.RegisterSocket(t);
+        io.RegisterSocket(r);
+        g_soak[i].tx = static_cast<JLib::IoSocket>(t);
+        g_soak[i].rx = static_cast<JLib::IoSocket>(r);
+        g_soak[i].dst = ra;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n; ++i)
+        JLib::Spawn(SoakOp(i, iters), static_cast<JLib::WaitGroup*>(nullptr), (uint8_t)1);
+
+    // No WaitGroup: these are long-lived loops, and a WaitFor from main would spin-help and perturb
+    // the very dispatch being measured. Poll the live count instead.
+    while (g_soakLive.load(std::memory_order_acquire) > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    secsOut = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    for (int i = 0; i < n; ++i) {
+        ::closesocket(static_cast<SOCKET>(g_soak[i].tx));
+        ::closesocket(static_cast<SOCKET>(g_soak[i].rx));
+    }
+
+    std::vector<long long> v;
+    for (long long x : g_soakLat) if (x > 0) v.push_back(x);
+    std::sort(v.begin(), v.end());
+    return v;
 }
 
 void Report(const char* label, std::vector<long long> s) {
@@ -349,62 +434,91 @@ int main(int argc, char** argv) {
         std::printf("    recv-completion -> coroutine resumed, us\n");
         std::printf("      N     ops     p50      p90      p99      max     ops/sec\n");
 
+        g_skewEveryNth = 0;
         for (int n : { 1, 2, 4, 8, 16, 32, 64 }) {
             const int iters = (n <= 8) ? 200 : 100;
-
-            g_soak.assign(n, SoakPair{});
-            g_soakBuf.assign(n, {});
-            g_soakLat.assign((size_t)n * iters, 0);
-            g_soakNext.store(0, std::memory_order_relaxed);
-            g_soakLive.store(n, std::memory_order_relaxed);
-
-            for (int i = 0; i < n; ++i) {
-                SOCKET t = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                SOCKET r = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                sockaddr_in ra{};
-                ra.sin_family = AF_INET;
-                ra.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
-                ra.sin_port = 0;
-                ::bind(r, reinterpret_cast<sockaddr*>(&ra), sizeof ra);
-                int rl = sizeof ra;
-                ::getsockname(r, reinterpret_cast<sockaddr*>(&ra), &rl);
-                io.RegisterSocket(t);
-                io.RegisterSocket(r);
-                g_soak[i].tx = static_cast<JLib::IoSocket>(t);
-                g_soak[i].rx = static_cast<JLib::IoSocket>(r);
-                g_soak[i].dst = ra;
+            double secs = 0.0;
+            std::vector<long long> v = SoakRun(n, iters, secs);
+            if (v.empty()) {
+                std::printf("    %3d  no samples (needs -DJLIBSCHED_IO_LOCK_STATS=ON)\n", n);
+                continue;
             }
+            const auto pk = [&](double p) {
+                return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+            };
+            std::printf("    %3d  %6zu  %7.2f  %7.2f  %7.2f  %7.2f  %10.0f\n",
+                        n, v.size(), pk(0.50), pk(0.90), pk(0.99),
+                        double(v.back()) / 1000.0, secs > 0 ? v.size() / secs : 0.0);
+        }
+    }
 
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < n; ++i) JLib::Spawn(SoakOp(i, iters), static_cast<JLib::WaitGroup*>(nullptr), (uint8_t)1);
+    // ---- SKEWED SOAK: is an idle hot worker sitting next to a backlogged one? ------------------
+    //
+    // THE QUESTION THIS EXISTS TO SETTLE. Hot->hot stealing was removed after measuring 20.6M probes
+    // at K=2 and 232M at K=4 for flat latency. That result is honest but it was taken against a
+    // UNIFORM load, where steering round-robins equal work across the hot set and there is nothing
+    // left to rebalance by construction. It says nothing about a lane whose handlers differ in size.
+    //
+    // A bad tail here still would not settle it, because two opposite situations produce one:
+    //
+    //   CAPACITY  every hot worker saturated. Stealing moves work between equally-buried cores and
+    //             changes nothing. The answer is a bigger K.
+    //   BALANCE   one hot worker buried behind a long handler while a sibling spins on an empty
+    //             deque. The answer is stealing, and only stealing.
+    //
+    // So the latency table is the SYMPTOM and the occupancy witness is the DIAGNOSIS. Read the
+    // witness first; the percentiles only say how much it is costing.
+    if (JLib::kHotOccStatsEnabled) {
+        const int n = 32, iters = 100;
+        std::printf("\n  skewed soak -- 1 in 8 resumptions burns `burn` us on the hot worker\n");
+        std::printf("    idle%%  = sampled idle passes where a SIBLING hot worker had a backlog.\n");
+        std::printf("    Near 0 -> steering balances, hot->hot is dead weight (keep it deleted).\n");
+        std::printf("    Well above 0 -> work is sitting still beside an idle core (build it).\n");
+        std::printf("      K    burn   skew   ops     p50      p90      p99   idle%%  meanDepth\n");
 
-            // No WaitGroup: these are long-lived loops, and a WaitFor from main would spin-help and
-            // perturb the very dispatch being measured. Poll the live count instead.
-            while (g_soakLive.load(std::memory_order_acquire) > 0)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            const double secs = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t0).count();
+        // BURN SIZE IS SWEPT, and that is not thoroughness -- it is the objection. A 200us handler
+        // arguably breaks the lane's own contract that lane work is short, so a result visible only
+        // there would say "keep handlers short", not "build stealing". 20us is a packet parse; 5us
+        // is barely more than the dispatch it rides on. If the witness only lights up at 200us the
+        // honest conclusion is a documentation fix.
+        for (long long burn : { 5000LL, 20000LL, 200000LL }) {
+          for (int skew : { 0, 8 }) {
+            for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+                if (skew == 0 && burn != 200000LL) continue;   // the control does not vary with burn
+                JLib::TaskScheduler::SetHotWorkers(k);
+                g_skewEveryNth = skew;
+                g_skewBurnNs = burn;
+                g_skewBurns.store(0, std::memory_order_relaxed);
+                JLib::HotOccStatsReset();
 
-            std::vector<long long> v;
-            for (long long x : g_soakLat) if (x > 0) v.push_back(x);
-            if (!v.empty()) {
-                std::sort(v.begin(), v.end());
+                double secs = 0.0;
+                std::vector<long long> v = SoakRun(n, iters, secs);
+
+                long long idle = 0, withSib = 0, depth = 0;
+                JLib::HotOccStatsRead(idle, withSib, depth);
+                const double pct = idle ? 100.0 * (double)withSib / (double)idle : 0.0;
+                const double meanD = withSib ? (double)depth / (double)withSib : 0.0;
+
+                if (v.empty()) { std::printf("    %3zu  %5d  no samples\n", k, skew); continue; }
                 const auto pk = [&](double p) {
                     return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
                 };
-                std::printf("    %3d  %6zu  %7.2f  %7.2f  %7.2f  %7.2f  %10.0f\n",
-                            n, v.size(), pk(0.50), pk(0.90), pk(0.99),
-                            double(v.back()) / 1000.0, secs > 0 ? v.size() / secs : 0.0);
+                std::printf("    %3zu  %6.0f  %5d  %6zu  %7.2f  %7.2f  %7.2f  %6.2f  %9.2f\n",
+                            k, burn / 1000.0, skew, v.size(), pk(0.50), pk(0.90), pk(0.99),
+                            pct, meanD);
             }
-            else {
-                std::printf("    %3d  no samples (needs -DJLIBSCHED_IO_LOCK_STATS=ON)\n", n);
-            }
-
-            for (int i = 0; i < n; ++i) {
-                ::closesocket(static_cast<SOCKET>(g_soak[i].tx));
-                ::closesocket(static_cast<SOCKET>(g_soak[i].rx));
-            }
+          }
         }
+        g_skewEveryNth = 0;
+        // This section moves K, and the steal-stat report below is per-configuration. Put back what
+        // the command line asked for so that number describes the run the caller requested.
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+    else {
+        std::printf("\n  skewed soak SKIPPED -- needs -DJLIBSCHED_HOT_OCCUPANCY_STATS=ON.\n");
+        std::printf("    The latency half would run, but without the witness it cannot tell\n");
+        std::printf("    'hot workers saturated' from 'one buried, one idle' -- and those two\n");
+        std::printf("    have opposite answers. Printing only the tail would invite the guess.\n");
     }
 
     // REMOTE DEQUE TOUCHES. A probe is one look at another core's deque endpoint -- the line that
