@@ -459,15 +459,22 @@ void Thread::Worker() {
 	while (running.load(std::memory_order_acquire)) {
 		// TWO DIFFERENT QUESTIONS, and conflating them deadlocks the pool.
 		//
-		//   servesHiPri  do I DRAIN the lane? True for everyone at K=0 (nothing else would), true
-		//                for the hot workers only at K>0.
+		//   servesHiPri  do I DRAIN the lane? Hot workers only. FALSE FOR EVERYONE AT K=0, where
+		//                nothing can enter a hiPri lane and scanning one is dead work.
 		//   isHotWorker  am I a DEDICATED lane server -- never steal, never park? False for everyone
-		//                at K=0. Keying the "does not steal" rule off servesHiPri instead meant that
-		//                at K=0, where servesHiPri is true for all, NO worker would steal at all.
+		//                at K=0. These are NOT the same question, and an earlier version keyed the
+		//                "does not steal" rule off the wrong one.
 		//
 		// Read once per pass; both are relaxed loads and re-read every pass, so SetHotWorkers stays
 		// safe to call on a running pool.
 		const bool servesHiPri = TaskScheduler::WorkerServesHiPri((size_t)qIndex);
+		// INSURANCE, not a scan: one load of a line this worker already owns. Covers the only way a
+		// task can sit in a lane nobody serves -- SetHotWorkers being LOWERED while work is queued.
+		// Costs nothing in the normal case because the queue is empty and the check short-circuits.
+		// BOTH structures, because the inbox drains INTO the deque -- work can sit in the deque with
+		// the inbox already empty, and checking only the inbox would strand exactly that case.
+		const bool hiPriStray = !servesHiPri &&
+			(!scheduler->hiPriInboxes[qIndex]->empty() || scheduler->hiPri[qIndex]->size() != 0);
 		const bool isHotWorker = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 
 		ready.store(true, std::memory_order_release);
@@ -842,7 +849,7 @@ void Thread::Worker() {
 				// HALF THE LOOP FOR N-K WORKERS: an ordinary worker never touches the lane, so it
 				// skips this inbox entirely. At K=0 nobody serves the lane and nothing is routed to
 				// it, so every worker takes the cheap path -- cheaper than before the lane existed.
-				if (servesHiPri) drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
+				if (servesHiPri || hiPriStray) drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
 				drainInbox(scheduler->loPriInboxes[qIndex].get(), /*inboxIsHiPri*/false);
 
 				if (EpochManager::Instance().ShouldSelfReclaim()) {
@@ -858,7 +865,7 @@ void Thread::Worker() {
 		}
 		{
 			// --- 3. Local  queues ---
-			if (!task_to_run && servesHiPri) {
+			if (!task_to_run && (servesHiPri || hiPriStray)) {
 				auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 				if (opt) {
 					Task* task = *opt;
@@ -933,8 +940,6 @@ void Thread::Worker() {
 					return false;
 				};
 				auto tryStealFrom = [&](int target) -> bool {
-					JLIBSCHED_STEAL_STAT(qIndex, probes);
-
 					// TWO DISJOINT STEAL WORLDS once hot workers exist: hot steals from hot, ordinary
 					// steals from ordinary. Neither ever probes the other's lane.
 					//
@@ -959,13 +964,44 @@ void Thread::Worker() {
 					const std::size_t hotN = TaskScheduler::GetHotWorkers();
 					const bool victimIsHot = hotN > (std::size_t)target;
 
-					if (hotN && isHotWorker != victimIsHot) return false;   // never cross the divide
+					// A HOT WORKER NEVER STEALS -- not bulk work, and not from another hot worker.
+					//
+					// Hot->hot stealing was added to give K>1 a rebalancing path, and MEASURED AS
+					// PURE COST: a hot worker never parks, so it runs this search continuously, and
+					// each pass touched the sibling's deque endpoint. Probe counts for an identical
+					// workload:
+					//
+					//     K=1        0 probes      p50 2.4us  p90 3.0us
+					//     K=2   20,592,209         p50 2.3us  p90 3.2us
+					//     K=4  232,627,776         p50 2.3us  p90 3.4us
+					//
+					// Quadratic in K, flat in latency. Twenty million cache-line invalidations
+					// bought nothing, because there is nothing to rebalance: steering round-robins
+					// pushes across the hot set, so the lane is already balanced at PUSH time, and
+					// lane work is short by contract. K>1 is for availability, not load sharing.
+					if (isHotWorker) return false;
+					if (hotN && victimIsHot) return false;   // and nobody reaches into the lane
 
-					auto s = (hotN && !isHotWorker)
-					       ? decltype(scheduler->hiPri[target]->steal_if(classOK)){}   // ordinary: loPri only
-					       : scheduler->hiPri[target]->steal_if(classOK);
-					if (!s && !(hotN && isHotWorker))                                   // hot: no bulk work
-						s = scheduler->loPri[target]->steal_if(classOK);
+					// COUNTED HERE, AFTER the early-out, on purpose: a probe is a TOUCH of another
+					// core's deque endpoint, and the cross-divide rejection above touches nothing.
+					// Counting attempts instead would report the same number for every K and hide
+					// the exact quantity this design set out to reduce -- remote line traffic.
+					JLIBSCHED_STEAL_STAT(qIndex, probes);
+
+					// ONE REMOTE LANE. loPri, always -- everything else was filtered above, so this
+					// is the only reachable case rather than a branch.
+					//
+					// The hiPri probe that used to be here was dead work in EVERY configuration.
+					// At K=0 push routing collapses the lane, so hiPri deques are empty by
+					// construction and the probe was a guaranteed-useless touch of another core's
+					// line, on every victim, on every pass, by every idle worker -- at the DEFAULT
+					// setting. At K>0 the lane belongs to workers nobody may steal from. Two-lane
+					// stealing cost remote traffic and never bought a task.
+					//
+					// OWN queues are a different question and stay unconditional: a worker's own
+					// inbox and deque are ITS cache lines, so checking them is free and is what
+					// keeps a stray lane task from stranding. Remote is where the ping-pong is.
+					auto s = scheduler->loPri[target]->steal_if(classOK);
 					if (!s) return false;
 					JLIBSCHED_STEAL_STAT(qIndex, hits);
 					task_to_run = *s;
@@ -1049,7 +1085,7 @@ void Thread::Worker() {
 		// the two are disjoint at the one place placement is decided. Bailing a mis-placed task out
 		// afterwards would cost a second push per task and could be outrun by multiple producers --
 		// enforcing the invariant is cheaper than repairing violations of it.
-		if (!task_to_run && servesHiPri) {
+		if (!task_to_run && (servesHiPri || hiPriStray)) {
 			size_t count = 0;
 			while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
 				count++;

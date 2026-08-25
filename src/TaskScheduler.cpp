@@ -2068,6 +2068,15 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	if (!task) return false;
 
 	size_t idx = (core_id - 1) % workers.size();
+
+	// A HOT WORKER IS NOT AVAILABLE FOR PINNING. PushImmediate/fork hands a worker a task and marks
+	// its core in-use until that task returns -- which for a long-lived pinned subsystem is
+	// FOREVER. Doing that to a lane server silently deletes it: every completion steered there
+	// queues behind work that may never finish, and nobody may steal from a hot worker to rescue
+	// them. Refusing is the honest answer; the caller already handles false (the core was busy), and
+	// a silent redirect would violate the "run on THIS core" contract PushImmediate exists for.
+	if (idx < GetHotWorkers()) return false;
+
 	if (immediateCoresInUse[idx]->load(std::memory_order_acquire)) return false;
 
 	// Marks this core busy-with-a-fork until Thread::Worker() clears it on completion (see

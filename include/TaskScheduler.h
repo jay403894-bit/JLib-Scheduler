@@ -355,10 +355,15 @@ namespace JLib {
 		// depend on catching every push site was the fragile half of this design; this makes the
 		// safe case the DEFAULT case and leaves the optimisation to the configuration that asked
 		// for it.
-		static bool WorkerServesHiPri(size_t qIndex) {
-			const size_t k = GetHotWorkers();
-			return k == 0 || qIndex < k;
-		}
+		// K == 0 RETURNS FALSE FOR EVERYONE, and that is the dead-lane elimination: PickNextWorker
+		// routes hiPri to the hot set only, so at K=0 nothing can enter a hiPri lane and scanning
+		// one is provably wasted work at the DEFAULT setting.
+		//
+		// It is not the whole safety story, though -- lowering K while lane work is already queued
+		// would strand it. The worker sites pair this with a cheap non-empty check on their OWN
+		// queues (a local cache line, one load) so anything stranded is still drained. Remote probes
+		// get no such fallback: those are the ping-pong, and there is nothing to rescue there.
+		static bool WorkerServesHiPri(size_t qIndex) { const size_t k = GetHotWorkers(); return k == 0 || qIndex < k; }
 
 		// HOW HARD the I/O critical path preempts. Applies to the K hot workers AND the reactor's
 		// completion threads -- NEVER to the process, and never to the other workers.

@@ -34,6 +34,7 @@
 #include "IoAsync.h"
 #include "Timer.h"
 #include "platform.h"
+#include "Thread.h"      // StealStatsReset/Read -- remote deque touches, the ping-pong quantity
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -182,6 +183,10 @@ int main(int argc, char** argv) {
                 coldMs, th, sched.GetWorkerCount(), noSleep ? "NoSleep" : "Sleep", hot,
                 (int)hotRt, (int)hotPin, (int)hotExcl);
 
+    // Reset AFTER setup so the count covers only the measured traffic. Registration and the
+    // synchronous connects do their own stealing, and counting those would flatter the result.
+    JLib::StealStatsReset();
+
     // MAIN MUST GET OFF THE HOT CORES TOO -- it is the thread running ::send, so it is a producer
     // for exactly those workers. Leaving it eligible for a hot core would leave the arrangement
     // half-done, and half-done is the configuration that measured WORSE than doing nothing.
@@ -285,6 +290,20 @@ int main(int argc, char** argv) {
             ::closesocket(static_cast<SOCKET>(g_bc[i]));
             ::closesocket(static_cast<SOCKET>(g_bs[i]));
         }
+    }
+
+    // REMOTE DEQUE TOUCHES. A probe is one look at another core's deque endpoint -- the line that
+    // ping-pongs when N idle workers scan each other. This is the quantity the lane split was meant
+    // to reduce, and unlike the latency percentiles it is not noisy: it is a count, so it separates
+    // the loop saving from steering, which the timing comparison could not.
+    {
+        long long probes = 0, hits = 0;
+        JLib::StealStatsRead(probes, hits);
+        if (!JLib::kStealStatsEnabled)
+            std::printf("\n  steal stats not compiled in -- rebuild with -DJLIBSCHED_STEAL_STATS=ON\n");
+        else
+            std::printf("\n  remote deque touches: %lld probes, %lld hits (%.2f%% productive)\n",
+                        probes, hits, probes ? 100.0 * double(hits) / double(probes) : 0.0);
     }
 
     io.Stop();
