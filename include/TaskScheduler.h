@@ -363,7 +363,7 @@ namespace JLib {
 		// would strand it. The worker sites pair this with a cheap non-empty check on their OWN
 		// queues (a local cache line, one load) so anything stranded is still drained. Remote probes
 		// get no such fallback: those are the ping-pong, and there is nothing to rescue there.
-		static bool WorkerServesHiPri(size_t qIndex) { const size_t k = GetHotWorkers(); return k == 0 || qIndex < k; }
+		static bool WorkerServesHiPri(size_t qIndex) { return GetHotWorkers() > qIndex; }
 
 		// HOW HARD the I/O critical path preempts. Applies to the K hot workers AND the reactor's
 		// completion threads -- NEVER to the process, and never to the other workers.

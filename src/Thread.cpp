@@ -1085,8 +1085,21 @@ void Thread::Worker() {
 		// the two are disjoint at the one place placement is decided. Bailing a mis-placed task out
 		// afterwards would cost a second push per task and could be outrun by multiple producers --
 		// enforcing the invariant is cheaper than repairing violations of it.
-		if (!task_to_run && (servesHiPri || hiPriStray)) {
+		// THE GATE COVERS THE hiPri DRAIN ONLY -- NOT THE WHOLE BLOCK.
+		//
+		// This is where the K=0 deadlock lived. The loPri drain further down is NESTED inside this
+		// block, so gating the block on `servesHiPri` swallowed it too: at K=0, where nothing serves
+		// the lane, a worker stopped draining its OWN loPri INBOX. The pool dump made it obvious and
+		// two rounds of reading had not -- worker 1 AWAKE, loPri inbox non-empty, 150 tasks never
+		// run, and every hiPri structure empty. I had been hunting stranded LANE work while the
+		// stranded work was ordinary.
+		//
+		// The lesson is narrower than "check your braces": a condition added to an EXISTING `if` is
+		// silently inherited by everything already inside it. The gate belongs on the hiPri pop, not
+		// on the section.
+		if (!task_to_run) {
 			size_t count = 0;
+			if (servesHiPri || hiPriStray) {
 			while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
 				count++;
 			}
@@ -1113,6 +1126,7 @@ void Thread::Worker() {
 						if (batch[i]) scheduler->Requeue(batch[i]);
 				}
 			}
+			}   // end of the hiPri-only gate -- the loPri drain below is NOT part of it
 
 			if (!task_to_run) {
 				count = 0;
