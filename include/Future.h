@@ -235,106 +235,155 @@ namespace JLib {
             alignas(T) unsigned char storage_[sizeof(T)];
         };
 
+        // Future<void> IS THE COROUTINE-AWAITABLE SIGNAL, not merely Future<T> with the value taken
+        // out. Event cannot serve a coroutine at all -- it is a fiber suspend point, indexed by
+        // assignedFiber->poolIndex -- so before this there was NO "wake N coroutines when a thing
+        // happens" primitive. That is what this is. It carries no value; everything else about it,
+        // including cancellation and the broken-producer rule, is identical.
+        template <>
+        class FutureState<void> final : public FutureStateBase {
+        public:
+            std::size_t SetValue() { return Publish(/*broken*/ false); }
+        };
+
+        // ONE COPY OF THE OWNERSHIP LOGIC, shared by Future<T> and Future<void>. Writing the refcount
+        // dance twice is exactly where the two would drift, and a refcount bug is a use-after-free
+        // rather than a wrong answer.
+        template <class State>
+        class FutureHandle {
+        public:
+            FutureHandle() noexcept = default;
+            FutureHandle(const FutureHandle& o) noexcept : s_(o.s_) { if (s_) s_->Retain(); }
+            FutureHandle(FutureHandle&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
+
+            FutureHandle& operator=(const FutureHandle& o) noexcept {
+                if (this != &o) { FutureHandle tmp(o); Swap(tmp); }
+                return *this;
+            }
+            FutureHandle& operator=(FutureHandle&& o) noexcept {
+                if (this != &o) { FutureHandle tmp(std::move(o)); Swap(tmp); }
+                return *this;
+            }
+            ~FutureHandle() { Reset(); }
+
+            void Swap(FutureHandle& o) noexcept { std::swap(s_, o.s_); }
+            void Reset() noexcept {
+                if (s_ && s_->Release()) delete s_;
+                s_ = nullptr;
+            }
+
+            [[nodiscard]] bool Valid()  const noexcept { return s_ != nullptr; }
+            [[nodiscard]] bool Ready()  const noexcept { return s_ && s_->Ready(); }
+            [[nodiscard]] bool Broken() const noexcept { return s_ && s_->Broken(); }
+            [[nodiscard]] int  UseCount() const noexcept { return s_ ? s_->UseCount() : 0; }
+
+            // Ejects THIS scope's waiters. Does not touch the producer or anyone else -- see the
+            // cancellation note at the top of this file.
+            std::size_t CancelWaiters(CancelToken token) noexcept {
+                return s_ ? s_->CancelWaiters(token) : 0;
+            }
+
+            // For Coroutine.h's awaiter; not part of the supported surface.
+            State* State_() const noexcept { return s_; }
+
+        protected:
+            explicit FutureHandle(State* s) noexcept : s_(s) { if (s_) s_->Retain(); }
+            State* s_ = nullptr;
+        };
+
+        // Same, for the producer half.
+        template <class State>
+        class PromiseHandle {
+        public:
+            PromiseHandle() : s_(new State()) {}
+            PromiseHandle(const PromiseHandle&) = delete;
+            PromiseHandle& operator=(const PromiseHandle&) = delete;
+            PromiseHandle(PromiseHandle&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
+            PromiseHandle& operator=(PromiseHandle&& o) noexcept {
+                if (this != &o) { Break(); s_ = std::exchange(o.s_, nullptr); }
+                return *this;
+            }
+
+            // A DESTROYED-UNSET PROMISE MUST NOT HANG ITS WAITERS. Dropping the producer on an error
+            // path is a normal thing to do, and the readers have to find out rather than park forever.
+            ~PromiseHandle() { Break(); }
+
+            [[nodiscard]] bool Valid() const noexcept { return s_ != nullptr; }
+
+        protected:
+            void Break() noexcept {
+                if (!s_) return;
+                s_->Publish(/*broken*/ true);      // no-op if a value already landed
+                if (s_->Release()) delete s_;
+                s_ = nullptr;
+            }
+            State* s_ = nullptr;
+        };
+
     } // namespace detail
 
     template <class T> class Promise;
-
     // A HANDLE, not the value. Copy it to hand another consumer a read on the same result.
     template <class T>
-    class Future {
+    class Future : public detail::FutureHandle<detail::FutureState<T>> {
+        using Base = detail::FutureHandle<detail::FutureState<T>>;
     public:
+        using Base::Base;
         Future() noexcept = default;
-
-        Future(const Future& o) noexcept : s_(o.s_) { if (s_) s_->Retain(); }
-        Future(Future&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
-
-        Future& operator=(const Future& o) noexcept {
-            if (this != &o) { Future tmp(o); Swap(tmp); }
-            return *this;
-        }
-        Future& operator=(Future&& o) noexcept {
-            if (this != &o) { Future tmp(std::move(o)); Swap(tmp); }
-            return *this;
-        }
-        ~Future() { Reset(); }
-
-        void Swap(Future& o) noexcept { std::swap(s_, o.s_); }
-        void Reset() noexcept {
-            if (s_ && s_->Release()) delete s_;
-            s_ = nullptr;
-        }
-
-        [[nodiscard]] bool Valid()  const noexcept { return s_ != nullptr; }
-        [[nodiscard]] bool Ready()  const noexcept { return s_ && s_->Ready(); }
-        [[nodiscard]] bool Broken() const noexcept { return s_ && s_->Broken(); }
 
         // Precondition: Ready(). The reference is valid while any Future on this result lives.
         [[nodiscard]] const T& Get() const noexcept {
-            assert(s_ && s_->Ready() && "Future::Get() before the value is set");
-            return *s_->Value();
+            assert(this->s_ && this->s_->Ready() && "Future::Get() before the value is set");
+            return *this->s_->Value();
         }
 
         // MOVE OUT, and it is checked because getting it wrong is silent. With another consumer still
         // holding a Future, moving the value out hands them something moved-from -- a bug that shows
         // up as an empty asset three frames later rather than as a crash here.
         [[nodiscard]] T Take() {
-            assert(s_ && s_->Ready() && "Future::Take() before the value is set");
-            assert(UseCount() == 1 && "Future::Take() with other consumers still holding this result");
-            return std::move(*s_->Value());
+            assert(this->s_ && this->s_->Ready() && "Future::Take() before the value is set");
+            assert(this->UseCount() == 1 &&
+                   "Future::Take() with other consumers still holding this result");
+            return std::move(*this->s_->Value());
         }
-
-        // Ejects THIS scope's waiters from this result. Does not touch the producer or anyone else.
-        std::size_t CancelWaiters(CancelToken token) noexcept {
-            return s_ ? s_->CancelWaiters(token) : 0;
-        }
-
-        [[nodiscard]] int UseCount() const noexcept { return s_ ? s_->UseCount() : 0; }
-
-        // For Coroutine.h's awaiter; not part of the supported surface.
-        detail::FutureState<T>* State() const noexcept { return s_; }
 
     private:
         friend class Promise<T>;
-        explicit Future(detail::FutureState<T>* s) noexcept : s_(s) { if (s_) s_->Retain(); }
+    };
 
-        detail::FutureState<T>* s_ = nullptr;
+    // NO Get() AND NO Take(), because there is nothing to get. Everything else -- copying,
+    // cancellation, the broken-producer rule -- is the general behaviour, inherited unchanged.
+    template <>
+    class Future<void> : public detail::FutureHandle<detail::FutureState<void>> {
+        using Base = detail::FutureHandle<detail::FutureState<void>>;
+    public:
+        using Base::Base;
+        Future() noexcept = default;
+    private:
+        friend class Promise<void>;
     };
 
     // THE PRODUCER SIDE, AND IT IS PLAIN C++17 -- settable from a worker, a Native task, an I/O
     // completion, or a thread that knows nothing about this scheduler.
     template <class T>
-    class Promise {
+    class Promise : public detail::PromiseHandle<detail::FutureState<T>> {
+        using Base = detail::PromiseHandle<detail::FutureState<T>>;
     public:
-        Promise() : s_(new detail::FutureState<T>()) {}
-
-        Promise(const Promise&) = delete;
-        Promise& operator=(const Promise&) = delete;
-        Promise(Promise&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
-        Promise& operator=(Promise&& o) noexcept {
-            if (this != &o) { Break(); s_ = std::exchange(o.s_, nullptr); }
-            return *this;
-        }
-
-        // A DESTROYED-UNSET PROMISE MUST NOT HANG ITS WAITERS. Dropping the producer on an error
-        // path is a normal thing to do, and the readers have to find out rather than park forever.
-        ~Promise() { Break(); }
-
-        [[nodiscard]] Future<T> GetFuture() const noexcept { return Future<T>(s_); }
-        [[nodiscard]] bool Valid() const noexcept { return s_ != nullptr; }
+        [[nodiscard]] Future<T> GetFuture() const noexcept { return Future<T>(this->s_); }
 
         // Returns how many waiters were woken. Setting twice is a no-op, not an error: a producer
         // racing its own cancellation path should not have to sequence them.
         template <class U>
-        std::size_t Set(U&& v) { return s_ ? s_->SetValue(std::forward<U>(v)) : 0; }
+        std::size_t Set(U&& v) { return this->s_ ? this->s_->SetValue(std::forward<U>(v)) : 0; }
+    };
 
-    private:
-        void Break() noexcept {
-            if (!s_) return;
-            s_->Publish(/*broken*/ true);      // no-op if a value already landed
-            if (s_->Release()) delete s_;
-            s_ = nullptr;
-        }
-        detail::FutureState<T>* s_ = nullptr;
+    // Set() takes nothing: this is a signal, not a value.
+    template <>
+    class Promise<void> : public detail::PromiseHandle<detail::FutureState<void>> {
+        using Base = detail::PromiseHandle<detail::FutureState<void>>;
+    public:
+        [[nodiscard]] Future<void> GetFuture() const noexcept { return Future<void>(this->s_); }
+        std::size_t Set() { return this->s_ ? this->s_->SetValue() : 0; }
     };
 
 } // namespace JLib

@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <exception>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace JLib {
@@ -949,6 +950,13 @@ namespace JLib {
         const T& operator*() const noexcept { return *value; }
     };
 
+    // No value to point at; the status IS the whole result.
+    template <>
+    struct FutureResult<void> {
+        FutureStatus status = FutureStatus::Broken;
+        [[nodiscard]] bool Ok() const noexcept { return status == FutureStatus::Ready; }
+    };
+
     template <class T>
     class FutureAwaiter {
     public:
@@ -963,7 +971,7 @@ namespace JLib {
 
         template <typename P>
         bool await_suspend(std::coroutine_handle<P> h) {
-            auto* s = f_.State();
+            auto* s = f_.State_();
             if (!s) { w_.status = FutureStatus::Broken; return false; }
             Task* t = detail::ArmResume(h);
             return !s->ReadyOrQueue(&w_, t, token_);
@@ -972,7 +980,9 @@ namespace JLib {
         [[nodiscard]] FutureResult<T> await_resume() const noexcept {
             FutureResult<T> r;
             r.status = w_.status;
-            if (r.status == FutureStatus::Ready && f_.State()) r.value = f_.State()->Value();
+            if constexpr (!std::is_void_v<T>) {
+                if (r.status == FutureStatus::Ready && f_.State_()) r.value = f_.State_()->Value();
+            }
             return r;
         }
 
@@ -996,11 +1006,11 @@ namespace JLib {
         template <typename P>
         bool await_suspend(std::coroutine_handle<P> h) { return inner_.await_suspend(h); }
 
-        [[nodiscard]] const T& await_resume() const noexcept {
+        [[nodiscard]] decltype(auto) await_resume() const noexcept {
             const FutureResult<T> r = inner_.await_resume();
             assert(r.Ok() && "co_await on a Future whose Promise was destroyed unset -- "
-                             "use fut.Wait(token) if the producer may legitimately go away");
-            return *r.value;
+                             "use WaitFuture(fut, token) if the producer may legitimately go away");
+            if constexpr (!std::is_void_v<T>) return (*r.value);
         }
 
     private:

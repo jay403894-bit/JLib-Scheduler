@@ -63,6 +63,21 @@ static JLib::Coro ScopedConsumer(JLib::Future<std::string> f, JLib::CancelToken 
     co_return;
 }
 
+// Future<void> consumers: the signal form.
+static JLib::Coro Signalled(JLib::Future<void> f) {
+    co_await f;
+    g_ran.fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
+static JLib::Coro ScopedSignalled(JLib::Future<void> f, JLib::CancelToken tok) {
+    const JLib::FutureResult<void> r = co_await JLib::WaitFuture(f, tok);
+    if (r.status == JLib::FutureStatus::Broken)         g_broken.fetch_add(1, std::memory_order_relaxed);
+    else if (r.status == JLib::FutureStatus::Cancelled) g_cancelled.fetch_add(1, std::memory_order_relaxed);
+    g_ran.fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     JLib::TaskScheduler::Init(0);
@@ -188,6 +203,34 @@ int main() {
         Check(p.Set(std::string("first")) == 0, "Set with no waiters wakes nobody");
         p.Set(std::string("second"));
         Check(f.Get() == "first", "the second Set was ignored; the first value stands");
+    }
+
+    // ---- Future<void>: the coroutine-awaitable signal Event cannot be --------------------------
+    std::printf("\nFuture<void> is a signal N coroutines can await\n");
+    {
+        g_ran.store(0); g_broken.store(0);
+        JLib::Promise<void> p;
+        JLib::Future<void>  f = p.GetFuture();
+        for (int i = 0; i < 5; ++i) JLib::Spawn(Signalled(f));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        Check(g_ran.load() == 0, "five coroutines parked on an unsignalled Future<void>");
+        Check(p.Set() == 5, "Set() woke all five");
+        Check(WaitUntil([&]{ return g_ran.load() == 5; }), "all five resumed");
+        Check(f.Ready(), "the signal stays set for anyone who asks later");
+    }
+    {
+        // Same broken-producer rule as the value form -- a dropped Promise<void> must release.
+        g_ran.store(0); g_broken.store(0);
+        {
+            JLib::Promise<void> p;
+            JLib::Future<void>  f = p.GetFuture();
+            JLib::CancelScope sc;
+            for (int i = 0; i < 3; ++i) JLib::Spawn(ScopedSignalled(f, sc.Token()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            Check(g_ran.load() == 0, "and park on a Promise<void> nobody sets");
+        }
+        Check(WaitUntil([&]{ return g_broken.load() == 3; }),
+              "a dropped Promise<void> releases its waiters as Broken too");
     }
 
     std::printf("\n%s -- %d failure(s)\n", g_fail ? "FAILED" : "PASSED", g_fail);

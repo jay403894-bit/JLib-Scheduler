@@ -764,6 +764,24 @@ completions. For scale, K=1's ceiling is ~980 completions per frame at 60 fps.
 its sibling core. On a 16-core machine K=4 is over a quarter of the pool; treat K>=2 as a server
 configuration and K=1 as the game one.
 
+**What may go in the lane.** The lane is a *sparse resource*, and that -- not speed -- is what
+decides. Its capacity is K, so everything routed there competes for K workers. Route all your work
+to it and you have not made anything fast; you have serialised the pool through one or two threads.
+That argument holds even if every task there were provably short.
+
+So the lane is for work with a **deadline someone else set**: an I/O completion, an audio buffer
+refill, a netcode tick. You may put your own task there -- `Spawn(coro, wg, /*hiPri*/ 1)`, or
+`CreateTask(..., hiPri)` -- and it is reasonable to, if the task genuinely needs to run promptly
+*and* you have K to spare. But `hiPri` is a claim about the work rather than a request for service:
+it says *this is short, and it is worth one of my K slots*. Both halves matter, because a running
+task cannot be preempted. One-in-eight resumes doing 200 us of work took the lane to a **1.1 ms
+p99**, with hot workers spending 62-65% of their idle passes beside a buried sibling.
+
+Priority belongs to the task and is inherited by every resume of it, so setting `hiPri` on a
+coroutine that suspends repeatedly puts *all* of its resumes on the lane, not just the first. Nothing
+in the scheduler promotes a task to the lane behind your back -- see the block above `SetHotWorkers`
+in `TaskScheduler.h`.
+
 **Use K=0 -- the default -- if you have no latency-critical I/O.** Pure compute gains nothing from a
 hot worker and pays a core for it. K=0 costs nothing: the lane collapses and the worker loop is
 *cheaper* than a pool without the feature, because a worker that serves no lane checks one inbox, one
