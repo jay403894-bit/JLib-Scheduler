@@ -379,6 +379,17 @@ namespace JLib {
 		// ================================================================================================
 		// COUNTED EPOCHS -- the second reader mechanism, for readers with no stable identity.
 		//
+		// WHY THIS IS WORTH TWO MECHANISMS, and it is not performance -- measured, the two are
+		// indistinguishable on the frame DAG (22.20 vs 21.78 us/graph, overlapping). It is that this
+		// library's whole claim is THREE EXECUTION MODES ON ONE POOL with Task as the common
+		// denominator, and reclamation was the one system that served only two of them. A coroutine
+		// could use the DAG, the reactor, the primitives and the slab -- but could not safely hold
+		// epoch protection, because it has no slot and borrowing a worker's corrupts rather than
+		// leaks. Closing that makes "universal" true rather than nearly true.
+		//
+		// The mechanism is chosen by a PROPERTY OF THE READER -- does it have a stable identity --
+		// not by preference, and CoroSafeEpochGuard is the one place that decides.
+		//
 		// The slot scheme above asks WHERE EVERY READER IS and needs one stable slot per reader.
 		// Fibers have that (fixed pool, registered once); coroutines cannot, and any fixed pool for
 		// them reintroduces the exact ceiling coroutines exist to escape. So this asks a different
