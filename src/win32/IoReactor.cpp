@@ -352,8 +352,20 @@ namespace JLib {
                 }
 
                 if (ov == nullptr) {
-                    // Not a completion: the port died, or Stop() posted the wake-up below.
-                    if (!ok) return;
+                    // Not a completion: a poll that found nothing, the port died, or Stop() posted
+                    // the wake-up below.
+                    //
+                    // THE TIMEOUT CASE HAS TO BE SEPARATED FROM THE DEAD-PORT CASE, and it did not
+                    // used to matter: with an INFINITE wait this call never times out, so `!ok` with
+                    // no OVERLAPPED could only mean the port was gone, and returning was right. The
+                    // moment anything polls with a zero timeout, that same condition means "nothing
+                    // ready right now" -- and returning KILLS THE COMPLETION THREAD on the first
+                    // empty poll, after which no I/O ever completes again. Silently: the reactor is
+                    // simply gone and every operation hangs forever.
+                    if (!ok) {
+                        if (::GetLastError() == WAIT_TIMEOUT) continue;
+                        return;
+                    }
                     if (stopping.load(std::memory_order_acquire) && total.load(std::memory_order_acquire) == 0) {
                         // Cascade the exit: one more wake-up so the next thread also sees it. Stop
                         // posts one per thread, and this makes the shutdown robust if a thread
