@@ -48,6 +48,7 @@
 #endif
 
 #include "TaskScheduler.h"
+#include "Future.h"      // Future<T>/Promise<T>: the C++17 half; the awaiter for it is at the bottom
 
 #include <coroutine>
 #include <cstdint>
@@ -916,6 +917,101 @@ namespace JLib {
         WaitGroup wg;
         Spawn(detail::SyncWaitRunnerVoid(&lazy), &wg);
         TaskScheduler::Instance().WaitFor(wg);
+    }
+
+    // ================================================================================================
+    // `co_await` FOR Future<T>. The C++17 half -- Promise, the shared state, the waiter list -- is in
+    // Future.h and never sees <coroutine>; this is the only part that needs C++20, exactly the split
+    // IoReactor and IoAsync use.
+    //
+    //     const Texture& t = co_await fut;              // uncancellable
+    //     auto r = co_await fut.Wait(scope.Token());    // cancellable; check r.status
+    //
+    // WHY THE WAITER IS A MEMBER, and it is the same load-bearing detail as IoOpAwaiter's request:
+    // the node is linked into a list owned by the shared state, which may outlive this coroutine. It
+    // lives in the FRAME, so it is alive for exactly as long as the suspension it represents, and the
+    // unlink-before-resume rule in Future.h is what guarantees nothing touches it afterwards.
+    //
+    // ONCE await_suspend RETURNS FALSE, TOUCH NOTHING. The value may already have landed on another
+    // thread and re-pushed this coroutine before this function has returned -- the same rule as
+    // everywhere else in this header.
+    template <class T>
+    struct FutureResult {
+        FutureStatus status = FutureStatus::Broken;
+        const T*     value  = nullptr;      // null unless status == Ready
+
+        [[nodiscard]] bool Ok() const noexcept { return status == FutureStatus::Ready; }
+        const T& operator*() const noexcept { return *value; }
+    };
+
+    template <class T>
+    class FutureAwaiter {
+    public:
+        FutureAwaiter(const Future<T>& f, CancelToken token) noexcept : f_(f), token_(token) {}
+        FutureAwaiter(const FutureAwaiter&) = delete;
+        FutureAwaiter& operator=(const FutureAwaiter&) = delete;
+
+        // ALWAYS false, for the same reason IoOpAwaiter's is: the "is it already final" question is
+        // answered in ONE place -- ReadyOrQueue, under the lock -- and asking it here as well is how
+        // the two answers drift apart.
+        bool await_ready() const noexcept { return false; }
+
+        template <typename P>
+        bool await_suspend(std::coroutine_handle<P> h) {
+            auto* s = f_.State();
+            if (!s) { w_.status = FutureStatus::Broken; return false; }
+            Task* t = detail::ArmResume(h);
+            return !s->ReadyOrQueue(&w_, t, token_);
+        }
+
+        [[nodiscard]] FutureResult<T> await_resume() const noexcept {
+            FutureResult<T> r;
+            r.status = w_.status;
+            if (r.status == FutureStatus::Ready && f_.State()) r.value = f_.State()->Value();
+            return r;
+        }
+
+    private:
+        const Future<T>&     f_;
+        CancelToken          token_;
+        detail::FutureWaiter w_{};      // MEMBER: lives in the frame, dies with the suspension
+    };
+
+    // Bare `co_await fut` -- uncancellable, and yields `const T&` directly. The uncancellable form
+    // stays the simple one for the same reason WaitFor(wg) does: most waits are not scoped, and
+    // making every caller unpack a status would be a tax on the common case. Use Wait(token) when the
+    // wait belongs to a scope. Broken here is a programmer error (the producer was dropped), and the
+    // assert says so rather than silently handing back a dangling reference.
+    template <class T>
+    class FutureRefAwaiter {
+    public:
+        explicit FutureRefAwaiter(const Future<T>& f) noexcept : inner_(f, CancelToken{}) {}
+
+        bool await_ready() const noexcept { return inner_.await_ready(); }
+        template <typename P>
+        bool await_suspend(std::coroutine_handle<P> h) { return inner_.await_suspend(h); }
+
+        [[nodiscard]] const T& await_resume() const noexcept {
+            const FutureResult<T> r = inner_.await_resume();
+            assert(r.Ok() && "co_await on a Future whose Promise was destroyed unset -- "
+                             "use fut.Wait(token) if the producer may legitimately go away");
+            return *r.value;
+        }
+
+    private:
+        FutureAwaiter<T> inner_;
+    };
+
+    template <class T>
+    [[nodiscard]] inline FutureRefAwaiter<T> operator co_await(const Future<T>& f) noexcept {
+        return FutureRefAwaiter<T>(f);
+    }
+
+    // Cancellable form. Cancels THIS WAIT only -- the producer keeps producing and the other
+    // consumers keep waiting. See the header note in Future.h.
+    template <class T>
+    [[nodiscard]] inline FutureAwaiter<T> WaitFuture(const Future<T>& f, CancelToken token) noexcept {
+        return FutureAwaiter<T>(f, token);
     }
 
 } // namespace JLib

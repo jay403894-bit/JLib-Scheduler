@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+#pragma once
+
+// A value produced by one party and read by MANY. C++17; the `co_await` spelling is in Coroutine.h.
+//
+//     JLib::Promise<Texture> p;
+//     JLib::Future<Texture>  f = p.GetFuture();      // copy it to as many consumers as you like
+//     ...
+//     p.Set(LoadTexture(path));                      // from a worker, an I/O completion, any thread
+//     const Texture& t = co_await f;                 // N coroutines may await the same f
+//
+// == WHY THIS EXISTS WHEN Lazy<T> ALREADY RETURNS A VALUE ==
+//
+// Lazy is single-consumer BY CONSTRUCTION and says so: the coroutine frame IS the shared state, the
+// promise knows its one awaiter, and nothing needs a lock because there is exactly one of everything.
+// That is a real advantage and it is not being replaced -- one reader, one result, zero allocation
+// and zero synchronisation is the right tool and stays the right tool.
+//
+// This is the case that shape structurally cannot serve: a result MANY things wait on. An asset five
+// systems want, a handshake several requests are queued behind. Making Lazy shareable would mean
+// giving it refcounting, a waiter list and a mutex -- i.e. turning it into this and losing the reason
+// it was good. So there are two types, and the choice between them is "how many readers", not taste.
+//
+//   Lazy<T>    one reader. Lazy: nothing runs until awaited, and it runs INLINE on the awaiting
+//              worker. Move-only. No allocation beyond the frame, no locks.
+//   Future<T>  many readers. Eager: the work is already in flight and this is a handle on its
+//              result. Copyable, refcounted, one small shared allocation.
+//
+// == THE THREE DECISIONS, AND WHAT THEY COST ==
+//
+// SHAREABLE AND COPYABLE, REFCOUNTED. Copying a Future is another consumer. The refcount is touched
+// on copy and on destruction -- NOT on await -- so the cost is per hand-off rather than per
+// operation, and in exchange the state cleans itself up with no ownership rules for the caller to
+// get wrong. That trade was made deliberately.
+//
+// `co_await` YIELDS `const T&`, NOT A COPY. With N consumers a by-value resume would copy the value
+// N times for no reason; the value lives in the shared state and is valid for as long as any Future
+// referring to it is alive. `Take()` exists for the case where you know you are the last reader and
+// want to move it out -- it is checked, because doing that with other readers around would hand them
+// a moved-from value.
+//
+// PRODUCED BY A SEPARATE Promise<T>, WHICH IS PLAIN C++17. The producer can be anything: a worker, a
+// Native task, an I/O completion, a thread that has never heard of this scheduler. Only the awaiting
+// side needs <coroutine>, which is the same split IoReactor and IoAsync already use -- the engine is
+// C++17 and the C++20 is confined to the awaiter.
+//
+// == CANCELLATION CANCELS THE WAIT, NEVER THE WORK ==
+//
+// The same rule as WaitFor(wg, token): a cancelled waiter stops waiting, and NOTHING else changes.
+// The producer keeps producing, the other consumers keep waiting, and the Future does not become
+// broken. Cancelling your own interest in a shared result cannot be allowed to destroy it for
+// everyone else -- there is no sense in which one consumer owns a value five others are waiting on.
+//
+// AND CANCELLATION TAKES THE SAME MUTEX AS Set(). It does not reach past the lock to pluck a waiter
+// out. That is what makes "exactly one of {Set, Cancel} claims each waiter" true, and it is the same
+// discipline as the cancelled condition-variable wait that must still return holding its mutex: a
+// cancel that bypasses the synchronisation it was waiting on leaves the caller in a state its own
+// code does not expect. Removal happens under the lock, before the resume, and a waiter is in the
+// list exactly once -- so there is no double resume and no lost one.
+//
+// == WHAT THIS IS NOT ==
+//
+// No `.then()`, no `when_all`, no `when_any`, no executors. Those turn a primitive into a framework,
+// and the combinators are all expressible in a coroutine already -- `when_all` is awaiting two
+// futures in a row, `when_any` is what a CancelScope with a deadline does. The same boundary
+// IoReactor draws at "not more opcodes": the extension point is a coroutine that awaits these, not
+// more members here.
+
+#include "CancelToken.h"
+#include "TaskScheduler.h"
+
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <mutex>
+#include <new>
+#include <utility>
+
+namespace JLib {
+
+    // Why a status rather than an exception: a waiter is resumed by a WORKER, and throwing out of a
+    // resume unwinds through the scheduler rather than through the caller's own stack. Every other
+    // wait in this library returns its outcome, and this matches.
+    enum class FutureStatus : std::uint8_t {
+        Ready,       // the value is set; Get() is valid
+        Cancelled,   // this waiter's scope was cancelled. Says nothing about the value.
+        Broken       // the Promise died without setting anything. Nobody is coming.
+    };
+
+    namespace detail {
+
+        // LIVES IN THE AWAITER'S COROUTINE FRAME, exactly like IoAcceptWaiter -- so parking allocates
+        // nothing and the node's lifetime is bounded by the suspension it represents. Deliberately
+        // the same shape as the acceptor's rather than a new idiom; there are already two documented
+        // cases in this project of parallel structures drifting apart.
+        //
+        // NOT the Event slot table, which cannot serve this at all: AddWaiter indexes by
+        // `assignedFiber->poolIndex` and coroutine tasks ride the Native path with no fiber, so it
+        // would silently drop every waiter.
+        struct FutureWaiter {
+            Task*          resume = nullptr;
+            std::uint32_t  token  = CancelToken::kNone;
+            FutureWaiter*  next   = nullptr;
+            FutureStatus   status = FutureStatus::Ready;
+        };
+
+        // Everything that does not depend on T, so the list surgery and the refcount exist once.
+        class FutureStateBase {
+        public:
+            void Retain() noexcept { refs_.fetch_add(1, std::memory_order_relaxed); }
+
+            // Acquire on the last release pairs with the releases above, so the destructor that
+            // follows sees every write any other holder made.
+            bool Release() noexcept {
+                if (refs_.fetch_sub(1, std::memory_order_release) != 1) return false;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                return true;
+            }
+
+            int  UseCount() const noexcept { return refs_.load(std::memory_order_relaxed); }
+            bool Ready()  const noexcept { std::lock_guard<std::mutex> lk(m_); return ready_; }
+            bool Broken() const noexcept { std::lock_guard<std::mutex> lk(m_); return broken_ && !ready_; }
+
+            // SAME RETURN POLARITY AS EVERY Submit AND AS IoAcceptor::TakeOrQueue: true means the
+            // answer is already final and the caller MUST NOT suspend; false means queued.
+            //
+            // The already-cancelled check happens HERE, under the lock, rather than in await_ready --
+            // one place decides, so a cancel landing between a check and a link cannot lose a waiter.
+            bool ReadyOrQueue(FutureWaiter* w, Task* resume, CancelToken token) {
+                std::lock_guard<std::mutex> lk(m_);
+                if (ready_)  { w->status = FutureStatus::Ready;  return true; }
+                if (broken_) { w->status = FutureStatus::Broken; return true; }
+                if (token.Valid() && token.Cancelled()) {
+                    w->status = FutureStatus::Cancelled;
+                    return true;
+                }
+                w->resume = resume;
+                w->token  = token.Raw();
+                w->status = FutureStatus::Ready;
+                w->next   = waiters_;
+                waiters_  = w;
+                return false;
+            }
+
+            // Eject waiters whose scope is `token` (or all, for an invalid one). The producer is NOT
+            // touched and the state is NOT marked broken -- see the header note on why one consumer
+            // cannot cancel a result five others want.
+            std::size_t CancelWaiters(CancelToken token) noexcept {
+                FutureWaiter* taken = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(m_);
+                    FutureWaiter** link = &waiters_;
+                    while (*link) {
+                        FutureWaiter* w = *link;
+                        const bool match = !token.Valid() || CancelToken(w->token).IsWithin(token);
+                        if (match) {
+                            *link = w->next;          // UNLINKED BEFORE RESUMED, under the lock: the
+                            w->status = FutureStatus::Cancelled;   // node dies with the frame the
+                            w->next = taken;          // moment its task is pushed.
+                            taken = w;
+                        } else {
+                            link = &w->next;
+                        }
+                    }
+                }
+                return Wake(taken);
+            }
+
+            // Called with the value already stored, so any waiter this wakes sees a complete value.
+            // Publishing after the wake would let a resumed reader observe a half-written result.
+            std::size_t Publish(bool broken) noexcept {
+                FutureWaiter* taken = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(m_);
+                    if (ready_ || broken_) return 0;      // Set twice, or Set after a break
+                    if (broken) broken_ = true; else ready_ = true;
+                    taken = waiters_;
+                    waiters_ = nullptr;
+                    for (FutureWaiter* w = taken; w; w = w->next)
+                        w->status = broken ? FutureStatus::Broken : FutureStatus::Ready;
+                }
+                return Wake(taken);
+            }
+
+        protected:
+            ~FutureStateBase() = default;
+
+            // OUTSIDE THE LOCK. Push can run the woken coroutine to completion on another worker
+            // before this returns, and that coroutine may destroy the last Future -- which would
+            // re-enter this object's destructor while the lock is held.
+            static std::size_t Wake(FutureWaiter* list) noexcept {
+                std::size_t n = 0;
+                while (list) {
+                    FutureWaiter* next = list->next;   // read before the frame can die
+                    Task* t = list->resume;
+                    if (t && TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(t);
+                    ++n;
+                    list = next;
+                }
+                return n;
+            }
+
+            // Short-held and never across a suspension -- it guards pointer surgery and two bools,
+            // nothing more. That is the reason a plain std::mutex is right here despite the usual
+            // "no raw mutexes inside a task" rule, and it is the same call IoReactor makes.
+            mutable std::mutex m_;
+            FutureWaiter*      waiters_ = nullptr;
+            std::atomic<int>   refs_{ 1 };
+            bool               ready_   = false;
+            bool               broken_  = false;
+        };
+
+        template <class T>
+        class FutureState final : public FutureStateBase {
+        public:
+            ~FutureState() { if (ready_) Value()->~T(); }
+
+            template <class U>
+            std::size_t SetValue(U&& v) {
+                // Constructed BEFORE Publish takes the lock, so the value is complete before any
+                // waiter can be woken to read it.
+                {
+                    std::lock_guard<std::mutex> lk(m_);
+                    if (ready_ || broken_) return 0;
+                }
+                ::new (static_cast<void*>(storage_)) T(std::forward<U>(v));
+                return Publish(/*broken*/ false);
+            }
+
+            T*       Value()       noexcept { return reinterpret_cast<T*>(storage_); }
+            const T* Value() const noexcept { return reinterpret_cast<const T*>(storage_); }
+
+        private:
+            alignas(T) unsigned char storage_[sizeof(T)];
+        };
+
+    } // namespace detail
+
+    template <class T> class Promise;
+
+    // A HANDLE, not the value. Copy it to hand another consumer a read on the same result.
+    template <class T>
+    class Future {
+    public:
+        Future() noexcept = default;
+
+        Future(const Future& o) noexcept : s_(o.s_) { if (s_) s_->Retain(); }
+        Future(Future&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
+
+        Future& operator=(const Future& o) noexcept {
+            if (this != &o) { Future tmp(o); Swap(tmp); }
+            return *this;
+        }
+        Future& operator=(Future&& o) noexcept {
+            if (this != &o) { Future tmp(std::move(o)); Swap(tmp); }
+            return *this;
+        }
+        ~Future() { Reset(); }
+
+        void Swap(Future& o) noexcept { std::swap(s_, o.s_); }
+        void Reset() noexcept {
+            if (s_ && s_->Release()) delete s_;
+            s_ = nullptr;
+        }
+
+        [[nodiscard]] bool Valid()  const noexcept { return s_ != nullptr; }
+        [[nodiscard]] bool Ready()  const noexcept { return s_ && s_->Ready(); }
+        [[nodiscard]] bool Broken() const noexcept { return s_ && s_->Broken(); }
+
+        // Precondition: Ready(). The reference is valid while any Future on this result lives.
+        [[nodiscard]] const T& Get() const noexcept {
+            assert(s_ && s_->Ready() && "Future::Get() before the value is set");
+            return *s_->Value();
+        }
+
+        // MOVE OUT, and it is checked because getting it wrong is silent. With another consumer still
+        // holding a Future, moving the value out hands them something moved-from -- a bug that shows
+        // up as an empty asset three frames later rather than as a crash here.
+        [[nodiscard]] T Take() {
+            assert(s_ && s_->Ready() && "Future::Take() before the value is set");
+            assert(UseCount() == 1 && "Future::Take() with other consumers still holding this result");
+            return std::move(*s_->Value());
+        }
+
+        // Ejects THIS scope's waiters from this result. Does not touch the producer or anyone else.
+        std::size_t CancelWaiters(CancelToken token) noexcept {
+            return s_ ? s_->CancelWaiters(token) : 0;
+        }
+
+        [[nodiscard]] int UseCount() const noexcept { return s_ ? s_->UseCount() : 0; }
+
+        // For Coroutine.h's awaiter; not part of the supported surface.
+        detail::FutureState<T>* State() const noexcept { return s_; }
+
+    private:
+        friend class Promise<T>;
+        explicit Future(detail::FutureState<T>* s) noexcept : s_(s) { if (s_) s_->Retain(); }
+
+        detail::FutureState<T>* s_ = nullptr;
+    };
+
+    // THE PRODUCER SIDE, AND IT IS PLAIN C++17 -- settable from a worker, a Native task, an I/O
+    // completion, or a thread that knows nothing about this scheduler.
+    template <class T>
+    class Promise {
+    public:
+        Promise() : s_(new detail::FutureState<T>()) {}
+
+        Promise(const Promise&) = delete;
+        Promise& operator=(const Promise&) = delete;
+        Promise(Promise&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
+        Promise& operator=(Promise&& o) noexcept {
+            if (this != &o) { Break(); s_ = std::exchange(o.s_, nullptr); }
+            return *this;
+        }
+
+        // A DESTROYED-UNSET PROMISE MUST NOT HANG ITS WAITERS. Dropping the producer on an error
+        // path is a normal thing to do, and the readers have to find out rather than park forever.
+        ~Promise() { Break(); }
+
+        [[nodiscard]] Future<T> GetFuture() const noexcept { return Future<T>(s_); }
+        [[nodiscard]] bool Valid() const noexcept { return s_ != nullptr; }
+
+        // Returns how many waiters were woken. Setting twice is a no-op, not an error: a producer
+        // racing its own cancellation path should not have to sequence them.
+        template <class U>
+        std::size_t Set(U&& v) { return s_ ? s_->SetValue(std::forward<U>(v)) : 0; }
+
+    private:
+        void Break() noexcept {
+            if (!s_) return;
+            s_->Publish(/*broken*/ true);      // no-op if a value already landed
+            if (s_->Release()) delete s_;
+            s_ = nullptr;
+        }
+        detail::FutureState<T>* s_ = nullptr;
+    };
+
+} // namespace JLib
