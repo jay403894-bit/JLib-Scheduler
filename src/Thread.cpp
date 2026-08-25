@@ -419,6 +419,13 @@ void Thread::Worker() {
 	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
 	// task would carry that count into its next idle episode and park early ever after.
 	unsigned idleSpins = 0;
+	// Raised once, the first time this worker notices it is hot. Not reset: a worker that stops
+	// being hot keeps the priority until the pool shuts down, which is acceptable for a knob that
+	// is off by default and set once at startup, and avoids thrashing the OS call in the idle loop.
+	bool hotPriorityRaised = false;
+	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
+	// on a genuine change. Meaningless unless hotPriorityRaised.
+	bool atCriticalPriority = false;
 	while (running.load(std::memory_order_acquire)) {
 
 		ready.store(true, std::memory_order_release);
@@ -476,6 +483,30 @@ void Thread::Worker() {
 				continue;
 			}
 			task_to_run->started = 1;
+
+#if defined(_WIN32)
+			// DEMOTE BEFORE RUNNING ORDINARY WORK. A hot worker sits at TIME_CRITICAL so it can
+			// take a completion the instant one lands -- but it also steals general work when its
+			// inbox is empty, and running a long ordinary task at priority 15 is exactly the
+			// starvation the elevated priority was supposed to be worth the risk of.
+			//
+			// hiPri IS the discriminator, and it needs no new state: the queue already exists, the
+			// app already sets the flag at Spawn, and "this task is worth pre-empting others for"
+			// is precisely what it means. So the worker runs hiPri work elevated and everything
+			// else at Normal, per task.
+			//
+			// Cached, because SetThreadPriority is a syscall and this is the per-task path -- it
+			// fires only when the level actually changes, which for a steady stream of one kind of
+			// work is never.
+			if (hotPriorityRaised) {
+				const bool wantCritical = (task_to_run->hiPri != 0);
+				if (wantCritical != atCriticalPriority) {
+					::SetThreadPriority(::GetCurrentThread(),
+						wantCritical ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_NORMAL);
+					atCriticalPriority = wantCritical;
+				}
+			}
+#endif
 
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
 			// or ContextSwitch paid at all. Only safe because Native tasks are a CONTRACT --
@@ -858,7 +889,27 @@ void Thread::Worker() {
 				};
 				auto tryStealFrom = [&](int target) -> bool {
 					JLIBSCHED_STEAL_STAT(qIndex, probes);
-					auto s = scheduler->hiPri[target]->steal_if(classOK);
+
+					// A HOT WORKER'S hiPri LANE IS RESERVED. When hot workers exist, an ordinary
+					// worker does not steal their high-priority work, because taking it is what the
+					// whole arrangement is trying to prevent: the task lands on a core that may be
+					// cold or contended, and it loses the cache the hot worker had warm for it. A
+					// hot worker that cannot keep up is a capacity question -- raise K -- not
+					// something to fix by scattering its work.
+					//
+					// CONDITIONAL ON K > 0, and that guard is load-bearing rather than cautious.
+					// hiPri is a GENERAL feature, not an I/O one; at the default K = 0 there are no
+					// hot workers, so an unconditional rule would mean nobody drains hiPri at all
+					// and every existing hiPri task starves. With K = 0 this is exactly the old
+					// behaviour. It also only protects HOT victims -- ordinary workers still steal
+					// hiPri from each other, as they always did.
+					const std::size_t hotN = TaskScheduler::GetHotWorkers();
+					const bool victimIsHot = hotN > (std::size_t)target;
+					const bool iAmHot      = hotN > (std::size_t)qIndex;
+					const bool mayTakeHiPri = !victimIsHot || iAmHot;
+
+					auto s = mayTakeHiPri ? scheduler->hiPri[target]->steal_if(classOK)
+					                      : decltype(scheduler->hiPri[target]->steal_if(classOK)){};
 					if (!s) s = scheduler->loPri[target]->steal_if(classOK);
 					if (!s) return false;
 					JLIBSCHED_STEAL_STAT(qIndex, hits);
@@ -1018,6 +1069,33 @@ void Thread::Worker() {
 				// advertises WS_GOING_TO_SLEEP (see the note above). So a hot worker is a landing
 				// spot that costs a pusher nothing, which is the actual hypothesis being tested.
 				const bool hot = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
+
+#if defined(_WIN32)
+				// TARGETED priority, and the targeting is the point. Raising the WHOLE PROCESS was
+				// measured 5x WORSE with K-hot: it elevates all N workers, so 29 spinning threads
+				// preempt the completion thread that feeds them. Raising only the hot workers (and,
+				// separately, the reactor's completion threads) elevates exactly the critical path
+				// and leaves everyone else at Normal.
+				//
+				// TIME_CRITICAL inside a NORMAL_PRIORITY_CLASS process is priority 15 -- the top of
+				// the non-realtime range. True realtime (16-31) needs REALTIME_PRIORITY_CLASS and a
+				// privilege, and would let a spin loop starve the OS, so it is deliberately not
+				// asked for here.
+				if (hot && !hotPriorityRaised && TaskScheduler::GetHotWorkerRealtime()) {
+					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+					hotPriorityRaised = true;
+					atCriticalPriority = true;
+				}
+				// Back up on the way into the idle search. A worker that was demoted to run an
+				// ordinary task must be elevated again BEFORE it starts waiting, or the very next
+				// completion is taken at Normal and the whole point is lost. Idle is also the only
+				// safe place to be at 15 unconditionally -- it is spinning, not holding a core off
+				// anyone doing real work.
+				else if (hotPriorityRaised && !atCriticalPriority) {
+					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+					atCriticalPriority = true;
+				}
+#endif
 				const bool mayspin = (hot || TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep)
 					&& running.load(std::memory_order_acquire)
 					&& !scheduler->paused.load(std::memory_order_seq_cst);

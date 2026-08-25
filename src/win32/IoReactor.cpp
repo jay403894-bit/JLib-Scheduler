@@ -251,6 +251,17 @@ namespace JLib {
         static constexpr std::size_t kBatch = 32;
 
         void Run() {
+            // THE PRODUCER HALF of the same knob the hot workers read. Elevating the consumer alone
+            // would just move the preemption: a hot worker at priority 15 waiting on a completion
+            // thread at 8 still waits for whatever preempts the completion thread. Both ends of the
+            // handoff, or neither.
+            //
+            // Safe to leave raised for the thread's whole life because this thread is BLOCKED in
+            // GetQueuedCompletionStatus whenever it is not draining -- it cannot spin at priority 15
+            // and starve anything, which is the risk that makes this dangerous for a worker.
+            if (TaskScheduler::GetHotWorkerRealtime())
+                ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
             // SPLIT BY PRIORITY. Push honours task->hiPri; PushBatch takes it as a PARAMETER and
             // applies it to the whole batch -- so batching them together silently forced every
             // resumption to low priority and threw away what the app chose at Spawn. Two runs, two
@@ -288,13 +299,33 @@ namespace JLib {
                 // cpuaffinity is 1-BASED and selects the worker directly, so 1..K is exactly the
                 // hot set. Rotated so a burst spreads across them instead of queueing behind one.
                 // Zero when K is 0, which is the ordinary spread-across-the-pool behaviour.
+                // SPLIT the batch across the hot set, do not hand it all to one of them.
+                //
+                // PushBatch treats an explicit affinity as "this worker, do not spread", so aiming a
+                // whole flush at one hot worker leaves the other K-1 spinning with nothing to do:
+                // all the contention of K hot cores and the throughput of one. That is what an
+                // earlier measurement mistook for "spreading a burst is worse than pinning it" --
+                // nothing was being spread.
+                //
+                // The starting worker still rotates per flush, so a stream of SINGLE completions
+                // spreads across the hot set instead of always hammering worker 1.
                 const std::size_t hotN = TaskScheduler::GetHotWorkers();
-                std::uint8_t aff = 0;
-                if (hotN) {
-                    aff = std::uint8_t(1 + (steer++ % hotN));
-                }
-                if (nh) { TaskScheduler::Instance().PushBatch(hi, nh, aff, 64, true);  nh = 0; }
-                if (nl) { TaskScheduler::Instance().PushBatch(lo, nl, aff, 64, false); nl = 0; }
+                auto pushSteered = [&](Task** arr, std::size_t n, bool hiPri) {
+                    if (!n) return;
+                    auto& s = TaskScheduler::Instance();
+                    if (hotN == 0) { s.PushBatch(arr, n, 0, 64, hiPri); return; }
+
+                    const std::size_t per = (n + hotN - 1) / hotN;   // ceil, so the last slice is the short one
+                    std::size_t off = 0, w = steer++;
+                    while (off < n) {
+                        const std::size_t len = (per < n - off) ? per : (n - off);
+                        s.PushBatch(arr + off, len, std::uint8_t(1 + (w % hotN)), 64, hiPri);
+                        off += len;
+                        ++w;
+                    }
+                };
+                pushSteered(hi, nh, true);  nh = 0;
+                pushSteered(lo, nl, false); nl = 0;
             };
 
             for (;;) {

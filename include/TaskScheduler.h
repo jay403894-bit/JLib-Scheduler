@@ -327,6 +327,20 @@ namespace JLib {
 		static void   SetHotWorkers(size_t k);
 		static size_t GetHotWorkers();
 
+		// Raise the hot workers AND the reactor's completion threads to THREAD_PRIORITY_TIME_CRITICAL
+		// -- the top of the non-realtime range (15) inside a normal-priority process. Windows only;
+		// a no-op elsewhere. OFF BY DEFAULT.
+		//
+		// TARGETED, and the targeting is the whole point. Raising the WHOLE PROCESS measured 5x
+		// WORSE alongside K-hot, because it elevates all N workers and 29 spinning threads then
+		// preempt the completion thread feeding them. This raises only the producer and the
+		// consumer on the I/O critical path and leaves every other worker at Normal.
+		//
+		// Deliberately NOT REALTIME_PRIORITY_CLASS: that needs a privilege and would let a spin loop
+		// starve the OS itself.
+		static void SetHotWorkerRealtime(bool on);
+		static bool GetHotWorkerRealtime();
+
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
 		// dispatch+join overhead, and an unoptimized build pays roughly an order of magnitude more of it.

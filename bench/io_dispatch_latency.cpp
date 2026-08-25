@@ -133,8 +133,19 @@ int main(int argc, char** argv) {
     // a curve that stays flat until K is a large fraction of the pool means steering, not K.
     const std::size_t hot = (argc > 5) ? std::size_t(std::atoi(argv[5])) : 0u;
 
+    // Raise ONLY the hot workers and the completion threads to TIME_CRITICAL. Tests whether the
+    // bistability is the OS descheduling one end of the completion handoff.
+    const bool hotRt = (argc > 6) ? (std::atoi(argv[6]) != 0) : false;
+
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    // BEFORE Init, and this ordering is load-bearing: a completion thread reads the flag once at
+    // Run() entry, and Run() starts inside Init. Setting it afterwards reaches the workers (they
+    // re-read it every idle pass) but NOT the completion threads -- which would silently measure
+    // only half the intervention, the half that was already shown to be the wrong half alone.
+    JLib::TaskScheduler::SetHotWorkerRealtime(hotRt);
+
     JLib::TaskScheduler::EnableIoReactor(true, th);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
@@ -147,8 +158,8 @@ int main(int argc, char** argv) {
         JLib::TaskScheduler::SetHotWorkers(hot);
 
     std::printf("io_dispatch_latency -- %d samples, cold pause %dms, %u completion thread(s), "
-                "%zu workers, idle=%s, hot=%zu\n\n", samples, coldMs, th, sched.GetWorkerCount(),
-                noSleep ? "NoSleep" : "Sleep", hot);
+                "%zu workers, idle=%s, hot=%zu, hotRT=%d\n\n", samples, coldMs, th,
+                sched.GetWorkerCount(), noSleep ? "NoSleep" : "Sleep", hot, (int)hotRt);
 
     // One loopback pair. Concurrency is deliberately ONE: this measures the seam, not the pipe.
     SOCKET lis = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -182,7 +193,9 @@ int main(int argc, char** argv) {
             if (cold) std::this_thread::sleep_for(std::chrono::milliseconds(coldMs));
 
             JLib::WaitGroup wg;
-            JLib::Spawn(OneOp(i), &wg);
+            // hiPri: with K-hot + hotRT this is what keeps the hot worker at TIME_CRITICAL while it
+            // runs the completion. An ordinary task demotes it to Normal first -- see Thread.cpp.
+            JLib::Spawn(OneOp(i), &wg, 1);
 
             // Give the receive time to be posted, then feed it.
             std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -229,7 +242,7 @@ int main(int argc, char** argv) {
         for (int rd = 0; rd < rounds; ++rd) {
             std::this_thread::sleep_for(std::chrono::milliseconds(coldMs));
             JLib::WaitGroup wg;
-            for (int i = 0; i < kBurst; ++i) JLib::Spawn(BurstOp(i, rd), &wg);
+            for (int i = 0; i < kBurst; ++i) JLib::Spawn(BurstOp(i, rd), &wg, 1);
             std::this_thread::sleep_for(std::chrono::microseconds(400));
             // One wave, back to back, so the completions land close enough to coalesce.
             for (int i = 0; i < kBurst; ++i)

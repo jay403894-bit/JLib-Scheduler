@@ -470,6 +470,12 @@ static std::atomic<size_t> g_hotWorkers{ 0 };
 void   TaskScheduler::SetHotWorkers(size_t k) { g_hotWorkers.store(k, std::memory_order_relaxed); }
 size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
 
+// Read by the hot workers themselves and by the reactor's completion threads, each of which raises
+// its OWN priority. Off by default -- see the header.
+static std::atomic<bool> g_hotRealtime{ false };
+void TaskScheduler::SetHotWorkerRealtime(bool on) { g_hotRealtime.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetHotWorkerRealtime() { return g_hotRealtime.load(std::memory_order_relaxed); }
+
 // The stale-library guard's other half. Compiled INTO the library, so it reports the signature as
 // the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
 // the including translation unit's view; a mismatch means somebody rebuilt one and not the other.
