@@ -1558,9 +1558,19 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	// spread is worth the wake-up it costs, and let small batches behave as they always did.
 	if (minPerSegment == 0) minPerSegment = 1;
 	const size_t nw = workers.size();
+
+	// CAP AT THE WORKERS THIS BATCH CAN ACTUALLY REACH, not at the pool. A hiPri batch goes to the
+	// hot set; everything else goes to the ordinary set. Capping at the whole pool cuts the batch
+	// into more pieces than there are destinations for them, so segments pile up on the same
+	// workers -- paying the per-segment notify without buying the spread it is meant to buy.
+	// SetHotWorkers is clamped so both sets are non-empty.
+	const size_t hotN = GetHotWorkers();
+	const size_t reachable = (hiPri && hotN) ? hotN
+	                       : (nw > hotN ? nw - hotN : nw);
+
 	size_t segments = (nw == 0) ? 1 : (count / minPerSegment);
-	if (segments < 1)  segments = 1;
-	if (segments > nw) segments = nw;
+	if (segments < 1)         segments = 1;
+	if (segments > reachable) segments = reachable;
 	const size_t per = count / segments;
 	const size_t rem = count % segments;
 
@@ -1866,6 +1876,25 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// TaskType::Coroutine, because resuming a coroutine is a function call on the current stack and
 	// needs no fiber. Only Fiber-backed tasks are off limits. The name is kept rather than churned
 	// because it is public API; read it as "a task that does not require a fiber".
+	// A HOT WORKER LANDS HERE TOO, and that is a hole worth naming. OnBareThread() is true for a
+	// worker running a NATIVE task (no fiber), so a hot worker whose lane task calls WaitFor,
+	// SchedulerMutex or a condition variable helps through this function -- and GetTask() steals
+	// BULK work, which is exactly what "hot workers never steal" exists to prevent.
+	//
+	// It is NOT fixed by refusing. The fallback below drains this worker's own inboxes, and that
+	// drain is load-bearing: a Native task blocking on a worker makes its own inbox unreachable by
+	// the whole pool, which is a documented deterministic deadlock. Refusing to help would trade a
+	// policy violation for a hang.
+	//
+	// So: drain the LANE FIRST. A hot worker checks its own inbox before touching anyone else's
+	// deque, which means lane work always wins over stolen bulk, and bulk is taken only when the
+	// lane is genuinely empty. The residual violation -- a hot worker running one bulk task while a
+	// lane task of its own is blocked -- is reachable only by breaking the lane contract (lane work
+	// must be short and non-blocking), and a bounded violation beats a deadlock.
+	Thread* selfHot = Thread::GetCurrent();
+	if (selfHot && GetHotWorkers() > (size_t)selfHot->qIndex)
+		selfHot->DrainOwnInboxesToDeques();
+
 	Task* task = GetTask();
 	if (!task) {
 		// Nothing stealable anywhere -- but "anywhere" only covers DEQUES, and if this caller is a
