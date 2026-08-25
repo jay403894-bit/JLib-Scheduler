@@ -307,6 +307,10 @@ namespace JLib {
 		// permanent cost, intermittent benefit, and the cost is proportional to the hot count while
 		// the benefit is sub-proportional (the other workers still wake cold).
 		static void       SetIdlePolicy(IdlePolicy p);
+		// Runtime kill switch for the bulk steal hint, so its value can be measured against an A/A
+		// control inside ONE process. Diagnostic: shipping code should leave it on.
+		static inline std::atomic<bool> stealHintOn{ true };
+		static void SetStealHint(bool on) noexcept { stealHintOn.store(on, std::memory_order_relaxed); }
 		static IdlePolicy GetIdlePolicy();
 
 		// K-HOT: keep the first K workers from ever parking, while the rest obey IdlePolicy.
@@ -1356,8 +1360,12 @@ namespace JLib {
 			stealHintParallel.fetch_and(~(1ull << q), std::memory_order_relaxed);
 		}
 
+		// Runtime kill switch, so the hint`s value can be measured against an A/A control inside one
+		// process. Three separately-built binaries measured in three sessions is how a 2x machine
+		// drift once got read as a result.
 		bool MaybeStealable(size_t q) const noexcept {
 			if (q >= 64 || loPri.size() > 64) return true;
+			if (!stealHintOn.load(std::memory_order_relaxed)) return true;
 			const unsigned long long bit = 1ull << q;
 			return ((stealHintBacklog.load(std::memory_order_acquire)
 			       | stealHintParallel.load(std::memory_order_acquire)) & bit) != 0;

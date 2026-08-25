@@ -420,6 +420,12 @@ target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 # Stamped into the header line so a pasted result identifies the build that produced it.
 target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED_VERSION}")
 
+# Measures what an IDLE NoSleep pool costs the main thread, and how much of that the steal hint
+# removes. Both arms run inside one process against one pool -- see the file header.
+add_executable(SchedulerNoSleepTax "${CMAKE_CURRENT_SOURCE_DIR}/bench/nosleep_tax.cpp")
+target_link_libraries(SchedulerNoSleepTax PRIVATE Scheduler)
+target_compile_features(SchedulerNoSleepTax PRIVATE cxx_std_17)
+
 # The lock primitives had no benchmark at all until 2.7.0 -- bench.cpp covers push/steal/ParallelFor
 # and never takes a SchedulerMutex. This one measures them, and it is what established that the
 # bare-thread fast spin had to be 0.
