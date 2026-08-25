@@ -158,7 +158,7 @@ int main() {
         JLib::WaitGroup wg;
 
         JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
-            const JLib::IoResult r = co_await JLib::RecvAsync(s, g_rxbuf, sizeof g_rxbuf);
+            const JLib::IoResult r = co_await JLib::RecvRawAsync(s, g_rxbuf, sizeof g_rxbuf);
             g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
             g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
             co_return;
@@ -166,7 +166,7 @@ int main() {
 
         JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
             static const char payload[] = "over the wire, asynchronously";
-            const JLib::IoResult r = co_await JLib::SendAsync(s, payload, 29);
+            const JLib::IoResult r = co_await JLib::SendRawAsync(s, payload, 29);
             g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
             co_return;
         }(client), &wg);
@@ -189,7 +189,7 @@ int main() {
         JLib::WaitGroup wg;
 
         JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
-            const JLib::IoResult r = co_await JLib::RecvAsync(s, g_rxbuf, sizeof g_rxbuf);
+            const JLib::IoResult r = co_await JLib::RecvRawAsync(s, g_rxbuf, sizeof g_rxbuf);
             g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
             g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
             co_return;
@@ -222,14 +222,14 @@ int main() {
     // ---- scatter/gather -------------------------------------------------------------------------
     // A header and a body from separate allocations, sent in ONE syscall with no copy to join them.
     // That is most of what a protocol implementation does, and the reason vectored I/O exists.
-    std::printf("SendVAsync writes a header and body without joining them\n");
+    std::printf("SendVRawAsync writes a header and body without joining them\n");
     {
         std::memset(g_rxbuf, 0, sizeof g_rxbuf);
         g_recvStatus.store(-1); g_recvBytes.store(-1); g_sendBytes.store(-1);
         JLib::WaitGroup wg;
 
         JLib::Spawn([](JLib::IoSocket s) -> JLib::Coro {
-            const JLib::IoResult r = co_await JLib::RecvAsync(s, g_rxbuf, sizeof g_rxbuf);
+            const JLib::IoResult r = co_await JLib::RecvRawAsync(s, g_rxbuf, sizeof g_rxbuf);
             g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
             g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
             co_return;
@@ -240,7 +240,7 @@ int main() {
             static const char hdr[]  = "LEN=5|";
             static const char body[] = "hello";
             const JLib::IoBuffer v[2] = { { (void*)hdr, 6 }, { (void*)body, 5 } };
-            const JLib::IoResult r = co_await JLib::SendVAsync(s, v, 2);
+            const JLib::IoResult r = co_await JLib::SendVRawAsync(s, v, 2);
             g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
             co_return;
         }(client2), &wg);
@@ -263,7 +263,7 @@ int main() {
             static char scratch[8];
             JLib::IoBuffer v[JLib::IoRequest::kMaxVectors + 1];
             for (auto& b : v) { b.data = scratch; b.len = 1; }
-            const JLib::IoResult r = co_await JLib::SendVAsync(
+            const JLib::IoResult r = co_await JLib::SendVRawAsync(
                 s, v, JLib::IoRequest::kMaxVectors + 1);
             st.store(static_cast<int>(r.status), std::memory_order_release);
             co_return;

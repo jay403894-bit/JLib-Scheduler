@@ -50,9 +50,9 @@ std::atomic<long long> g_ops{ 0 };
 // One connection's traffic: `rounds` ping-pongs, two reactor operations each.
 JLib::Coro RunPair(int i, int rounds) {
     for (int r = 0; r < rounds; ++r) {
-        const JLib::IoResult w = co_await JLib::SendAsync(g_client[i], g_txBuf[i].data(), kMsg);
+        const JLib::IoResult w = co_await JLib::SendRawAsync(g_client[i], g_txBuf[i].data(), kMsg);
         if (!w.Ok()) break;
-        const JLib::IoResult rd = co_await JLib::RecvAsync(g_server[i], g_rxBuf[i].data(), kMsg);
+        const JLib::IoResult rd = co_await JLib::RecvRawAsync(g_server[i], g_rxBuf[i].data(), kMsg);
         if (!rd.Ok()) break;
         g_ops.fetch_add(2, std::memory_order_relaxed);
     }

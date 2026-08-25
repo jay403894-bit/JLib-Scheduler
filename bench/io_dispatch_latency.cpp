@@ -70,7 +70,7 @@ std::vector<std::array<char, 8>> g_brx;
 // enough together that the reactor actually has something to coalesce. The one-at-a-time pass
 // cannot exercise batching at all -- every batch there is size 1.
 JLib::Coro BurstOp(int slot, int sample) {
-    const JLib::IoResult r = co_await JLib::RecvAsync(g_bs[slot], g_brx[slot].data(), 8);
+    const JLib::IoResult r = co_await JLib::RecvRawAsync(g_bs[slot], g_brx[slot].data(), 8);
     const long long now = JLib::MonotonicNs();
     if (r.completedAtNs != 0) {
         const int k = sample * kBurst + slot;
@@ -81,7 +81,7 @@ JLib::Coro BurstOp(int slot, int sample) {
 }
 
 JLib::Coro OneOp(int i) {
-    const JLib::IoResult r = co_await JLib::RecvAsync(g_server, g_rx, sizeof g_rx);
+    const JLib::IoResult r = co_await JLib::RecvRawAsync(g_server, g_rx, sizeof g_rx);
     const long long now = JLib::MonotonicNs();
     if (r.completedAtNs != 0) {
         g_samples[i] = now - r.completedAtNs;
