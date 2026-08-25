@@ -343,6 +343,12 @@ namespace JLib {
         // the task, and the worker's read happens after it pops.
         template <typename P>
         inline Task* ArmResume(std::coroutine_handle<P> h) noexcept {
+            // THE ONE CHOKE POINT for coroutine suspension: every parking await goes through here to
+            // re-arm its resume, so this is where the epoch invariant is checkable exactly once. The
+            // fiber tripwires sit on Fiber::Suspend and the wait primitives and cover none of this --
+            // a co_await is not a fiber suspend. Debug-only; see CoroEpochGuardSuspendCheck for why
+            // the coroutine case is a use-after-free rather than the fiber case.s leak.
+            JLIB_EPOCH_CHECK_NO_GUARD_CORO();
             Task* t = h.promise().task;
             t->data = h.address();
             return t;

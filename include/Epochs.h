@@ -369,14 +369,56 @@ namespace JLib {
 			assert(false && "fiber suspended while holding an EpochGuard -- see stderr");
 		}
 	}
+
+	// THE COROUTINE CASE IS WORSE THAN THE FIBER CASE, and it is a separate message because the
+	// consequence is different in kind.
+	//
+	// A coroutine runs as a NATIVE task, so `Thread::currentFiber` is null and CurrentEpochSlot()
+	// falls through to the per-THREAD fallback slot. That is correct while the guarded region stays
+	// on one worker -- which it does, as long as nothing suspends inside it.
+	//
+	// Suspend inside a guard and the guard's ENTER and EXIT happen on DIFFERENT WORKERS, because a
+	// resumed coroutine goes wherever the scheduler puts it. Then:
+	//
+	//   * the entering worker's slot stays announced at that epoch FOREVER, so MinActiveEpoch()
+	//     never advances and nothing is ever reclaimed again -- the fiber failure, but permanent
+	//     rather than merely for the duration of the wait; and
+	//   * the destructor clears the RESUMING worker's slot, which it never set. If that worker was
+	//     mid-traversal in a guard of its own, that traversal is now un-announced and its nodes
+	//     become reclaimable underneath it. THAT IS A USE-AFTER-FREE, not a leak.
+	//
+	// The fiber version is a liveness bug because a fiber's slot travels with the fiber, so enter
+	// and exit always write the same place. A coroutine has no slot of its own, so they do not.
+	// ~EpochGuard already predicted this in its note about the shared per-thread fallback.
+	//
+	// THE FIX IS NOT TO GIVE COROUTINES SLOTS. That would legitimise suspending inside a guard, and
+	// a stalled participant stalls reclamation for everyone -- that is what EBR IS, in the paper as
+	// much as here. The invariant is the same for both: finish the traversal, drop the guard, then
+	// await.
+	inline void CoroEpochGuardSuspendCheck() {
+		if (t_epochGuardDepth > 0) {
+			fprintf(stderr,
+				"[JLib::Scheduler] INVARIANT VIOLATED: a coroutine suspended inside an EpochGuard "
+				"(depth %d). A coroutine has no epoch slot of its own -- it uses the WORKER's -- so "
+				"this guard will exit on whichever worker resumes it. The entering worker stays "
+				"announced forever (nothing is ever reclaimed again) and the resuming worker's slot "
+				"is cleared without having been set, which can un-announce a live traversal and free "
+				"nodes underneath it. Fix: end the guarded traversal and let the EpochGuard destruct "
+				"BEFORE the co_await.\n",
+				t_epochGuardDepth);
+			assert(false && "coroutine suspended while holding an EpochGuard -- see stderr");
+		}
+	}
 }
 #define JLIB_EPOCH_GUARD_ENTER()        (++JLib::t_epochGuardDepth)
 #define JLIB_EPOCH_GUARD_LEAVE()        (--JLib::t_epochGuardDepth)
 #define JLIB_EPOCH_CHECK_NO_GUARD(where) JLib::EpochGuardSuspendCheck(where)
+#define JLIB_EPOCH_CHECK_NO_GUARD_CORO() JLib::CoroEpochGuardSuspendCheck()
 #else
 #define JLIB_EPOCH_GUARD_ENTER()        ((void)0)
 #define JLIB_EPOCH_GUARD_LEAVE()        ((void)0)
 #define JLIB_EPOCH_CHECK_NO_GUARD(where) ((void)0)
+#define JLIB_EPOCH_CHECK_NO_GUARD_CORO() ((void)0)
 #endif
 
 struct EpochGuard {
