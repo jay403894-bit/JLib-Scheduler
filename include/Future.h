@@ -79,6 +79,31 @@
 // code does not expect. Removal happens under the lock, before the resume, and a waiter is in the
 // list exactly once -- so there is no double resume and no lost one.
 //
+// == WHY THE SHARED STATE IS `new` AND NOT A SLAB SLOT (measured 2026-08-25) ==
+//
+// It fits -- that was the first question and the answer is yes:
+//
+//     std::mutex 80    FutureState<void> 96    <int> 104    <std::string> 128
+//
+// so every ordinary T lands in the existing 128-byte class and a large one lands in 256. The waiter
+// node is 32 bytes and costs nothing, because it lives in the awaiter's frame.
+//
+// IT IS NOT SLABBED ANYWAY, for two reasons. First, look at that table again: std::mutex is 80 of
+// the 96 bytes. Eighty-three percent of this object is the lock, so moving the allocation is
+// optimising the wrong end -- a spinlock would take the void form from 96 bytes to about 24 and
+// drop everything into the 64-byte class, which is a far larger change than where the memory comes
+// from. That is a real option (the lock is held only for pointer surgery and two bools, never
+// across a suspension) and it is deliberately NOT taken yet, because a spinlock trades a bounded
+// wait for burning a core if the holder is preempted, and this project's default has been to avoid
+// that.
+//
+// Second and decisively: the slab exists because TASKS are allocated at frame rate. Nothing has
+// shown a Future is. An asset load creates a handful; a per-request server might create thousands a
+// second, and if one ever does, this is the note that says what to do about it -- shrink the lock
+// first, then slab. Until then `new` for a 96-byte object that outlives a whole asynchronous
+// operation is not the cost worth attacking, and pre-emptively slabbing it would tie Future's
+// lifetime to the task slab's sizing for a benefit nobody has measured.
+//
 // == WHAT THIS IS NOT ==
 //
 // No `.then()`, no `when_all`, no `when_any`, no executors. Those turn a primitive into a framework,
@@ -109,6 +134,43 @@ namespace JLib {
     };
 
     namespace detail {
+
+        // ================================================================================================
+        // PARKING A COROUTINE: THE FOUR RULES. Canonical statement -- IoAcceptor implements the same
+        // discipline and points here rather than restating it.
+        //
+        // There are deliberately TWO implementations rather than one shared type, because the
+        // SEMANTICS differ: IoAcceptor is a QUEUE (N ready sockets, each waiter takes a different
+        // one) and this is a BROADCAST (one value, every waiter observes it). A shared list type
+        // would invite the assumption that they behave alike. What is shared is the discipline
+        // below, and it is shared because getting any of it wrong is a use-after-free rather than a
+        // wrong answer.
+        //
+        //   1. THE NODE LIVES IN THE AWAITER'S FRAME. Never heap-allocated, never owned by the
+        //      structure. Its lifetime is exactly the suspension it represents, which is what makes
+        //      parking allocation-free and what makes rules 3 and 4 necessary.
+        //
+        //   2. LINK AND UNLINK UNDER THE SAME MUTEX THAT PUBLISHES. The take-or-park decision and
+        //      the hand-off-or-queue decision must be made under one lock, so one of them is always
+        //      second and sees the other. That mutex is doing the job a single successful CAS would
+        //      have to do in a lock-free version -- which is why neither of these is lock-free. A
+        //      cancel that reaches past the lock to pluck a waiter out breaks it: exactly one of
+        //      {publish, cancel} must claim each waiter, and only the lock can arbitrate that.
+        //
+        //   3. UNLINK BEFORE RESUMING, and read `next` BEFORE pushing. The moment a waiter's Task is
+        //      pushed, another worker may resume that coroutine, run it to completion and destroy
+        //      the frame the node lives in. Reading node->next afterwards reads freed memory. This
+        //      is the rule that looks redundant and is not.
+        //
+        //   4. WAKE OUTSIDE THE LOCK. The resumed coroutine can drop the last reference to the very
+        //      state whose lock is held, re-entering its destructor while it is locked. Collect the
+        //      claimed waiters under the lock, release it, then push.
+        //
+        // NOT the Event slot table, which cannot serve either of these: Event::AddWaiter indexes by
+        // `assignedFiber->poolIndex`, and a coroutine task rides the Native path with no fiber, so
+        // it silently drops every waiter. Event is a FIBER suspend point; these are the coroutine
+        // equivalent, and the two cannot be merged.
+        // ================================================================================================
 
         // LIVES IN THE AWAITER'S COROUTINE FRAME, exactly like IoAcceptWaiter -- so parking allocates
         // nothing and the node's lifetime is bounded by the suspension it represents. Deliberately

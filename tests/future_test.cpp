@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <mutex>
 
 static int g_fail = 0;
 static const char* g_failed[32];
@@ -82,7 +83,14 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
-    std::printf("Future<T> -- workers=%zu\n\n", sched.GetWorkerCount());
+    std::printf("Future<T> -- workers=%zu\n", sched.GetWorkerCount());
+    // Printed because the shared state's size decides whether it can come off the task slab, and
+    // std::mutex on MSVC is far larger than people expect.
+    std::printf("  sizeof: mutex=%zu State<void>=%zu State<int>=%zu State<string>=%zu Waiter=%zu\n\n",
+                sizeof(std::mutex), sizeof(JLib::detail::FutureState<void>),
+                sizeof(JLib::detail::FutureState<int>),
+                sizeof(JLib::detail::FutureState<std::string>),
+                sizeof(JLib::detail::FutureWaiter));
 
     // ---- the whole point: N consumers, one result ---------------------------------------------
     std::printf("N consumers all receive one result\n");

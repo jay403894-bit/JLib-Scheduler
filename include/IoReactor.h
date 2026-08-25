@@ -553,6 +553,16 @@ namespace JLib {
     // it lives in the awaiter, in the coroutine frame, which is alive for exactly as long as the
     // wait. No allocation, and no wait primitive -- the thing that resumes it is Push, the same call
     // the reactor already makes for every completion.
+    // A COROUTINE PARKED ON AN ACCEPT. The node lives in AcceptAsync.s awaiter frame, so parking
+    // allocates nothing and the node dies with the suspension.
+    //
+    // THE FOUR RULES THIS OBEYS ARE STATED ONCE, IN Future.h, above detail::FutureWaiter -- node in
+    // the frame, link and unlink under the publishing mutex, unlink and read `next` before pushing,
+    // wake outside the lock. They are not restated here on purpose: two copies of a rule is how the
+    // two implementations drift, and this project has paid for that twice.
+    //
+    // The two are deliberately NOT one shared type. This is a QUEUE -- N ready sockets, each waiter
+    // takes a different one -- and Future is a BROADCAST. Same discipline, opposite semantics.
     struct IoAcceptWaiter {
         Task*           resume = nullptr;
         IoSocket*       out    = nullptr;   // receives the socket, or 0 if cancelled
