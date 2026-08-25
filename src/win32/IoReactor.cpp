@@ -259,7 +259,7 @@ namespace JLib {
             // Safe to leave raised for the thread's whole life because this thread is BLOCKED in
             // GetQueuedCompletionStatus whenever it is not draining -- it cannot spin at priority 15
             // and starve anything, which is the risk that makes this dangerous for a worker.
-            if (TaskScheduler::GetHotWorkerRealtime())
+            if (TaskScheduler::GetHotThreadPolicy() != TaskScheduler::HotThreadPolicy::Normal)
                 ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
             // And in exclusive mode, off the hot cores. The completion thread is a PRODUCER for the

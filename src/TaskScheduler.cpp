@@ -472,9 +472,9 @@ size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_ord
 
 // Read by the hot workers themselves and by the reactor's completion threads, each of which raises
 // its OWN priority. Off by default -- see the header.
-static std::atomic<bool> g_hotRealtime{ false };
-void TaskScheduler::SetHotWorkerRealtime(bool on) { g_hotRealtime.store(on, std::memory_order_relaxed); }
-bool TaskScheduler::GetHotWorkerRealtime() { return g_hotRealtime.load(std::memory_order_relaxed); }
+static std::atomic<TaskScheduler::HotThreadPolicy> g_hotPolicy{ TaskScheduler::HotThreadPolicy::Normal };
+void TaskScheduler::SetHotThreadPolicy(HotThreadPolicy p) { g_hotPolicy.store(p, std::memory_order_relaxed); }
+TaskScheduler::HotThreadPolicy TaskScheduler::GetHotThreadPolicy() { return g_hotPolicy.load(std::memory_order_relaxed); }
 
 // Hard-pin the hot workers only. Read in StartWorker, so it must be set BEFORE Init.
 static std::atomic<bool> g_hotPin{ false };
@@ -1477,7 +1477,10 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// Priority is a PARAMETER, not read from the tasks: a batch is documented as homogeneous, and
 		// silently routing a hiPri run into the loPri inbox is a priority inversion no caller could
 		// see. Before this existed, every batch went to loPri unconditionally.
-		(hiPri ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
+		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes hiPri, so a batch routed there
+		// would never run. Same rule as PushLocal and Requeue, asked of the same predicate.
+		const bool useHi = hiPri && HiPriLaneActive();
+		(useHi ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
 		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
 		// is private and nothing wakes it without a notify targeting it specifically.
 		workers[chosen]->MarkQueuedWork();
@@ -1527,10 +1530,14 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	for (size_t s = 0; s < segments; ++s) {
 		const size_t len = per + (s < rem ? 1 : 0);
 		if (len == 0) continue;
-		int chosen = PickNextWorker(pref);
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+		// Same lane branch as the single-task path -- a hiPri BATCH rotates the hot set. The retry
+		// applies to ordinary placement only; PickNextWorker settles a fully-claimed hot set itself,
+		// and yielding in a loop here on K = 1 would never terminate.
+		const bool useHiSeg = hiPri && HiPriLaneActive();
+		int chosen = PickNextWorker(pref, useHiSeg);
+		while (!useHiSeg && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			std::this_thread::yield();
-			chosen = PickNextWorker(pref);
+			chosen = PickNextWorker(pref, false);
 		}
 		submitRun(first, len, chosen);
 		first += len;
@@ -2015,14 +2022,18 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 			return false;
 	}
 	else {
-		uint8_t chosen = PickNextWorker(task->corePref);
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			chosen = PickNextWorker(task->corePref);
+		const size_t hotN = GetHotWorkers();
+		const bool useHi = task->hiPri && hotN;
+		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
+		// The claimed-core retry applies to ORDINARY placement only. PickNextWorker already handles
+		// a fully-claimed hot set internally, and re-rolling there could spin forever on K = 1.
+		while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+			chosen = (uint8_t)PickNextWorker(task->corePref, false);
 		}
-		if(task->hiPri)
+		if(useHi)
 			hiPriInboxes[chosen]->push(task);
 		else
-			loPriInboxes[chosen]->push(task);
+			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 		workers[chosen]->MarkQueuedWork();
 		workers[chosen]->NotifyWorker();
 
@@ -2035,14 +2046,18 @@ bool TaskScheduler::Requeue(Task* task) {
 	// re-count the task -- it was already accounted for at its original submission and
 	// is only resuming, not newly created. (The yield path does the same, via the
 	// worker's push_bottom.) Otherwise every suspend->resume cycle leaks +1.
-	uint8_t chosen = PickNextWorker(task->corePref);
-	while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-		chosen = PickNextWorker(task->corePref);
+	// Same routing as PushLocal -- a RESUMED hiPri task is still on the lane, and sending it back to
+	// an ordinary worker would strand it just as surely as a fresh one.
+	const size_t hotN = GetHotWorkers();
+	const bool useHi = task->hiPri && hotN;
+	uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
+	while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
+		chosen = (uint8_t)PickNextWorker(task->corePref, false);
 	}
-	if(task->hiPri)
+	if(useHi)
 		hiPriInboxes[chosen]->push(task);
 	else
-		loPriInboxes[chosen]->push(task);
+		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 	workers[chosen]->MarkQueuedWork();
 	workers[chosen]->NotifyWorker();
 	return true;
@@ -2072,7 +2087,30 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	workers[idx]->NotifyWorker();
 	return true;
 }
-int TaskScheduler::PickNextWorker(CorePref pref) {
+int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
+	// THE LANE INVARIANT, ENFORCED AT THE ONE PLACE PLACEMENT IS DECIDED. A hiPri task rotates the
+	// HOT workers only. Nothing downstream then has to rescue a lane task from a queue nobody
+	// drains, because none can ever be put there -- and a rescue would be bailing a sinking ship:
+	// it costs a second push, and multiple hiPri producers can outrun one bailing worker.
+	//
+	// Ordinary work takes the branch below and skips 0..K-1, so the two sets are disjoint. At K = 0
+	// there are no hot workers, `hiPri` cannot be true here (the push sites collapse it), and this
+	// is the original function unchanged.
+	const size_t hotN = GetHotWorkers();
+	if (hiPri && hotN) {
+		const size_t n = workers.size();
+		const size_t m = (hotN < n) ? hotN : n;
+		for (size_t i = 0; i < m; ++i) {
+			const size_t j = (nextHotWorker.fetch_add(1, std::memory_order_relaxed)) % m;
+			if (!immediateCoresInUse[j]->load(std::memory_order_acquire))
+				return (int)j;
+		}
+		// Every hot worker is claimed by a PushImmediate. Return one anyway rather than spilling to
+		// an ordinary worker: spilling would strand the task, which is strictly worse than queueing
+		// behind a claim that is by definition temporary.
+		return (int)(nextHotWorker.fetch_add(1, std::memory_order_relaxed) % m);
+	}
+
 	// Placement is governed SOLELY by CorePref (see Task.h) -- queue priority (hiPri) is never consulted
 	// here; the two axes are fully orthogonal by design. Default/Any/Wide all mean "no class preference"
 	// and fall through to the original full-pool round-robin below.
@@ -2080,12 +2118,22 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 	// Round-robin a worker subset, returning the first NON-pinned worker (immediateCoresInUse = a
 	// persistent PushImmediate claim), or -1 if the set is empty or every worker in it is pinned
 	// -- which tells the caller to SPILL to the other class rather than block on an unavailable core.
-	auto pickFrom = [this](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
+	// DEDICATED HOT WORKERS: ordinary work must never be ROUTED to one. A hot worker exists to have
+	// nothing else to do -- that is the entire latency guarantee. Letting a bulk task land there
+	// costs a completion the whole duration of that task, because a running task cannot be
+	// preempted and no bounded "short work" class exists to steal from instead.
+	//
+	// Hot workers are indices 0..K-1 by construction, so skipping them is an index test. Zero when
+	// K = 0, which is the untouched original behaviour. P/E routing is preserved for the rest.
+	// (hotN is read once at the top of this function, above the lane branch.)
+
+	auto pickFrom = [this, hotN](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
 		size_t m = set.size();
 		if (m == 0) return -1;
 		size_t start = cur.load(std::memory_order_relaxed);
 		for (size_t i = 0; i < m; ++i) {
 			int idx = set[(start + i) % m];
+			if ((size_t)idx < hotN) continue;          // reserved for the low-latency lane
 			if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
 				cur.store((start + i + 1) % m, std::memory_order_relaxed);
 				return idx;
@@ -2129,13 +2177,22 @@ int TaskScheduler::PickNextWorker(CorePref pref) {
 	size_t n = workers.size();
 	for (size_t i = 0; i < n; ++i) {
 		size_t j = (nextWorker.load(std::memory_order_seq_cst) + i) % n;
+		if (j < hotN) continue;                        // reserved; see the note on pickFrom
 		if (!immediateCoresInUse[j]->load(std::memory_order_acquire)) {
 			nextWorker.store((int)((j + 1) % n), std::memory_order_seq_cst);
 			return static_cast<int>(j);
 		}
 	}
+	// Every eligible worker is pinned. Rotate among the NON-hot ones -- returning a hot worker here
+	// would put bulk work on the lane precisely when the pool is most loaded, which is the worst
+	// moment for it. Falls back to 0 only when every worker is hot, which K < workers.size() makes
+	// impossible for any sane K but is not worth crashing over.
 	int fallback = nextWorker.load(std::memory_order_seq_cst);
-	nextWorker.store((int)((fallback + 1) % n), std::memory_order_seq_cst);
+	if (hotN < n) {
+		const size_t m = n - hotN;
+		fallback = (int)(hotN + ((size_t)fallback % m));
+	}
+	nextWorker.store((int)(((size_t)fallback + 1) % n), std::memory_order_seq_cst);
 	return fallback;
 }
 

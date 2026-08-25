@@ -457,6 +457,18 @@ void Thread::Worker() {
 	if (!(TaskScheduler::GetHotWorkers() > (size_t)qIndex))
 		TaskScheduler::ExcludeCurrentThreadFromHotCpus();
 	while (running.load(std::memory_order_acquire)) {
+		// TWO DIFFERENT QUESTIONS, and conflating them deadlocks the pool.
+		//
+		//   servesHiPri  do I DRAIN the lane? True for everyone at K=0 (nothing else would), true
+		//                for the hot workers only at K>0.
+		//   isHotWorker  am I a DEDICATED lane server -- never steal, never park? False for everyone
+		//                at K=0. Keying the "does not steal" rule off servesHiPri instead meant that
+		//                at K=0, where servesHiPri is true for all, NO worker would steal at all.
+		//
+		// Read once per pass; both are relaxed loads and re-read every pass, so SetHotWorkers stays
+		// safe to call on a running pool.
+		const bool servesHiPri = TaskScheduler::WorkerServesHiPri((size_t)qIndex);
+		const bool isHotWorker = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 
 		ready.store(true, std::memory_order_release);
 		// Cleared once per iteration, unconditionally, BEFORE this iteration's own-queue/steal/
@@ -827,7 +839,10 @@ void Thread::Worker() {
 								/*minPerSegment*/8, inboxIsHiPri, CorePref::E);
 					}
 				};
-				drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
+				// HALF THE LOOP FOR N-K WORKERS: an ordinary worker never touches the lane, so it
+				// skips this inbox entirely. At K=0 nobody serves the lane and nothing is routed to
+				// it, so every worker takes the cheap path -- cheaper than before the lane existed.
+				if (servesHiPri) drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
 				drainInbox(scheduler->loPriInboxes[qIndex].get(), /*inboxIsHiPri*/false);
 
 				if (EpochManager::Instance().ShouldSelfReclaim()) {
@@ -843,7 +858,7 @@ void Thread::Worker() {
 		}
 		{
 			// --- 3. Local  queues ---
-			if (!task_to_run) {
+			if (!task_to_run && servesHiPri) {
 				auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 				if (opt) {
 					Task* task = *opt;
@@ -920,27 +935,37 @@ void Thread::Worker() {
 				auto tryStealFrom = [&](int target) -> bool {
 					JLIBSCHED_STEAL_STAT(qIndex, probes);
 
-					// A HOT WORKER'S hiPri LANE IS RESERVED. When hot workers exist, an ordinary
-					// worker does not steal their high-priority work, because taking it is what the
-					// whole arrangement is trying to prevent: the task lands on a core that may be
-					// cold or contended, and it loses the cache the hot worker had warm for it. A
-					// hot worker that cannot keep up is a capacity question -- raise K -- not
-					// something to fix by scattering its work.
+					// TWO DISJOINT STEAL WORLDS once hot workers exist: hot steals from hot, ordinary
+					// steals from ordinary. Neither ever probes the other's lane.
 					//
-					// CONDITIONAL ON K > 0, and that guard is load-bearing rather than cautious.
-					// hiPri is a GENERAL feature, not an I/O one; at the default K = 0 there are no
-					// hot workers, so an unconditional rule would mean nobody drains hiPri at all
-					// and every existing hiPri task starves. With K = 0 this is exactly the old
-					// behaviour. It also only protects HOT victims -- ordinary workers still steal
-					// hiPri from each other, as they always did.
+					//   HOT -> HOT, hiPri only. Stealing between hot workers is what makes K > 1
+					//   mean anything: without it, one hot worker can be backed up while another
+					//   sits idle and nothing rebalances the lane. It does NOT take loPri -- bulk
+					//   work is unbounded and a running task cannot be preempted, so one stolen
+					//   bulk task costs every completion behind it that task's whole duration.
+					//   Dedicated is what the latency guarantee means, and an idle hot worker
+					//   spinning is the price the caller opted into by setting K.
+					//
+					//   ORDINARY -> ORDINARY, loPri only. ONE probe per victim instead of two, and
+					//   that halving is the point: under NoSleep every idle worker runs this search
+					//   continuously, so the probe count IS the contention. Letting ordinary workers
+					//   take hiPri "under pressure" would put the probe back and give the saving
+					//   away -- and would land a lane task on a cold or contended core, which is the
+					//   thing the arrangement exists to prevent. A hot worker that cannot keep up is
+					//   a capacity question: raise K.
+					//
+					// AT K = 0 neither world exists, so this is the original both-lanes steal
+					// against every victim, unchanged.
 					const std::size_t hotN = TaskScheduler::GetHotWorkers();
 					const bool victimIsHot = hotN > (std::size_t)target;
-					const bool iAmHot      = hotN > (std::size_t)qIndex;
-					const bool mayTakeHiPri = !victimIsHot || iAmHot;
 
-					auto s = mayTakeHiPri ? scheduler->hiPri[target]->steal_if(classOK)
-					                      : decltype(scheduler->hiPri[target]->steal_if(classOK)){};
-					if (!s) s = scheduler->loPri[target]->steal_if(classOK);
+					if (hotN && isHotWorker != victimIsHot) return false;   // never cross the divide
+
+					auto s = (hotN && !isHotWorker)
+					       ? decltype(scheduler->hiPri[target]->steal_if(classOK)){}   // ordinary: loPri only
+					       : scheduler->hiPri[target]->steal_if(classOK);
+					if (!s && !(hotN && isHotWorker))                                   // hot: no bulk work
+						s = scheduler->loPri[target]->steal_if(classOK);
 					if (!s) return false;
 					JLIBSCHED_STEAL_STAT(qIndex, hits);
 					task_to_run = *s;
@@ -1019,7 +1044,12 @@ void Thread::Worker() {
 		
 
 		// 5. --- Pull from inboxes before sleep (drain them so nothing gets stuck) ---
-		if (!task_to_run) {
+		// NO RESCUE HERE, deliberately. A lane task cannot reach an ordinary worker's inbox at all:
+		// PickNextWorker rotates the hot set for hiPri and the ordinary set for everything else, so
+		// the two are disjoint at the one place placement is decided. Bailing a mis-placed task out
+		// afterwards would cost a second push per task and could be outrun by multiple producers --
+		// enforcing the invariant is cheaper than repairing violations of it.
+		if (!task_to_run && servesHiPri) {
 			size_t count = 0;
 			while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
 				count++;
@@ -1111,7 +1141,11 @@ void Thread::Worker() {
 				// the non-realtime range. True realtime (16-31) needs REALTIME_PRIORITY_CLASS and a
 				// privilege, and would let a spin loop starve the OS, so it is deliberately not
 				// asked for here.
-				if (hot && !hotPriorityRaised && TaskScheduler::GetHotWorkerRealtime()) {
+				// Elevated and Realtime map to the SAME Windows call: TIME_CRITICAL is already the
+				// top of the non-realtime range, and the only step above it is a process-wide class
+				// this deliberately refuses to touch. See HotThreadPolicy.
+				if (hot && !hotPriorityRaised &&
+				    TaskScheduler::GetHotThreadPolicy() != TaskScheduler::HotThreadPolicy::Normal) {
 					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 					hotPriorityRaised = true;
 					atCriticalPriority = true;

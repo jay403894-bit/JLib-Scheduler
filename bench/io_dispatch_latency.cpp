@@ -158,7 +158,9 @@ int main(int argc, char** argv) {
     // Run() entry, and Run() starts inside Init. Setting it afterwards reaches the workers (they
     // re-read it every idle pass) but NOT the completion threads -- which would silently measure
     // only half the intervention, the half that was already shown to be the wrong half alone.
-    JLib::TaskScheduler::SetHotWorkerRealtime(hotRt);
+    JLib::TaskScheduler::SetHotThreadPolicy(
+        hotRt ? JLib::TaskScheduler::HotThreadPolicy::Elevated
+              : JLib::TaskScheduler::HotThreadPolicy::Normal);
 
     // ALSO before Init, and for a second reason: StartWorker decides placement as each worker
     // starts, so the hot COUNT must already be known there for pinning to select the right ones.

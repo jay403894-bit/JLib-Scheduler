@@ -327,19 +327,67 @@ namespace JLib {
 		static void   SetHotWorkers(size_t k);
 		static size_t GetHotWorkers();
 
-		// Raise the hot workers AND the reactor's completion threads to THREAD_PRIORITY_TIME_CRITICAL
-		// -- the top of the non-realtime range (15) inside a normal-priority process. Windows only;
-		// a no-op elsewhere. OFF BY DEFAULT.
+		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
+		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
+		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
+		// how the pickup-discard invariant drifted three times, so there are no copies.
 		//
-		// TARGETED, and the targeting is the whole point. Raising the WHOLE PROCESS measured 5x
-		// WORSE alongside K-hot, because it elevates all N workers and 29 spinning threads then
-		// preempt the completion thread feeding them. This raises only the producer and the
-		// consumer on the I/O critical path and leaves every other worker at Normal.
+		// THE LANE ONLY EXISTS WHEN SOMEONE SERVES IT. At K=0 a hiPri task routes to the ordinary
+		// lane and NOBODY probes hiPri -- which makes the default pool's worker loop CHEAPER than it
+		// was before any of this: one inbox, one deque, one steal probe per victim.
 		//
-		// Deliberately NOT REALTIME_PRIORITY_CLASS: that needs a privilege and would let a spin loop
-		// starve the OS itself.
-		static void SetHotWorkerRealtime(bool on);
-		static bool GetHotWorkerRealtime();
+		// hiPri was never a real priority queue -- per-worker queues plus stealing gave no global
+		// ordering, so "picked up first" cost every worker a second inbox, a second deque and a
+		// second probe per victim to buy something close to a coin flip. It has a job now, and only
+		// where it has one.
+		static bool HiPriLaneActive() { return GetHotWorkers() > 0; }
+
+		// Does THIS worker serve the lane?
+		//
+		// K > 0: only the hot ones, so N-K workers halve their search -- half the inbox checks, half
+		// the deque checks, half the steal probes. That is the structural win, and it is why
+		// ordinary workers must NOT steal hiPri: letting them means they have to probe it.
+		//
+		// K == 0: EVERY worker serves it, exactly as before any of this existed. Without that clause
+		// nobody drains a hiPri lane at the default setting, and anything that reaches one -- a task
+		// queued before K changed, the shutdown drain, any push site the collapse missed -- strands
+		// forever while the pool spins looking for work it refuses to take. Making correctness
+		// depend on catching every push site was the fragile half of this design; this makes the
+		// safe case the DEFAULT case and leaves the optimisation to the configuration that asked
+		// for it.
+		static bool WorkerServesHiPri(size_t qIndex) {
+			const size_t k = GetHotWorkers();
+			return k == 0 || qIndex < k;
+		}
+
+		// HOW HARD the I/O critical path preempts. Applies to the K hot workers AND the reactor's
+		// completion threads -- NEVER to the process, and never to the other workers.
+		//
+		// THE SCOPE IS IN THE CALL, NOT THE ENUM, and that is deliberate. Process-wide elevation
+		// measured 5x WORSE alongside K-hot: it raises all N workers, and N spinning threads then
+		// preempt the completion thread feeding them. An enum offering a process-wide tier as a peer
+		// of a per-thread one would invite exactly that mistake, so it does not offer one.
+		//
+		//   Normal    leave scheduling alone. The default.
+		//   Elevated  no privilege required. Windows: THREAD_PRIORITY_TIME_CRITICAL, the top of the
+		//             non-realtime range (15) inside a normal-priority process -- this is the
+		//             configuration measured best (HOT p99 4.5-10us against a 144-2416us baseline).
+		//             Linux/BSD would be SCHED_RR per thread; macOS QOS_CLASS_USER_INTERACTIVE.
+		//   Realtime  the privileged tier: Linux/BSD SCHED_FIFO (needs CAP_SYS_NICE), macOS
+		//             THREAD_TIME_CONSTRAINT_POLICY (what CoreAudio uses).
+		//
+		// ON WINDOWS, Realtime BEHAVES AS Elevated, on purpose. The only step above TIME_CRITICAL is
+		// REALTIME_PRIORITY_CLASS, which is PROCESS-wide, needs a privilege, and would let a spin
+		// loop starve the OS itself. Refusing to escalate is the honest mapping; silently giving the
+		// caller a process-wide change they did not ask for is not.
+		//
+		// POSIX IS NOT IMPLEMENTED -- there is no backend yet, so both tiers are a no-op there
+		// rather than a lie. Note that affinity is NOT a substitute: exclusive pinning was measured
+		// and is worse than doing nothing (see SetHotWorkerExclusive). A POSIX port genuinely needs
+		// the privileged call or real core isolation.
+		enum class HotThreadPolicy : uint8_t { Normal = 0, Elevated, Realtime };
+		static void            SetHotThreadPolicy(HotThreadPolicy p);
+		static HotThreadPolicy GetHotThreadPolicy();
 
 		// Hard-pin ONLY the hot workers to their cores, leaving the rest on the global policy.
 		// MUST be set before Init -- placement happens as each worker starts. OFF BY DEFAULT.
@@ -1119,7 +1167,11 @@ namespace JLib {
 		Task* GetTask();
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
-		int PickNextWorker(CorePref pref = CorePref::Default);
+		// `hiPri` selects WHICH SET is rotated, and that is what makes the lane invariant structural
+		// rather than a convention every call site has to remember. A hiPri task rotates the hot
+		// workers only; everything else rotates the ordinary ones only. One branch, one place, and
+		// no caller can route a lane task somewhere nothing serves it.
+		int PickNextWorker(CorePref pref = CorePref::Default, bool hiPri = false);
 		bool PushToCore(size_t core_id, Task* task);
 		// Picks a worker from the requested class set (P/E), SPILLING to the other class if unavailable;
 		// Default/Any/Wide (and non-hybrid / all-pinned) use the original full-pool round-robin. Placement
@@ -1225,6 +1277,9 @@ namespace JLib {
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
 		std::atomic<bool> poolActive{ false };
 		std::atomic<int> nextWorker{ 0 };
+		// Separate cursor for the hot set, so lane traffic and ordinary traffic do not perturb each
+		// other's rotation -- and so the hot rotation stays over 0..K-1 rather than the whole pool.
+		std::atomic<size_t> nextHotWorker{ 0 };
 		// P/E routing (see PickNextWorker): worker qIndices split by efficiency class (from isPCore),
 		// each with its own round-robin cursor. Built in StartPool. Preference is a HINT -- PickNextWorker
 		// spills to the other class if the preferred one has no available worker, and an empty set (non-
