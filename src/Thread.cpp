@@ -87,6 +87,30 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 	// running tasks. Only its PLACEMENT is dropped, which is exactly AffinityPolicy::None, and its
 	// locality becomes approximate. Raising the cap is CpuMask::kWords in Topology.h.
 	auto affinityPolicy = scheduler->GetAffinityPolicy();
+
+	// PIN THE HOT WORKERS ONLY. Hard-pinning the WHOLE pool was measured harmful -- ~45% worse wake
+	// latency, ~2x on a frame DAG -- which is why the default is Ideal. That finding is about the
+	// pool: a pinned worker cannot escape a core someone else is occupying, and with N workers the
+	// chance that SOME core is occupied approaches certainty.
+	//
+	// A hot worker looked like the opposite case -- it never parks, so it has no wake latency to
+	// lose, and there are one or two rather than N. IT MEASURED WORSE ANYWAY, and badly: burst p99
+	// 27ms against a 150us baseline, HOT p99 up to 10ms, and pin+RT worse than RT alone.
+	//
+	// Because this is taskset-style pinning: the worker is confined to a core, but NOTHING ELSE IS
+	// EXCLUDED FROM IT. When the completion thread or an OS thread lands on that CPU the hot worker
+	// cannot migrate away and simply waits; unpinned it moves to whichever core is free, which with
+	// 29 workers plus service threads on ~32 logical CPUs it constantly needs to.
+	//
+	// isolcpus-style isolation -- the core RESERVED so nothing else is scheduled there -- is the
+	// opposite arrangement and is NOT refuted by this. It also cannot be tested without booting for
+	// it. Kept as a knob for exactly that case, off by default, and do not enable it expecting a win
+	// on an ordinary machine.
+	//
+	// Requires SetHotWorkers BEFORE Init -- qIndex is set by SetQueueIndex before StartWorker, but
+	// the hot COUNT has to already be known here.
+	if (TaskScheduler::GetHotWorkerPin() && TaskScheduler::GetHotWorkers() > (size_t)qIndex)
+		affinityPolicy = TaskScheduler::AffinityPolicy::Hard;
 	if (cpu_affinity >= topology::CpuMask::kMaxCpus &&
 	    affinityPolicy != TaskScheduler::AffinityPolicy::None) {
 		affinityPolicy = TaskScheduler::AffinityPolicy::None;

@@ -341,6 +341,17 @@ namespace JLib {
 		static void SetHotWorkerRealtime(bool on);
 		static bool GetHotWorkerRealtime();
 
+		// Hard-pin ONLY the hot workers to their cores, leaving the rest on the global policy.
+		// MUST be set before Init -- placement happens as each worker starts. OFF BY DEFAULT.
+		//
+		// Hard-pinning the whole pool measured ~45%% worse wake latency and ~2x on a frame DAG,
+		// which is why the default policy is Ideal. A hot worker is the opposite case: it never
+		// parks, so it has no wake latency to lose, and there are one or two rather than N. This is
+		// also the PORTABLE half of the priority story -- it reduces preemption without needing
+		// TIME_CRITICAL or CAP_SYS_NICE.
+		static void SetHotWorkerPin(bool on);
+		static bool GetHotWorkerPin();
+
 		// How much estimated SERIAL WORK (microseconds) a loop must represent before ParallelFor splits
 		// it. Defaults to 75us in Release and 750us in Debug -- the constant is the fork-join
 		// dispatch+join overhead, and an unoptimized build pays roughly an order of magnitude more of it.

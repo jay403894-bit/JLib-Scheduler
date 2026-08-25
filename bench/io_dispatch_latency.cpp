@@ -137,6 +137,10 @@ int main(int argc, char** argv) {
     // bistability is the OS descheduling one end of the completion handoff.
     const bool hotRt = (argc > 6) ? (std::atoi(argv[6]) != 0) : false;
 
+    // Hard-pin the hot workers. The PORTABLE preemption mitigation -- no privilege needed, works
+    // the same on Linux/macOS -- so the question is how close pin-without-RT gets to RT.
+    const bool hotPin = (argc > 7) ? (std::atoi(argv[7]) != 0) : false;
+
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
 
@@ -146,6 +150,11 @@ int main(int argc, char** argv) {
     // only half the intervention, the half that was already shown to be the wrong half alone.
     JLib::TaskScheduler::SetHotWorkerRealtime(hotRt);
 
+    // ALSO before Init, and for a second reason: StartWorker decides placement as each worker
+    // starts, so the hot COUNT must already be known there for pinning to select the right ones.
+    if (hot) JLib::TaskScheduler::SetHotWorkers(hot);
+    JLib::TaskScheduler::SetHotWorkerPin(hotPin);
+
     JLib::TaskScheduler::EnableIoReactor(true, th);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
@@ -154,12 +163,10 @@ int main(int argc, char** argv) {
 
     if (noSleep)
         JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
-    if (hot)
-        JLib::TaskScheduler::SetHotWorkers(hot);
 
     std::printf("io_dispatch_latency -- %d samples, cold pause %dms, %u completion thread(s), "
-                "%zu workers, idle=%s, hot=%zu, hotRT=%d\n\n", samples, coldMs, th,
-                sched.GetWorkerCount(), noSleep ? "NoSleep" : "Sleep", hot, (int)hotRt);
+                "%zu workers, idle=%s, hot=%zu, hotRT=%d, hotPin=%d\n\n", samples, coldMs, th,
+                sched.GetWorkerCount(), noSleep ? "NoSleep" : "Sleep", hot, (int)hotRt, (int)hotPin);
 
     // One loopback pair. Concurrency is deliberately ONE: this measures the seam, not the pipe.
     SOCKET lis = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

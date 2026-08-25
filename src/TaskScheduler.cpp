@@ -476,6 +476,11 @@ static std::atomic<bool> g_hotRealtime{ false };
 void TaskScheduler::SetHotWorkerRealtime(bool on) { g_hotRealtime.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::GetHotWorkerRealtime() { return g_hotRealtime.load(std::memory_order_relaxed); }
 
+// Hard-pin the hot workers only. Read in StartWorker, so it must be set BEFORE Init.
+static std::atomic<bool> g_hotPin{ false };
+void TaskScheduler::SetHotWorkerPin(bool on) { g_hotPin.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetHotWorkerPin() { return g_hotPin.load(std::memory_order_relaxed); }
+
 // The stale-library guard's other half. Compiled INTO the library, so it reports the signature as
 // the library's own build saw these headers. The inline check in TaskScheduler.h compares it against
 // the including translation unit's view; a mismatch means somebody rebuilt one and not the other.
