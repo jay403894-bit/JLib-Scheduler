@@ -154,6 +154,96 @@ int main() {
         Check(g_lost.load() == 0, "and NONE lost protection, however many there were");
     }
 
+    // ================================================================================================
+    // BOTH MECHANISMS AT ONCE, against the REAL reclaim path.
+    //
+    // Everything above tests counted readers alone, and the GenMC model has no slot readers in it at
+    // all. But both are live in a running pool -- fibers and bare threads announce in slots,
+    // coroutines increment counters -- and MinActiveEpoch is a minimum over their union. Nothing so
+    // far checks that the union is actually respected, and "the two halves each work" does not imply
+    // "reclaim works with both".
+    //
+    // So: retire a real object through RetirePtr, hold it with ONE reader of each kind, and watch
+    // the deleter. It must not run while either is holding, and it must run once both let go. The
+    // two are released SEPARATELY, so a scheme that only honoured one of them would free early at
+    // whichever release came first.
+    std::printf("\nreclaim respects BOTH mechanisms at once\n");
+    {
+        static std::atomic<int> s_deleted{ 0 };
+        s_deleted.store(0);
+        struct Victim { int x; };
+        auto* victim = new Victim{ 1 };
+
+        // A bare-thread SLOT reader, held open on this thread for the whole section.
+        auto* slotHold = new EpochGuard(JLib::CurrentEpochSlot());
+
+        // A COUNTED reader, parked in a coroutine.
+        g_done.store(0);
+        JLib::Promise<void> p;
+        JLib::Future<void>  f = p.GetFuture();
+        JLib::Spawn(Offending(f));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        Check(g_done.load() == 0, "one slot reader and one counted reader are both holding");
+
+        em.RetirePtr(victim, em.CurrentEpoch(),
+                     [](void* q) { delete static_cast<Victim*>(q); s_deleted.fetch_add(1); });
+
+        for (int i = 0; i < 64; ++i) em.Tick();
+        Check(s_deleted.load() == 0, "not freed while BOTH are holding");
+
+        // Release only the COUNTED one. The slot reader still holds, so this must not be enough.
+        p.Set();
+        Check(WaitUntil([&]{ return g_done.load() == 1; }), "the counted reader leaves");
+        for (int i = 0; i < 64; ++i) em.Tick();
+        Check(s_deleted.load() == 0, "STILL not freed -- the slot reader alone is enough to hold it");
+
+        // Now release the slot reader too. Nothing is left, so it must go.
+        delete slotHold;
+        Check(WaitUntil([&]{
+                  for (int i = 0; i < 8; ++i) em.Tick();
+                  return s_deleted.load() == 1;
+              }), "freed once BOTH have let go");
+    }
+
+    // THE SAME THING WITH THE RELEASE ORDER REVERSED, and it is not redundant -- it is the control
+    // that makes the section above mean anything.
+    //
+    // Releasing the COUNTED reader first proves only that SLOTS are respected: a MinActiveEpoch that
+    // ignored counters entirely would still pass every check above, because the slot reader holds
+    // through all of them. Releasing the SLOT reader first is what proves the COUNTER contributes --
+    // with counters ignored, nothing would be left holding and the object would free early.
+    std::printf("\nthe same, releasing the SLOT reader first (proves counters are respected)\n");
+    {
+        static std::atomic<int> s_deleted2{ 0 };
+        s_deleted2.store(0);
+        struct Victim2 { int x; };
+        auto* victim = new Victim2{ 2 };
+
+        auto* slotHold = new EpochGuard(JLib::CurrentEpochSlot());
+
+        g_done.store(0);
+        JLib::Promise<void> p;
+        JLib::Future<void>  f = p.GetFuture();
+        JLib::Spawn(Offending(f));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+
+        em.RetirePtr(victim, em.CurrentEpoch(),
+                     [](void* q) { delete static_cast<Victim2*>(q); s_deleted2.fetch_add(1); });
+
+        // Slot reader goes FIRST this time. Only the counted reader is left.
+        delete slotHold;
+        for (int i = 0; i < 64; ++i) em.Tick();
+        Check(s_deleted2.load() == 0,
+              "not freed with only the COUNTED reader left (fails if counters are ignored)");
+
+        p.Set();
+        Check(WaitUntil([&]{ return g_done.load() == 1; }), "the counted reader leaves");
+        Check(WaitUntil([&]{
+                  for (int i = 0; i < 8; ++i) em.Tick();
+                  return s_deleted2.load() == 1;
+              }), "and only then is it freed");
+    }
+
     std::printf("\n%s -- %d failure(s)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     for (int i = 0; i < g_failedCount; ++i) std::printf("  FAILED: %s\n", g_failed[i]);
     sched.Join();
