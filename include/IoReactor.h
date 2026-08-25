@@ -103,7 +103,7 @@
 // faster on Linux while leaving the same program racing on Windows.
 
 #include "CancelToken.h"
-#include "TaskScheduler.h"   // SchedulerSemaphore: IoAcceptor queues ready connections behind one
+#include "TaskScheduler.h"   // Task, Push: the only scheduler surface this file needs
 
 #include <atomic>
 #include <cstddef>
@@ -310,10 +310,16 @@ namespace JLib {
 
         // ---- sockets ---------------------------------------------------------------------------
         //
-        // WHY THESE ARE NOT JUST Read/Write. On Windows ReadFile does work on a socket, so it was
-        // tempting to stop at the file API -- but it cannot carry flags (MSG_PEEK, MSG_OOB), cannot
-        // do vectored buffers, and, decisively, ACCEPT AND CONNECT HAVE NO ReadFile ANALOGUE AT ALL.
-        // A reactor that cannot accept a connection is not a reactor.
+        // WHY THESE ARE NOT JUST Read/Write. Sockets need Winsock-specific APIs because the socket
+        // interface carries things the generic handle interface does not represent: per-operation
+        // flags (MSG_PEEK, MSG_OOB), vectored buffers, and -- decisively -- CONNECTION-ESTABLISHMENT
+        // OPERATIONS. Accept and connect have no file-API analogue at all, and a reactor that cannot
+        // accept a connection is not a reactor.
+        //
+        // (Do not reach for the file API on a socket on the strength of it appearing to work. A
+        // Winsock SOCKET is not contractually interchangeable with a HANDLE -- whether the generic
+        // calls succeed depends on the provider underneath, so it is a property of the deployment
+        // rather than of the API. Nothing here needs that to be true.)
         //
         // Sockets are the app's to create, bind and listen -- this is a reactor, not a networking
         // library. It takes a socket the same way it takes a handle.
@@ -573,8 +579,10 @@ namespace JLib {
     // cancels every outstanding accept and DRAINS the completions before releasing anything, for
     // the same reason IoReactor::Stop does: the kernel is holding pointers into that storage.
     //
-    // Ready connections queue behind a semaphore, one permit each. That makes waiting for a
-    // connection an ordinary cancellable wait, with scopes and deadlines working on it unchanged.
+    // Ready connections queue in the ACCEPTOR ITSELF, and waiters park as Task* in caller-owned
+    // state -- no wait primitive is involved. Scopes and deadlines work on the wait because it
+    // carries a CancelToken like every other operation here, not because it borrows a semaphore.
+    // See TakeOrQueue below for why that is the design and not merely an implementation detail.
     // ================================================================================================
     class IoAcceptor {
     public:
@@ -596,7 +604,8 @@ namespace JLib {
         void Stop() noexcept;
 
         // Non-blocking. Returns 0 when nothing is ready. Normally reached through AcceptAsync in
-        // IoAsync.h, which waits on the semaphore below first.
+        // IoAsync.h, which goes via TakeOrQueue below so that an empty queue parks the caller
+        // instead of returning nothing.
         IoSocket TryTake() noexcept;
 
         // Take a ready connection, or QUEUE this waiter until one arrives.

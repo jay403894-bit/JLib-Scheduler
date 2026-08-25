@@ -126,6 +126,15 @@ namespace JLib {
     }
 
     // ---- sockets --------------------------------------------------------------------------------
+    //
+    // THE RAW OVERLOADS. These take an IoSocket and DO NOT SERIALISE: two operations in the same
+    // direction on one stream socket may interleave their bytes, which is silent protocol
+    // corruption. The IoStream overloads further down serialise and are what stream code should
+    // use; the difference is semantic, is chosen by overload resolution on this first argument
+    // alone, and is invisible until two operations are actually in flight. See the block comment
+    // above the IoStream overloads for the full rule.
+    //
+    // Correct uses: a datagram socket, or a caller that can name its own ordering guarantee.
 
     [[nodiscard]] inline auto RecvAsync(IoSocket s, void* buf, std::uint32_t len,
                                         std::uint32_t flags = 0,
@@ -165,8 +174,10 @@ namespace JLib {
 
     // Next ready connection from a pre-posted acceptor. Returns 0 if cancelled or shutting down.
     //
-    // The wait is an ORDINARY cancellable semaphore acquire, which is what makes scopes and
-    // deadlines work on "wait for a connection" without IoAcceptor knowing either exists.
+    // The wait is an ordinary cancellable I/O wait -- the waiter is a Task* parked in this awaiter's
+    // own frame, not a scheduler wait primitive. Scopes and deadlines work on "wait for a
+    // connection" because it carries a CancelToken like every other operation here, without
+    // IoAcceptor knowing either exists. See IoAcceptor::TakeOrQueue for why there is no semaphore.
     class AcceptAwaiter {
     public:
         AcceptAwaiter(IoAcceptor& a, CancelToken t) noexcept : acc_(a), token_(t) {}
@@ -304,8 +315,21 @@ namespace JLib {
     // ================================================================================================
     // ONE OPERATION PER DIRECTION PER STREAM SOCKET -- WHICH IoStream ABOVE ENFORCES FOR YOU.
     //
-    // This note is about the RAW IoSocket overloads, which do not serialise. Use IoStream unless you
-    // have your own ordering guarantee; what follows is why the guarantee is needed at all.
+    //     SendAsync(IoStream&, ...)   SERIALISES. Transfers queue; bytes cannot interleave.
+    //     SendAsync(IoSocket,  ...)   DOES NOT. Concurrent sends may interleave their bytes.
+    //
+    // THAT IS A SEMANTIC DIFFERENCE, NOT A PERFORMANCE ONE, and it is selected by overload
+    // resolution on the first argument. Passing a raw socket where a stream was meant compiles
+    // silently, runs correctly in every single-operation test, and corrupts the protocol only once
+    // two operations are genuinely in flight -- which is to say, under load, nondeterministically,
+    // in a way that looks like a peer or kernel bug rather than a call-site mistake.
+    //
+    // So: use IoStream for stream sockets. Reach for the raw overload only where you can name the
+    // guarantee that replaces it. (The datagram calls -- SendToAsync/RecvFromAsync -- take a raw
+    // IoSocket and are CORRECT that way: a datagram is atomic, so there is nothing to interleave.
+    // The hazard is specific to streams.)
+    //
+    // What follows is why the guarantee is needed at all.
     //
     // Two SendAsync calls in flight on the same TCP socket are two independent operations, and the
     // kernel does not promise to complete them in the order they were submitted. Their bytes can
