@@ -1784,7 +1784,16 @@ Task* TaskScheduler::GetTask() {
 		return sb.type != TaskType::Fiber && StealClassCompatible(sb.corePref, thiefIsP, degen);
 	};
 
-	if (!forceLoPri) {
+	// A BARE THREAD IS NOT A HOT WORKER, so it does not reach into the lane. This is the same
+	// reservation the worker steal path enforces, and it was a hole: a caller sitting in WaitFor
+	// helps through here, and without this it would pull a completion out of a hot worker's deque
+	// onto a thread that is not spinning, is not elevated, and may be about to block again. Every
+	// reason ordinary workers are kept out applies harder to main.
+	//
+	// K = 0 leaves this exactly as it was -- no lane exists, and skipping hiPri there would strand
+	// whatever is in it.
+	const size_t hotN_ = GetHotWorkers();
+	if (!forceLoPri && hotN_ == 0) {
 		size_t numThreads = hiPri.size();
 		size_t start = rand() % numThreads;
 		for (size_t i = 0; i < numThreads; ++i) {
@@ -2223,30 +2232,24 @@ Task* TaskScheduler::GetCurrentTask() const {
 	return nullptr; // Not on a worker thread, or no task currently running
 }
 
-void TaskScheduler::BoostTaskPriority(Task* task) {
-	if (!task) return;
-
-	// Only boost if not already boosted (no lock needed: only one thread modifies this task)
-	if (task->priorityBoost == 0) {
-		task->priorityBoost = task->hiPri;
-		task->hiPri = 1; // boost to high priority
-	}
-}
-
-void TaskScheduler::UnboostTaskPriority(Task* task) {
-	if (!task) return;
-	// Restore original priority if boosted (no lock needed: only one thread modifies this task)
-	if (task->priorityBoost != 0) {
-		task->hiPri = task->priorityBoost; // restore original priority
-		task->priorityBoost = 0;
-	}
-}
+// BoostTaskPriority/UnboostTaskPriority REMOVED. They were the lock-priority half of the old
+// spinlock mutex, and Boost had had no callers since 21719ac -- which made Unboost a permanent
+// no-op, since priorityBoost could only ever be zero.
+//
+// Deleting them matters now rather than being tidiness: hiPri is THE LOW-LATENCY LANE, so a
+// mechanism that promotes an AGED ORDINARY TASK to hiPri would push bulk work onto the hot
+// workers -- exactly the long-running work the lane is defined to exclude, and unstealable once
+// there. A dead function that would be actively wrong if revived is worse than no function.
+//
+// Task::priorityBoost is deliberately LEFT IN PLACE: the flag block is static_asserted and
+// fingerprinted by the stale-library guard, so removing a bit is a separate, deliberate change.
+// The bit is now free for a future user.
 
 void TaskScheduler::CleanupTaskMetadata(Task* task) {
 	if (!task) return;
-	// Metadata is stored directly on task, no cleanup needed (task is about to be freed anyway)
-	// Just restore priority if it was boosted
-	UnboostTaskPriority(task);
+	// Metadata is stored directly on task, no cleanup needed (task is about to be freed anyway).
+	// The priority-restore that used to be here went with BoostTaskPriority -- see above.
+	(void)task;
 }
 
 
@@ -2383,11 +2386,6 @@ void SchedulerMutex::Unlock()
 
 		if (next.result) *next.result = WaitResult::Ok;
 		break;   // this one gets the lock; released below, outside the spinlock
-	}
-
-	// Only unboos if scheduler is initialized AND it's not a recursive/shutdown path
-	if (wasHolder && TaskScheduler::IsInitialized()) {
-		TaskScheduler::Instance().UnboostTaskPriority(wasHolder);
 	}
 
 	// Release whichever kind of waiter was queued. This is the only place the two kinds diverge, and

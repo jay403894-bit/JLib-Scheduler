@@ -124,8 +124,6 @@ namespace JLib {
 	public:
 		// Priority inheritance methods (public for SchedulerMutex access)
 		Task* GetCurrentTask() const;
-		void BoostTaskPriority(Task* task);
-		void UnboostTaskPriority(Task* task);
 		void CleanupTaskMetadata(Task* task);
 
 		// Cancellation, observed wherever a task is about to RUN. True means the task was cancelled
@@ -1315,10 +1313,12 @@ namespace JLib {
 	// IT NO LONGER INHERITS PRIORITY, and the comment here claimed it did for a month. Boosting the
 	// holder on contention was added in 8555cbd ("implemented starvation prevention", 2026-07-15)
 	// and its single call site was removed five days later in 21719ac, the rewrite that turned this
-	// from a spinlock into the suspend-or-help lock described above. `BoostTaskPriority` still
-	// exists and still has no callers anywhere in the library or its consumers, so `priorityBoost`
-	// is permanently 0 and `UnboostTaskPriority` -- which Unlock() does still call -- always takes
-	// its false branch.
+	// from a spinlock into the suspend-or-help lock described above. Both functions are now DELETED
+	// (see the note where they lived in TaskScheduler.cpp): Boost had no callers, which made
+	// `priorityBoost` permanently 0 and Unboost a permanent no-op -- and once hiPri became the
+	// low-latency lane, a mechanism that promotes an aged ORDINARY task into it would have pushed
+	// bulk work onto the hot workers, which is precisely what the lane excludes. The packed
+	// `priorityBoost` bit is left in place so Task's layout fingerprint is unchanged.
 	//
 	// That removal was correct, and it is worth knowing WHY so nobody re-adds the boost as a fix for
 	// a hang it cannot cause. Classic priority inversion needs a high-priority waiter to starve the
