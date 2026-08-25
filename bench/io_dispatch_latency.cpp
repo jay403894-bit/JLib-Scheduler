@@ -474,17 +474,23 @@ int main(int argc, char** argv) {
         std::printf("    idle%%  = sampled idle passes where a SIBLING hot worker had a backlog.\n");
         std::printf("    Near 0 -> steering balances, hot->hot is dead weight (keep it deleted).\n");
         std::printf("    Well above 0 -> work is sitting still beside an idle core (build it).\n");
-        std::printf("      K    burn   skew   ops     p50      p90      p99   idle%%  meanDepth\n");
+        std::printf("      K    burn   skew   arm      p50      p90      p99   idle%%  meanDepth\n");
 
         // BURN SIZE IS SWEPT, and that is not thoroughness -- it is the objection. A 200us handler
         // arguably breaks the lane's own contract that lane work is short, so a result visible only
         // there would say "keep handlers short", not "build stealing". 20us is a packet parse; 5us
         // is barely more than the dispatch it rides on. If the witness only lights up at 200us the
         // honest conclusion is a documentation fix.
-        for (long long burn : { 5000LL, 20000LL, 200000LL }) {
+        // ARM IS THE INNERMOST LOOP, deliberately. Building three executables and measuring them in
+        // three sessions moved the K=1 rows by 2x -- and K=1 has no sibling, so the mechanism under
+        // test provably cannot act there. That was machine drift being read as a result. Adjacent
+        // arms share thermal and background state; separated ones do not.
+        for (long long burn : { 20000LL, 200000LL }) {
           for (int skew : { 0, 8 }) {
             for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+              for (int arm : { 0, 3, 1 }) {   // arm 2 dropped: measured indistinguishable from arm 1
                 if (skew == 0 && burn != 200000LL) continue;   // the control does not vary with burn
+                JLib::TaskScheduler::SetLaneHintMode(arm);
                 JLib::TaskScheduler::SetHotWorkers(k);
                 g_skewEveryNth = skew;
                 g_skewBurnNs = burn;
@@ -503,9 +509,11 @@ int main(int argc, char** argv) {
                 const auto pk = [&](double p) {
                     return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
                 };
-                std::printf("    %3zu  %6.0f  %5d  %6zu  %7.2f  %7.2f  %7.2f  %6.2f  %9.2f\n",
-                            k, burn / 1000.0, skew, v.size(), pk(0.50), pk(0.90), pk(0.99),
-                            pct, meanD);
+                std::printf("    %3zu  %6.0f  %5d  %4s  %7.2f  %7.2f  %7.2f  %6.2f  %9.2f\n",
+                            k, burn / 1000.0, skew,
+                            (arm == 0 ? "off" : arm == 3 ? "hnt" : arm == 1 ? "drn" : "pop"),
+                            pk(0.50), pk(0.90), pk(0.99), pct, meanD);
+              }
             }
           }
         }

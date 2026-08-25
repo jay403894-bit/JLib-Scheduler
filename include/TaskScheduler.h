@@ -326,6 +326,17 @@ namespace JLib {
 		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
 		void ClampHotWorkersToPool();
 		static size_t GetHotWorkers();
+		// LANE STEALING: whether a hot worker may take lane work from a BACKLOGGED hot sibling.
+		// 1 (default) on, 0 off. Modes 2 and 3 are diagnostic arms the dispatch bench interleaves to
+		// separate the hint machinery from the steal itself -- see the block in Thread.cpp`s steal
+		// predicate for what each one isolates and what it measured. Callers should use 0 or 1.
+		//
+		// Turn it OFF if your lane handlers are uniformly short AND you care about median over tail:
+		// stealing measured ~35-40%% worse p50 for ~30-50%% better p90/p99. On by default because a
+		// lane exists for its tail, and because the threshold makes it inert until a worker is behind.
+		static inline std::atomic<int> laneHintMode{ 1 };
+		static void SetLaneHintMode(int m) noexcept { laneHintMode.store(m, std::memory_order_relaxed); }
+		static int  GetLaneHintMode() noexcept { return laneHintMode.load(std::memory_order_relaxed); }
 
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
@@ -1336,6 +1347,69 @@ namespace JLib {
 			const unsigned long long bit = 1ull << q;
 			return ((stealHintBacklog.load(std::memory_order_acquire)
 			       | stealHintParallel.load(std::memory_order_acquire)) & bit) != 0;
+		}
+
+		// ---- THE LANE'S OWN BACKLOG SIGNAL, and why it is not the one above -------------------
+		//
+		// The two hints above are OWNER-maintained: the worker updates them once per pass through
+		// its loop. That works for bulk work and fails for the lane, in exactly the case the lane
+		// cares about. MEASURED: with one in eight completions running a 200us handler, a hot worker
+		// spends 62-65% of its idle passes next to a SIBLING sitting on a mean depth of 8-13 -- and
+		// during those 200us the buried worker is not looping, so an owner-maintained bit would stay
+		// unset precisely when it is needed. Whoever advertises the backlog must be running, and the
+		// only party guaranteed to be running is the one doing the pushing.
+		//
+		// So: an EXACT count of lane tasks outstanding at each worker, incremented by the publisher
+		// and decremented by whoever removes one (the owner popping, or a thief stealing). The
+		// counter is per-worker and on its own line; the BIT derived from it is what thieves read,
+		// so a spinning hot worker touches one shared word rather than K contended counters.
+		//
+		// THRESHOLD, not "non-empty". Steering placed that task on that worker deliberately, and a
+		// hot worker about to run its own warm task must not lose it to a sibling -- that is the
+		// v1 steal-hint failure (owner loses the race, 22,000 probes against a 9,164 baseline) with
+		// higher stakes, because here it also defeats the placement. Four is above the depth a
+		// keeping-up worker reaches and well below the 8-13 measured when one is buried.
+		static constexpr int kLaneStealDepth = 4;
+
+		std::atomic<unsigned long long> stealHintLane{ 0 };
+
+		// MAINTAINED BY THE OWNER AT ITS DRAIN, and the distinction from "owner maintained per pass"
+		// is the whole reason this works. The buried worker is not looping during its 200us handler
+		// -- but it drained its inbox into its deque IMMEDIATELY BEFORE starting that handler, and
+		// at that moment it knew the depth. So the backlog is advertised before the worker goes
+		// dark, and stays advertised for exactly as long as it is buried.
+		//
+		// The publisher-side exact counter this replaces worked too, and cost p50 ~30% ACROSS THE
+		// BOARD -- including the uniform control where stealing almost never fires, which is what
+		// identified it as accounting rather than mechanism. One atomic RMW per lane push, on a line
+		// shared between the completion thread and the worker it steers to, on the hot path. Same
+		// shape as the unsharded coroutine counter that once cost 62%. This version writes only on
+		// threshold crossings, and only from a thread that already owns the line.
+		//
+		// The gap it accepts: tasks arriving DURING the handler sit in the inbox unadvertised. Those
+		// are the ones a publisher-side counter would have caught, and giving them up is what buys
+		// back the p50.
+		// DIAGNOSTIC ARM SELECTOR, so the three candidate designs run from ONE binary and can be
+		// interleaved. Comparing them as three separately-built executables measured in three
+		// sessions produced a 2x swing in the K=1 rows -- a configuration with no sibling, where
+		// hot->hot stealing provably cannot act -- which is machine drift, not a result. The branch
+		// costs the same in every arm, which is the property that matters here.
+		//
+		//   0  no lane hint, no hot->hot stealing (the shipped behaviour before this)
+		//   1  hint maintained at the DRAIN only, from a local count
+		//   2  hint maintained per pickup, from hiPri->size()  (touches the thief-written line)
+
+		void UpdateLaneHint(size_t w, size_t depth) noexcept {
+			if (w >= 64) return;
+			const unsigned long long bit = 1ull << w;
+			const bool want = depth >= (size_t)kLaneStealDepth;
+			if (want == ((stealHintLane.load(std::memory_order_relaxed) & bit) != 0)) return;
+			if (want) stealHintLane.fetch_or(bit, std::memory_order_release);
+			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
+		}
+		bool LaneStealable(size_t w) const noexcept {
+			if (w >= 64) return false;
+			return (stealHintLane.load(std::memory_order_acquire) & (1ull << w)) != 0;
 		}
 
 		std::atomic<int> nextWorker{ 0 };

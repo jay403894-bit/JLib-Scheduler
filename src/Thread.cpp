@@ -487,6 +487,12 @@ void Thread::Worker() {
 			const size_t depth = scheduler->loPri[qIndex]->size();
 			scheduler->UpdateBacklogHint((size_t)qIndex, depth);
 			scheduler->ClearParallelHintIfEmpty((size_t)qIndex, depth);
+			// The lane's own retirement path, for the case no thief covers: a hot worker that
+			// drained its own backlog by popping. ONCE PER PASS, not per pickup -- that frequency
+			// difference is the entire cost argument, and a pass is exactly when this worker has
+			// nothing better to do anyway.
+			if (isHotWorker)
+				scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 		}
 
 		ready.store(true, std::memory_order_release);
@@ -885,6 +891,11 @@ void Thread::Worker() {
 						std::cerr << "[worker " << qIndex << "] Null task from pop_bottom!" << std::endl;
 					}
 					else {
+						// Arm 2 only: the per-pickup maintenance whose cost is under test. size() reads
+						// the deque`s top, which thieves write -- a contended line touched once per lane
+						// task rather than once per idle pass.
+						if (TaskScheduler::GetLaneHintMode() == 2)
+							scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = task;
 						continue;
 					}
@@ -991,7 +1002,77 @@ void Thread::Worker() {
 					// bought nothing, because there is nothing to rebalance: steering round-robins
 					// pushes across the hot set, so the lane is already balanced at PUSH time, and
 					// lane work is short by contract. K>1 is for availability, not load sharing.
-					if (isHotWorker) return false;
+					// A HOT WORKER STEALS ONLY FROM A HOT SIBLING, ONLY LANE WORK, AND ONLY WHEN
+					// THAT SIBLING IS ADVERTISING A BACKLOG.
+					//
+					// This was removed once, correctly, on a measurement of 20.6M probes at K=2 and
+					// 232M at K=4 for flat latency. What made that true was the workload: uniform
+					// completions, round-robin steering, so the lane was balanced at push time and
+					// there was nothing to rebalance. Skewing the handler sizes changes the answer.
+					// Sampled idle passes where a SIBLING held a backlog, medians of 3:
+					//
+					//     handler    uniform   5us    20us   200us
+					//       K = 2      3.0%    8.6%   3.5%   62.4%
+					//       K = 4      8.8%   11.5%  22.8%   65.1%
+					//
+					// and at 200us capacity stops working -- K=1 to K=4 moves p99 only 1142us to
+					// 906us -- because the tail is not saturation, it is one worker buried behind a
+					// long handler while siblings spin. That is what this steals.
+					//
+					// It is gated, not restored: the probe happens only when the victim has
+					// advertised a real backlog, so the 232M-probe outcome cannot recur -- an idle
+					// hot pool reads one shared word and stops.
+					//
+					// WHAT IT COSTS, isolated. Four arms interleaved inside one process (three
+					// separately-built binaries measured in three sessions moved the K=1 rows -- a
+					// configuration with no sibling, where this cannot act -- by 2x, which was
+					// machine drift being read as a result). Arm `hnt` maintains the hint and never
+					// steals, which is what separates accounting from mechanism. Medians of 3:
+					//
+					//     20us handler, K=4       p50     p90     p99    idle%
+					//       off                  17.8    84.8   167.2     13.2
+					//       hint, never steal    17.3    77.6   159.8     12.6
+					//       hint + steal         24.7    55.3    88.6      2.6
+					//
+					// hnt is off, on every metric. THE HINT MACHINERY IS FREE -- the bitmap write,
+					// the drain-side update and the predicate cost nothing measurable, and two
+					// earlier suspects were wrong: it is not the atomic RMW (a publisher-side exact
+					// counter measured the same) and it is not the contended cache line (maintaining
+					// from a local `count` instead of size() measured the same).
+					//
+					// The whole difference is the STEAL, and it is a genuine trade, not overhead:
+					// ~35-40% worse p50 for ~30-50% better p90/p99, consistently, at every K and
+					// every handler size. Moving a completion moves it to a core where its coroutine
+					// frame and its buffer are cold. That is the price of not queueing behind a busy
+					// worker, and for a lane whose entire reason to exist is the tail, it is the
+					// right side of the trade.
+					//
+					// IT IS ALSO SELF-GATING, which is why it is on by default. The threshold is
+					// only crossed when a worker is actually behind, so an unloaded lane -- the
+					// case K-hot was built for, where dispatch is ~1-2us -- never steals and never
+					// pays. The p50 appears under load, which is exactly when the tail is worth
+					// buying.
+					if (isHotWorker) {
+						if (!victimIsHot) return false;                 // never bulk work
+						// Mode 3 maintains the hint but never acts on it: the isolator above.
+						{ const int m = TaskScheduler::GetLaneHintMode(); if (m == 0 || m == 3) return false; }
+						if (!scheduler->LaneStealable((std::size_t)target)) return false;
+						JLIBSCHED_STEAL_STAT(qIndex, probes);
+						auto h = scheduler->hiPri[target]->steal_if(classOK);
+						// THE THIEF RETIRES THE ADVERTISEMENT, because the owner no longer can. The
+						// owner sets the bit at its drain and then stops touching it -- deliberately,
+						// since clearing it per pop costs the contended read this design just removed.
+						// So the party that empties the deque is whoever is looking at it, and on a
+						// failed steal that is this thread, which has already paid for the line.
+						// Clearing on a merely-lost race is conservative in the safe direction: the
+						// next drain re-advertises, and until then thieves stay off a deque that has
+						// nothing for them.
+						if (!h) { scheduler->UpdateLaneHint((std::size_t)target, 0); return false; }
+						scheduler->UpdateLaneHint((std::size_t)target, scheduler->hiPri[target]->size());
+						JLIBSCHED_STEAL_STAT(qIndex, hits);
+						task_to_run = *h;
+						return true;
+					}
 					if (hotN && victimIsHot) return false;   // and nobody reaches into the lane
 
 					// THE HINT. Two bits, ORed, and the OR is the whole design -- see the comment on
@@ -1125,6 +1206,16 @@ void Thread::Worker() {
 				if (scheduler->hiPri[qIndex]->push_bottom_batch(batch, count)) {
 					auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 					if (opt) {
+						// THE DRAIN, and the ONLY place the owner touches the hint. Depth is `count - 1`
+						// -- what this drain just landed, less the one being taken -- and that is a LOCAL
+						// number. Calling size() here instead would read the deque`s top, which thieves
+						// write, adding a contended-line read to every lane pickup: measured as a ~30%
+						// p50 regression in EVERY configuration including the uniform control, which is
+						// how it was caught. The drain is reached only when the deque was already empty,
+						// so `count - 1` is the depth, not an increment to it.
+						const int _lhm = TaskScheduler::GetLaneHintMode();
+						if (_lhm == 1 || _lhm == 3) scheduler->UpdateLaneHint((size_t)qIndex, count - 1);
+						else if (_lhm == 2) scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = *opt;
 						JLIBSCHED_LATENCY_MARK(Found);
 						continue;

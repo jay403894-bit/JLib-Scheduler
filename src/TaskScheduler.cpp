@@ -1254,6 +1254,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	immediateCoresInUse.clear();
 	loPriInboxes.clear();
 	hiPri.clear();
+	stealHintLane.store(0, std::memory_order_relaxed);
 	hiPriInboxes.clear();
 	workers.reserve(num_workers);
 	// +1 for the NON-WORKER LANE (see nonWorkerLane's declaration). Only the deques get it --
@@ -1291,6 +1292,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	loPri.push_back(std::make_unique<TaskDeque>());
 	hiPri.push_back(std::make_unique<TaskDeque>());
 	nonWorkerLaneClaimed.store(false, std::memory_order_relaxed);
+	stealHintLane.store(0, std::memory_order_relaxed);
 
 	// TWO PASSES, and the split is load-bearing. Creating a worker and STARTING it in the same
 	// iteration meant worker 0 was running -- and reading `workers` in its own startup path
@@ -2167,8 +2169,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 			chosen = (uint8_t)PickNextWorker(task->corePref, false);
 		}
-		if(useHi)
-			hiPriInboxes[chosen]->push(task);
+		if (useHi) hiPriInboxes[chosen]->push(task);
 		else
 			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 		workers[chosen]->MarkQueuedWork();
@@ -2191,8 +2192,7 @@ bool TaskScheduler::Requeue(Task* task) {
 	while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
 		chosen = (uint8_t)PickNextWorker(task->corePref, false);
 	}
-	if(useHi)
-		hiPriInboxes[chosen]->push(task);
+	if (useHi) hiPriInboxes[chosen]->push(task);
 	else
 		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 	workers[chosen]->MarkQueuedWork();
