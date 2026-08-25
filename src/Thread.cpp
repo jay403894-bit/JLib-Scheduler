@@ -1073,7 +1073,28 @@ void Thread::Worker() {
 						task_to_run = *h;
 						return true;
 					}
-					if (hotN && victimIsHot) return false;   // and nobody reaches into the lane
+					// ORDINARY -> LANE, mode 4 only. The open question: once a backlog is advertised,
+					// is an ordinary worker a useful place to put lane work, or only a cold one?
+					//
+					// It is not the same question as hot->hot, and the difference is not the probe.
+					// A hot sibling is awake by construction, at raised priority, and running only
+					// short lane work. An ordinary worker is none of those: under the default Sleep
+					// policy it is PARKED precisely when the lane backs up -- it has no bulk work to
+					// keep it awake -- so this arm can do nothing unless something wakes it, and
+					// waking it costs an OS round trip of the same order as the tail being bought.
+					// That is why this is measured under both idle policies: NoSleep answers "is an
+					// ordinary worker a good landing site", Sleep answers "can one even be reached".
+					if (hotN && victimIsHot) {
+						if (TaskScheduler::GetLaneHintMode() != 4) return false;
+						if (!scheduler->LaneStealable((std::size_t)target)) return false;
+						JLIBSCHED_STEAL_STAT(qIndex, probes);
+						auto h = scheduler->hiPri[target]->steal_if(classOK);
+						if (!h) { scheduler->UpdateLaneHint((std::size_t)target, 0); return false; }
+						scheduler->UpdateLaneHint((std::size_t)target, scheduler->hiPri[target]->size());
+						JLIBSCHED_STEAL_STAT(qIndex, hits);
+						task_to_run = *h;
+						return true;
+					}
 
 					// THE HINT. Two bits, ORed, and the OR is the whole design -- see the comment on
 					// stealHintBacklog. One shared pair of words read here in place of a remote
@@ -1214,7 +1235,7 @@ void Thread::Worker() {
 						// how it was caught. The drain is reached only when the deque was already empty,
 						// so `count - 1` is the depth, not an increment to it.
 						const int _lhm = TaskScheduler::GetLaneHintMode();
-						if (_lhm == 1 || _lhm == 3) scheduler->UpdateLaneHint((size_t)qIndex, count - 1);
+						if (_lhm == 1 || _lhm == 3 || _lhm == 4) scheduler->UpdateLaneHint((size_t)qIndex, count - 1);
 						else if (_lhm == 2) scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = *opt;
 						JLIBSCHED_LATENCY_MARK(Found);

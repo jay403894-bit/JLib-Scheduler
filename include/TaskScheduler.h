@@ -326,15 +326,29 @@ namespace JLib {
 		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
 		void ClampHotWorkersToPool();
 		static size_t GetHotWorkers();
-		// LANE STEALING: whether a hot worker may take lane work from a BACKLOGGED hot sibling.
-		// 1 (default) on, 0 off. Modes 2 and 3 are diagnostic arms the dispatch bench interleaves to
-		// separate the hint machinery from the steal itself -- see the block in Thread.cpp`s steal
-		// predicate for what each one isolates and what it measured. Callers should use 0 or 1.
+		// WHO MAY DRAIN A BACKLOGGED LANE.
 		//
-		// Turn it OFF if your lane handlers are uniformly short AND you care about median over tail:
-		// stealing measured ~35-40%% worse p50 for ~30-50%% better p90/p99. On by default because a
-		// lane exists for its tail, and because the threshold makes it inert until a worker is behind.
-		static inline std::atomic<int> laneHintMode{ 1 };
+		//   0  nobody -- the lane is strictly private to its hot worker
+		//   1  hot workers only, from a backlogged hot sibling
+		//   4  (default) hot workers, plus any ORDINARY worker that is already awake and searching
+		//   2, 3  diagnostic arms the dispatch bench interleaves; see Thread.cpp`s steal predicate
+		//
+		// Mode 4 NEVER WAKES ANYONE. It is purely opportunistic: it spends capacity that happens to
+		// be spinning already. That is exactly why it is safe to default on -- under the default Sleep
+		// policy an ordinary worker is PARKED when the lane backs up (it has no bulk work keeping it
+		// awake), so the arm is inert and measured identical to mode 1 in every row. Under NoSleep it
+		// is a capacity valve, and the valve matters most where K is smallest:
+		//
+		//     NoSleep, p99            off    hot-only   + ordinary
+		//       K=1  200us uniform    229       173          53
+		//       K=1  200us skewed    1190      1165         554
+		//       K=2  200us skewed    1196       806         464
+		//       K=4   20us            162       108          92
+		//
+		// At K=4 the hot set already absorbs the backlog and mode 4 is a wash. It is a safety valve
+		// for an under-provisioned lane, NOT a substitute for setting K: under Sleep it cannot help
+		// at all, and that is the default.
+		static inline std::atomic<int> laneHintMode{ 4 };
 		static void SetLaneHintMode(int m) noexcept { laneHintMode.store(m, std::memory_order_relaxed); }
 		static int  GetLaneHintMode() noexcept { return laneHintMode.load(std::memory_order_relaxed); }
 

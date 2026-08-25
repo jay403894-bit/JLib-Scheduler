@@ -488,7 +488,7 @@ int main(int argc, char** argv) {
         for (long long burn : { 20000LL, 200000LL }) {
           for (int skew : { 0, 8 }) {
             for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
-              for (int arm : { 0, 3, 1 }) {   // arm 2 dropped: measured indistinguishable from arm 1
+              for (int arm : { 0, 1, 4 }) {   // arm 2 dropped (== arm 1); arm 3 answered its question
                 if (skew == 0 && burn != 200000LL) continue;   // the control does not vary with burn
                 JLib::TaskScheduler::SetLaneHintMode(arm);
                 JLib::TaskScheduler::SetHotWorkers(k);
@@ -511,7 +511,7 @@ int main(int argc, char** argv) {
                 };
                 std::printf("    %3zu  %6.0f  %5d  %4s  %7.2f  %7.2f  %7.2f  %6.2f  %9.2f\n",
                             k, burn / 1000.0, skew,
-                            (arm == 0 ? "off" : arm == 3 ? "hnt" : arm == 1 ? "drn" : "pop"),
+                            (arm == 0 ? "off" : arm == 3 ? "hnt" : arm == 1 ? "hot" : arm == 4 ? "any" : "pop"),
                             pk(0.50), pk(0.90), pk(0.99), pct, meanD);
               }
             }
