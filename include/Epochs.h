@@ -88,6 +88,9 @@ namespace JLib {
 			threadEpochs.clear();
 		}
 		// Simply pass the address of the member that already exists in your Task
+		// For the mechanism benchmark: how many slots MinActiveEpoch has to walk.
+		int ParticipantCount() const { return (int)participants.size(); }
+
 		void RegisterParticipant(std::atomic<size_t>* slot) {
 		//	std::lock_guard<std::mutex> lock(participantMutex);
 			participants.push_back(slot);
@@ -369,8 +372,22 @@ namespace JLib {
 		//   protected pointer BEFORE entering an epoch breaks this silently. The RAII guard is what
 		//   enforces it: construct, then traverse. If a call site ever cannot, restore the
 		//   re-validation (load, increment, re-load, retry) rather than reasoning about the case.
+	public:
 		static constexpr size_t kEpochSlots = 8;               // power of two: the modulo is a mask
 		static size_t EpochRing(size_t e) { return e & (kEpochSlots - 1); }
+
+		// DIAGNOSTIC: route EVERY reader through the counted path, not just coroutines, so the two
+		// mechanisms can be benchmarked against each other in one process. This is the measurement
+		// that decides whether counted epochs should REPLACE the slot scan or merely sit beside it.
+		//
+		// The tradeoff is not obvious in either direction. Slots cost two uncontended stores per
+		// guard and an O(participants) scan per reclamation -- ~2,000 loads on a 31-worker box with
+		// a full fiber pool. Counters cost two RMWs on a SHARED line per guard and an O(kEpochSlots)
+		// scan. So replacing one moves cost from a cold amortised path onto every lock-free
+		// operation, and which way that nets out depends entirely on the guard-to-reclaim ratio.
+		static inline std::atomic<bool> forceCounted{ false };
+		static void SetForceCountedEpochs(bool on) { forceCounted.store(on, std::memory_order_relaxed); }
+		static bool ForceCountedEpochs() { return forceCounted.load(std::memory_order_relaxed); }
 
 		// Returns the epoch entered; pass it back to LeaveCounted unchanged.
 	public:

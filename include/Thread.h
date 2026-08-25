@@ -363,8 +363,8 @@ namespace JLib {
     class CoroSafeEpochGuard {
     public:
         CoroSafeEpochGuard() {
-            if (OnCoroutineTask()) counted_.emplace();
-            else                   slotted_.emplace(CurrentEpochSlot());
+            if (OnCoroutineTask() || EpochManager::ForceCountedEpochs()) counted_.emplace();
+            else                                                        slotted_.emplace(CurrentEpochSlot());
         }
         CoroSafeEpochGuard(const CoroSafeEpochGuard&) = delete;
         CoroSafeEpochGuard& operator=(const CoroSafeEpochGuard&) = delete;

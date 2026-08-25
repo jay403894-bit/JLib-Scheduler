@@ -422,6 +422,10 @@ target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED
 
 # Measures what an IDLE NoSleep pool costs the main thread, and how much of that the steal hint
 # removes. Both arms run inside one process against one pool -- see the file header.
+add_executable(SchedulerEpochMechBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/epoch_mechanisms.cpp")
+target_link_libraries(SchedulerEpochMechBench PRIVATE Scheduler)
+target_compile_features(SchedulerEpochMechBench PRIVATE cxx_std_17)
+
 add_executable(SchedulerNoSleepTax "${CMAKE_CURRENT_SOURCE_DIR}/bench/nosleep_tax.cpp")
 target_link_libraries(SchedulerNoSleepTax PRIVATE Scheduler)
 target_compile_features(SchedulerNoSleepTax PRIVATE cxx_std_17)
