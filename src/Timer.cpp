@@ -518,6 +518,13 @@ namespace JLib {
         return impl->armedCount;
     }
 
+    // Counterpart to Stop, for an Init-after-Join cycle. Only clears the latch: the wheel itself is
+    // intact and the worker thread is spawned lazily on the next Arm, so nothing else needs undoing.
+    void TimerQueue::Start() noexcept {
+        std::lock_guard<std::mutex> lk(impl->m);
+        impl->stopping = false;
+    }
+
     void TimerQueue::Stop() noexcept {
         std::thread t;
         {

@@ -337,17 +337,9 @@ void TaskScheduler::Join() {
 	// than a crash. Both stops are idempotent and both layers are opt-in, so this is a no-op for a
 	// job-system-only user.
 	//
-	// KNOWN GAP, NOT FIXED HERE: Init() does not bring them back. After Join(), EnableIoReactor and
-	// EnableTimers still report true, but their threads are gone -- so a Join()-then-Init() cycle
-	// gives you a pool whose service layers claim to be on and are not. Every submit into them then
-	// fails, or worse, waits.
-	//
-	// Left as a gap rather than papered over because restarting is not symmetric with stopping:
-	// IoReactor::Stop() closes the completion port, so a restart has to rebuild it and re-register
-	// every handle the caller had registered -- which the reactor cannot do, since it does not
-	// retain them. Making this work means giving the reactor a real Start()/Stop() lifecycle, which
-	// is a deliberate change and not a line in Join(). Until then: ONE Init/Join cycle per process
-	// when the service layers are enabled.
+	// Init() BRINGS THEM BACK -- StartPool calls the matching Start() on each, so a Join-then-Init
+	// cycle works. Neither Stop destroys state: the completion port survives (closed only by the
+	// reactor destructor) and the timer wheel is intact, so restarting is just clearing the latch.
 	if (IoReactorEnabled() && IoReactor::IsAvailable())
 		IoReactor::Instance().Stop();
 	if (TimersEnabled())
@@ -1314,6 +1306,20 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// K is clamped against the ACTUAL pool size here -- it may have been set before Init, when there
 	// was nothing to clamp against. Must precede the hot-CPU publish below, which reads it.
 	ClampHotWorkersToPool();
+
+	// UNDO Join()'s service-layer shutdown, so Init works a second time. Join stops the reactor and
+	// timer threads (it must -- they push into the pool it is about to clear), and both latch
+	// `stopping`. Without this, a Join-then-Init cycle leaves EnableIoReactor/EnableTimers reporting
+	// true with nothing behind them, and every submit into them fails or waits.
+	//
+	// Cheap because neither Stop destroys its state: the completion port survives (closed only by
+	// the reactor's destructor, so registered handles stay associated) and the timer wheel is
+	// untouched. Both thread sets respawn lazily -- the reactor's on the next Register/Submit, the
+	// timer's on the next Arm -- so clearing the latch is the entire restart.
+	if (IoReactorEnabled() && IoReactor::IsAvailable())
+		IoReactor::Instance().Start();
+	if (TimersEnabled())
+		TimerQueue::Instance().Start();
 
 	// PUBLISH THE HOT CPU SET BEFORE ANY WORKER STARTS. Every other thread masks these bits off as
 	// it comes up, so the set has to be complete first -- a non-hot worker that started earlier

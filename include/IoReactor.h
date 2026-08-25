@@ -446,6 +446,10 @@ namespace JLib {
         // exists to prevent.
         void Stop() noexcept;
 
+        // Undo Stop so the reactor can serve a NEW pool after Join. See the definition -- the
+        // completion port survives Stop, so this only has to clear the stop latch.
+        void Start() noexcept;
+
         struct Impl;
 
     private:

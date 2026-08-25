@@ -791,6 +791,17 @@ namespace JLib {
         return impl->total.load(std::memory_order_acquire);
     }
 
+    // The counterpart to Stop, so a pool can be Init-ed again after Join. Clearing the stop latch is
+    // the whole job: the completion PORT outlives Stop -- it is closed only by the destructor -- so
+    // every handle registered against it is still associated, and the drain threads come back
+    // through the existing lazy EnsureThreads path on the next Register or Submit.
+    //
+    // Idempotent, and a no-op on a reactor that was never stopped.
+    void IoReactor::Start() noexcept {
+        std::lock_guard<std::mutex> lk(impl->life);
+        impl->stopping.store(false, std::memory_order_release);
+    }
+
     void IoReactor::Stop() noexcept {
         bool needJoin = false;
         {
