@@ -119,6 +119,15 @@ int main(int argc, char** argv) {
     const int coldMs  = (argc > 2) ? std::atoi(argv[2]) : 3;
     const unsigned th = (argc > 3) ? unsigned(std::atoi(argv[3])) : 1u;
 
+    // 0 = Sleep (the default), 1 = NoSleep. SAME BINARY, selected at runtime, because comparing two
+    // builds is the control failure that invalidated the first version of this harness.
+    //
+    // NoSleep is the UPPER BOUND on what this seam can be worth, not a proposal: it deletes the OS
+    // wake entirely, so whatever tail survives it is NOT wake latency and no parking policy can
+    // remove it. It costs a spinning core per worker and taxes every other thread in the process
+    // (~3.5% on an idle pool against a memory-bound main thread), which is why the default is Sleep.
+    const bool noSleep = (argc > 4) ? (std::atoi(argv[4]) != 0) : false;
+
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
     JLib::TaskScheduler::EnableIoReactor(true, th);
@@ -127,8 +136,12 @@ int main(int argc, char** argv) {
     auto& io = JLib::IoReactor::Instance();
     io.InitSockets();
 
+    if (noSleep)
+        JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
+
     std::printf("io_dispatch_latency -- %d samples, cold pause %dms, %u completion thread(s), "
-                "%zu workers\n\n", samples, coldMs, th, sched.GetWorkerCount());
+                "%zu workers, idle=%s\n\n", samples, coldMs, th, sched.GetWorkerCount(),
+                noSleep ? "NoSleep" : "Sleep");
 
     // One loopback pair. Concurrency is deliberately ONE: this measures the seam, not the pipe.
     SOCKET lis = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
