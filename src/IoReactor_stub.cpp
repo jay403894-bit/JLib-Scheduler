@@ -107,7 +107,14 @@ namespace JLib {
 
     std::size_t IoReactor::RequestCancel(CancelToken) noexcept { return 0; }
     std::size_t IoReactor::InFlight() const noexcept { return 0; }
+    // Both no-ops: there is no backend, so there are no threads to stop and no latch to clear.
+    // They exist because TaskScheduler::Join and StartPool call them unconditionally on every
+    // platform -- Join must stop the service threads before it clears the pool they push into, and
+    // StartPool must undo that so Init works after Join. A stub missing either is a LINK error on
+    // POSIX only, which is exactly how this one was found: Windows built clean and all three POSIX
+    // jobs failed with `undefined reference to JLib::IoReactor::Start()`.
     void IoReactor::Stop() noexcept {}
+    void IoReactor::Start() noexcept {}
 
     // IoAcceptor: nothing to pre-post without a backend. Start fails, so a caller finds out at
     // startup rather than by waiting forever for a connection that can never be accepted.
