@@ -739,6 +739,20 @@ TaskDeque* TaskScheduler::LaneForCurrentThread() {
 	return nullptr;
 }
 
+// Which lane index LaneForCurrentThread just returned. Mirrors it exactly; SIZE_MAX when there is
+// none. Split for one reason: the PARALLELISM hint is per-lane and needs the index, and duplicating
+// the resolution at the call site is how the two would drift.
+size_t TaskScheduler::LaneIndexForCurrentThread() {
+	Thread* self = Thread::GetCurrent();
+	if (self) {
+		const int q = self->qIndex;
+		if (q >= 0 && (size_t)q < loPri.size()) return (size_t)q;
+		return SIZE_MAX;
+	}
+	if (t_ownsNonWorkerLane && nonWorkerLane < loPri.size()) return nonWorkerLane;
+	return SIZE_MAX;
+}
+
 // Publish-right, recurse-left, down to grain.
 //
 // THIS SELF-SPAWNS, AND THE OLD FORK-JOIN SPLITTER MEASURED THAT AS A DISASTER. Worth stating up
@@ -785,6 +799,7 @@ TaskDeque* TaskScheduler::LaneForCurrentThread() {
 // 10.9x and ParallelFor's 6.3x.
 void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 	TaskDeque* myLane = LaneForCurrentThread();
+	const size_t myLaneIndex = LaneIndexForCurrentThread();
 
 	while (myLane && (hi - lo) > st->grain) {
 		// The wake decision below needs to know whether our previous split is still sitting here.
@@ -803,6 +818,11 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// count to zero prematurely, because every task increments for its own children before its
 		// own decrement happens (which is after its body returns).
 		st->wg->n.fetch_add(1, std::memory_order_relaxed);
+
+		// PARALLELISM hint, set BEFORE the push is visible, for the same reason the count is
+		// incremented before it: a thief that can see the task must also see the advertisement, or
+		// the first split of a range is stealable by nobody and the whole range runs serially.
+		if (myLaneIndex != SIZE_MAX) SetParallelHint(myLaneIndex);
 
 		if (!myLane->push_bottom(t)) {
 			// Deque full. Unwind the count and the task, then fall through to running the whole
@@ -946,6 +966,9 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	}
 
 	TaskDeque* myLane = LaneForCurrentThread();
+	// The non-worker lane has no worker looping over it, so the per-pass maintenance in Worker()
+	// never runs for it. This drain is the only consumer that reliably passes, so it clears here.
+	const size_t myLaneIndex = LaneIndexForCurrentThread();
 	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
 		if (myLane) {
 			if (auto opt = myLane->pop_bottom()) {
@@ -967,6 +990,7 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 				taskAllocator.Free(t);
 				continue;
 			}
+			if (myLaneIndex != SIZE_MAX) ClearParallelHintIfEmpty(myLaneIndex, 0);
 		}
 		// Our lane is empty: everything we published is out with thieves. Help the pool generally
 		// rather than spinning -- this is the same policy WaitFor's bare path takes.

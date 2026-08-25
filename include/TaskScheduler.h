@@ -1136,6 +1136,7 @@ namespace JLib {
 		// invocation and never cached across one: a split that gets stolen resumes on a different
 		// thread, and it must then publish onto THAT thread's deque, not the one it came from.
 		TaskDeque* LaneForCurrentThread();
+		size_t LaneIndexForCurrentThread();
 		void RunLazyRange(int lo, int hi, LazyRangeState* st);
 		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
 		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
@@ -1281,6 +1282,62 @@ namespace JLib {
 		std::mutex registryMtx;
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
 		std::atomic<bool> poolActive{ false };
+		// TWO STEAL HINTS, because the pool holds two kinds of queue content with OPPOSITE
+		// requirements, and one bit cannot mean both.
+		//
+		//   BACKLOG      "this worker has substantial excess work." Stealing it is an OPTIMISATION
+		//                and only pays when the owner is demonstrably behind, since migration costs
+		//                a cache miss on the task's working set. Threshold-maintained by the owner,
+		//                so it is written only on crossings -- almost never for a queue that stays
+		//                deep or stays shallow.
+		//   PARALLELISM  "this work was deliberately produced for parallel execution." Stealing it
+		//                is the LOAD-BALANCING MECHANISM, not an optimisation -- ParallelFor has no
+		//                cost model and steals are what divide the range. A single split must be
+		//                visible the instant it exists.
+		//
+		//   stealable = backlog || parallelism
+		//
+		// WHY BOTH ARE NEEDED, measured: a backlog-only hint cut remote probes 46x (9,164 -> 200,
+		// every probe productive) and simultaneously took ParallelFor from 7.49x to 0.93x -- SLOWER
+		// THAN SERIAL -- because shallow splits never reach any threshold. Thresholds of 2, 4, 8 and
+		// 16 all did it. Threshold 1 is not a fix either: that is "any non-empty queue", which
+		// summons every idle thief onto one deque for ONE task and measured 22,000 probes against a
+		// 9,164 baseline, with the owner losing races for work it was about to run warm.
+		//
+		// The herd is correct exactly when there is work for a herd. PARALLELISM says so; BACKLOG
+		// says so; a bare non-empty queue does not.
+		static constexpr size_t kStealHintDepth = 8;
+
+		std::atomic<unsigned long long> stealHintBacklog{ 0 };
+		std::atomic<unsigned long long> stealHintParallel{ 0 };
+
+		// Owner-maintained, on push and pop. Writes only on a threshold crossing.
+		void UpdateBacklogHint(size_t q, size_t depth) noexcept {
+			if (q >= 64) return;
+			const unsigned long long bit = 1ull << q;
+			const bool want = depth >= kStealHintDepth;
+			if (want == ((stealHintBacklog.load(std::memory_order_relaxed) & bit) != 0)) return;
+			if (want) stealHintBacklog.fetch_or(bit, std::memory_order_release);
+			else      stealHintBacklog.fetch_and(~bit, std::memory_order_relaxed);
+		}
+		// Set by the splitter when it publishes; cleared by the owner when its lane drains. Held
+		// conservatively -- while ANY work remains the lane stays advertised, which costs a probe
+		// and can never hide a split.
+		void SetParallelHint(size_t q) noexcept {
+			if (q < 64) stealHintParallel.fetch_or(1ull << q, std::memory_order_release);
+		}
+		void ClearParallelHintIfEmpty(size_t q, size_t depth) noexcept {
+			if (q >= 64 || depth != 0) return;
+			stealHintParallel.fetch_and(~(1ull << q), std::memory_order_relaxed);
+		}
+
+		bool MaybeStealable(size_t q) const noexcept {
+			if (q >= 64 || loPri.size() > 64) return true;
+			const unsigned long long bit = 1ull << q;
+			return ((stealHintBacklog.load(std::memory_order_acquire)
+			       | stealHintParallel.load(std::memory_order_acquire)) & bit) != 0;
+		}
+
 		std::atomic<int> nextWorker{ 0 };
 		// Separate cursor for the hot set, so lane traffic and ordinary traffic do not perturb each
 		// other's rotation -- and so the hot rotation stays over 0..K-1 rather than the whole pool.

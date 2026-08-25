@@ -477,6 +477,18 @@ void Thread::Worker() {
 			(!scheduler->hiPriInboxes[qIndex]->empty() || scheduler->hiPri[qIndex]->size() != 0);
 		const bool isHotWorker = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 
+		// Steal hints, maintained here and nowhere else: this is the one place the owner of this
+		// deque reliably passes, and size() reads a line it already owns. Both writes are
+		// conditional on a state CHANGE, so a queue that stays deep, or stays empty, never writes at
+		// all. The hint goes stale while a long task runs -- the worker is not looping then -- which
+		// can only cost a wasted probe, never hide work: the PARALLELISM bit is set by the splitter
+		// at push time, before the task it split off can be picked up by anyone.
+		{
+			const size_t depth = scheduler->loPri[qIndex]->size();
+			scheduler->UpdateBacklogHint((size_t)qIndex, depth);
+			scheduler->ClearParallelHintIfEmpty((size_t)qIndex, depth);
+		}
+
 		ready.store(true, std::memory_order_release);
 		// Cleared once per iteration, unconditionally, BEFORE this iteration's own-queue/steal/
 		// inbox-drain search (steps 3-5 below) -- so any push that landed before this clear gets
@@ -981,6 +993,12 @@ void Thread::Worker() {
 					// lane work is short by contract. K>1 is for availability, not load sharing.
 					if (isHotWorker) return false;
 					if (hotN && victimIsHot) return false;   // and nobody reaches into the lane
+
+					// THE HINT. Two bits, ORed, and the OR is the whole design -- see the comment on
+					// stealHintBacklog. One shared pair of words read here in place of a remote
+					// deque endpoint; the words are written only on state changes, so under a steady
+					// workload they sit shared-clean in every thief's cache and this test is free.
+					if (!scheduler->MaybeStealable((std::size_t)target)) return false;
 
 					// COUNTED HERE, AFTER the early-out, on purpose: a probe is a TOUCH of another
 					// core's deque endpoint, and the cross-divide rejection above touches nothing.
