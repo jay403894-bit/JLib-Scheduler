@@ -387,8 +387,35 @@ namespace JLib {
 		// epoch protection, because it has no slot and borrowing a worker's corrupts rather than
 		// leaks. Closing that makes "universal" true rather than nearly true.
 		//
-		// The mechanism is chosen by a PROPERTY OF THE READER -- does it have a stable identity --
-		// not by preference, and CoroSafeEpochGuard is the one place that decides.
+		// ============================================================================================
+		// WHICH MECHANISM A NEW KIND OF READER SHOULD USE, because this will come up again.
+		//
+		// The rule is NOT "does it have identity". It is: IS THE READER DRAWN FROM A BOUNDED SET
+		// ALLOCATED UP FRONT?
+		//
+		//   YES -> SLOTS. A slot can be reserved for each one at startup, registered once, and never
+		//          unregistered. Threads and fibers both qualify: the fiber pool is preallocated and
+		//          recycled, so a fiber's slot is stable for the life of the process. Slots are
+		//          faster and lock-free -- two uncontended stores against two RMWs -- and the
+		//          participant vector stays frozen, which is what lets MinActiveEpoch scan it with
+		//          no lock at all.
+		//
+		//   NO  -> THE COUNTED RING. Transients. Nothing can be reserved for a reader that does not
+		//          exist yet and may never exist again, and any fixed pool you invent reintroduces
+		//          the ceiling that made them transient in the first place.
+		//
+		// THE COUNTERFACTUAL IS THE CLEAN TEST: if fibers were created on demand rather than drawn
+		// from a pool built at launch, they would be transients too and belong on the ring. Nothing
+		// about a fiber makes slots right -- the POOL does. Coroutines are on the ring because they
+		// are allocated per operation from the slab, not because they are coroutines.
+		//
+		// SRCU reached the same structure from a different direction: its readers may SLEEP, so a
+		// critical section outlives the CPU it started on. Ours SUSPEND, so it outlives the worker.
+		// Both reduce to the same thing -- the reader is not bound to whatever you would index by --
+		// and both answer it by counting readers per epoch instead of locating them.
+		//
+		// CoroSafeEpochGuard is the single place this decision is made. Keep it that way.
+		// ============================================================================================
 		//
 		// The slot scheme above asks WHERE EVERY READER IS and needs one stable slot per reader.
 		// Fibers have that (fixed pool, registered once); coroutines cannot, and any fixed pool for
