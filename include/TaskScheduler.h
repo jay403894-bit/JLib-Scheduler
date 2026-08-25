@@ -388,6 +388,36 @@ namespace JLib {
 		// routes hiPri to the hot set only, so at K=0 nothing can enter a hiPri lane and scanning
 		// one is provably wasted work at the DEFAULT setting.
 		//
+		// ================================================================================================
+		// PRIORITY BELONGS TO THE TASK, AND NOTHING MAY OVERRIDE IT ON RESUME.
+		//
+		// A task's hiPri is set once, at CreateTask, and defaults to 0. Push, Requeue and PushLocal
+		// all route on it; IoReactor splits its completion batch by it precisely so PushBatch taking
+		// priority as a PARAMETER cannot quietly drop it. There is no path that promotes a task to
+		// the lane behind the caller's back, and there must not be one.
+		//
+		// THE TEMPTING CHANGE IS "RESUMES SHOULD BE hiPri" -- a woken fiber or coroutine is latency
+		// sensitive, the argument goes, so put it on the fast lane. It is wrong for a reason that has
+		// nothing to do with how long the resumed body runs:
+		//
+		//     THE LANE'S CAPACITY IS K. Anything routed there competes for K workers.
+		//
+		// K is 0 or 1 by default. Routing every resume there does not make resumes fast -- it
+		// SERIALISES a 31-worker pool through one worker. The lane is valuable because it is sparse;
+		// fill it with everything and it is just a smaller pool with a longer queue. That argument
+		// holds even if every resumed body were provably short.
+		//
+		// The body length is the SECOND problem, and it is measured: a resumed coroutine is arbitrary
+		// code, a running task cannot be preempted, and the skewed soak found that one-in-eight
+		// resumes doing 200us of work takes the lane to a 1.1ms p99 with hot workers spending 62-65%
+		// of their idle passes beside a buried sibling. Lane stealing drains the queue behind such a
+		// task but cannot touch the task itself.
+		//
+		// So hiPri stays OPT-IN, per task, defaulting off -- and setting it is a claim about the work
+		// ("every resume of this is short, and it is worth one of my K slots"), not a request for
+		// speed. Only the caller can make that claim; the scheduler cannot infer it.
+		// ================================================================================================
+		//
 		// It is not the whole safety story, though -- lowering K while lane work is already queued
 		// would strand it. The worker sites pair this with a cheap non-empty check on their OWN
 		// queues (a local cache line, one load) so anything stranded is still drained. Remote probes

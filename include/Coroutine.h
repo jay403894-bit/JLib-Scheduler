@@ -497,6 +497,11 @@ namespace JLib {
     // cancellable awaiters are unreachable for anything spawned this way, which is everything.
     //
     // Typically dag.Token().Raw(), so work a graph starts but does not own is cancelled with it.
+    // hiPri DEFAULTS OFF AND SHOULD USUALLY STAY OFF. Setting it puts this coroutine AND EVERY
+    // RESUME OF IT on the low-latency lane, which is served by K workers -- 0 or 1 by default. It is
+    // a claim that the body is short and worth one of those slots, not a request for speed; a pool
+    // whose resumes all land there is serialised through K workers rather than accelerated. See the
+    // block above SetHotWorkers in TaskScheduler.h for the measurement behind that.
     inline bool Spawn(Coro&& c, WaitGroup* wg = nullptr,
                       uint8_t hiPri = 0, CorePref pref = CorePref::Default,
                       uint32_t cancelToken = CancelToken::kNone) {
