@@ -22,10 +22,30 @@
 // giving it refcounting, a waiter list and a mutex -- i.e. turning it into this and losing the reason
 // it was good. So there are two types, and the choice between them is "how many readers", not taste.
 //
-//   Lazy<T>    one reader. Lazy: nothing runs until awaited, and it runs INLINE on the awaiting
-//              worker. Move-only. No allocation beyond the frame, no locks.
-//   Future<T>  many readers. Eager: the work is already in flight and this is a handle on its
-//              result. Copyable, refcounted, one small shared allocation.
+// == THE VOCABULARY, WHICH IS THE POINT ==
+//
+// Between them these four cover "something will eventually become ready" without every suspension
+// mechanism needing its own bespoke type:
+//
+//   Lazy<T>                    single-consumer OWNERSHIP. You own the frame, you destroy it, you
+//                              are the only reader -- so nothing needs a refcount or a lock. Lazy:
+//                              the body does not start until awaited, and runs INLINE on the
+//                              awaiting worker. Move-only.
+//   Future<T>                  copyable, refcounted, multi-consumer OBSERVATION. N readers observe
+//                              one value. Nobody owns it; it dies when the last observer does.
+//   Future<void>               copyable, refcounted, multi-consumer COMPLETION. N readers observe
+//                              that a thing finished.
+//   Promise<T>, Promise<void>  the producer side of both. Plain C++17.
+//
+// OWNERSHIP vs OBSERVATION is the axis, and it is why Lazy is not simply a degenerate Future: an
+// owner may move the value out and destroy the frame, which an observer must never do. That is the
+// same distinction Take() encodes -- it is legal only when you have become the sole owner.
+//
+// COMPLETION RATHER THAN SIGNAL, and the word is load-bearing: a completion happens exactly once and
+// is terminal. There is no reset and no second firing, so a consumer that arrives LATE still
+// observes it. An Event is the opposite -- arrive after the signal and you wait for the next one --
+// which is why Future<void> is not "an Event for coroutines" but a different thing that happens to
+// serve the same need better.
 //
 // == THE THREE DECISIONS, AND WHAT THEY COST ==
 //
@@ -235,11 +255,16 @@ namespace JLib {
             alignas(T) unsigned char storage_[sizeof(T)];
         };
 
-        // Future<void> IS THE COROUTINE-AWAITABLE SIGNAL, not merely Future<T> with the value taken
-        // out. Event cannot serve a coroutine at all -- it is a fiber suspend point, indexed by
-        // assignedFiber->poolIndex -- so before this there was NO "wake N coroutines when a thing
-        // happens" primitive. That is what this is. It carries no value; everything else about it,
-        // including cancellation and the broken-producer rule, is identical.
+        // A MULTI-CONSUMER COMPLETION, which is not merely Future<T> with the value taken out.
+        // Event cannot serve a coroutine at all -- it is a fiber suspend point, indexed by
+        // assignedFiber->poolIndex -- so before this there was no way for N coroutines to observe
+        // that a thing finished. It carries no value; everything else, including cancellation and
+        // the broken-producer rule, is identical.
+        //
+        // COMPLETION RATHER THAN SIGNAL, and the word is doing work: a completion happens exactly
+        // once and is terminal. There is no reset and no second firing, so a consumer that arrives
+        // late still observes it -- which is the opposite of an Event, where arriving after the
+        // signal means waiting for the next one.
         template <>
         class FutureState<void> final : public FutureStateBase {
         public:
