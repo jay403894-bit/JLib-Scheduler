@@ -113,11 +113,21 @@
 
 #define NSLOTS   2                       /* ring size; see header */
 #define SLOT(e)  ((e) & (NSLOTS - 1))    /* power of two, so the modulo is a mask */
+#define NSHARDS  2                       /* see the sharding note in the header */
 #define MAX_TRY  2                        /* bound the retry loop -- a model checker needs finite */
 #define MAX_ADV  2                        /* enough advances to lap a ring of 2 */
 
 static _Atomic(unsigned) g_epoch = 0;
-static _Atomic(int)      g_counters[NSLOTS];
+static _Atomic(int)      g_counters[NSLOTS][NSHARDS];
+
+/* Sum one ring slot across shards. The ONLY thing anybody reads -- individual shards may be
+   negative, which is the mechanism rather than a bug. See enter/leave. */
+static int ring_total(unsigned ring) {
+    int t = 0;
+    for (unsigned s = 0; s < NSHARDS; ++s)
+        t += atomic_load_explicit(&g_counters[ring][s], memory_order_seq_cst);
+    return t;
+}
 
 /* THE OBJECT AND ITS REACHABILITY. `g_ptr` is the link a reader traverses; `g_freed` stands in for
    "returned to the allocator". Modelling the link is not decoration -- the FIRST version of this
@@ -134,10 +144,10 @@ static _Atomic(int)       g_freed    = 0;
 //
 // Returns the epoch acquired, or (unsigned)-1 if it gave up. Giving up is not a correctness
 // failure; it is how the bounded retry keeps the model finite.
-static unsigned enter_epoch(void) {
+static unsigned enter_epoch(unsigned shard) {
     for (int attempt = 0; attempt < MAX_TRY; ++attempt) {
         unsigned e = atomic_load_explicit(&g_epoch, memory_order_seq_cst);
-        atomic_fetch_add_explicit(&g_counters[SLOT(e)], 1, memory_order_seq_cst);
+        atomic_fetch_add_explicit(&g_counters[SLOT(e)][shard], 1, memory_order_seq_cst);
 
 #ifndef NO_REVALIDATE
         /* THE RE-CHECK. If the epoch moved between our load and our increment, a reclaimer may have
@@ -149,7 +159,7 @@ static unsigned enter_epoch(void) {
            the same store-buffer argument as the deque's pop_bottom fence. */
         unsigned again = atomic_load_explicit(&g_epoch, memory_order_seq_cst);
         if (again != e) {
-            atomic_fetch_sub_explicit(&g_counters[SLOT(e)], 1, memory_order_seq_cst);
+            atomic_fetch_sub_explicit(&g_counters[SLOT(e)][shard], 1, memory_order_seq_cst);
             continue;
         }
 #endif
@@ -158,13 +168,18 @@ static unsigned enter_epoch(void) {
     return (unsigned)-1;
 }
 
-static void leave_epoch(unsigned token) {
-    atomic_fetch_sub_explicit(&g_counters[SLOT(token)], 1, memory_order_seq_cst);
+/* LEAVE ON A DIFFERENT SHARD THAN WE ENTERED ON -- the migration case, and the whole reason this
+   dimension exists. A coroutine enters on worker A and resumes on worker B, so the decrement lands
+   elsewhere: A sits at +1, B at -1, and only the SUM is correct. If that is wrong, it is wrong
+   here. */
+static void leave_epoch(unsigned token, unsigned shard) {
+    atomic_fetch_sub_explicit(&g_counters[SLOT(token)][shard], 1, memory_order_seq_cst);
 }
 
 static void *reader(void *arg) {
     (void)arg;
-    unsigned tok = enter_epoch();
+    const unsigned enter_shard = 0, leave_shard = NSHARDS - 1;   /* migrate between them */
+    unsigned tok = enter_epoch(enter_shard);
     if (tok != (unsigned)-1) {
         /* Traverse the link UNDER protection. A null means the reclaimer unlinked before we looked,
            so there is nothing to reach and nothing to protect -- that reader is trivially safe and
@@ -174,7 +189,7 @@ static void *reader(void *arg) {
             /* THE ACCESS. Everything above exists so that this is safe. */
             assert(atomic_load_explicit(&g_freed, memory_order_seq_cst) == 0);
         }
-        leave_epoch(tok);
+        leave_epoch(tok, leave_shard);
     }
     return 0;
 }
@@ -191,7 +206,7 @@ static int try_advance(void) {
        reclaimer can no longer tell which epoch is actually held. Refusing to advance keeps every
        slot's epoch unique, at the cost of stalling reclamation while somebody is parked -- which
        is the leak we are willing to accept and exactly what a parked fiber already costs. */
-    if (atomic_load_explicit(&g_counters[SLOT(next)], memory_order_seq_cst) != 0) return 0;
+    if (ring_total(SLOT(next)) != 0) return 0;
 #endif
 
     return atomic_compare_exchange_strong_explicit(
@@ -225,7 +240,7 @@ static void *reclaimer(void *arg) {
     for (unsigned k = 0; k < NSLOTS; ++k) {
         /* the unique live epoch e with SLOT(e) == k */
         unsigned e = cur - ((cur - k) & (NSLOTS - 1));
-        if (e <= r && atomic_load_explicit(&g_counters[k], memory_order_seq_cst) != 0) blocked = 1;
+        if (e <= r && ring_total(k) != 0) blocked = 1;
     }
     if (!blocked)
         atomic_store_explicit(&g_freed, 1, memory_order_seq_cst);

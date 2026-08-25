@@ -8,6 +8,7 @@
 #include <mutex>
 #include <cstdio>    // fprintf -- the debug-only EpochGuard suspend tripwire below
 #include <cassert>   // assert   -- ditto
+#include <cstdlib>   // getenv    -- the JLIB_FORCE_COUNTED diagnostic
 #include "Task.h"
 #include "platform.h"   // kCacheLine, for the counted-epoch ring below
 #include "concurrentqueue.h"
@@ -70,12 +71,36 @@ namespace JLib {
 		};
 		std::vector<ThreadEpoch*> threadEpochs;
 
-		// The counted-epoch ring. NOT registered as `participants` -- these are not slots and the
-		// scan reads them separately, which is what keeps the participant vector frozen and its
-		// lock-free read valid. Cache-line separated: every reader in an epoch hits one counter, so
-		// false sharing here would be self-inflicted contention.
+		// The counted-epoch ring, SHARDED. NOT registered as `participants` -- these are not slots
+		// and the scan reads them separately, which is what keeps the participant vector frozen and
+		// its lock-free read valid.
+		//
+		// SHARDED BECAUSE ONE COUNTER PER EPOCH IS A CACHE LINE EVERY READER FIGHTS OVER, which is
+		// exactly the ping-pong a per-reader slot exists to avoid. Measured unsharded at 40.9M
+		// guards/sec against slots' 2.52 BILLION -- 61x, and essentially all of it contention rather
+		// than the RMW itself. Sharding by thread turns a contended line into a private one.
+		//
+		// ENTER AND LEAVE NEED NOT USE THE SAME SHARD, which is what makes this work for a coroutine
+		// that migrates. Enter on worker A (+1 on A's shard), resume on worker B, leave (-1 on B's
+		// shard): A sits at +1, B at -1, and the SUM -- the only thing anybody reads -- is correctly
+		// zero. Individual shards going negative is not a bug, it is the mechanism. The token
+		// therefore carries only the epoch, never a shard.
 		struct alignas(platform::kCacheLine) EpochCounter { std::atomic<int> n{ 0 }; };
-		EpochCounter epochCounters[8];   // == kEpochSlots; declared before it for member ordering
+		static constexpr size_t kEpochShards = 32;      // power of two; covers a large pool
+		EpochCounter epochCounters[8][kEpochShards];    // [kEpochSlots][shards]
+
+		// Which shard this thread uses. Only ever an optimisation for contention -- correctness does
+		// not depend on a reader picking the same one twice, per the note above.
+		static size_t ShardOf() { return thread_id & (kEpochShards - 1); }
+
+		// Sum one ring slot across its shards. Cold path only (the gate and MinActiveEpoch); the
+		// whole point is that readers never do this.
+		int RingTotal(size_t ring) const {
+			int total = 0;
+			for (size_t s = 0; s < kEpochShards; ++s)
+				total += epochCounters[ring][s].n.load(std::memory_order_seq_cst);
+			return total;
+		}
 
 		EpochManager() = default;
 	public:
@@ -103,6 +128,14 @@ namespace JLib {
 			// so a Meyers-singleton destructor would run at static teardown while a
 			// worker still calls Enter/LeaveEpoch -> threadEpochs[tid] freed -> read AV.
 			// Leaking the manager lets the OS reclaim it at process exit instead.
+			// Diagnostic: route every reader through the counted path, for the mechanism comparison.
+			// Env rather than an API because it must be decided before any guard is taken.
+			static bool once = [] {
+				const char* e = std::getenv("JLIB_FORCE_COUNTED");
+				if (e && e[0] == '1') forceCounted.store(true, std::memory_order_relaxed);
+				return true;
+			}();
+			(void)once;
 			static EpochManager* mgr = new EpochManager();
 			return *mgr;
 		}
@@ -305,7 +338,7 @@ namespace JLib {
 			// count can be pinned to it. Without the gate this arithmetic is a lie -- see the model.
 			const size_t cur = globalEpoch.load(std::memory_order_acquire);
 			for (size_t k = 0; k < kEpochSlots; ++k) {
-				if (epochCounters[k].n.load(std::memory_order_seq_cst) == 0) continue;
+				if (RingTotal(k) == 0) continue;
 				const size_t e = cur - ((cur - k) & (kEpochSlots - 1));   // the live epoch for slot k
 				if (e < minEpoch) minEpoch = e;
 			}
@@ -393,11 +426,11 @@ namespace JLib {
 	public:
 		size_t EnterCounted() {
 			const size_t e = globalEpoch.load(std::memory_order_seq_cst);
-			epochCounters[EpochRing(e)].n.fetch_add(1, std::memory_order_seq_cst);
+			epochCounters[EpochRing(e)][ShardOf()].n.fetch_add(1, std::memory_order_seq_cst);
 			return e;
 		}
 		void LeaveCounted(size_t token) {
-			epochCounters[EpochRing(token)].n.fetch_sub(1, std::memory_order_seq_cst);
+			epochCounters[EpochRing(token)][ShardOf()].n.fetch_sub(1, std::memory_order_seq_cst);
 		}
 
 		// GATED, and GenMC proves the gate is necessary -- removing it is the one control that
@@ -412,7 +445,7 @@ namespace JLib {
 		bool AdvanceEpoch() {
 			size_t e = globalEpoch.load(std::memory_order_acquire);
 			const size_t next = e + 1;
-			if (epochCounters[EpochRing(next)].n.load(std::memory_order_seq_cst) != 0) return false;
+			if (RingTotal(EpochRing(next)) != 0) return false;
 			return globalEpoch.compare_exchange_strong(e, next, std::memory_order_seq_cst,
 			                                           std::memory_order_relaxed);
 		}
