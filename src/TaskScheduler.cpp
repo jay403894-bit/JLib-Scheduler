@@ -1334,6 +1334,58 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		}
 	}
 }
+// WaitFor that a cancel can end early. Returns Cancelled when `tok` fires while still waiting.
+//
+// WHAT IT DOES NOT DO: touch n. Cancelling a wait is "I stopped waiting", not "the group finished".
+// Every task still outstanding stays outstanding and still decrements when it completes, so a second
+// waiter -- or a later WaitFor on the same group -- still sees the truth. This is why Cancel() must
+// never smash the count to zero: that would strand every task still in flight with nothing left to
+// release, and lie to everyone else looking at the same group.
+//
+// COMPLETION WINS OVER CANCELLATION when both are true. A group that genuinely finished reports Ok,
+// because it did; reporting Cancelled there would tell the caller to discard results that exist.
+WaitResult TaskScheduler::WaitFor(WaitGroup& wg, CancelToken tok) {
+	auto thread = Thread::GetCurrent();
+	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
+
+	if (current != nullptr) {
+		WaitOnEventDirectArmed([&wg, tok](DirectEvent* ev) {
+			std::lock_guard<std::mutex> lock(wg.mtx);
+			wg.cancellable.push_back(WaitGroup::CancelWaiter{ ev, tok.Raw() });
+			const int old = wg.n.fetch_or(WaitGroup::WAITER_BIT, std::memory_order_acq_rel);
+
+			// Two reasons to wake ourselves instead of parking, checked under the SAME lock that
+			// published us -- which is what makes the second one sound. A cancel landing between the
+			// caller's check and this push would otherwise walk a list we are not on yet, and we
+			// would park with nobody holding us: the park-publish race, exactly as on the semaphore
+			// and Event paths.
+			if ((old & WaitGroup::COUNT_MASK) == 0 || tok.Cancelled()) {
+				wg.cancellable.pop_back();   // we are last: we pushed under this same lock
+				ev->Signal();
+			}
+			});
+
+		if ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) == 0)
+			return WaitResult::Ok;
+		return tok.Cancelled() ? WaitResult::Cancelled : WaitResult::Ok;
+	}
+
+	// BARE THREAD: nothing to park, so cancellation is observed between helping passes rather than
+	// delivered. Same helping policy and the same two reentrancy guards as the uncancellable path.
+	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
+		if (tok.Cancelled()) return WaitResult::Cancelled;
+		bool ranSomething = false;
+		if (t_heldMutexes == 0) {
+			++t_spinHelpDepth;
+			ranSomething = TryRunStolenNativeTask();
+			--t_spinHelpDepth;
+		}
+		if (!ranSomething)
+			std::this_thread::yield();
+	}
+	return WaitResult::Ok;
+}
+
 void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment,
 	bool hiPri, CorePref pref)
 {

@@ -2,9 +2,13 @@
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #pragma once
+#include "CancelToken.h"
+
 #include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <unordered_set>
+#include <vector>
 
 namespace JLib {
     struct DirectEvent;   // pointer-only below; the definition is needed in WaitGroup.cpp
@@ -30,6 +34,25 @@ namespace JLib {
         std::mutex mtx;
         std::unordered_set<DirectEvent*> waiters;  // fibers parked on this group
 
+        // Waiters that asked to be released early if their scope is cancelled. Kept apart from
+        // `waiters` because they are the only ones CancelWaiters may touch -- a plain WaitFor is
+        // uncancellable by contract and must never be woken by somebody else's cancel.
+        struct CancelWaiter {
+            DirectEvent* ev = nullptr;
+            uint32_t     token = 0xFFFFFFFFu;   // CancelToken::kNone
+        };
+        std::vector<CancelWaiter> cancellable;
+
         void WakeAll();
+
+        // Release the waiters whose scope is `tok` (or inside it) and tell them they were cancelled.
+        // Returns how many were woken.
+        //
+        // DOES NOT TOUCH n, AND THAT IS THE WHOLE POINT. Cancelling a wait means "I stopped
+        // waiting", not "this group is finished": the outstanding tasks are still outstanding and
+        // still decrement when they complete. Zeroing the count here would be a lie that a second
+        // waiter, or a later WaitFor on the same group, would believe -- and it would strand every
+        // task still in flight with nothing left to release.
+        std::size_t CancelWaiters(CancelToken tok) noexcept;
     };
 }

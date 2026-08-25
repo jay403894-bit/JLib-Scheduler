@@ -493,6 +493,13 @@ add_executable(SchedulerDagCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_can
 target_link_libraries(SchedulerDagCancelTest PRIVATE Scheduler)
 target_compile_features(SchedulerDagCancelTest PRIVATE cxx_std_17)
 
+# WaitFor(wg, token): cancelling a WAIT, not the work. Mostly a test of what must NOT change --
+# the count is untouched, the abandoned tasks still finish, and an uncancellable waiter on the
+# same group is not collateral.
+add_executable(SchedulerWaitGroupCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/waitgroup_cancel_test.cpp")
+target_link_libraries(SchedulerWaitGroupCancelTest PRIVATE Scheduler)
+target_compile_features(SchedulerWaitGroupCancelTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerTimerTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/timer_test.cpp")
 target_link_libraries(SchedulerTimerTest PRIVATE Scheduler)
 target_compile_features(SchedulerTimerTest PRIVATE cxx_std_17)

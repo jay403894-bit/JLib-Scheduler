@@ -476,6 +476,12 @@ namespace JLib {
 
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
+
+		// Cancellable WaitFor: returns Cancelled if `tok` fires while still waiting, Ok if the group
+		// completed. Cancelling ends THIS WAIT ONLY -- the count is untouched, the outstanding tasks
+		// still run and still decrement, and any other waiter on the same group is unaffected. Use
+		// WaitGroup::CancelWaiters(tok) to release such waiters eagerly. See the definition.
+		WaitResult WaitFor(WaitGroup& wg, CancelToken tok);
 		bool Push(uint8_t cpu_affinity, Task* task);
 		bool Requeue(Task* task);
 		// minPerSegment: the smallest run this is willing to hand to a single worker. The default of
