@@ -88,21 +88,29 @@
 // so every ordinary T lands in the existing 128-byte class and a large one lands in 256. The waiter
 // node is 32 bytes and costs nothing, because it lives in the awaiter's frame.
 //
-// IT IS NOT SLABBED ANYWAY, for two reasons. First, look at that table again: std::mutex is 80 of
-// the 96 bytes. Eighty-three percent of this object is the lock, so moving the allocation is
-// optimising the wrong end -- a spinlock would take the void form from 96 bytes to about 24 and
-// drop everything into the 64-byte class, which is a far larger change than where the memory comes
-// from. That is a real option (the lock is held only for pointer surgery and two bools, never
-// across a suspension) and it is deliberately NOT taken yet, because a spinlock trades a bounded
-// wait for burning a core if the holder is preempted, and this project's default has been to avoid
-// that.
+// WHAT SLABBING WOULD ACTUALLY BUY, and it is not the size class. The slab exists to avoid the CRT
+// allocator's lock -- it is sharded, so concurrent creation from several workers does not serialise
+// -- and to keep objects contiguous. Size classes are how it is organised, not why it exists. So
+// the question is not "does it fit" (it does, at 128) but "are these created concurrently, often
+// enough for the allocator lock to matter".
 //
-// Second and decisively: the slab exists because TASKS are allocated at frame rate. Nothing has
-// shown a Future is. An asset load creates a handful; a per-request server might create thousands a
-// second, and if one ever does, this is the note that says what to do about it -- shrink the lock
-// first, then slab. Until then `new` for a 96-byte object that outlives a whole asynchronous
-// operation is not the cost worth attacking, and pre-emptively slabbing it would tie Future's
-// lifetime to the task slab's sizing for a benefit nobody has measured.
+// NOT SLABBED FOR NOW, on the judgement that nothing has shown they are. Tasks are created at frame
+// rate by every worker at once, which is what justified the slab; a Future is created once per
+// asynchronous operation and outlives it. An asset load makes a handful. A per-request server might
+// make thousands a second -- and if one ever does, slab it at 128 rather than adding a class.
+//
+// THE COUNTERWEIGHT, which is why this is a judgement rather than an obvious yes: the 128-byte
+// class is shared with coroutine frames, and it is a FIXED capacity chosen by SlabSizes. Slabbing
+// Futures spends frame budget on them, so an app that makes many would hit the cap sooner and the
+// symptom would appear as frame-allocation failure somewhere unrelated. `new` has no cap. That
+// coupling is worth taking on for something allocated at frame rate; it is not obviously worth it
+// for something allocated once per operation.
+//
+// A SEPARATE AND LARGER OPTION, noted because it changes the arithmetic above: std::mutex is 80 of
+// these 96 bytes. A spinlock would take the void form to about 24 and drop everything into the
+// 64-byte class. The lock is held only for pointer surgery and two bools, never across a
+// suspension, so it is a candidate -- but a spinlock trades a bounded wait for burning a core when
+// the holder is preempted, which is a bigger decision than where the memory comes from.
 //
 // == WHAT THIS IS NOT ==
 //

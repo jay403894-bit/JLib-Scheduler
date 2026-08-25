@@ -336,6 +336,40 @@ namespace JLib {
 // hour into a session -- precisely the profile of the LockFreeList destructor leak this project
 // already paid for once. That is why this is a tripwire and not a comment.
 //
+// AND FOR A COROUTINE IT IS WORSE THAN A LEAK -- it is memory corruption. A coroutine has no epoch
+// slot: it runs as a Native task with no fiber, so CurrentEpochSlot() hands it the WORKER's fallback
+// -- and a coroutine is not bound to a worker. Park inside a guard and that worker keeps running;
+// its very next EpochGuard writes its own epoch into the same slot on entry and SIZE_MAX on exit.
+// The parked coroutine's announcement is gone while its traversal is still live, and whatever it was
+// protecting becomes reclaimable underneath it. See ~EpochGuard's note about the shared fallback --
+// this is that, arriving.
+//
+// GIVING COROUTINES SLOTS WAS TRIED (2026-08-25) AND REVERTED. Not because it was hard: because it
+// cannot be made to work, for a reason that is worth writing down so nobody rebuilds it.
+//
+// Per-coroutine registration is out immediately -- MinActiveEpoch() scans `participants` WITHOUT a
+// lock precisely because registration happens once at setup, and coroutines are unbounded and
+// dynamic. So the attempt was a FIXED pool of slots claimed on guard entry and released on exit,
+// sized at 2x threads on the reasoning that concurrent guards cannot exceed threads-executing-
+// guarded-code.
+//
+// That reasoning is circular. It holds only while no guard spans a suspension, which is the one
+// case the slot exists for. Measured: 132 coroutines parked inside guards against a 62-slot pool
+// left 37 of them falling back to the shared worker slot. Corruption 28% of the time rather than
+// 100% is not a fix -- it is a worse bug, because it passes every test and fails in production.
+//
+// AND ANY BOUND IS WRONG IN PRINCIPLE, which is the deciding argument. Coroutines exist in this
+// library precisely BECAUSE fibers are bounded: IoReactor.h's own note says a reactor's steady state
+// is thousands of parked operations, so a bounded park budget "would not degrade, it would stop".
+// A pool of parking slots -- of any size -- reintroduces exactly the ceiling coroutines were adopted
+// to escape. Sizing was never the problem. Bounding was.
+//
+// SO THE INVARIANT IS THE ANSWER, not a slot scheme. EBR cannot express "protected across an
+// unbounded wait" -- that is what the technique is, not a gap in this implementation. Hazard
+// pointers can, by protecting per-object and paying on every read. If something ever genuinely needs
+// protection across a suspension, that is the mechanism to reach for; do not try to make epochs do
+// it. The tripwire below is enforcement, and ArmResume carries the coroutine half.
+//
 // Not a defect peculiar to this design: bounded critical sections are what EBR IS, in the paper too.
 // A stalled participant stalls reclamation everywhere; hazard pointers dodge it by protecting
 // per-object and pay on every read. What fibers change is only how EASY the violation is to write,
