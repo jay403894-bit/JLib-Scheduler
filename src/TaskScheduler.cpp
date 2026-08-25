@@ -5,6 +5,8 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
+#include "../include/IoReactor.h" // Join() stops the completion threads before clearing the pool
+#include "../include/Timer.h"     // ...and the timer thread, for the same reason
 #include "../include/platform.h"
 #include "../include/Topology.h"
 #include <stdexcept>
@@ -319,8 +321,37 @@ void TaskScheduler::WaitForMain(WaitGroup& wg) {
 }
 void TaskScheduler::Join() {
 	if (!poolActive) return;
-	
+
 	stopFlag.store(true, std::memory_order_release);
+
+	// STOP THE SERVICE THREADS FIRST, BEFORE THE WORKERS THEY PUSH INTO.
+	//
+	// Join() used to take down `workers` and nothing else, so a reactor completion thread and the
+	// timer thread outlived it. That is not merely untidy: both PUSH TASKS, and the block below
+	// clears `workers`, `mainQ` and `immediateCoresInUse`. A completion landing in that window
+	// indexes vectors that are being emptied. The window is small, which is the worst kind -- it
+	// makes the failure rare enough to look like something else.
+	//
+	// ORDER IS THE WHOLE POINT. Producers stop, then consumers: stopping the workers first would
+	// leave a completion thread pushing into a pool that can no longer drain, which is a hang rather
+	// than a crash. Both stops are idempotent and both layers are opt-in, so this is a no-op for a
+	// job-system-only user.
+	//
+	// KNOWN GAP, NOT FIXED HERE: Init() does not bring them back. After Join(), EnableIoReactor and
+	// EnableTimers still report true, but their threads are gone -- so a Join()-then-Init() cycle
+	// gives you a pool whose service layers claim to be on and are not. Every submit into them then
+	// fails, or worse, waits.
+	//
+	// Left as a gap rather than papered over because restarting is not symmetric with stopping:
+	// IoReactor::Stop() closes the completion port, so a restart has to rebuild it and re-register
+	// every handle the caller had registered -- which the reactor cannot do, since it does not
+	// retain them. Making this work means giving the reactor a real Start()/Stop() lifecycle, which
+	// is a deliberate change and not a line in Join(). Until then: ONE Init/Join cycle per process
+	// when the service layers are enabled.
+	if (IoReactorEnabled() && IoReactor::IsAvailable())
+		IoReactor::Instance().Stop();
+	if (TimersEnabled())
+		TimerQueue::Instance().Stop();
 
 	{
 		registryMtx.lock();
