@@ -79,43 +79,35 @@
 // code does not expect. Removal happens under the lock, before the resume, and a waiter is in the
 // list exactly once -- so there is no double resume and no lost one.
 //
-// == THE SHARED STATE COMES OFF THE SLAB ==
+// == THE SHARED STATE IS HEAP-ALLOCATED, AND THAT IS THE RULE RATHER THAN AN OVERSIGHT ==
 //
-//     std::mutex 80    FutureState<void> 96    <int> 104    <std::string> 128
+// THE EFFICIENT ALLOCATOR IS THE WRONG DEFAULT WHEN THE LIFETIME IS NOT YOURS.
 //
-// so the void form and an ordinary T land in the 128-byte class, and a large T in 256. AllocSized
-// routes by size exactly as TaskNode does, and falls through to a larger class when a pool is dry --
-// an undersized pool costs memory, not failure.
+//   Task              slab. The scheduler creates it, runs it, frees it -- inside a frame. Lifetime
+//                     is the allocator owner`s, and the pool is sized for exactly that churn.
+//   coroutine frame   slab, when it fits. Destroy is PAIRED with the handle, so the lifetime is
+//                     still bounded by something the scheduler controls.
+//   Future            HEAP. Its lifetime belongs to whoever holds a copy, and that is a user
+//                     decision made outside this library.
 //
-// WHY, and it is NOT the size class. The slab exists to keep the general allocator off the hot path:
-// it is sharded, so concurrent creation from several workers does not serialise on the CRT lock.
-// Almost nothing in this scheduler reaches that allocator at runtime, and a Future being the
-// exception was an inconsistency rather than a considered trade -- a frame that touches the CRT
-// allocator has taken a lock the rest of the design spent real effort avoiding.
+// The slab`s capacity is a resource the SCHEDULER needs. Putting a user-lifetime object in it means
+// a user decision -- caching a resolved handle for the session, which is a perfectly reasonable
+// thing to write -- silently consumes slots that tasks require. The pool assumes churn; a handle
+// held indefinitely is the one shape it was not sized for. That is an occupancy problem, not a
+// capacity one: exhausting the 128-byte class takes ~131,000 concurrent Futures, so the danger was
+// never running out, it was never giving back.
 //
-// IT FALLS BACK TO THE HEAP, and the case that matters is a Promise created BEFORE Init() -- a
-// normal, non-failure path, and the reason the C++17 producer side still works with no scheduler at
-// all. (It also covers total slab exhaustion, but that is not much of a rescue: at that point tasks
-// cannot be created either.) Provenance rides in a bool inside the state rather than being re-derived from the address
-// at free time: FreeSized() can answer by address, but only while the allocator is reachable, and a
-// Future may outlive Join(). A bit that travels WITH the object cannot go stale.
+// THIS WAS BUILT AND REVERTED, 2026-08-25, so the work is not repeated. It fits (96 bytes for the
+// void form, 128 for an ordinary T), it cost nothing measurable, and the sizes did not even change
+// because the provenance flag rode in padding std::mutex already forced. None of that is the
+// question. The argument FOR it was consistency -- almost nothing else here touches the CRT
+// allocator at runtime -- and consistency is the weaker claim when the thing being made consistent
+// has a different lifetime shape from everything around it.
 //
-// THE RISK IS OCCUPANCY, NOT CAPACITY, and the obvious worry is the wrong one. Exhausting the
-// 128-byte class takes roughly 131,000 concurrent Futures (128K slots); ten thousand in flight is
-// about 8% of it. And if you ever did exhaust it, tasks could not be created either -- so the heap
-// fallback would be rescuing a process that is already finished, which is why the pre-Init case is
-// the one that actually justifies it.
-//
-// What the slab assumes is CHURN. A task is created, runs, and is freed inside a frame. A Future is
-// a HANDLE, alive as long as any consumer holds it -- so an application that caches resolved
-// Futures (an asset handle kept for the session, say) holds slab slots indefinitely, which is a
-// lifetime shape the pool was not sized for. That is a plausible thing to write, unlike exhaustion,
-// and it is the case to watch.
-//
-// A LARGER OPTION LEFT ON THE TABLE: std::mutex is 80 of these 96 bytes. A spinlock would take the
-// void form to about 24 and drop everything into the 64-byte class. The lock is held only for
-// pointer surgery and two bools, never across a suspension -- but a spinlock trades a bounded wait
-// for burning a core when the holder is preempted, which is a bigger decision than this one.
+// IF A WORKLOAD EVER SHOWS FUTURE CREATION IS HOT, the answer is a pool of its own that cannot take
+// task classes -- not the shared slab. That keeps the allocator-lock saving without letting user
+// lifetime spend scheduler capacity. Nothing has shown that yet; a Future is created once per
+// asynchronous operation and outlives it.
 //
 // == WHAT THIS IS NOT ==
 //
@@ -304,20 +296,6 @@ namespace JLib {
             std::atomic<int>   refs_{ 1 };
             bool               ready_   = false;
             bool               broken_  = false;
-
-            // WHERE THIS OBJECT CAME FROM. Rides in padding the mutex already forced (80 of these
-            // 96 bytes are std::mutex), so it costs nothing.
-            //
-            // FreeSized() would answer the same question by ADDRESS -- it returns false for a
-            // pointer in no pool, exactly so a caller can route the rest itself -- but only while
-            // the allocator is reachable. A Future can outlive Join(), and deciding provenance from
-            // a source that may have gone away is how a slab slot reaches operator delete. One bit
-            // travelling WITH the object cannot go stale.
-            bool               fromSlab_ = false;
-
-        public:
-            void SetFromSlab(bool v) noexcept { fromSlab_ = v; }
-            bool FromSlab() const noexcept    { return fromSlab_; }
         };
 
         template <class T>
@@ -382,7 +360,7 @@ namespace JLib {
 
             void Swap(FutureHandle& o) noexcept { std::swap(s_, o.s_); }
             void Reset() noexcept {
-                if (s_ && s_->Release()) FreeState(s_);
+                if (s_ && s_->Release()) delete s_;
                 s_ = nullptr;
             }
 
@@ -405,45 +383,11 @@ namespace JLib {
             State* s_ = nullptr;
         };
 
-        // SLAB ALLOCATION FOR THE SHARED STATE. Almost nothing in this scheduler reaches the general
-        // allocator at runtime, and that is the point of having a slab at all -- a frame that touches
-        // the CRT allocator has taken a lock the rest of the design spent effort avoiding. Futures
-        // were the exception; they are not any more.
-        //
-        // AllocSized routes by size exactly as TaskNode does: the void form is 96 bytes and an
-        // ordinary T lands in the 128-byte class. It FALLS THROUGH to a larger class when a pool is
-        // dry, so an undersized pool costs memory rather than failing.
-        //
-        // FALLS BACK TO THE HEAP when there is no slab to allocate from -- a Promise created before
-        // Init(), or a pool exhausted across every class. That is not a degradation to hide: it is
-        // the only reason a Promise remains usable outside a running scheduler at all, which the
-        // C++17 producer side is supposed to be.
-        template <class State>
-        inline State* AllocState() {
-            void* mem = nullptr;
-            if (TaskScheduler::IsInitialized())
-                if (TaskAllocator* a = TaskScheduler::Instance().GetAllocator())
-                    mem = a->AllocSized(sizeof(State));
-            const bool slab = (mem != nullptr);
-            if (!mem) mem = ::operator new(sizeof(State));
-            State* s = new (mem) State();
-            s->SetFromSlab(slab);
-            return s;
-        }
-
-        template <class State>
-        inline void FreeState(State* s) {
-            const bool slab = s->FromSlab();
-            s->~State();
-            if (slab) TaskScheduler::Instance().GetAllocator()->Free(s);
-            else      ::operator delete(static_cast<void*>(s));
-        }
-
         // Same, for the producer half.
         template <class State>
         class PromiseHandle {
         public:
-            PromiseHandle() : s_(AllocState<State>()) {}
+            PromiseHandle() : s_(new State()) {}
             PromiseHandle(const PromiseHandle&) = delete;
             PromiseHandle& operator=(const PromiseHandle&) = delete;
             PromiseHandle(PromiseHandle&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
@@ -462,7 +406,7 @@ namespace JLib {
             void Break() noexcept {
                 if (!s_) return;
                 s_->Publish(/*broken*/ true);      // no-op if a value already landed
-                if (s_->Release()) FreeState(s_);
+                if (s_->Release()) delete s_;
                 s_ = nullptr;
             }
             State* s_ = nullptr;

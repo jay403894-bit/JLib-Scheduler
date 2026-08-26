@@ -82,24 +82,24 @@ static JLib::Coro ScopedSignalled(JLib::Future<void> f, JLib::CancelToken tok) {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    // ---- BEFORE Init(): the heap fallback ------------------------------------------------------
+    // ---- BEFORE Init(): a Promise works with no scheduler ---------------------------------------
     //
-    // The shared state comes off the slab, and there is no slab until Init(). The producer side is
-    // documented as plain C++17 usable from anything, so a Promise built before the scheduler exists
-    // has to work -- it falls back to ::operator new, and the provenance bit inside the state is
-    // what routes it back to ::operator delete rather than into a pool that never owned it.
+    // The producer side is documented as plain C++17, usable from a thread that has never heard of
+    // this scheduler -- so a Promise built before Init() has to work. It is also the property that
+    // decided where the shared state lives: slab allocation was built and reverted (see Future.h),
+    // because a Future's lifetime belongs to whoever holds a copy, and an allocator sized for the
+    // scheduler's own churn is the wrong home for an object the user decides how long to keep.
     //
-    // RUN FIRST, DELIBERATELY: once Init() has happened this path is unreachable, so testing it
-    // afterwards would test nothing.
-    std::printf("before Init(): the state falls back to the heap\n");
+    // RUN FIRST, DELIBERATELY: after Init() this section says nothing.
+    std::printf("before Init(): a Promise works with no scheduler at all\n");
     {
         JLib::Promise<std::string> p;
         JLib::Future<std::string>  f = p.GetFuture();
         Check(f.Valid() && !f.Ready(), "a Promise works with no scheduler at all");
         p.Set(std::string("preinit"));
         Check(f.Ready() && f.Get() == "preinit", "and carries its value");
-    }   // destroyed here: a slab Free() on this pointer would be a wild write
-    Check(true, "and destructs without touching a slab it never came from");
+    }
+    Check(true, "and destructs cleanly with no scheduler ever started");
 
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
