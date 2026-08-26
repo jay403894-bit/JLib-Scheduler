@@ -640,11 +640,14 @@ static constexpr unsigned     kMinTopSamples = 16;
 // because being late to shed costs a spinning core and being late to add costs latency continuously.
 static constexpr unsigned     kLowWindowsToDemote = 3;
 static std::atomic<unsigned>  g_lowWindows{ 0 };
+static std::atomic<long long> g_lastDemoteNs{ 0 };
+// Lane MISSES: completions that had to queue behind another. See NoteLaneMiss.
+static std::atomic<unsigned>  g_laneMisses{ 0 };
 
 // Up fast, down slow, and the asymmetry is the anti-thrash. A saturated lane loses latency every
 // microsecond it stays saturated; an idle hot worker loses only a spinning core, which is the cost
 // K-hot already accepts by design. Cheap to be late going down, expensive to be wrong.
-static constexpr long long kHotUpIntervalNs   =   2000000;     // 2 ms between changes
+static constexpr long long kHotUpIntervalNs   =    200000;     // 200us between promotions
 static constexpr long long kHotWindowNs       =  10000000;     // 10 ms of evidence per decision
 static constexpr long long kHotDownIntervalNs = 200'000'000;   // 200 ms of sustained quiet
 
@@ -665,6 +668,28 @@ void TaskScheduler::SetHotWorkerRange(size_t minK, size_t maxK) noexcept {
 void TaskScheduler::GetHotWorkerRange(size_t& minK, size_t& maxK) noexcept {
 	minK = g_hotMin.load(std::memory_order_relaxed);
 	maxK = g_hotMax.load(std::memory_order_relaxed);
+}
+
+// A LANE MISS: a completion that had to QUEUE behind another one on the same worker.
+//
+// WHY THIS AND NOT THE SATURATION EDGE. The edge trigger needs every hot worker past
+// kLaneStealDepth before the first promotion fires -- so at the start of a burst the pool sits at
+// K=1 accumulating four items before it even begins to climb. p50 hides that (most of the burst
+// runs at full K once the climb finishes) but the TAIL is made of exactly those early completions:
+// measured 22%% worse p90 and 30%% worse p99 than static K=4 while p50 matched to 7%%.
+//
+// A miss is detectable at depth ONE instead of four, and it is FREE: the inbox drain already
+// computes how many items it moved, so `count > 1` means somebody waited. No new counter on the
+// hot path, no remote reads -- the owner reports it from a line it already owns.
+//
+// Promote on the FIRST miss rather than on an accumulated rate. The cost model is asymmetric and
+// says to: an early promote costs one core for as long as it takes the occupancy test to notice,
+// while a late one costs every completion in the burst a full wait. The up interval is the only
+// brake, and demotion is on its own clock now, so an overshoot is self-correcting.
+void TaskScheduler::NoteLaneMiss(size_t waiting) noexcept {
+	if (!instance || waiting == 0) return;
+	g_laneMisses.fetch_add(1, std::memory_order_relaxed);
+	MaybeAdjustHotWorkers();
 }
 
 void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
@@ -737,7 +762,13 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	if (k < instance->workers.size() && instance->immediateCoresInUse[k]->load(std::memory_order_acquire))
 		return;
 
-	if (k < hi && adv == mask && now - g_lastHotChangeNs.load(std::memory_order_relaxed) >= kHotUpIntervalNs) {
+	// A MISS PROMOTES ON ITS OWN, without waiting for adv == mask. This is the fast half of the fast
+	// half: saturation says "every hot worker is four deep", a miss says "somebody just had to wait",
+	// and the second is true far earlier in a burst than the first.
+	const bool missed = g_laneMisses.exchange(0, std::memory_order_relaxed) != 0;
+
+	if (k < hi && (missed || adv == mask)
+	    && now - g_lastHotChangeNs.load(std::memory_order_relaxed) >= kHotUpIntervalNs) {
 		g_lowWindows.store(0, std::memory_order_relaxed);
 		SetHotWorkersEffective(k + 1);
 		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
@@ -803,7 +834,14 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	if (low) lows = g_lowWindows.fetch_add(1, std::memory_order_relaxed) + 1;
 	else     g_lowWindows.store(0, std::memory_order_relaxed);
 
-	if (k > lo && lows >= kLowWindowsToDemote && now - last >= kHotDownIntervalNs) {
+	// GATED ON ITS OWN TIMESTAMP, not on the shared one. `last` is stamped by PROMOTIONS as well, so
+	// gating demotion on it means any load that keeps promoting can never shed -- which is exactly
+	// the continuous-light-load case, and lowering the up interval to 200us made it strictly worse.
+	// The patience already lives in kLowWindowsToDemote, and a promote RESETS that counter, so the
+	// hysteresis survives without borrowing the promote clock.
+	if (k > lo && lows >= kLowWindowsToDemote
+	    && now - g_lastDemoteNs.load(std::memory_order_relaxed) >= kHotDownIntervalNs) {
+		g_lastDemoteNs.store(now, std::memory_order_relaxed);
 		g_lowWindows.store(0, std::memory_order_relaxed);
 		SetHotWorkersEffective(k - 1);
 		g_lastHotChangeNs.store(now, std::memory_order_relaxed);

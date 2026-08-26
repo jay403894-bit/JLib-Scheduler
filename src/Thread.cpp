@@ -1375,6 +1375,9 @@ void Thread::Worker() {
 						// so `count - 1` is the depth, not an increment to it.
 						const int _lhm = TaskScheduler::GetLaneHintMode();
 						if (_lhm == 1 || _lhm == 3 || _lhm == 4) scheduler->UpdateLaneHint((size_t)qIndex, count - 1);
+						// A MISS: this drain moved more than one lane task, so at least one completion
+						// waited behind another. Free -- count is already here.
+						if (count > 1) TaskScheduler::NoteLaneMiss(count - 1);
 						else if (_lhm == 2) scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = *opt;
 						JLIBSCHED_LATENCY_MARK(Found);

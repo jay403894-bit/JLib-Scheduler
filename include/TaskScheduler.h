@@ -401,6 +401,11 @@ namespace JLib {
 		// Evaluated by ONE worker, sampled rather than every pass -- a clock read per pass per
 		// worker would cost more than the mechanism saves. Public only so Thread.cpp can call it.
 		static void MaybeAdjustHotWorkers() noexcept;
+
+		// Reported by a worker whose inbox drain moved more than one lane task -- i.e. a completion had
+		// to queue behind another. Detected at depth ONE, where the saturation edge needs
+		// kLaneStealDepth, and computed for free from a count the drain already has.
+		static void NoteLaneMiss(size_t waiting) noexcept;
 		// WHO MAY DRAIN A BACKLOGGED LANE.
 		//
 		//   0  nobody -- the lane is strictly private to its hot worker
