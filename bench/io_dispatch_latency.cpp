@@ -534,8 +534,13 @@ int main(int argc, char** argv) {
     // most likely to be running.
     //
     // SHIPS AT 0 ANYWAY, because a default that helps K=1 and costs K=4 is a policy decision and not
-    // a measurement. The obvious follow-up is to gate the wake on GetHotWorkers() <= 1 inside
+    // a measurement. The obvious follow-up is to gate the wake on GetHotWorkers() == 1 inside
     // WakeForLane, which is not a tuning knob but the precondition above written down.
+    //
+    // == 1 AND NOT <= 1. At K=0 nothing can enter a hiPri lane at all -- push routes hiPri to the
+    // ordinary lane, isHotWorker is false for every worker, so the hint is never set and the wake
+    // never fires. Writing <= would imply K=0 is a case being handled when it is a case that cannot
+    // occur.
     {
         const int n = 32, iters = 100;
         std::printf("\n  lane wakes -- a buried hot worker pulls parked workers up to steal\n");
