@@ -461,13 +461,13 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		(int)paused.load(std::memory_order_relaxed),
 		(int)poolActive.load(std::memory_order_relaxed),
 		workers.size());
-	printf("  q  state           queued busy imm run   inbox(hi/lo)  deque(hi/lo)\n");
+	printf("  q  state           queued busy run   inbox(hi/lo)  deque(hi/lo)\n");
 	for (size_t i = 0; i < workers.size(); ++i) {
 		const auto s = workers[i]->GetDebugState();
 		static const char* kNames[] = { "AWAKE", "GOING_TO_SLEEP", "SLEEPING" };
 		const char* st = (s.workerState >= 0 && s.workerState <= 2) ? kNames[s.workerState] : "?";
 		printf(" %2d  %-14s   %d      %d    %d   %d     %d/%d           %zu/%zu%s\n",
-			s.qIndex, st, (int)s.hasQueuedWork, (int)s.busy, (int)s.immediate, (int)s.running,
+			s.qIndex, st, (int)s.hasQueuedWork, (int)s.busy, (int)s.running,
 			(int)!hiPriInboxes[i]->empty(), (int)!loPriInboxes[i]->empty(),
 			hiPri[i]->size(), loPri[i]->size(),
 			// The signature: parked, but holding work nobody else can take.

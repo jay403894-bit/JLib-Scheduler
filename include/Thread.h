@@ -308,7 +308,6 @@ namespace JLib {
             int  workerState;      // 0 AWAKE, 1 GOING_TO_SLEEP, 2 SLEEPING
             bool hasQueuedWork;
             bool busy;
-            bool immediate;
             bool running;
         };
         DebugState GetDebugState() const {
@@ -317,7 +316,6 @@ namespace JLib {
                 workerState.load(std::memory_order_relaxed),
                 hasQueuedWork.load(std::memory_order_relaxed),
                 busy.load(std::memory_order_relaxed),
-                immediate.load(std::memory_order_relaxed),
                 running.load(std::memory_order_relaxed)
             };
         }
@@ -327,7 +325,7 @@ namespace JLib {
         uint32_t FastRand();
         void WaitBackoff(int& spin_count);
         void ExecuteTask(Task* task);
-        Task* AcquireWork(bool& isFork);   // inbox drain + immediate + localQ + pop_bottom + steal
+        Task* AcquireWork(bool& isFork);   // inbox drain + localQ + pop_bottom + steal
         void  RunTask(Task* task, bool isFork);  // acquire/resume fiber, switch, handle DEAD/YIELD/SUSPEND
         void Worker();
 
@@ -335,7 +333,6 @@ namespace JLib {
         ThreadLocalCache<> localCache;
         static thread_local Thread* instance;
 
-        std::atomic<bool> immediate{ false };
         // Set by MarkQueuedWork() (see its comment) whenever THIS worker's own inbox/deque
         // receives a task; cleared once per Worker() loop iteration right before that
         // iteration's local-queue/steal/inbox-drain search, so a push that lands between one

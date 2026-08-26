@@ -333,19 +333,20 @@ void Thread::NotifyWorker(bool force){
 	// at 8 workers to 0.8 at 14+, a threshold rather than a gradient.
 	//
 	// The load is seq_cst and pairs with the seq_cst STORES of every flag the sleep decision reads:
-	// hasQueuedWork (MarkQueuedWork), immediate (SetImmediateTask and the fork path) and paused
-	// (Pause/Resume). All four operations of each pair have to be in one total order or the skip is
-	// unsound -- see tests/verify/sleepwake_model.c.
+	// hasQueuedWork (MarkQueuedWork), laneWake (MarkLaneWake) and paused (Pause/Resume). Both
+	// operations of each pair have to be in one total order or the skip is unsound -- see
+	// tests/verify/sleepwake_model.c.
 	//
 	// THIS SHIPPED BROKEN ONCE, in 1.2.0, and the reason is worth keeping. The first model had ONE
-	// flag and proved the handshake for it. The predicate has three. `immediate` and `paused` were
-	// left as release stores read with acquire, so for those the total-order argument did not exist:
+	// flag and proved the handshake for it. The predicate had more. The others were left as release
+	// stores read with acquire, so for those the total-order argument did not exist:
 	// the setter stores its flag, loads workerState, sees AWAKE, skips -- while the worker stores
 	// GOING_TO_SLEEP, loads the flag, sees the stale value, and parks forever. It hung macOS arm64
 	// in CI about one run in three and never once reproduced on x86, because TSO hides it.
 	//
-	// The model now carries `-DIMMEDIATE_ONLY -DWEAK_IMMEDIATE` as a permanent negative control that
-	// reproduces exactly that. If a FOURTH input is ever added to the sleep predicate, it must be
+	// The flag that bug was found on -- `immediate` -- is gone with PushImmediate (4.0.1), but the
+	// control survives it: `-DLANE_ONLY -DWEAK_LANEWAKE` is the same shape on laneWake and fails the
+	// same way. If ANOTHER input is ever added to the sleep predicate, it must be
 	// seq_cst on both sides and it must go into that model. A proof covers what it modelled.
 	if (!force && workerState.load(std::memory_order_seq_cst) == WS_AWAKE) return;
 
@@ -1490,7 +1491,6 @@ void Thread::Worker() {
 			// task strands and every waiter on it hangs.
 			// The flag stays as the cheap common case; the queue is the truth.
 			if (!running.load(std::memory_order_acquire)
-				|| immediate.load(std::memory_order_seq_cst)
 				|| (!scheduler->paused.load(std::memory_order_seq_cst)
 					&& (hasQueuedWork.load(std::memory_order_seq_cst)
 						|| laneWake.load(std::memory_order_seq_cst)
@@ -1532,7 +1532,6 @@ void Thread::Worker() {
 			// its flag write was already lost.
 			cv.wait(lock, [this]() {
 				return !running.load(std::memory_order_acquire)
-					|| immediate.load(std::memory_order_acquire)
 					|| (!scheduler->paused.load(std::memory_order_acquire)
 						&& (hasQueuedWork.load(std::memory_order_acquire)
 							|| laneWake.load(std::memory_order_acquire)

@@ -1072,10 +1072,46 @@ namespace JLib {
 			// fall back. No measured workload looks like that -- but none has been measured, either,
 			// and the honest version of "we have evidence for this shape and none for the other" is
 			// to say so rather than to imply the case is closed.
-			size_t slots256 = 1024 * 1024 / 4;   // DAG edge chunks, frames >128 B, oversized lambdas
-			size_t slots128 = 1024 * 1024 / 8;   // larger coroutine frames
-			size_t slots80  = 1024 * 1024;       // two-capture lambdas: the common frame-loop task
-			size_t slots64  = 1024 * 1024 / 4;   // capture-free / single-capture tasks, TaskNodes
+			// ================= RESIZED IN 4.0.1: 176 MB -> 4 MB, and why that is safe ==============
+			//
+			// THE OLD NUMBERS WERE SIZED FOR A WORLD WHERE RUNNING OUT WAS FATAL. Exhaustion meant a
+			// null Task and a dropped unit of work, so the only defensible default was one nobody
+			// could plausibly exhaust -- and 176 MB of reserved address space, prefaulted at Init,
+			// is what "nobody" costs. That is a backend-server footprint arrived at defensively.
+			//
+			// Growth (4.0.1) changed the trade. Exhaustion is now one allocation and a one-line
+			// warning naming the class, so under-sizing costs a hitch instead of a failure. The
+			// default no longer has to cover the worst case; it has to cover the COMMON case and
+			// degrade honestly outside it.
+			//
+			// THE DISTRIBUTION IS UNCHANGED and still says where to spend: Game01, 37,480 real
+			// tasks, 15.4% at exactly 64 bytes and 84.6% at exactly 80, nothing above 80. What
+			// changed is the QUANTITY, because the figure that matters is PEAK CONCURRENT live
+			// slots, not tasks ever created -- and 37,480 tasks over a run is nothing like 37,480
+			// at once. TaskScheduler::ReportSlabUsage() now measures that peak directly, which is
+			// the tool the old numbers did not have.
+			//
+			//     16K x 80 = 1.25 MB     24K x 64 = 1.5 MB
+			//      2K x 128 = 0.25 MB     4K x 256 = 1.0 MB       total ~4.0 MB
+			//
+			// A MIDDLE, DELIBERATELY. IoT wants kilobytes and a cloud service wants gigabytes, and
+			// no single number serves both -- so this targets the 80% that never call SetSlabSizes,
+			// and everyone else profiles with ReportSlabUsage and sets their own. Being wrong low
+			// now prints a warning telling them exactly that; being wrong high silently taxed every
+			// user who never noticed.
+			//
+			// PREFAULT COST FALLS WITH IT. lazy=false means Init() walks and links every slot, so
+			// the old default paid that on 176 MB of pages at startup. This is ~3.8 MB.
+			// 64B GETS THE LARGEST SHARE despite being 15.4%% of the task distribution, and that is not
+			// a contradiction. AllocSized falls through 64 -> 80 -> 128 -> 256, so the 64-byte class is
+			// FIRST CHOICE for everything that fits it -- capture-free tasks, single-capture tasks, and
+			// every TaskNode (56 bytes). The distribution describes what tasks ARE; the fall-through
+			// decides what the class is ASKED FOR, and it is asked for more. Both benches exhaust this
+			// class and no other, which is the measurement that set these numbers.
+			size_t slots256 = 4 * 1024;          // DAG edge chunks, frames >128 B, oversized lambdas
+			size_t slots128 = 2 * 1024;          // larger coroutine frames
+			size_t slots80  = 16 * 1024;         // two-capture lambdas: the common frame-loop task
+			size_t slots64  = 24 * 1024;         // capture-free / single-capture tasks, TaskNodes
 		};
 
 		// PRE-INIT ONLY: the allocator is constructed with these

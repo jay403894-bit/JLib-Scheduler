@@ -35,13 +35,22 @@ int main() {
     // earlier cut of the same release added the 80-byte pool without shrinking the 256-byte one
     // and reserved 360 MB -- a memory regression shipped as a memory optimisation, and a test that
     // pinned only one pool would not have said a word about it.
+    char what[160];
     const JLib::TaskScheduler::SlabSizes def = JLib::TaskScheduler::CurrentSlabSizes();
-    Check(def.slots256 == 1024 * 1024 / 4, "default 256-byte pool is 256K slots (64 MB)");
-    Check(def.slots128 == 1024 * 1024 / 8, "default 128-byte pool is 128K slots (16 MB)");
-    Check(def.slots80  == 1024 * 1024,     "default 80-byte pool is 1M slots (80 MB) -- the primary");
-    Check(def.slots64  == 1024 * 1024 / 4, "default 64-byte pool is 256K slots (16 MB)");
-    Check(def.slots256 * 256 + def.slots128 * 128 + def.slots80 * 80 + def.slots64 * 64
-              == 176u * 1024 * 1024,       "defaults reserve 176 MB in total, down from 256 MB");
+    // RESIZED IN 4.0.1: 176 MB -> ~3.8 MB. The old figure was sized for a world where exhaustion
+    // was FATAL, so the only safe default was one nobody could exhaust. Growth made under-sizing a
+    // hitch instead of a failure, so the default now covers the common case and warns outside it.
+    Check(def.slots256 == 4 * 1024,  "default 256-byte pool is 4K slots (1 MB)");
+    Check(def.slots128 == 2 * 1024,  "default 128-byte pool is 2K slots (0.25 MB)");
+    Check(def.slots80  == 16 * 1024, "default 80-byte pool is 16K slots (1.25 MB) -- the primary");
+    Check(def.slots64  == 24 * 1024, "default 64-byte pool is 24K slots (1.5 MB) -- first choice for anything small");
+    // The TOTAL is pinned too, and that is not redundant: an earlier release added the 80-byte pool
+    // without shrinking the 256-byte one and reserved 360 MB -- a memory regression shipped as a
+    // memory optimisation, which a per-pool check alone would not have caught.
+    const size_t total = def.slots256 * 256 + def.slots128 * 128 + def.slots80 * 80 + def.slots64 * 64;
+    std::snprintf(what, sizeof(what), "defaults reserve at most 4 MB in total, got %.2f MB",
+                  (double)total / (1024.0 * 1024.0));
+    Check(total <= 4u * 1024 * 1024, what);
 
     // Small, and deliberately not a round number, so a coincidental pass against the untouched
     // default is impossible and exhaustion below is cheap to trigger and easy to reason about.
@@ -71,7 +80,6 @@ int main() {
     Check(sched.GetAllocator()->Slot80Capacity() == 37, "80-byte pool got its own configured size");
     Check(sched.GetAllocator()->BigCapacity()   == kSlots, "256-byte pool got its own configured size");
     Check(sched.GetAllocator()->SmallCapacity() == 53, "64-byte pool got its own configured size");
-    char what[128];
     std::snprintf(what, sizeof(what), "allocator capacity is the configured %zu, got %zu",
                   kSlots + 21 + 37 + 53, capacity);
     // Capacity() is the TOTAL across the three pools, because a Task can come from any of
