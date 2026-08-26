@@ -69,7 +69,7 @@ std::atomic<int> g_sink{ 0 };
 void ReaderEBR() {
     long long n = 0;
     while (!g_stop.load(std::memory_order_relaxed)) {
-        for (int i = 0; i < 32; ++i) { JLib::CoroSafeEpochGuard g; g_sink.store(Walk(), std::memory_order_relaxed); }
+        for (int i = 0; i < 32; ++i) { JLib::EpochGuard g; g_sink.store(Walk(), std::memory_order_relaxed); }
         n += 32;
     }
     g_reads.fetch_add(n, std::memory_order_relaxed);

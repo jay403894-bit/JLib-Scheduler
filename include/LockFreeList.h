@@ -256,7 +256,7 @@ namespace JLib {
 		// TaskNode's constructor comment already describes.
 		bool push(T item) {
 			if (!head) return false;   // inert list -- see ok()
-			CoroSafeEpochGuard guard;
+			EpochGuard guard;
 			void* mem = allocator.Alloc();
 			if (!mem) return false;
 			LNode<T>* node = new (mem) LNode<T>(0, item);
@@ -270,7 +270,7 @@ namespace JLib {
 
 		bool add(uint64_t key, T item) {
 			if (!head) return false;   // inert list -- see ok()
-			CoroSafeEpochGuard guard;   // RAII: leaves on every return path
+			EpochGuard guard;   // RAII: leaves on every return path
 			while (true) {
 				Window window = Window::find(head, key);
 				LNode<T>* pred = static_cast<LNode<T>*>(window.pred);
@@ -296,7 +296,7 @@ namespace JLib {
 		}
 		bool remove(uint64_t key) {
 			if (!head) return false;   // inert list -- see ok()
-			CoroSafeEpochGuard guard;   // RAII: leaves on every return path
+			EpochGuard guard;   // RAII: leaves on every return path
 			bool snip = false;
 			while (true) {
 				Window window = Window::find(head, key);
@@ -324,7 +324,7 @@ namespace JLib {
 		void for_each(F func) {
 			if (!head) return;         // inert list -- see ok()
 
-			CoroSafeEpochGuard guard;  // Ensure we are in an epoch for safe traversal
+			EpochGuard guard;  // Ensure we are in an epoch for safe traversal
 			// Start after the sentinel head
 			LNodeBase* curr = head->next.getReference();
 
@@ -343,7 +343,7 @@ namespace JLib {
 		}
 		bool contains(uint64_t key) {
 			if (!head) return false;   // inert list -- see ok()
-			CoroSafeEpochGuard guard;  // Ensure we are in an epoch for safe traversal
+			EpochGuard guard;  // Ensure we are in an epoch for safe traversal
 			LNodeBase* curr = head;
 
 			while (curr != nullptr) {
@@ -359,7 +359,7 @@ namespace JLib {
 			return false;
 		}
 		T* get(uint64_t key) {
-			CoroSafeEpochGuard guard;  // Ensure we are in an epoch for safe traversal
+			EpochGuard guard;  // Ensure we are in an epoch for safe traversal
 			bool marked = false;
 			LNodeBase* curr = head;
 
