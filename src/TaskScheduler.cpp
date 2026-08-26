@@ -186,6 +186,9 @@ TaskScheduler::TaskScheduler(size_t poolSize) {
 static bool g_reserveTimerCore = false;
 
 static bool g_reserveIoCore = false;
+// Cores the APP has claimed for threads of its own. Read only by GetSafeTC, so it matters only
+// before Init -- see SetReservedCores.
+static std::atomic<unsigned> g_reservedUserCores{ 0 };
 
 // EnableIoReactor implies EnableTimers, and the implication is applied HERE rather than checked at
 // the point of use -- so there is one moment where the two are made consistent, and no path that can
@@ -214,6 +217,13 @@ bool TaskScheduler::ReserveTimerCore() noexcept { return TimersEnabled(); }
 void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { EnableIoReactor(reserve); }
 bool TaskScheduler::ReserveIoCore() noexcept { return IoReactorEnabled(); }
 
+void TaskScheduler::SetReservedCores(unsigned n) noexcept {
+	g_reservedUserCores.store(n, std::memory_order_relaxed);
+}
+unsigned TaskScheduler::GetReservedCores() noexcept {
+	return g_reservedUserCores.load(std::memory_order_relaxed);
+}
+
 size_t TaskScheduler::GetSafeTC() {
 	// The AUTO pool size (Init/StartPool with poolSize == 0): hw-1 -- main pins CPU 0, workers pin
 	// CPUs 1..hw-1. HISTORY (don't relive it): this was briefly hw-2 (2026-07-31) because GameInput's
@@ -241,6 +251,15 @@ size_t TaskScheduler::GetSafeTC() {
 	// numbers cannot drift apart -- a pool sized for one thread while four drain the port is the
 	// silent oversubscription the opt-in exists to prevent.
 	if (g_reserveIoCore)    reserved += g_ioCompletionThreads;
+	// AND WHATEVER THE APP RESERVED FOR ITS OWN THREADS. Same census argument as the two above, just
+	// with the count coming from the caller instead of from a feature flag: a thread the scheduler
+	// does not own still occupies a core, and one it does not KNOW about is a core that quietly went
+	// missing. Declaring it here is what keeps workers + main + timer + io + yours an exact fit.
+	//
+	// This is the replacement for PushImmediate. Pinning a pool worker to a blocking subsystem took
+	// a worker out of a WORK-STEALING pool and spilled its queue to everyone else; reserving a core
+	// and running a plain std::thread gets the same accounting with none of the invariants.
+	reserved += g_reservedUserCores.load(std::memory_order_relaxed);
 	if (cores <= reserved) return 1;
 	return static_cast<size_t>(cores - reserved);
 }

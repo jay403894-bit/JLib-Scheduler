@@ -1191,6 +1191,31 @@ namespace JLib {
 		// deadlines" and "do I use async I/O" -- not "how many service threads does the library run",
 		// which is the library's business and has changed twice already.
 		static void SetReserveIoCore(bool reserve) noexcept;
+
+		// RESERVE CORES FOR THREADS THE APP RUNS ITSELF. Set BEFORE Init; read only when the pool
+		// is sized, so setting it afterwards does nothing.
+		//
+		// The general case of SetReserveTimerCore and SetReserveIoCore, which reserve one core for
+		// the timer thread and one per I/O completion thread. Same argument, count from the caller:
+		// a thread the scheduler does not own still occupies a core, and one it does not KNOW about
+		// is a core that quietly went missing. Declaring it keeps workers + main + timer + io + yours
+		// an exact fit instead of oversubscribing by however many the app started.
+		//
+		//     TaskScheduler::SetReservedCores(1);       // I will run an audio mixer myself
+		//     TaskScheduler::Init(0);                   // pool sizes itself around it
+		//     std::thread mixer(RunMixer);              // ...and here it is
+		//
+		// THIS IS THE REPLACEMENT FOR PushImmediate, which pinned a pool worker to a blocking
+		// subsystem: that took a worker out of a WORK-STEALING pool and spilled its queue to
+		// everyone else, and under a hot set that moves it could not even be kept consistent.
+		// Reserving a core and running a plain std::thread buys the same census accounting with
+		// none of the invariants -- the scheduler never owns the thread, so nothing can promote it,
+		// steal from it, or wait on it.
+		//
+		// Only affects the AUTO size (Init(0) / Init with poolSize == 0). An explicit poolSize is
+		// taken as the caller's own arithmetic and is not adjusted.
+		static void     SetReservedCores(unsigned n) noexcept;
+		static unsigned GetReservedCores() noexcept;
 		static bool ReserveIoCore() noexcept;
 
 
