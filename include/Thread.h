@@ -358,18 +358,38 @@ namespace JLib {
     // reclamation respects whichever readers exist. See EpochManager's counted-epoch block and
     // tests/verify/counted_epoch_model.c.
     //
-    // Returns by value into an `auto` at the call site; the two guards are different types and that
-    // is deliberate -- there is nothing a caller should ever want to do with one that is not RAII.
-    class CoroSafeEpochGuard {
+    // ------------------------------------------------------------------------------------------
+    // WHY THIS LIVES IN Thread.h AND NOT NEXT TO THE OTHER TWO GUARDS IN Epochs.h
+    //
+    // It cannot live there. The picking decision needs OnCoroutineTask(), which needs
+    // Thread::GetCurrent() and Task::type -- and Thread.h ALREADY INCLUDES Epochs.h. Moving this
+    // class down would invert that edge: Epochs.h would have to see Thread, which sees Epochs.
+    //
+    // A forward declaration would compile, and it is worse than the split, because it fails in
+    // exactly the wrong direction: the guard would pick correctly only in translation units that
+    // also happened to pull in Thread.h. Every other one would fail to link -- or, if someone
+    // "fixed" that with a fallback definition, would quietly hand a coroutine a borrowed slot,
+    // which is the use-after-free this class exists to prevent. The value of this type is that
+    // there is exactly ONE decision site and it can never be the wrong one.
+    //
+    // SO THE SPLIT IS: Epochs.h owns the two MECHANISMS (SlotEpochGuard, CountedEpochGuard) and
+    // knows nothing about who is running. Thread.h owns the CHOICE, because only Thread.h can see
+    // the caller. Both mechanism definitions in Epochs.h point back here.
+    //
+    // And this one has the plain name deliberately. Callers should essentially never name
+    // SlotEpochGuard or CountedEpochGuard directly; this spelling is the correct one everywhere,
+    // so it gets the obvious name and the two mechanisms get the qualified ones.
+    // ------------------------------------------------------------------------------------------
+    class EpochGuard {
     public:
-        CoroSafeEpochGuard() {
+        EpochGuard() {
             if (OnCoroutineTask() || EpochManager::ForceCountedEpochs()) counted_.emplace();
             else                                                        slotted_.emplace(CurrentEpochSlot());
         }
-        CoroSafeEpochGuard(const CoroSafeEpochGuard&) = delete;
-        CoroSafeEpochGuard& operator=(const CoroSafeEpochGuard&) = delete;
+        EpochGuard(const EpochGuard&) = delete;
+        EpochGuard& operator=(const EpochGuard&) = delete;
     private:
         std::optional<CountedEpochGuard> counted_;
-        std::optional<EpochGuard>        slotted_;
+        std::optional<SlotEpochGuard>    slotted_;
     };
 };

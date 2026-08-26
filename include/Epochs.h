@@ -414,7 +414,10 @@ namespace JLib {
 		// Both reduce to the same thing -- the reader is not bound to whatever you would index by --
 		// and both answer it by counting readers per epoch instead of locating them.
 		//
-		// CoroSafeEpochGuard is the single place this decision is made. Keep it that way.
+		// JLib::EpochGuard -- DEFINED IN Thread.h, not here -- is the single place this decision is
+		// made. Keep it that way. It lives there because picking needs OnCoroutineTask(), which needs
+		// Thread::GetCurrent(), and Thread.h includes THIS header; the reverse edge cannot exist. The
+		// full reasoning is in the block above that class.
 		// ============================================================================================
 		//
 		// The slot scheme above asks WHERE EVERY READER IS and needs one stable slot per reader.
@@ -626,13 +629,30 @@ namespace JLib {
 #define JLIB_EPOCH_CHECK_NO_GUARD_CORO() ((void)0)
 #endif
 
+// ==================================================================================================
+// THE TWO MECHANISMS. NEITHER OF THESE IS THE ONE YOU WANT AT A CALL SITE.
+//
+// >>> USE JLib::EpochGuard, WHICH IS DEFINED IN Thread.h, NOT IN THIS FILE. <<<
+//
+// It is a tiny RAII wrapper that picks between the two below by asking WHO IS RUNNING, and it is
+// the only place that decision is allowed to be made. It lives in Thread.h and not next to these
+// definitions for one hard reason: picking requires OnCoroutineTask() -> Thread::GetCurrent(), and
+// Thread.h already includes Epochs.h. Epochs.h cannot see Thread without a cycle. Forward-declaring
+// it here would compile and then fail silently in any TU that did not also include Thread.h, which
+// is precisely the mistake -- handing a coroutine a borrowed slot -- that the class exists to make
+// impossible. The long version of this argument sits above the class in Thread.h.
+//
+// So: this file owns the mechanisms and knows nothing about the caller. Thread.h owns the choice.
+// Name these two directly only in code that is provably one kind of reader forever (the benchmark
+// that measures one against the other, for instance).
+// ==================================================================================================
+
 // THE COUNTED GUARD -- for a reader with no stable slot, i.e. a coroutine. Announces by
 // incrementing the current epoch's counter rather than by writing a slot, so the protection travels
 // with the token in the coroutine's own frame and survives a suspension and a migration.
 //
-// Use CoroSafeEpochGuard() in Thread.h rather than constructing this directly; it picks between the
-// two mechanisms. Constructing this on a FIBER would work but is pure loss -- a fiber already owns a
-// slot, and a counter is contended where a slot is not.
+// Constructing this on a FIBER would work but is pure loss -- a fiber already owns a slot, and a
+// counter is contended where a slot is not.
 struct CountedEpochGuard {
 	size_t token;
 
@@ -647,17 +667,21 @@ struct CountedEpochGuard {
 	CountedEpochGuard& operator=(const CountedEpochGuard&) = delete;
 };
 
-struct EpochGuard {
+// THE SLOT GUARD -- for a reader that owns a stable slot for the guard's whole life: a fiber, or a
+// bare thread. Two uncontended stores, which is why it stays the default for those. Named
+// SlotEpochGuard, not EpochGuard, because it is a mechanism and not a call-site choice; see the
+// block above, and use JLib::EpochGuard from Thread.h.
+struct SlotEpochGuard {
 	std::atomic<size_t>* slot;
 
-	EpochGuard(std::atomic<size_t>* s) : slot(s) {
+	SlotEpochGuard(std::atomic<size_t>* s) : slot(s) {
 		// Enter: store global epoch
 		slot->store(JLib::EpochManager::Instance().CurrentEpoch(),
 			std::memory_order_release);
 		JLIB_EPOCH_GUARD_ENTER();
 	}
 
-	~EpochGuard() {
+	~SlotEpochGuard() {
 		// Leave: mark as SIZE_MAX.
 		//
 		// NOTE, unstated until now: this stores SIZE_MAX unconditionally rather than restoring the

@@ -66,7 +66,7 @@ static std::atomic<int> g_lost{ 0 };     // protection was gone when we came bac
 // exactly the case being bounded.
 static JLib::Coro Offending(JLib::Future<void> f) {
     {
-        JLib::CoroSafeEpochGuard guard;
+        JLib::EpochGuard guard;
 
         // What we are protecting: everything retired from here on must stay alive until we leave.
         // Sampling MinActiveEpoch is not the check (it is a global minimum) -- it is the value we
@@ -108,7 +108,7 @@ int main() {
         // repeatedly, while the coroutines are parked. Under the slot scheme this is what wipes
         // their announcements.
         for (int i = 0; i < 4096; ++i) {
-            if (auto* t = sched.CreateTask([] { JLib::CoroSafeEpochGuard g; })) sched.Push(t);
+            if (auto* t = sched.CreateTask([] { JLib::EpochGuard g; })) sched.Push(t);
         }
         for (int i = 0; i < 64; ++i) em.Tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -175,7 +175,7 @@ int main() {
         auto* victim = new Victim{ 1 };
 
         // A bare-thread SLOT reader, held open on this thread for the whole section.
-        auto* slotHold = new EpochGuard(JLib::CurrentEpochSlot());
+        auto* slotHold = new SlotEpochGuard(JLib::CurrentEpochSlot());
 
         // A COUNTED reader, parked in a coroutine.
         g_done.store(0);
@@ -219,7 +219,7 @@ int main() {
         struct Victim2 { int x; };
         auto* victim = new Victim2{ 2 };
 
-        auto* slotHold = new EpochGuard(JLib::CurrentEpochSlot());
+        auto* slotHold = new SlotEpochGuard(JLib::CurrentEpochSlot());
 
         g_done.store(0);
         JLib::Promise<void> p;

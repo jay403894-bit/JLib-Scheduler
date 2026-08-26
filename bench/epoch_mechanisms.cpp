@@ -48,7 +48,7 @@ std::atomic<bool>      g_stop{ false };
 void HammerSlots() {
     long long n = 0;
     while (!g_stop.load(std::memory_order_relaxed)) {
-        for (int i = 0; i < 64; ++i) { EpochGuard g(JLib::CurrentEpochSlot()); }
+        for (int i = 0; i < 64; ++i) { SlotEpochGuard g(JLib::CurrentEpochSlot()); }
         n += 64;
     }
     g_guards.fetch_add(n, std::memory_order_relaxed);
