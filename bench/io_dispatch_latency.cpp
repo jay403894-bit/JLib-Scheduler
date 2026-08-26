@@ -478,6 +478,124 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- STEERING: is it cheaper to AVOID a buried hot worker than to STEAL BACK OFF one? -------
+    //
+    // stealHintLane is published by the buried worker so an idle sibling can find it. The completion
+    // thread is choosing placement at that exact moment and was ignoring it -- pushSteered rotates
+    // blind. So the same backlog is discovered twice: once by the producer, who could simply not put
+    // work there, and once by a thief, who pays a probe, a contended CAS against the owner, and a
+    // lost cache line to take it back.
+    //
+    // FOUR ARMS, because "does skipping help" and "does skipping REPLACE stealing" are different
+    // questions and only the 2x2 separates them:
+    //
+    //     lane=off steer=off   neither mechanism -- the floor
+    //     lane=any steer=off   stealing repairs the placement (what ships today)
+    //     lane=off steer=on    the producer avoids it, nobody repairs
+    //     lane=any steer=on    both
+    //
+    // If (off,on) reaches (any,off), the repair was buying what a free load could have. If (any,on)
+    // beats both, they cover different windows -- steering can only act on tasks it is placing NOW,
+    // and nothing it does helps a task already sitting in a buried worker's deque.
+    //
+    // K=1 IS THE A/A CONTROL AND IT IS NOT DECORATION. With one hot worker there is nobody to skip
+    // to, so pushSteered falls back to the plain rotation and the steer arm is bit-identical to the
+    // control. Any K=1 separation is drift, and this project has already read drift as a result once
+    // (2x on exactly these rows, from measuring three arms as three executables).
+    //
+    // == MEASURED 8-25, Sleep policy, 29 workers, median of 3 interleaved reps ==
+    //
+    // READ THE CONTROL FIRST AND IT DISQUALIFIES MOST OF THE TABLE. The 20us rows carry a 77% p50
+    // spread across four identical K=1 arms; nothing under 2x is readable there. The 200us skewed
+    // rows are tight -- 5% at p50, 6% at p90, 9% at p99 -- and those are the only rows below that
+    // are worth reading. This is why the control is swept rather than assumed: the noise floor is
+    // not a property of the harness, it is a property of the ROW.
+    //
+    //   200us, skew 1-in-8            p50      p90      p99
+    //     K=2  neither               92.3    547.2   1120.8
+    //          steer only            73.2    476.6    850.1     p99 -24%
+    //          stealing only         97.1    395.8    689.2     p99 -38%
+    //          both                  79.5    382.5    660.8     p99 -41%
+    //     K=4  neither               33.6    392.4    868.1
+    //          steer only            31.1    280.4    683.7     p90 -29%, p99 -21%
+    //          stealing only         37.8    241.9    485.8     p90 -38%, p99 -44%
+    //          both                  36.4    248.1    458.4     p99 -47%
+    //
+    // THE SKIP IS REAL AND IT IS REDUNDANT. Against nothing it is worth 21-29% at the tail, far
+    // outside that 9% control -- so the producer genuinely was throwing work at a buried worker.
+    // But hot->hot stealing beats it on the same rows, and once stealing is on the skip adds
+    // 4-6%, which is INSIDE the control and therefore not a result.
+    //
+    // WHY THE REPAIR BEATS THE AVOIDANCE, which was not the expected direction: the producer can
+    // only act on the batch in its hand. The tasks that actually make the tail are the ones ALREADY
+    // in the buried worker's deque -- placed before it went dark, and by definition unreachable to
+    // anyone but a thief. Skipping stops the queue growing; stealing empties it. Those are
+    // different windows, and the second one is where the microseconds are.
+    //
+    // So it ships OFF: under the default laneHintMode 4 it buys nothing measurable, and a branch
+    // that buys nothing does not belong on by default. It stays in the tree because it is worth
+    // real time when hot->hot stealing is disabled (mode 0), and because deleting the measurement
+    // along with the code is how the same question gets asked a third time.
+    {
+        const int n = 32, iters = 100;
+        std::printf("\n  steering skip -- producer avoids hot workers advertising a backlog\n");
+        std::printf("    K=1 rows are the A/A control: no sibling to skip to, so both arms are the\n");
+        std::printf("    same code path. Separation there is noise and calibrates the rest.\n");
+        std::printf("      K    burn   skew   lane  steer      p50      p90      p99\n");
+
+        // REPEATED AND MEDIANED, and that is not caution -- a single interleaved pass ALREADY
+        // produced a 2.6x p50 spread across the four K=1 arms, which are the same code path. Arms
+        // adjacent in time is necessary and it is not sufficient; a run that lands on a background
+        // process is still a run. Median of REPS, arms still innermost.
+        constexpr int kReps = 3;
+        constexpr int kArms = 4;                     // (lane off/any) x (steer off/on)
+        const char* armLane[kArms] = { "off", "off", "any", "any" };
+        const char* armSteer[kArms] = { "off", "on",  "off", "on"  };
+
+        for (long long burn : { 20000LL, 200000LL }) {
+          for (int skew : { 0, 8 }) {
+            for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+                if (skew == 0 && burn != 200000LL) continue;
+                std::vector<double> p50[kArms], p90[kArms], p99[kArms];
+
+                for (int rep = 0; rep < kReps; ++rep) {
+                  for (int a = 0; a < kArms; ++a) {
+                    JLib::TaskScheduler::SetLaneHintMode(a < 2 ? 0 : 4);
+                    JLib::TaskScheduler::SetSteerSkip((a & 1) != 0);
+                    JLib::TaskScheduler::SetHotWorkers(k);
+                    g_skewEveryNth = skew;
+                    g_skewBurnNs   = burn;
+
+                    double secs = 0.0;
+                    std::vector<long long> v = SoakRun(n, iters, secs);
+                    if (v.empty()) continue;
+                    const auto pk = [&](double p) {
+                        return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                    };
+                    p50[a].push_back(pk(0.50));
+                    p90[a].push_back(pk(0.90));
+                    p99[a].push_back(pk(0.99));
+                  }
+                }
+
+                const auto med = [](std::vector<double> x) {
+                    if (x.empty()) return -1.0;
+                    std::sort(x.begin(), x.end());
+                    return x[x.size() / 2];
+                };
+                for (int a = 0; a < kArms; ++a)
+                    std::printf("    %3zu  %6.0f  %5d   %4s  %5s  %7.2f  %7.2f  %7.2f\n",
+                                k, burn / 1000.0, skew, armLane[a], armSteer[a],
+                                med(p50[a]), med(p90[a]), med(p99[a]));
+            }
+          }
+        }
+        g_skewEveryNth = 0;
+        JLib::TaskScheduler::SetSteerSkip(false);
+        JLib::TaskScheduler::SetLaneHintMode(4);
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+
     // ---- SKEWED SOAK: is an idle hot worker sitting next to a backlogged one? ------------------
     //
     // THE QUESTION THIS EXISTS TO SETTLE. Hot->hot stealing was removed after measuring 20.6M probes

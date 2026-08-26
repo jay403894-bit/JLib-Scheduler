@@ -356,6 +356,33 @@ namespace JLib {
 		static void SetLaneHintMode(int m) noexcept { laneHintMode.store(m, std::memory_order_relaxed); }
 		static int  GetLaneHintMode() noexcept { return laneHintMode.load(std::memory_order_relaxed); }
 
+		// THE SAME HINT, READ BY A PRODUCER INSTEAD OF A THIEF.
+		//
+		// stealHintLane exists so an idle hot worker can find a buried sibling. But the I/O
+		// completion thread is choosing WHERE TO PUT work at exactly the moment that bit is set, and
+		// it was choosing blind: pushSteered rotates `w = steer++` across the hot set with no idea
+		// that worker w is 200us into a handler. Stealing then has to undo a placement the producer
+		// could simply not have made -- and stealing is the expensive repair (a probe, a contended
+		// CAS against the owner, a lost line) where not-aiming-there is free.
+		//
+		// One atomic load per flush, of a line the producer already shares with the hot set. The
+		// mask, not a per-worker query, so a flush pays for one load rather than K.
+		//
+		// Bit w == worker w (queue index, so PushBatch affinity w+1) is advertising a lane backlog
+		// at or past kLaneStealDepth. Only the first 64 workers can ever be represented; past that
+		// the bit is absent and the worker reads as available, which is the safe direction.
+		static unsigned long long LaneBacklogMask() noexcept {
+			return Instance().stealHintLane.load(std::memory_order_acquire);
+		}
+
+		// Runtime arm for the above, so the dispatch bench interleaves skip-on against skip-off
+		// INSIDE ONE PROCESS. Three separately-built binaries once moved the K=1 rows -- a
+		// configuration where the mechanism provably cannot act -- by 2x, which was machine drift
+		// presented as a result. Never compare arms across builds again.
+		static inline std::atomic<bool> steerSkipOn{ false };
+		static void SetSteerSkip(bool on) noexcept { steerSkipOn.store(on, std::memory_order_relaxed); }
+		static bool GetSteerSkip() noexcept { return steerSkipOn.load(std::memory_order_relaxed); }
+
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
 		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is

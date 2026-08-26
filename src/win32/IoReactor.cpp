@@ -314,17 +314,64 @@ namespace JLib {
                 //
                 // The starting worker still rotates per flush, so a stream of SINGLE completions
                 // spreads across the hot set instead of always hammering worker 1.
+                //
+                // AND SKIP THE ONES THAT ARE ALREADY BURIED, when TaskScheduler::GetSteerSkip() is on.
+                //
+                // The rotation above is blind: it hands worker w a slice whether or not w is 200us
+                // into a handler. Hot->hot stealing exists to repair exactly that, but repair is the
+                // expensive path -- a probe, a contended CAS against the owner, a lost cache line --
+                // and the producer is standing right there holding the task with the answer already
+                // published in stealHintLane. Not aiming at a buried worker is free; taking the task
+                // back off it is not.
+                //
+                // ONE load of the mask per flush, not one query per slice.
+                //
+                // MEASURED 8-25 AND IT SHIPS OFF, because the expected direction was wrong. Against
+                // nothing this is worth 21-29% at p90/p99 on a skewed lane -- the producer really
+                // was aiming at buried workers. But hot->hot STEALING beats it on the same rows
+                // (44% at K=4), and with stealing on this adds 4-6%, inside the control's own noise.
+                //
+                // The reason is that the two cover different windows and stealing has the bigger
+                // one: the producer can only act on the batch in its hand, while the tail is made by
+                // tasks ALREADY sitting in the buried worker's deque, placed before it went dark.
+                // Skipping stops the queue growing; only a thief can empty it.
+                //
+                // See bench/io_dispatch_latency.cpp's steering block for the table and the control.
+                //
+                // If EVERY hot worker is advertising, there is nothing to prefer and this falls back
+                // to the plain rotation rather than spreading across the pool. Spreading would mean
+                // waking a cold worker -- ~90us under the default Sleep policy -- to beat a hot one
+                // that may be about to finish. Ordinary workers already drain a backlogged lane
+                // opportunistically under laneHintMode 4, without anyone paying a wake for it, and
+                // that is the right place for that decision.
                 const std::size_t hotN = TaskScheduler::GetHotWorkers();
                 auto pushSteered = [&](Task** arr, std::size_t n, bool hiPri) {
                     if (!n) return;
                     auto& s = TaskScheduler::Instance();
                     if (hotN == 0) { s.PushBatch(arr, n, 0, 64, hiPri); return; }
 
-                    const std::size_t per = (n + hotN - 1) / hotN;   // ceil, so the last slice is the short one
+                    // Candidate hot workers, by queue index. Bounded by the hint's own width: past
+                    // worker 64 no bit exists, so those are simply always candidates.
+                    constexpr std::size_t kMaxSteer = 64;
+                    std::uint8_t cand[kMaxSteer];
+                    std::size_t  nc = 0;
+                    const std::size_t scanN = (hotN < kMaxSteer) ? hotN : kMaxSteer;
+
+                    if (TaskScheduler::GetSteerSkip()) {
+                        const unsigned long long busy = TaskScheduler::LaneBacklogMask();
+                        for (std::size_t i = 0; i < scanN; ++i)
+                            if (!(busy & (1ull << i))) cand[nc++] = std::uint8_t(i);
+                    }
+                    if (nc == 0)                                  // skip disabled, or all of them buried
+                        for (std::size_t i = 0; i < scanN; ++i) cand[nc++] = std::uint8_t(i);
+
+                    // Slice across the workers actually taking work, not across the whole hot set --
+                    // otherwise skipping one would leave its slice unsent.
+                    const std::size_t per = (n + nc - 1) / nc;   // ceil, so the last slice is the short one
                     std::size_t off = 0, w = steer++;
                     while (off < n) {
                         const std::size_t len = (per < n - off) ? per : (n - off);
-                        s.PushBatch(arr + off, len, std::uint8_t(1 + (w % hotN)), 64, hiPri);
+                        s.PushBatch(arr + off, len, std::uint8_t(1 + cand[w % nc]), 64, hiPri);
                         off += len;
                         ++w;
                     }
