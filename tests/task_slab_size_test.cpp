@@ -211,8 +211,10 @@ int main() {
     JLib::TaskScheduler::ReportSlabUsage("slab usage after this test");
     {
         const auto u = sched.GetAllocator()->UsageProfile();
-        Check(u.c64.highWater > 0 || u.c80.highWater > 0 || u.c256.highWater > 0,
-              "the high-water mark is non-zero after real allocation");
+        // PEAK-LIVE, not resident. Resident is capacity by construction in the default build --
+        // Prefault touches every slot -- so asserting on it would pass without measuring anything.
+        Check(u.c64.peakLive > 0 || u.c80.peakLive > 0 || u.c256.peakLive > 0,
+              "peak live slots is non-zero after real allocation");
         const bool grewSomewhere = u.c64.extents || u.c80.extents || u.c128.extents || u.c256.extents;
         Check(grewSomewhere, "the report identifies the class that had to grow");
         Check(sched.GetAllocator()->HighWaterBytes() > 0, "resident bytes are reported");

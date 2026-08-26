@@ -45,7 +45,14 @@ namespace JLib {
         // the pool because a default member initializer cannot be used by a static data member of
         // the same enclosing class: the initializer is not complete until the class is, which GCC
         // diagnoses and MSVC quietly accepts.
-        struct alignas(platform::kCacheLine) LiveCounter { std::atomic<long long> v{ 0 }; };
+        // Live slots for one shard, plus that shard`s PEAK. The peak is the number worth configuring
+        // against, and it has to be tracked rather than derived: the bump cursor looks like a
+        // high-water mark and is not one in the DEFAULT build, because Prefault links every slot at
+        // construction and leaves the cursor at capacity. It only reads as demand in lazy mode.
+        struct alignas(platform::kCacheLine) LiveCounter {
+            std::atomic<long long> v{ 0 };
+            std::atomic<long long> peak{ 0 };
+        };
 
         // SLAB GROWTH, process-wide and ON by default.
         //
@@ -154,13 +161,25 @@ namespace JLib {
         }
         static void liveAdd(long long d) {
             const LiveRef& r = liveSlot();
+            long long now;
             if (r.exclusive) {
                 // Sole writer: read it, adjust it, put it back. No lock prefix, no line handoff.
-                r.c->v.store(r.c->v.load(std::memory_order_relaxed) + d, std::memory_order_relaxed);
+                now = r.c->v.load(std::memory_order_relaxed) + d;
+                r.c->v.store(now, std::memory_order_relaxed);
             }
             else {
-                r.c->v.fetch_add(d, std::memory_order_relaxed);
+                now = r.c->v.fetch_add(d, std::memory_order_relaxed) + d;
             }
+            // PER-SHARD PEAK, which is the only reason this is affordable. A global peak would need
+            // the shards SUMMED and compared on every allocation -- reintroducing exactly the shared
+            // line the sharding exists to avoid, and that mistake cost 62% in this allocator once.
+            // This is a compare plus a rarely-taken store on a line this thread just dirtied anyway.
+            //
+            // Summing the per-shard peaks OVERESTIMATES the true peak, since two shards need not
+            // peak at the same instant. That is the right direction to be wrong in for sizing, and
+            // it is reported as an upper bound rather than passed off as exact.
+            if (d > 0 && now > r.c->peak.load(std::memory_order_relaxed))
+                r.c->peak.store(now, std::memory_order_relaxed);
         }
 
 
@@ -427,6 +446,17 @@ namespace JLib {
             return n;
         }
         std::size_t HighWaterBytes() const { return HighWaterSlots() * SLOT; }
+
+        // PEAK LIVE SLOTS -- an UPPER BOUND, being the sum of per-shard peaks, which need not have
+        // occurred at the same instant. This is the demand figure to size against; HighWaterSlots is
+        // RESIDENCY, and in the default (non-lazy) build that is capacity by construction because
+        // Prefault touches every slot up front.
+        static long long PeakLive() {
+            long long p = 0;
+            for (std::size_t i = 0; i < kLiveSlots; ++i)
+                p += s_live[i].peak.load(std::memory_order_relaxed);
+            return p;
+        }
 
         // How many times this class had to grow past its configured size. Non-zero means the
         // configuration was too small for the workload -- the pool coped, and paid an allocation.

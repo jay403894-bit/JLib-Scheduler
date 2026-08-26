@@ -230,29 +230,40 @@ void TaskScheduler::ReportSlabUsage(const char* label) {
 	const TaskAllocator::ClassUsage* cs[4] = { &u.c64, &u.c80, &u.c128, &u.c256 };
 
 	std::printf("\n=== %s ===\n", label);
-	std::printf("  class  configured    high-water        live  grown\n");
-	std::size_t hwBytes = 0, capBytes = 0;
+	// THREE DIFFERENT NUMBERS, and conflating them is what made the first version of this report
+	// useless:
+	//   configured  what SetSlabSizes asked for, plus any grown extents
+	//   resident    slots actually touched. In the DEFAULT build this equals capacity, because
+	//               Prefault links every slot at construction -- it only measures demand when the
+	//               pool is lazy. Reported anyway because it is the real memory footprint.
+	//   peak-live   the most slots checked out AT ONCE. THIS is the sizing number, and it is an
+	//               upper bound (a sum of per-shard peaks that need not have coincided).
+	std::printf("  class  configured    resident   peak-live        live  grown\n");
+	std::size_t resBytes = 0, capBytes = 0;
+	long long   peakBytes = 0;
 	for (const auto* c : cs) {
-		hwBytes  += c->highWater * c->slotBytes;
-		capBytes += c->capacity  * c->slotBytes;
-		std::printf("  %4zuB  %10zu  %10zu (%6.1f MB)  %8lld  %5zu\n",
-			c->slotBytes, c->capacity, c->highWater,
-			(double)(c->highWater * c->slotBytes) / (1024.0 * 1024.0),
-			c->live, c->extents);
+		resBytes  += c->resident * c->slotBytes;
+		capBytes  += c->capacity * c->slotBytes;
+		peakBytes += c->peakLive * (long long)c->slotBytes;
+		std::printf("  %4zuB  %10zu  %10zu  %10lld  %8lld  %5zu\n",
+			c->slotBytes, c->capacity, c->resident, c->peakLive, c->live, c->extents);
 	}
-	std::printf("  reserved %.1f MB, actually resident %.1f MB\n",
-		(double)capBytes / (1024.0 * 1024.0), (double)hwBytes / (1024.0 * 1024.0));
+	std::printf("  reserved %.1f MB, resident %.1f MB, peak demand %.2f MB\n",
+		(double)capBytes / (1024.0 * 1024.0),
+		(double)resBytes / (1024.0 * 1024.0),
+		(double)peakBytes / (1024.0 * 1024.0));
 
-	// THE ACTIONABLE LINE, with headroom. The high-water mark is what THIS run needed; sizing to
-	// the exact peak means growing on the first busier frame, which is a hitch the number was
-	// supposed to avoid.
+	// THE ACTIONABLE LINE, and it is built from PEAK-LIVE rather than residency -- residency in a
+	// non-lazy build is just the number you already configured, so suggesting from it would hand
+	// back the input. Headroom because the peak is what THIS run needed, and sizing to the exact
+	// peak means growing on the first busier frame -- the hitch the number exists to avoid.
 	std::printf("  suggested (measured peak +50%%):\n");
 	std::printf("    JLib::TaskScheduler::SlabSizes s;\n");
 	std::printf("    s.slots64 = %zu; s.slots80 = %zu; s.slots128 = %zu; s.slots256 = %zu;\n",
-		u.c64.highWater  + u.c64.highWater  / 2 + 64,
-		u.c80.highWater  + u.c80.highWater  / 2 + 64,
-		u.c128.highWater + u.c128.highWater / 2 + 64,
-		u.c256.highWater + u.c256.highWater / 2 + 64);
+		(std::size_t)(u.c64.peakLive  + u.c64.peakLive  / 2) + 64,
+		(std::size_t)(u.c80.peakLive  + u.c80.peakLive  / 2) + 64,
+		(std::size_t)(u.c128.peakLive + u.c128.peakLive / 2) + 64,
+		(std::size_t)(u.c256.peakLive + u.c256.peakLive / 2) + 64);
 	std::printf("    JLib::TaskScheduler::SetSlabSizes(s);   // before Init()\n");
 
 	for (const auto* c : cs)

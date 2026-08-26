@@ -219,7 +219,8 @@ namespace JLib {
         struct ClassUsage {
             std::size_t slotBytes;
             std::size_t capacity;      // slots configured (plus any grown extents)
-            std::size_t highWater;     // slots ever made resident -- SIZE TO THIS
+            std::size_t resident;      // slots made resident (== capacity unless the pool is lazy)
+            long long   peakLive;      // SIZE TO THIS -- upper bound on concurrent demand
             long long   live;          // checked out right now
             std::size_t extents;       // times this class had to grow; non-zero = under-configured
         };
@@ -227,10 +228,10 @@ namespace JLib {
 
         Usage UsageProfile() const {
             return Usage{
-                { 64,  pool64.Capacity(),  pool64.HighWaterSlots(),  pool64.LiveCount(),  pool64.ExtentCount()  },
-                { 80,  pool80.Capacity(),  pool80.HighWaterSlots(),  pool80.LiveCount(),  pool80.ExtentCount()  },
-                { 128, pool128.Capacity(), pool128.HighWaterSlots(), pool128.LiveCount(), pool128.ExtentCount() },
-                { 256, pool256.Capacity(), pool256.HighWaterSlots(), pool256.LiveCount(), pool256.ExtentCount() },
+                { 64,  pool64.Capacity(),  pool64.HighWaterSlots(),  SlabPool<SMALL_SLOT>::PeakLive(), pool64.LiveCount(),  pool64.ExtentCount()  },
+                { 80,  pool80.Capacity(),  pool80.HighWaterSlots(),  SlabPool<SLOT80>::PeakLive(),     pool80.LiveCount(),  pool80.ExtentCount()  },
+                { 128, pool128.Capacity(), pool128.HighWaterSlots(), SlabPool<MID_SLOT>::PeakLive(),   pool128.LiveCount(), pool128.ExtentCount() },
+                { 256, pool256.Capacity(), pool256.HighWaterSlots(), SlabPool<SLOT>::PeakLive(),       pool256.LiveCount(), pool256.ExtentCount() },
             };
         }
 

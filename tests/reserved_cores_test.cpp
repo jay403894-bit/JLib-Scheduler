@@ -80,6 +80,14 @@ int main() {
     sched.WaitFor(wg);
     Check(ran.load() == 64, "the reduced pool still runs work");
 
+    // A DEFAULT-SIZED pool that was never starved, so these high-water marks are a real profile
+    // rather than "every class hit its ceiling" -- which is all the slab-size test can show, since
+    // that one deliberately exhausts every class in turn.
+    //
+    // PRINTED, NOT ASSERTED. The numbers depend on what this binary happened to run; pinning them
+    // would be asserting the test rather than the code.
+    JLib::TaskScheduler::ReportSlabUsage("slab usage, default pool");
+
     sched.Join();
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
