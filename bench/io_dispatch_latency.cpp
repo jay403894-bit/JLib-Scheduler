@@ -546,8 +546,11 @@ int main(int argc, char** argv) {
         std::printf("\n  lane wakes -- a buried hot worker pulls parked workers up to steal\n");
         std::printf("    Sleep policy. wake=0 is today's behaviour (mode 4 inert while parked).\n");
         std::printf("    K=1 is NOT a control here: one hot worker can bury itself, so wakes fire.\n");
+        // probes/s = remote deque touches. A hint held LONGER is a hint thieves keep acting on, so
+        // this is the one cost of widening the gap that the latency columns would not surface.
         if (JLib::kLaneWakeStatsEnabled)
-            std::printf("      K    burn   skew   wake  clear      p50      p90      p99   edges/s  wakes/s   core%%\n");
+            std::printf("      K    burn   skew   wake  clear      p50      p90      p99   edges/s  wakes/s   core%%%s\n",
+                        JLib::kStealStatsEnabled ? "    probes/s" : "");
         else
             std::printf("      K    burn   skew   wake  clear      p50      p90      p99\n");
 
@@ -589,8 +592,38 @@ int main(int argc, char** argv) {
         // wake=0 rows vary the gap with the wake path off, and they are flat in all four
         // configurations -- 487/490/484 at K=1 200us, 25.7/25.6/25.1 at K=4 20us. No regression.
         //
-        // clear=0 wins nearly every row. The default stays 3 pending a decision, since it is a
-        // change to a hint that ships ON.
+        // == THE PROBE COST, added 8-26, and it decides the default ==
+        //
+        // A bit held longer is a bit thieves keep acting on, and that is the one cost latency alone
+        // would not surface -- remote deque touches are exactly the quantity the lane split exists to
+        // reduce. Counted per arm:
+        //
+        //   probes/s              clear 3    clear 1    clear 0
+        //     K=4  20us  wake=0     90625     166347     183750     2.0x
+        //     K=4 200us  wake=0     30312      62510      77837     2.6x
+        //     K=1 200us  wake=2     77173      88904      95272     1.2x
+        //
+        // THE wake=0 ROWS SETTLE IT. There the gap doubles probes and buys NOTHING -- latency is
+        // flat across all three (64.0/89.2/65.9 p50 at K=4 200us, inside its own noise). So in the
+        // SHIPPED configuration, where lane wakes are off, widening the hint is pure cost.
+        //
+        // The two knobs are therefore COUPLED and should be set together, not independently:
+        //
+        //     wake = 0   ->  clear = 3    widening pays for probes and gets nothing back
+        //     wake > 0   ->  clear = 0    the probe rise is 1.2-1.5x and the latency win is large
+        //
+        // which is why laneClearDepth's default stays 3: it is the correct partner for the wake
+        // default of 0. Enabling one without the other is the misconfiguration to warn about.
+        //
+        // THE FULL STACK, K=1, 200us burials, against the shipped default:
+        //
+        //     wake=0 clear=3    p50 510.60   p90 942.60   p99 1334.70
+        //     wake=2 clear=0    p50  57.70   p90 247.80   p99  449.00
+        //                           8.8x         3.8x          3.0x
+        //
+        // for an upper-bound 100% of one core in wakes, against NoSleep's 29 cores spinning. That is
+        // the original hypothesis -- NoSleep-like lane behaviour without the NoSleep tax -- and on
+        // this workload it holds by a factor of about thirty.
         //
         // THE wake=0 ROWS ARE NOT PADDING. The hint bit is read by thieves as well as by the wake
         // path, so widening it changes hot->hot stealing too -- a mechanism that is default ON and
@@ -602,7 +635,7 @@ int main(int argc, char** argv) {
 
         for (long long burn : { 20000LL, 200000LL }) {
           for (std::size_t k : { (std::size_t)1, (std::size_t)4 }) {
-            std::vector<double> p50[kNW], p90[kNW], p99[kNW], eps[kNW], wps[kNW];
+            std::vector<double> p50[kNW], p90[kNW], p99[kNW], eps[kNW], wps[kNW], prb[kNW];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNW; ++a) {
                 JLib::TaskScheduler::SetLaneHintMode(4);      // the wake is a no-op under any other
@@ -613,6 +646,8 @@ int main(int argc, char** argv) {
                 g_skewEveryNth = 8;
                 g_skewBurnNs   = burn;
                 JLib::LaneWakeStatsReset();
+                JLib::StealStatsReset();   // a bit held longer means thieves PROBE longer -- the one cost
+                                           // of widening the gap that latency alone would not surface
 
                 double secs = 0.0;
                 std::vector<long long> v = SoakRun(n, iters, secs);
@@ -625,6 +660,9 @@ int main(int argc, char** argv) {
                 long long ed = 0, nf = 0;
                 JLib::LaneWakeStatsRead(ed, nf);
                 if (secs > 0.0) { eps[a].push_back(ed / secs); wps[a].push_back(nf / secs); }
+                long long pr = 0, ht = 0;
+                JLib::StealStatsRead(pr, ht);
+                if (secs > 0.0) prb[a].push_back(pr / secs);
               }
             }
             const auto med = [](std::vector<double> x) {
@@ -643,6 +681,7 @@ int main(int argc, char** argv) {
                     // i.e. 2900% -- because that is what decides whether this is a bargain.
                     const double w = med(wps[a]);
                     std::printf("  %8.0f %8.0f  %6.2f", med(eps[a]), w, w * 90e-6 * 100.0);
+                    if (JLib::kStealStatsEnabled) std::printf("  %10.0f", med(prb[a]));
                 }
                 std::printf("\n");
             }

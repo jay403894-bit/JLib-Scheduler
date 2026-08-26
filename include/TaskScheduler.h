@@ -423,6 +423,24 @@ namespace JLib {
 		// behaviour before hysteresis existed. Lower it to open the gap. It is a runtime knob and
 		// not a constant so the arms interleave INSIDE one process -- comparing them as two builds is
 		// how a 1.8x drift on a control arm got read as a result twice in two days.
+		//
+		// SET IT WITH SetLaneWake, NOT INDEPENDENTLY. The two are coupled, and measurement 8-26 says
+		// the wrong pairing is strictly worse than either default:
+		//
+		//     wake = 0  ->  clear = 3   widening doubles steal probes and buys nothing, because
+		//                               there is no woken helper for the wider window to serve
+		//     wake > 0  ->  clear = 0   probes rise 1.2-1.5x and p50 falls by up to 3.5x
+		//
+		// WHY THE GAP ONLY PAYS ALONGSIDE WAKES. The bit is a PERMISSION: an ordinary worker may
+		// touch the lane only while LaneStealable holds. A wake takes ~90us to land, and at clear=3
+		// the owner has usually drained below kLaneStealDepth by then -- so the helper that was
+		// summoned arrives to find itself no longer allowed to help, parks again, and delivered
+		// nothing for the price of a wake. The gap keeps the permission alive long enough for the
+		// helper to arrive. With no wakes there is nobody arriving, so all the wider window does is
+		// keep thieves probing.
+		//
+		// The recommended pair for a latency-sensitive lane on one hot core:
+		//     SetHotWorkers(1); SetLaneWake(2); SetLaneClearDepth(0);
 		static inline std::atomic<int> laneClearDepth{ 3 };
 		static void SetLaneClearDepth(int d) noexcept { laneClearDepth.store(d, std::memory_order_relaxed); }
 		static int  GetLaneClearDepth() noexcept { return laneClearDepth.load(std::memory_order_relaxed); }
