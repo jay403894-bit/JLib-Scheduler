@@ -693,6 +693,64 @@ int main(int argc, char** argv) {
         JLib::TaskScheduler::SetHotWorkers(hot);
     }
 
+    // ---- DYNAMIC K: does it reach static-maxK latency without paying for maxK? ------------------
+    //
+    // THE ONLY QUESTION WORTH ASKING OF IT. A controller that reaches K=4's latency is pointless if
+    // it just sits at 4 -- that is static 4 with extra machinery. It earns its keep only if it
+    // reaches that latency under load AND gives the cores back when the lane is quiet.
+    //
+    // So the arms are the static rungs it is supposed to climb between, plus the controller itself:
+    // if dynamic(1,4) lands on the K=4 row it is working, if it lands on the K=1 row it never
+    // ramped, and anywhere between says how fast it climbs relative to how long the load lasts.
+    {
+        const int n = 32, iters = 100;
+        std::printf("\n  dynamic K -- against the static rungs it climbs between\n");
+        std::printf("    dyn should sit near the K=4 row under load; K=1 means it never ramped.\n");
+        std::printf("      arm        burn   skew      p50      p90      p99   endK\n");
+
+        constexpr int kReps = 3;
+        const char* names[] = { "K=1", "K=2", "K=4", "dyn1-4" };
+        constexpr int kNA = 4;
+
+        for (long long burn : { 20000LL, 200000LL }) {
+            std::vector<double> p50[kNA], p90[kNA], p99[kNA], endK[kNA];
+            for (int rep = 0; rep < kReps; ++rep) {
+              for (int a = 0; a < kNA; ++a) {
+                JLib::TaskScheduler::SetLaneHintMode(4);
+                JLib::TaskScheduler::SetSteerSkip(false);
+                JLib::TaskScheduler::SetLaneWake(0);
+                JLib::TaskScheduler::SetLaneClearDepth(3);
+                if (a < 3) JLib::TaskScheduler::SetHotWorkers(a == 0 ? 1 : (a == 1 ? 2 : 4));
+                else     { JLib::TaskScheduler::SetHotWorkers(1);
+                           JLib::TaskScheduler::SetHotWorkerRange(1, 4); }
+                g_skewEveryNth = 8;
+                g_skewBurnNs   = burn;
+
+                double secs = 0.0;
+                std::vector<long long> v = SoakRun(n, iters, secs);
+                endK[a].push_back((double)JLib::TaskScheduler::GetHotWorkers());
+                JLib::TaskScheduler::SetHotWorkers(1);   // collapse the range before the next arm
+                if (v.empty()) continue;
+                const auto pk = [&](double p) {
+                    return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                };
+                p50[a].push_back(pk(0.50)); p90[a].push_back(pk(0.90)); p99[a].push_back(pk(0.99));
+              }
+            }
+            const auto med = [](std::vector<double> x) {
+                if (x.empty()) return -1.0;
+                std::sort(x.begin(), x.end());
+                return x[x.size() / 2];
+            };
+            for (int a = 0; a < kNA; ++a)
+                std::printf("      %-8s  %5.0f  %5d  %7.2f  %7.2f  %7.2f  %5.1f\n",
+                            names[a], burn / 1000.0, 8,
+                            med(p50[a]), med(p90[a]), med(p99[a]), med(endK[a]));
+        }
+        g_skewEveryNth = 0;
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+
     // ---- THE UPPER EDGE: can a LOWER set threshold harvest the residual imbalance? --------------
     //
     // THE LEAD COMES FROM THE OCCUPANCY WITNESS, not from a hunch. At K=4 with hot->hot stealing on
