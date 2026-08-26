@@ -121,7 +121,20 @@ namespace JLib {
         //
         // Small pool is checked first: Tasks and TaskNodes are the common case and both fit
         // the 64-byte class, so the common path is a single range check.
-        void  Free(void* slot)            { if (!FreeSized(slot)) pool256.Free(slot); }
+        // THE ONE DISPOSAL FUNNEL. FreeSized routes by ADDRESS and returns false for a pointer no
+        // pool owns -- which since 4.0.1 is a real case, not an impossible one: a task whose body is
+        // larger than the biggest slot, or one allocated while the slab was exhausted, comes from
+        // the global heap exactly as an oversized coroutine frame does (see detail::FrameAlloc).
+        //
+        // THE OLD FALLBACK WAS pool256.Free(slot), and it was a corruption waiting for a caller.
+        // FreeSized already tests pool256, so reaching the fallback means the pointer belongs to NO
+        // pool -- and handing that to pool256's free list would have spliced foreign memory into it.
+        // Unreachable while every task fit in a slot; reachable the moment one did not.
+        //
+        // ::operator delete, NOT `delete task`: Task::operator delete exists only because a virtual
+        // destructor requires it and asserts if ever called. The destructor is run by the caller
+        // (DestroyTask); this releases the storage.
+        void  Free(void* slot)            { if (!FreeSized(slot)) ::operator delete(slot); }
         bool  SlotInSlab(const void* p) const { return pool256.SlotInSlab(p); }
         long long LiveCount() const       { return pool256.LiveCount(); }
         // TOTAL across all three pools, because that is what bounds how many Tasks can exist:

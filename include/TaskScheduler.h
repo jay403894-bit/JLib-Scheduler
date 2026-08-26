@@ -1300,7 +1300,15 @@ namespace JLib {
 		template<typename F>
 		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
-			static_assert(sizeof(L) <= TaskAllocator::SLOT, "lambda too big for a slot");
+			// NO SIZE CEILING, as of 4.0.1. A capture larger than the biggest slot used to be a
+			// COMPILE ERROR, which made the task path stricter than the coroutine path for no reason
+			// anyone could defend: a coroutine frame over 256 bytes has always fallen back to the
+			// global heap (detail::FrameAlloc), and a lambda body is the same kind of object with
+			// the same lifetime -- allocated once, destroyed exactly once, through a handle the
+			// scheduler owns. The only difference was that one of them was allowed to be big.
+			//
+			// The slab stays the fast path and the overwhelmingly common one; this only removes a
+			// wall. Disposal needs no size flag because TaskAllocator::Free routes by ADDRESS.
 			// Concrete size is a compile-time constant here, which is also why size-classing the
 			// task path would be nearly free: the class could be picked at compile time.
 			detail::RecordTaskSize(sizeof(L));
@@ -1309,7 +1317,12 @@ namespace JLib {
 			// sizeof(L) is a compile-time constant, so the class is chosen at compile time and is correct
 			// for ANY capture size -- a big lambda still lands in the 256-byte class. Nothing here
 			// depends on knowing the size distribution in advance.
+			// AllocSized returns null for two different reasons and both end up here: the body does
+			// not fit any class, or every class that would fit is exhausted. Neither is a reason to
+			// fail a task the caller has already written -- the heap is slower, not wrong, and a
+			// task that runs late beats one that never runs.
 			void* mem = taskAllocator.AllocSized(sizeof(L));
+			if (!mem) mem = ::operator new(sizeof(L));
 			if (!mem) return static_cast<L*>(nullptr);
 			L* t = ::new (mem) L(std::forward<F>(f));
  			t->hiPri = hipri;

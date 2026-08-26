@@ -790,7 +790,10 @@ void Thread::Worker() {
 
 					scheduler->CleanupTaskMetadata(task_to_run);
 					DestroyTask(task_to_run);
-					scheduler->GetAllocator()->FreeSized(task_to_run);
+					// Free(), not FreeSized(): FreeSized reports failure by RETURNING false, and a task
+					// whose body did not fit a slot lives on the heap. Free() is the funnel that routes
+					// both. Ignoring the bool here leaked such a task.
+					scheduler->GetAllocator()->Free(task_to_run);
 				}
 				else {
 					// Coroutine: the task may already be freed, so nothing below may touch it.
@@ -894,7 +897,8 @@ void Thread::Worker() {
 
 				scheduler->CleanupTaskMetadata(task_to_run);
 				DestroyTask(task_to_run);
-				scheduler->GetAllocator()->FreeSized(task_to_run);
+				// Free(), not FreeSized() -- see the Native path above.
+				scheduler->GetAllocator()->Free(task_to_run);
 
 				// No core release here: the is_handling_fork clear below this whole block covers the
 				// fiber path for PushImmediate. The isForked clear that used to sit here went with

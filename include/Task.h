@@ -323,7 +323,12 @@ namespace JLib {
     class alignas(16) LambdaTask : public Task {
         F func;
     public:
-        static_assert(sizeof(F) <= (256 - sizeof(Task)), "LambdaTask exceeds 256-byte slab capacity");
+        // NO SIZE CEILING as of 4.0.1. This used to be a static_assert, and it was the SECOND copy
+        // of the same rule -- CreateTask carried one too -- which is why removing that one alone did
+        // not lift the limit. A body larger than the biggest slot now falls back to the global heap,
+        // exactly as an oversized coroutine frame always has (detail::FrameAlloc), and disposal needs
+        // no flag because TaskAllocator::Free routes by ADDRESS.
+        static_assert(alignof(F) <= 16, "LambdaTask capture is over-aligned for a slab slot");
         // NOTE: F here is the CLASS template parameter, which CreateTask has already run through
         // std::decay_t. So this is a plain rvalue reference, NOT a forwarding reference, and it
         // accepts temporaries only. That is why a NAMED callable used to fail to compile:

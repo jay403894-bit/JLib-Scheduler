@@ -15,6 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 static int failures = 0;
 static void Check(bool ok, const char* what) {
@@ -99,9 +102,70 @@ int main() {
     Check(allocated <= capacity, what);
     Check(allocated > 0, "at least one task was allocated before exhaustion");
 
-    // No manual cleanup of `held` -- these were never pushed, so nothing but memory is owned, and
-    // the process exits immediately after. DestroyTask() is not public API for a standalone task
-    // like this, so nothing here relies on finding it.
+    for (auto* t : held) sched.GetAllocator()->Free(t);
+    held.clear();
+
+    // ============================================================================================
+    // A LAMBDA BIGGER THAN THE BIGGEST SLOT. Until 4.0.1 this was a static_assert -- a COMPILE
+    // error -- which made the task path stricter than the coroutine path for no defensible reason:
+    // an oversized coroutine frame has always fallen back to the global heap. This section only
+    // exists because it could not previously be written.
+    //
+    // THE DESTRUCTOR COUNT IS THE POINT, not that it runs. A heap task that is freed into a slab
+    // pool, or freed twice, or never freed, all still "run" -- so the assertion is on the capture's
+    // destructor firing EXACTLY once, which separates all three.
+    {
+        // CONSTRUCTIONS == DESTRUCTIONS, not a predicted count. The first version of this asserted
+        // "exactly two" and saw three -- correctly, because [big, &ran] copies into the closure and
+        // the closure is then copied into LambdaTask. Predicting the copy count makes the test
+        // fragile against an unrelated change; the invariant that actually matters is that nothing
+        // leaked and nothing was destroyed twice, and that is a balance, not a number.
+        struct Tracked {
+            // ATOMIC, and this is not pedantry: the task copy is destroyed on a WORKER thread while
+            // the assertion reads on main. With plain ints the read is a data race and the main
+            // thread may simply never observe the increment -- which reads as "3 built, 2 destroyed",
+            // i.e. indistinguishable from a genuine leak. That flaked ~50%% here and cost a real
+            // hunt through three disposal sites before a probe using atomics came back balanced 12
+            // times out of 12.
+            static std::atomic<int>& Ctors() { static std::atomic<int> c{ 0 }; return c; }
+            static std::atomic<int>& Dtors() { static std::atomic<int> d{ 0 }; return d; }
+            char        ballast[512];   // forces sizeof(LambdaTask<...>) well past SLOT (256)
+            Tracked()                 { ballast[0] = 1; Ctors().fetch_add(1); }
+            Tracked(const Tracked& o) { ballast[0] = o.ballast[0]; Ctors().fetch_add(1); }
+            ~Tracked()                { Dtors().fetch_add(1); }
+        };
+        Tracked::Ctors().store(0);
+        Tracked::Dtors().store(0);
+
+        std::atomic<int> ran{ 0 };
+        JLib::WaitGroup wg;
+        wg.n.store(1, std::memory_order_relaxed);
+        {
+            Tracked big;
+            auto* t = sched.CreateTask([big, &ran]() {
+                (void)big.ballast[0];
+                ran.fetch_add(1, std::memory_order_relaxed);
+            });
+            Check(t != nullptr, "a lambda larger than the biggest slot can be created at all");
+            if (t) { t->waitGroup = &wg; sched.Push(t); sched.WaitFor(wg); }
+            else   { wg.n.store(0, std::memory_order_relaxed); }
+        }
+
+        Check(ran.load() == 1, "the oversized task actually ran");
+        // One for the local `big`, one for the copy captured into the task body. More means a double
+        // free ran the destructor twice; fewer means the task body was never destroyed.
+        // WAIT FOR THE BALANCE, do not sample it. The WaitGroup is signalled BEFORE the worker
+        // destroys and frees the task, so reading the counters the instant WaitFor returns catches
+        // the gap and reports "3 built, 2 destroyed" -- a race in the TEST, seen 1 run in 6. A
+        // bounded wait cannot mask a real leak: a leaked copy never balances, so it still fails.
+        for (int i = 0; i < 2000 && Tracked::Dtors().load() != Tracked::Ctors().load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::snprintf(what, sizeof(what),
+                      "every captured copy is destroyed exactly once: %d built, %d destroyed",
+                      Tracked::Ctors().load(), Tracked::Dtors().load());
+        Check(Tracked::Ctors().load() > 0 && Tracked::Ctors().load() == Tracked::Dtors().load(), what);
+    }
+
     sched.Join();
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
