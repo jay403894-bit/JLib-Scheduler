@@ -85,6 +85,12 @@ int main() {
     // not at exactly kSlots -- the bound below is deliberately loose for that reason. What it rules
     // out is the wiring silently reverting to the old 1M-slot default: with that bug, none of these
     // 137 attempts would ever fail, and `allocated` would land at 137, well over kSlots.
+    // GROWTH OFF FOR THIS SECTION, and turning it off is what keeps the section meaningful. With
+    // growth on (the default) CreateTask never returns null, so every one of these attempts succeeds
+    // and the check below passes while testing NOTHING -- the third vacuous shape this file has
+    // produced. A ceiling that moves cannot be asserted, so the ceiling is pinned first.
+    JLib::TaskScheduler::SetSlabGrowth(false);
+
     std::vector<JLib::Task*> held;
     size_t allocated = 0;
     for (size_t i = 0; i < kSlots + 100; ++i) {
@@ -104,6 +110,36 @@ int main() {
 
     for (auto* t : held) sched.GetAllocator()->Free(t);
     held.clear();
+
+    // ============================================================================================
+    // AND THE OTHER HALF: with growth ON -- the default -- the same loop must NOT fail. This is the
+    // point of the feature, so it gets its own assertion rather than being inferred from the
+    // section above passing. Exhaustion becomes a hitch (one allocation, one warning on stderr)
+    // instead of a null return that strands whatever the caller was trying to schedule.
+    //
+    // The bound is well past the pinned capacity of 148, so reaching it can only mean the pool grew.
+    JLib::TaskScheduler::SetSlabGrowth(true);
+    Check(JLib::TaskScheduler::SlabGrowthEnabled(), "growth reports itself enabled");
+    {
+        std::vector<JLib::Task*> grown;
+        size_t got = 0;
+        for (size_t i = 0; i < capacity + 500; ++i) {
+            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+            if (!t) break;
+            grown.push_back(t);
+            ++got;
+        }
+        std::snprintf(what, sizeof(what),
+                      "with growth ON, allocation continues past the configured %zu -- got %zu",
+                      capacity, got);
+        Check(got > capacity, what);
+        // Every one of those must free correctly, which is the real risk of growth: a slot from an
+        // EXTENT has to route home by address just as a primary-block slot does. If SlotInSlab did
+        // not walk the extent chain, these would fall through to ::operator delete on slab memory.
+        for (auto* t : grown) sched.GetAllocator()->Free(t);
+        Check(sched.GetAllocator()->Capacity() > capacity,
+              "Capacity() reports the grown total, not the configured one");
+    }
 
     // ============================================================================================
     // A LAMBDA BIGGER THAN THE BIGGEST SLOT. Until 4.0.1 this was a static_assert -- a COMPILE

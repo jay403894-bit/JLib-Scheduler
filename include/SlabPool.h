@@ -46,6 +46,17 @@ namespace JLib {
         // the same enclosing class: the initializer is not complete until the class is, which GCC
         // diagnoses and MSVC quietly accepts.
         struct alignas(platform::kCacheLine) LiveCounter { std::atomic<long long> v{ 0 }; };
+
+        // SLAB GROWTH, process-wide and ON by default.
+        //
+        // Default ON because the alternative to growing is FAILING, and a task that runs late beats
+        // one that never runs. Off is still a legitimate choice -- a fixed-footprint build that
+        // would rather find out at test time that it under-sized a class, and the exhaustion test
+        // itself, which cannot assert a ceiling that moves.
+        inline std::atomic<bool>& SlabGrowthEnabled() {
+            static std::atomic<bool> on{ true };
+            return on;
+        }
     }
 
     // A fixed-slot-size slab with a per-thread free-list cache, a shared overflow pool, and lazy
@@ -88,6 +99,32 @@ namespace JLib {
         // needed. Resident cost becomes proportional to PEAK LIVE slots instead of capacity.
         std::unique_ptr<Block[]> mem;
         std::size_t memSlots = 0;
+
+        // ---- GROWTH: exhaustion becomes a hitch, not a failure ------------------------------
+        //
+        // "No allocations at runtime" was always a PERFORMANCE rule, and a performance rule that
+        // converts into a crash at its boundary is the wrong rule. A game that runs out of slab
+        // should stutter once, not die. Everything below is for correctness, not speed -- the
+        // primary block stays the fast path and an extent is only ever touched after it is full.
+        //
+        // APPEND-ONLY, AND NEVER FREED BEFORE THE POOL IS. That is what lets SlotInSlab walk the
+        // chain with no lock and no reclamation scheme: a node, once published, is immutable and
+        // outlives every pointer that could be tested against it. Growth itself happens under mtx
+        // (refill already holds it), so there is exactly one writer.
+        //
+        // The cost in the common case is ONE null check on a line nobody writes.
+        struct Extent {
+            std::unique_ptr<Block[]> mem;
+            std::size_t              slots    = 0;
+            std::size_t              bumpNext = 0;
+            std::atomic<Extent*>     next{ nullptr };
+        };
+        std::atomic<Extent*> extents{ nullptr };
+        // Fixed-size growth rather than doubling: the point is a SMALL hitch, repeated if need be,
+        // not one big stall. 4096 slots is 320 KB in the 80-byte class -- a page fault storm nobody
+        // notices, against a doubling of a 1M-slot pool which would be 40 MB in one go.
+        static constexpr std::size_t kGrowSlots = 4096;
+        bool grewOnce = false;      // guarded by mtx; drives the one-time developer warning
         // Index of the first slot never yet handed out. Everything below it has been through the
         // free list at least once; everything at or above it has never been touched. Guarded by mtx.
         std::size_t bumpNext = 0;
@@ -259,7 +296,16 @@ namespace JLib {
             if (!lazy) Prefault(slots);
         }
 
-        ~SlabPool() { LiveInstances().fetch_sub(1, std::memory_order_relaxed); }
+        ~SlabPool() {
+            // Extents are append-only and never freed while the pool lives -- which is what makes the
+            // lock-free walk in SlotInSlab safe -- so this is the one place they are released.
+            for (Extent* e = extents.exchange(nullptr, std::memory_order_acquire); e; ) {
+                Extent* nx = e->next.load(std::memory_order_relaxed);
+                delete e;
+                e = nx;
+            }
+            LiveInstances().fetch_sub(1, std::memory_order_relaxed);
+        }
 
         SlabPool(const SlabPool&) = delete;
         SlabPool& operator=(const SlabPool&) = delete;
@@ -275,11 +321,22 @@ namespace JLib {
         // Also the basis for routing a pointer to the right size class on free: separate backing
         // allocations cannot overlap, so at most one pool claims any given address.
         bool SlotInSlab(const void* p) const {
-            if (!mem) return false;
-            const std::byte* base = reinterpret_cast<const std::byte*>(mem.get());
-            const std::byte* q    = reinterpret_cast<const std::byte*>(p);
-            if (q < base || q >= base + (std::size_t)memSlots * SLOT) return false;
-            return ((std::size_t)(q - base) % SLOT) == 0;   // a slot START, not an interior byte
+            const std::byte* q = reinterpret_cast<const std::byte*>(p);
+            if (mem) {
+                const std::byte* base = reinterpret_cast<const std::byte*>(mem.get());
+                if (q >= base && q < base + (std::size_t)memSlots * SLOT)
+                    return ((std::size_t)(q - base) % SLOT) == 0;  // a slot START, not an interior byte
+            }
+            // EXTENTS SECOND, and usually not at all -- the load below is a null check on a line
+            // nobody writes once the pool has stopped growing. Walking is safe without a lock
+            // because the list is append-only and nodes outlive the pool's users.
+            for (Extent* e = extents.load(std::memory_order_acquire); e;
+                 e = e->next.load(std::memory_order_acquire)) {
+                const std::byte* base = reinterpret_cast<const std::byte*>(e->mem.get());
+                if (q >= base && q < base + (std::size_t)e->slots * SLOT)
+                    return ((std::size_t)(q - base) % SLOT) == 0;
+            }
+            return false;
         }
 
         void* Alloc() {                        // lock-free unless the cache is empty
@@ -343,7 +400,15 @@ namespace JLib {
                 n += s_live[i].v.load(std::memory_order_relaxed);
             return n;
         }
-        std::size_t Capacity() const { return memSlots; }
+        // INCLUDES GROWN EXTENTS, because a caller asking "how big is this pool" after it grew wants
+        // the truth rather than the configured figure. A test that needs the FIXED ceiling should
+        // turn growth off (detail::SlabGrowthEnabled) rather than read a number that lies.
+        std::size_t Capacity() const {
+            std::size_t n = memSlots;
+            for (Extent* e = extents.load(std::memory_order_acquire); e;
+                 e = e->next.load(std::memory_order_acquire)) n += e->slots;
+            return n;
+        }
 
         // Print what the counters saw. Call after the workload, not during -- it reads relaxed
         // shards while other threads may still be running, so it is a smear across a short window
@@ -472,7 +537,63 @@ namespace JLib {
                     bumpNext += take;
                     moved += take;
                 }
+
+                // 3. STILL NOTHING: nothing recycled and the primary block is fully bumped. Grow
+                //    rather than fail. This is the whole point -- a hitch instead of a crash.
+                //
+                //    Existing extents are bumped before a new one is cut, so repeated exhaustion
+                //    does not allocate a block per refill.
+                if (moved == 0 && detail::SlabGrowthEnabled().load(std::memory_order_relaxed)) {
+                    Extent* e = extents.load(std::memory_order_acquire);
+                    while (e && e->bumpNext >= e->slots) e = e->next.load(std::memory_order_acquire);
+
+                    if (!e) {
+                        // WARN ONCE, to stderr, and say what to change. This is for a developer
+                        // profiling a build, not a user: growing is CORRECT, it is merely slower
+                        // than having been sized right, and the fix is a number at Init.
+                        if (!grewOnce) {
+                            grewOnce = true;
+                            std::fprintf(stderr,
+                                "[JLib::Scheduler] slab class %zu exhausted (%zu slots) -- growing by "
+                                "%zu. This is safe but costs an allocation; raise this class in "
+                                "TaskScheduler::SetSlabSizes() before Init() to avoid it.\n",
+                                (std::size_t)SLOT, memSlots, kGrowSlots);
+                        }
+                        auto* fresh = new (std::nothrow) Extent();
+                        if (fresh) {
+                            fresh->mem.reset(new (std::nothrow) Block[kGrowSlots]);
+                            if (!fresh->mem) { delete fresh; fresh = nullptr; }
+                        }
+                        // Out of real memory: return empty-handed exactly as before. Growth removes
+                        // a self-imposed ceiling, not the machine's.
+                        if (!fresh) goto refill_done;
+                        fresh->slots = kGrowSlots;
+
+                        // Published LAST, after the node is fully built, so a concurrent SlotInSlab
+                        // walker never sees a node with a null mem. Only one writer (under mtx), so
+                        // a plain exchange of the head is enough.
+                        fresh->next.store(extents.load(std::memory_order_relaxed),
+                                          std::memory_order_relaxed);
+                        extents.store(fresh, std::memory_order_release);
+                        e = fresh;
+                    }
+
+                    std::size_t take = BATCH;
+                    if (take > e->slots - e->bumpNext) take = e->slots - e->bumpNext;
+                    for (std::size_t k = 0; k < take; ++k) {
+                        void* slot = &e->mem[e->bumpNext + k];
+                        next(slot) = batchHead;
+                        if (!batchHead) batchTail = slot;
+                        batchHead = slot;
+#ifdef JLIBSCHED_ALLOC_CANARY
+                        StampCanary(slot);
+#endif
+                    }
+                    e->bumpNext += take;
+                    moved += take;
+                }
             }
+        refill_done:
             if (!batchHead) return;                 // recycled list empty AND capacity exhausted
             // Thread-local from here -- batchTail's chain is ours alone now.
             next(batchTail) = c.head;

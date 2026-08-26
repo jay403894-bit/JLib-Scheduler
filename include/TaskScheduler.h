@@ -1098,6 +1098,22 @@ namespace JLib {
 		// `small` and `mid` for the peak number of coroutine frames live at once, which is bounded by
 		// how many you actually spawn, not by anything the library controls.
 		static void SetSlabSizes(const SlabSizes& sizes);
+
+		// SLAB GROWTH -- process-wide, ON by default, safe to call at any time.
+		//
+		// When a size class runs out, the pool allocates another extent instead of returning null.
+		// That is a CORRECTNESS choice rather than a performance one: the alternative is a task that
+		// never runs. "No allocations at runtime" was always a PERFORMANCE rule, and a performance
+		// rule that turns into a crash at its own boundary is the wrong rule -- a game that exhausts
+		// the slab should stutter once, not die.
+		//
+		// The cost is one allocation plus a one-time warning on stderr naming the class and its
+		// size, so a developer profiling a build can size it properly at Init. Users never see it.
+		//
+		// Turn it OFF for a fixed-footprint build that would rather fail loudly, or for a test that
+		// needs to assert a ceiling -- a ceiling that moves cannot be asserted.
+		static void SetSlabGrowth(bool on) noexcept;
+		static bool SlabGrowthEnabled() noexcept;
 		static SlabSizes CurrentSlabSizes();
 
 		// ---- OPTIONAL SERVICE LAYERS ------------------------------------------------------------

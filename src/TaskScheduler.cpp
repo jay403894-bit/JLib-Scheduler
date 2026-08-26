@@ -2527,6 +2527,13 @@ bool TaskScheduler::LazyTaskSlabEnabled()    { return g_lazyTaskSlab; }
 // like it worked. A removed symbol is a compile error at every call site, which is exactly the
 // review this change wants; a shim would have silently left two pools at defaults.
 static JLib::TaskScheduler::SlabSizes g_slabSizes{};
+void TaskScheduler::SetSlabGrowth(bool on) noexcept {
+	detail::SlabGrowthEnabled().store(on, std::memory_order_relaxed);
+}
+bool TaskScheduler::SlabGrowthEnabled() noexcept {
+	return detail::SlabGrowthEnabled().load(std::memory_order_relaxed);
+}
+
 void TaskScheduler::SetSlabSizes(const SlabSizes& s) { g_slabSizes = s; }
 JLib::TaskScheduler::SlabSizes TaskScheduler::CurrentSlabSizes() { return g_slabSizes; }
 
