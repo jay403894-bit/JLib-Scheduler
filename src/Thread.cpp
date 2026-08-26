@@ -4,6 +4,8 @@
 #include "../include/Thread.h"
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
+#include "../include/Timer.h"   // MonotonicNs -- lane occupancy stamps
+#include <cassert>
 #include <chrono>
 #include <iostream>
 #include <cstring>   // std::memset -- MSVC pulls this in transitively, libstdc++ does not
@@ -454,6 +456,11 @@ void Thread::Worker() {
 	// starts life after a K change does not treat its own startup as a transition.
 	unsigned long long hotGenSeen = TaskScheduler::GetHotGeneration();
 	bool hotChangePending = false;
+	// Did this worker execute a LANE task on the previous pass? The occupancy numerator. A worker
+	// busy bit is the wrong thing here: general help and pure spin must read as not-lane-busy, or
+	// demotion never fires.
+	bool ranLaneTaskLastPass = false;
+	long long laneStartNs = 0;
 	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
 	// on a genuine change. Meaningless unless hotPriorityRaised.
 	bool atCriticalPriority = false;
@@ -502,19 +509,34 @@ void Thread::Worker() {
 				const size_t laneDepth = scheduler->hiPri[qIndex]->size();
 				scheduler->UpdateLaneHint((size_t)qIndex, laneDepth);
 
-				// DUTY CYCLE, sampled by the worker being measured. See Thread.h: the central-sampler
-				// version gathered one or two samples per window under a light load, because its
-				// density depended on some other worker's loop rate. Here it scales with this
-				// worker's own loop, which is the thing the ratio is about.
+				// ---- DUTY CYCLE, and both halves of it were wrong once ------------------------
 				//
-				// 1-in-16 because the answer is a RATIO -- every sixteenth pass estimates it just as
-				// well as every pass, at a sixteenth of the cost, and both counters are on lines this
-				// worker already owns.
-				if ((++laneDutyTick & 0xF) == 0) {
-					laneCyclesTotal.fetch_add(1, std::memory_order_relaxed);
-					if (laneDepth != 0 || !scheduler->hiPriInboxes[qIndex]->empty())
-						laneCyclesBusy.fetch_add(1, std::memory_order_relaxed);
-				}
+				// COUNTED BY THE WORKER BEING MEASURED. The central-sampler version polled the top
+				// worker from ONE driver worker's loop and gathered one or two samples per window
+				// under light load, because its density depended on a third party's loop rate.
+				//
+				// EVERY PASS, NOT 1-IN-16. The pass RATE is inversely related to how busy a worker
+				// is -- one pass per task when working, millions per second when spinning -- so any
+				// per-pass divisor starves the sample count of exactly the state being detected.
+				// 256 tasks yielded 16 samples, under the minimum, so the controller never decided.
+				//
+				// BUSY MEANS "RAN A TASK", NOT "HAS A QUEUE", and that distinction is what the
+				// dispatch bench caught. A hot worker that is perfectly keeping up drains each
+				// completion the pass it arrives, so its deque is empty at almost every sample --
+				// fully utilised and reading as idle. Queue depth measures BACKLOG, which is what
+				// stealHintLane is already for; utilisation is what decides whether a core is
+				// earning its keep. The flag is set after the search, so this counts the PREVIOUS
+				// pass, which is the only point at which the answer is known.
+				laneCyclesTotal.fetch_add(1, std::memory_order_relaxed);
+			}
+			// CLOSED OUTSIDE THE HOT GUARD, and that is not tidiness. Inside it, a worker demoted
+			// between setting the flag and reading it keeps the flag set until it is promoted again
+			// -- and then books the ENTIRE INTERVENING GAP as lane time. Observed directly: 8.1
+			// SECONDS of occupancy inside a 200 ms window, which is how the bug announced itself
+			// rather than quietly inflating K. The stamp is closed wherever the worker next passes.
+			if (ranLaneTaskLastPass) {
+				laneBusyNs.fetch_add(MonotonicNs() - laneStartNs, std::memory_order_relaxed);
+				ranLaneTaskLastPass = false;
 			}
 			// ---- RETIRING A BIT LEFT BEHIND BY A DEMOTION -----------------------------------
 			//
@@ -610,6 +632,18 @@ void Thread::Worker() {
 		laneWake.store(false, std::memory_order_seq_cst);
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
+			// LANE OCCUPANCY, read on the next pass. One site, and it is the one place the loop
+			// knows the answer -- see the duty-cycle block above.
+			//
+			// task->hiPri, NOT "a task ran". A hot worker that helps with ordinary work is not
+			// occupied by the LANE, and counting it as such is the "any work on that thread" metric
+			// that never demotes: the core looks busy while the deadline path it was provisioned
+			// for is empty. K exists for the deadline path, so the numerator has to be the deadline
+			// path.
+			if (task_to_run->hiPri != 0 && isHotWorker) {
+				laneStartNs = MonotonicNs();
+				ranLaneTaskLastPass = true;
+			}
 			// CANCELLATION, OBSERVED AT PICKUP. One flag in the scope; every task carrying a token
 			// to it reads the new value the next time it is touched, and this is one of those
 			// points. Nothing was removed from any queue to make this work -- which is exactly why
@@ -858,6 +892,20 @@ void Thread::Worker() {
 
 			if (EpochManager::Instance().ShouldSelfReclaim()) {
 				EpochManager::Instance().Tick();
+			}
+
+			// CLOSE THE LANE STAMP WHERE THE TASK ENDS, which is the only place the interval is
+			// actually over. Closing it at the top of the next pass instead banks everything between
+			// task-end and next-pass-top as lane time -- and if the worker parks in that gap, its
+			// entire sleep. Measured with that bug present: a 6%-duty trickle reported 78-99%
+			// occupancy and windows stretched from 10 ms to ~300 ms, so nothing ever demoted.
+			//
+			// The top-of-pass and pre-park closes remain, because this branch has `continue`
+			// escapes that leave without reaching here. Those are backstops; this is the normal
+			// path, and after it the stamp is provably shut.
+			if (ranLaneTaskLastPass) {
+				laneBusyNs.fetch_add(MonotonicNs() - laneStartNs, std::memory_order_relaxed);
+				ranLaneTaskLastPass = false;
 			}
 
 			task_to_run = nullptr;
@@ -1513,6 +1561,24 @@ void Thread::Worker() {
 				if (!running.load(std::memory_order_acquire)) break;
 				continue;   // work landed while deciding: go search for it instead of parking
 			}
+
+			// CLOSE THE LANE STAMP BEFORE PARKING. Occupancy is closed at the top of the next pass,
+			// and a worker that runs a lane task and then sleeps does not HAVE a next pass until
+			// somebody wakes it -- so the delta would bank its entire sleep as lane time. Measured
+			// before this line existed: a 6%-duty trickle reported 78% occupancy, with windows
+			// stretched from 10 ms to ~300 ms, and K never came back down.
+			//
+			// Two close sites and no more: the top of a pass, and here. Both are points the worker
+			// provably reaches with a stamp open.
+			if (ranLaneTaskLastPass) {
+				laneBusyNs.fetch_add(MonotonicNs() - laneStartNs, std::memory_order_relaxed);
+				ranLaneTaskLastPass = false;
+			}
+			// THE INVARIANT, asserted rather than trusted: no lane stamp may be open across a park.
+			// Every regression of this bug looks the same from outside -- occupancy reads far above
+			// true duty and K stops demoting -- and that symptom is several inferential steps from
+			// the cause. This turns it into a stop at the exact line.
+			assert(!ranLaneTaskLastPass && "a lane occupancy stamp was left open across a park");
 
 			std::unique_lock<std::mutex> lock(workerMutex);
 			int expectedGoing = WS_GOING_TO_SLEEP;

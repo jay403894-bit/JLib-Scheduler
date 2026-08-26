@@ -617,6 +617,11 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// is a predicate input, added for lane wakes and carried through the GenMC model with its own
 	// negative control. Reusing it costs no new proof: "come up and look again" is exactly what it
 	// means, and a promoted worker that comes up and looks will find itself hot and spin.
+	// GUARDED, because this setter is legal BEFORE Init -- which is the documented way to configure
+	// K, and is what every bench and most apps actually do. There is no pool to notify then, and no
+	// need for one: a worker created later reads its hot status on its first pass. Missing this
+	// guard segfaulted the dispatch bench before its first line of output.
+	if (!instance) return;
 	for (size_t i = prev; i < eff && i < instance->workers.size(); ++i) {
 		instance->workers[i]->MarkLaneWake();
 		instance->workers[i]->NotifyWorker(/*force*/ true);
@@ -629,16 +634,18 @@ unsigned long long TaskScheduler::GetHotGeneration() { return g_hotGeneration.lo
 // See the SetHotScaling block in TaskScheduler.h for the design; this is only the mechanism.
 static std::atomic<long long> g_lastHotChangeNs{ 0 };
 // Duty-cycle window for the MARGINAL hot worker -- see the down branch of MaybeAdjustHotWorkers.
-static std::atomic<unsigned>  g_topSamples{ 0 };
-static std::atomic<unsigned>  g_topBusy{ 0 };
 static std::atomic<long long> g_windowStartNs{ 0 };
-static std::atomic<long long> g_saturatedSinceNs{ 0 };
-static constexpr unsigned     kMinTopSamples = 32;
+static constexpr unsigned     kMinTopSamples = 16;
+// Consecutive low-occupancy windows before a demote. Promote reacts in one; demote waits for three,
+// because being late to shed costs a spinning core and being late to add costs latency continuously.
+static constexpr unsigned     kLowWindowsToDemote = 3;
+static std::atomic<unsigned>  g_lowWindows{ 0 };
 
 // Up fast, down slow, and the asymmetry is the anti-thrash. A saturated lane loses latency every
 // microsecond it stays saturated; an idle hot worker loses only a spinning core, which is the cost
 // K-hot already accepts by design. Cheap to be late going down, expensive to be wrong.
-static constexpr long long kHotUpIntervalNs   =   2'000'000;   // 2 ms
+static constexpr long long kHotUpIntervalNs   =   2000000;     // 2 ms between changes
+static constexpr long long kHotWindowNs       =  10000000;     // 10 ms of evidence per decision
 static constexpr long long kHotDownIntervalNs = 200'000'000;   // 200 ms of sustained quiet
 
 void TaskScheduler::SetHotWorkerRange(size_t minK, size_t maxK) noexcept {
@@ -669,84 +676,90 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	const size_t k = GetHotWorkers();
 	if (k == 0) return;   // no lane exists, so there is nothing to observe -- see SetHotWorkerRange
 
-	// THE MASK IS NOT DEFENSIVE. Bits above k-1 survive a previous, higher K -- nothing clears a
-	// hint for a worker that stopped being hot except that worker's own threshold path, which no
-	// longer runs for it. Without the mask a stale bit reads as live evidence and ramps on it.
+	// ONE MEASUREMENT SERVES BOTH DIRECTIONS: the fraction of its own passes on which each hot
+	// worker had lane work queued. A worker keeping up has an empty deque most of the time; a worker
+	// that cannot keep up always has something in it. So the duty cycle IS the saturation signal,
+	// and asking it per worker removes the thing that broke both earlier attempts.
+	//
+	// WHY NOT popcount(stealHintLane) == K, which is where this started. That is an INSTANT AND
+	// across every hot worker, and both failure modes came from that shape:
+	//   - taken instantaneously it fires on a BURST -- at K=1, one worker briefly holding four items
+	//     is not a shortfall, and K oscillated (below its peak on 5 samples of 160).
+	//   - required to hold CONTINUOUSLY it becomes unreachable as K grows, because K workers being
+	//     simultaneously buried for milliseconds on end is rare under round-robin steering. Measured:
+	//     the climb stalled at K=2 and the dispatch bench landed on the K=2 row instead of K=4.
+	// A duty cycle is neither: it accumulates evidence rather than demanding coincidence.
+	//
+	// THE CLOCK BOUNDS HOW OFTEN WE DECIDE, not how often we sample -- the samples are gathered by
+	// the workers themselves, which is the fix for a measurement whose density used to depend on
+	// whoever happened to be polling.
+	const long long now = MonotonicNs();
+	const long long ws  = g_windowStartNs.load(std::memory_order_relaxed);
+	if (ws == 0) { g_windowStartNs.store(now, std::memory_order_relaxed); return; }
+	if (now - ws < kHotWindowNs) return;
+	g_windowStartNs.store(now, std::memory_order_relaxed);
+
+	// The BACKLOG half of the up signal, alongside the occupancy half. Masked to the live hot set:
+	// bits above k-1 survive a previous, higher K, because nothing clears a hint for a worker that
+	// stopped being hot, and an unmasked read takes a stale bit as live evidence.
 	const unsigned long long mask = (k >= 64) ? ~0ull : ((1ull << k) - 1);
 	const unsigned long long adv  = instance->stealHintLane.load(std::memory_order_acquire) & mask;
 
-	// THE CLOCK IS READ LAST, and only when the state might actually cause a move. The common case
-	// by far is "busy, keeping up" -- neither saturated nor quiet -- and that path now costs one
-	// relaxed load and two compares. This matters because the caller is sampled off a hot worker's
-	// pass counter, so it runs often.
-	const bool saturated = (adv == mask);
-	if (saturated && k >= hi) return;       // already at the ceiling: nothing to decide
-	if (!saturated && k <= lo) return;      // already at the floor
+	// Read and reset every hot worker's window. Cheap: K is small, and these are relaxed counters on
+	// lines their owners write and nobody else reads between windows.
+	// OCCUPANCY IS A FRACTION OF WALL TIME, and the denominator is the window itself -- no per-pass
+	// counter is involved, which is what makes it invariant to how fast any worker happens to loop.
+	const long long windowNs = now - ws;
+	if (windowNs <= 0) return;
 
-	const long long now  = MonotonicNs();
+	unsigned minTotal = ~0u;
+	long long minBusyNs = 0, topBusyNs = 0;
+	for (size_t i = 0; i < k && i < instance->workers.size(); ++i) {
+		Thread* w = instance->workers[i].get();
+		const unsigned  t  = w->laneCyclesTotal.exchange(0, std::memory_order_relaxed);
+		const long long ns = w->laneBusyNs.exchange(0, std::memory_order_relaxed);
+		if (t < minTotal) minTotal = t;
+		if (i == k - 1) topBusyNs = ns;
+		if (i == 0 || ns < minBusyNs) minBusyNs = ns;
+	}
+
+	// Not enough evidence. A window in which some hot worker barely looped says the pool was busy
+	// elsewhere, not that the lane was saturated or idle, and deciding on it is reading noise.
+	if (minTotal == ~0u || minTotal < kMinTopSamples) return;
+
 	const long long last = g_lastHotChangeNs.load(std::memory_order_relaxed);
 
-	if (saturated) {                        // EVERY hot worker buried: capacity, which K fixes
-		g_windowStartNs.store(now, std::memory_order_relaxed);
-
-		// SUSTAINED, NOT INSTANTANEOUS -- and the difference is not pedantry, it decides whether the
-		// controller settles or oscillates. "Every hot worker holds at least kLaneStealDepth" is a
-		// weak test at small K: at K=1 it means ONE worker briefly had four items, which is what a
-		// burst looks like, not what being out of capacity looks like. Measured before this clause
-		// existed: under a light trickle of six-task bursts, K shed the surplus core and the very
-		// next burst re-added it, leaving it below its peak on 5 samples out of 160.
-		//
-		// The interval was already here as a RATE LIMIT on changes, which is a different thing and
-		// does not help -- it bounds how often you may act, not whether the condition was real. So
-		// saturation now has to hold continuously for the same interval before it counts, which a
-		// burst that drains in a few hundred microseconds cannot do and a genuine shortfall does
-		// trivially. Symmetric with the duty cycle on the way down.
-		const long long satSince = g_saturatedSinceNs.load(std::memory_order_relaxed);
-		if (satSince == 0) { g_saturatedSinceNs.store(now, std::memory_order_relaxed); return; }
-		if (now - satSince >= kHotUpIntervalNs && now - last >= kHotUpIntervalNs) {
-			SetHotWorkersEffective(k + 1);
-			g_lastHotChangeNs.store(now, std::memory_order_relaxed);
-			g_saturatedSinceNs.store(0, std::memory_order_relaxed);
-		}
+	// UP: even the LEAST loaded hot worker had lane work almost all the time. That is capacity, and
+	// it is the only thing another core fixes. Using the minimum rather than the mean is deliberate:
+	// a mean can be carried by one buried worker while its siblings idle, which is an imbalance
+	// problem that stealing already handles and that a larger K would not.
+	// AND a non-empty lane. Occupancy alone can read high on a worker that is merely being handed
+	// work steadily; adding "somebody is actually backed up" is what separates a busy lane that is
+	// keeping up from one that is not, and a larger K only helps the second.
+	if (k < hi
+	    && minBusyNs * 10 >= windowNs * 7              // every hot worker >= 70%% lane-occupied
+	    && adv != 0
+	    && now - last >= kHotUpIntervalNs) {
+		g_lowWindows.store(0, std::memory_order_relaxed);
+		SetHotWorkersEffective(k + 1);
+		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
 		return;
 	}
-	g_saturatedSinceNs.store(0, std::memory_order_relaxed);   // the run of saturation is over
 
-	// ---- DOWN: IS THE LAST CORE I ADDED EARNING ITS KEEP? --------------------------------------
-	//
-	// THE PREVIOUS SIGNAL WAS "SUSTAINED SILENCE", AND IT WAS WRONG. Any single hot worker
-	// advertising anywhere reset the accumulator, and transient backlogs fire thousands of times a
-	// second under load. A program with constant I/O never falls silent -- it merely stops being
-	// SATURATED -- so the window could never complete, K ratcheted to maxK and stayed, and dynamic K
-	// degenerated into static maxK with extra machinery. Reproduced before it was fixed: ramped to
-	// 2, then held 2 through 2.5 s of light trickle, twelve times the down interval.
-	//
-	// The right question is not about the lane as a whole. It is about the MARGINAL core -- the one
-	// added last, at index k-1. If that specific worker is mostly empty it is not paying for itself
-	// and should go back, whether or not the rest of the lane is busy.
-	//
-	// A SAMPLED DUTY CYCLE, not an instant test and not a continuous timer. An instant test thrashes
-	// on the gap between two items. A continuous-idle timer has the exact defect being fixed here,
-	// because round-robin steering hands the top worker an item now and then and each one would
-	// restart the clock. COUNTING means transients dilute instead of resetting: the core has to be
-	// busy on a quarter of samples to keep its place, which a needed core manages easily and a
-	// surplus one does not.
-	// The window is a TIME bound on how often we DECIDE; the samples inside it are gathered by the
-	// top worker on its own loop, so their count no longer depends on how often this runs.
-	const long long ws = g_windowStartNs.load(std::memory_order_relaxed);
-	if (ws == 0) { g_windowStartNs.store(now, std::memory_order_relaxed); return; }
-	if (now - ws < kHotDownIntervalNs) return;
-	g_windowStartNs.store(now, std::memory_order_relaxed);
+	// DOWN: is the LAST core added earning its keep? Half, per the rule that a core idle more than
+	// half the time is not paying for a core. Slower than up by an order of magnitude, because being
+	// late to shed costs only a spinning core while being late to add costs latency continuously.
+	// SEVERAL WINDOWS, not one. A single low window is the gap between two bursts; a core that is
+	// genuinely surplus is low in all of them. Counting consecutive windows rather than widening the
+	// window keeps the UP path's reaction time short -- one evidence stream serves both directions,
+	// and only the down side has to be patient.
+	const bool low = topBusyNs * 5 < windowNs;      // the marginal core under 20%% lane-occupied
+	unsigned lows = 0;
+	if (low) lows = g_lowWindows.fetch_add(1, std::memory_order_relaxed) + 1;
+	else     g_lowWindows.store(0, std::memory_order_relaxed);
 
-	Thread* topWorker = instance->workers[k - 1].get();
-	const unsigned samples = topWorker->laneCyclesTotal.exchange(0, std::memory_order_relaxed);
-	const unsigned busy    = topWorker->laneCyclesBusy.exchange(0, std::memory_order_relaxed);
-
-	// Enough samples to mean anything. A window that gathered only a handful says the controller was
-	// rarely reached, not that the top core was idle, and acting on it would be reading noise.
-	if (samples < kMinTopSamples) return;
-	// HALF, not a quarter. A core that is idle more than half the time is not earning a core.
-	if (busy * 2 < samples && now - last >= kHotDownIntervalNs) {
+	if (k > lo && lows >= kLowWindowsToDemote && now - last >= kHotDownIntervalNs) {
+		g_lowWindows.store(0, std::memory_order_relaxed);
 		SetHotWorkersEffective(k - 1);
 		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
 	}

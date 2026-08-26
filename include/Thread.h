@@ -379,6 +379,11 @@ namespace JLib {
     public:
         std::atomic<unsigned> laneCyclesTotal{ 0 };
         std::atomic<unsigned> laneCyclesBusy{ 0 };
+        // Nanoseconds spent executing LANE tasks. Time, not passes: the loop alternates an execute
+        // pass with a search pass, so a fully occupied worker tops out at exactly 50%% of passes --
+        // measured as 32/64, 18/36, 14/28, structurally rather than statistically. A pass is not a
+        // unit of time, so the ratio it produces is not an occupancy.
+        std::atomic<long long> laneBusyNs{ 0 };
     private:
 
         // Worker sleep state, so a push can skip the wake entirely when this worker is already
