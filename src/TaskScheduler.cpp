@@ -694,16 +694,43 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// the workers themselves, which is the fix for a measurement whose density used to depend on
 	// whoever happened to be polling.
 	const long long now = MonotonicNs();
-	const long long ws  = g_windowStartNs.load(std::memory_order_relaxed);
+
+	// Masked to the live hot set: bits above k-1 survive a previous, higher K, because nothing
+	// clears a hint for a worker that stopped being hot, and an unmasked read takes a stale bit as
+	// live evidence.
+	const unsigned long long mask = (k >= 64) ? ~0ull : ((1ull << k) - 1);
+	const unsigned long long adv  = instance->stealHintLane.load(std::memory_order_acquire) & mask;
+
+	// ================== PROMOTE IS EVENT-DRIVEN AND RUNS BEFORE THE WINDOW GATE ==================
+	//
+	// THE TWO DIRECTIONS DO NOT SHARE A WINDOW, and making them share one was the mistake. The
+	// ratchet-to-maxK was a DEMOTE failure -- nothing ever gave a core back -- and it got "fixed" by
+	// making PROMOTE wait for sustained evidence. Wrong lever, and the bench charged for it: p50
+	// went from 41.50 to 173.10 against static K=4's 75.30, because the climb spent most of each
+	// burst at K=1 or 2 waiting for windows that were themselves stretched.
+	//
+	// Once demotion is correct, promotion has no reason to be cautious. The costs are asymmetric and
+	// they point opposite ways: a slightly early promote costs ONE CORE FOR A FEW MILLISECONDS, and
+	// it is taken back automatically by the occupancy test below. A late promote costs every
+	// completion in the burst a full park latency. So: instant evidence to TAKE a core, sustained
+	// evidence to RETURN one.
+	//
+	// This fires from UpdateLaneHint's set edge -- the moment the last unadvertised hot worker
+	// becomes buried -- which is precisely when adv == mask can first become true. The rate limit is
+	// the only brake, and it is what keeps a burst from adding four cores at once while still
+	// allowing 1 -> 4 in a few milliseconds.
+	if (k < hi && adv == mask && now - g_lastHotChangeNs.load(std::memory_order_relaxed) >= kHotUpIntervalNs) {
+		g_lowWindows.store(0, std::memory_order_relaxed);
+		SetHotWorkersEffective(k + 1);
+		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
+		return;
+	}
+
+	// ---- everything below is the SLOW path: occupancy over a full window, for demotion ----------
+	const long long ws = g_windowStartNs.load(std::memory_order_relaxed);
 	if (ws == 0) { g_windowStartNs.store(now, std::memory_order_relaxed); return; }
 	if (now - ws < kHotWindowNs) return;
 	g_windowStartNs.store(now, std::memory_order_relaxed);
-
-	// The BACKLOG half of the up signal, alongside the occupancy half. Masked to the live hot set:
-	// bits above k-1 survive a previous, higher K, because nothing clears a hint for a worker that
-	// stopped being hot, and an unmasked read takes a stale bit as live evidence.
-	const unsigned long long mask = (k >= 64) ? ~0ull : ((1ull << k) - 1);
-	const unsigned long long adv  = instance->stealHintLane.load(std::memory_order_acquire) & mask;
 
 	// Read and reset every hot worker's window. Cheap: K is small, and these are relaxed counters on
 	// lines their owners write and nobody else reads between windows.
@@ -729,15 +756,15 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 
 	const long long last = g_lastHotChangeNs.load(std::memory_order_relaxed);
 
-	// UP: even the LEAST loaded hot worker had lane work almost all the time. That is capacity, and
-	// it is the only thing another core fixes. Using the minimum rather than the mean is deliberate:
-	// a mean can be carried by one buried worker while its siblings idle, which is an imbalance
-	// problem that stealing already handles and that a larger K would not.
-	// AND a non-empty lane. Occupancy alone can read high on a worker that is merely being handed
-	// work steadily; adding "somebody is actually backed up" is what separates a busy lane that is
-	// keeping up from one that is not, and a larger K only helps the second.
+	// A SECOND, SLOWER WAY UP, for the load that never trips the edge above. adv == mask requires
+	// every hot worker to be past kLaneStealDepth AT ONE INSTANT; a lane that is fully occupied but
+	// shallow -- completions arriving exactly as fast as they are served -- is saturated without
+	// ever looking backed up. Occupancy sees that, and it is the only signal that does.
+	//
+	// Deliberately AND-ed with adv != 0: occupancy alone reads high on a worker being handed work
+	// steadily and keeping up perfectly, which needs no extra core.
 	if (k < hi
-	    && minBusyNs * 10 >= windowNs * 7              // every hot worker >= 70%% lane-occupied
+	    && minBusyNs * 10 >= windowNs * 7              // every hot worker >= 70% lane-occupied
 	    && adv != 0
 	    && now - last >= kHotUpIntervalNs) {
 		g_lowWindows.store(0, std::memory_order_relaxed);
