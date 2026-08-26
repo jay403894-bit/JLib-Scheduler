@@ -702,6 +702,29 @@ int main(int argc, char** argv) {
     // So the arms are the static rungs it is supposed to climb between, plus the controller itself:
     // if dynamic(1,4) lands on the K=4 row it is working, if it lands on the K=1 row it never
     // ramped, and anywhere between says how fast it climbs relative to how long the load lasts.
+    //
+    // == MEASURED 8-26, Sleep policy, 29 workers, median of 3 ==
+    //
+    //   arm        burn      p50      p90      p99   endK
+    //   K=1          20     98.30   233.20   338.30    1.0
+    //   K=4          20     29.10    61.30   113.00    4.0
+    //   dyn1-4       20     30.50    66.40   117.80    4.0
+    //   K=1         200    274.50   749.90  1184.30    1.0
+    //   K=4         200     38.30   244.10   446.10    4.0
+    //   dyn1-4      200     41.50   257.10   488.30    4.0
+    //
+    // IT STARTS AT 1 AND LANDS ON THE K=4 ROW. p50 274.50 -> 41.50 at 200us, a 6.6x cut, within 8%
+    // of static K=4 without being told what K to use. endK is 4.0 in every rep, so it climbed all
+    // three rungs unaided.
+    //
+    // THE 5-9% GAP IS THE RAMP, not overhead: the first milliseconds are spent at K=1, 2 and 3, and
+    // those samples are in the median. It amortises on a long load, and it is the price of not
+    // knowing K in advance on a bursty one.
+    //
+    // WHAT THIS CANNOT SHOW is the other half -- cores being GIVEN BACK -- because the down interval
+    // is 200 ms of sustained quiet and the soak never goes quiet that long. That half is asserted in
+    // SchedulerDynamicKTest instead, which is the right place for a property a latency bench cannot
+    // reach.
     {
         const int n = 32, iters = 100;
         std::printf("\n  dynamic K -- against the static rungs it climbs between\n");
