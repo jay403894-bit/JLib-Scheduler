@@ -434,9 +434,10 @@ void Thread::Worker() {
 	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
 	// task would carry that count into its next idle episode and park early ever after.
 	unsigned idleSpins = 0;
-	// Raised once, the first time this worker notices it is hot. Not reset: a worker that stops
-	// being hot keeps the priority until the pool shuts down, which is acceptable for a knob that
-	// is off by default and set once at startup, and avoids thrashing the OS call in the idle loop.
+	// TRUE while this worker holds the elevated priority. Raised when it becomes hot, and DROPPED
+	// again when it stops -- it used to be one-way, which was correct only while the hot set was
+	// static. Dynamic K made "was hot once" permanent while K itself sheds; see the stand-down
+	// branch in the idle section for why that mattered under NoSleep.
 	bool hotPriorityRaised = false;
 	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
 	unsigned hotCtlTick = 0;
@@ -1385,11 +1386,34 @@ void Thread::Worker() {
 					hotPriorityRaised = true;
 					atCriticalPriority = true;
 				}
+				// AND BACK DOWN WHEN THIS WORKER STOPS BEING HOT. The raise used to be permanent --
+				// "not reset: a worker that stops being hot keeps the priority until the pool shuts
+				// down, which is acceptable for a knob that is off by default and set once at
+				// startup". That was sound while the hot set was STATIC, because only ever K workers
+				// could be raised and K never moved.
+				//
+				// DYNAMIC K BREAKS IT, and in the direction that matters. K ramps to maxK, every
+				// worker that was ever hot keeps the capability, K sheds back to minK -- and the
+				// priority does not shed with it. The idle branch below then puts those demoted
+				// workers at 15 while they wait. Under the default Sleep policy they PARK, so 15
+				// costs nothing; under NoSleep they SPIN at 15, which is exactly the "N spinning
+				// threads preempt the completion thread feeding them" configuration this file
+				// records as 5x worse. NoSleep is not a corner case -- it is what a server build
+				// would choose.
+				//
+				// So K comes down and the priority comes down with it. The original objection was
+				// thrashing the syscall in the idle loop; the flags make it fire only on a real
+				// change, and K moves at 200us up / 200ms down, not per pass.
+				else if (!hot && hotPriorityRaised) {
+					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+					hotPriorityRaised = false;
+					atCriticalPriority = false;
+				}
 				// Back up on the way into the idle search. A worker that was demoted to run an
 				// ordinary task must be elevated again BEFORE it starts waiting, or the very next
-				// completion is taken at Normal and the whole point is lost. Idle is also the only
-				// safe place to be at 15 unconditionally -- it is spinning, not holding a core off
-				// anyone doing real work.
+				// completion is taken at Normal and the whole point is lost. Safe to be at 15 here
+				// only because this worker is still HOT -- the branch above has already stood down
+				// anyone who is not.
 				else if (hotPriorityRaised && !atCriticalPriority) {
 					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 					atCriticalPriority = true;

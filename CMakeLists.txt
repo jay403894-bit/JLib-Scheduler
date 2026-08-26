@@ -539,6 +539,12 @@ add_executable(SchedulerReservedCoresTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/res
 target_link_libraries(SchedulerReservedCoresTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedCoresTest PRIVATE cxx_std_17)
 
+if(WIN32)
+    add_executable(SchedulerHotPriorityTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hot_priority_test.cpp")
+    target_link_libraries(SchedulerHotPriorityTest PRIVATE Scheduler)
+    target_compile_features(SchedulerHotPriorityTest PRIVATE cxx_std_17)
+endif()
+
 add_executable(SchedulerDagBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/dag_scaling.cpp")
 target_link_libraries(SchedulerDagBench PRIVATE Scheduler)
 target_compile_features(SchedulerDagBench PRIVATE cxx_std_17)
