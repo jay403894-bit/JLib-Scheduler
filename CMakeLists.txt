@@ -530,6 +530,10 @@ add_executable(SchedulerTimerTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/timer_test.
 target_link_libraries(SchedulerTimerTest PRIVATE Scheduler)
 target_compile_features(SchedulerTimerTest PRIVATE cxx_std_17)
 
+add_executable(SchedulerDynamicKTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dynamic_k_test.cpp")
+target_link_libraries(SchedulerDynamicKTest PRIVATE Scheduler)
+target_compile_features(SchedulerDynamicKTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerDagBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/dag_scaling.cpp")
 target_link_libraries(SchedulerDagBench PRIVATE Scheduler)
 target_compile_features(SchedulerDagBench PRIVATE cxx_std_17)

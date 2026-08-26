@@ -330,6 +330,69 @@ namespace JLib {
 		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
 		void ClampHotWorkersToPool();
 		static size_t GetHotWorkers();
+
+		// Moves K WITHOUT touching the bounds. SetHotWorkers pins [k,k]; this is the move on its own,
+		// used by the range clamp and by the controller -- which must not rewrite the bounds it is
+		// being steered by. Public only so the controller can reach it; apps want SetHotWorkers.
+		static void SetHotWorkersEffective(size_t k);
+
+		// ============================== DYNAMIC K (opt-in, off by default) ==========================
+		//
+		// STATIC IS THE DEFAULT AND THAT IS NOT CAUTION. An app with a handful of I/O tasks wants
+		// deterministic core assignment, and a K that moves underneath it also perturbs the
+		// reactor's ExcludeCurrentThreadFromHotCpus placement and anything the app pinned itself.
+		// Predictability is the feature; set the policy once, before Init, and forget it.
+		//
+		// WHAT THE APP DECIDES IS THE CEILING, NOT THE SET POINT. That distinction is the whole
+		// design. The scheduler cannot know whether a core is better spent on the lane or on frame
+		// work -- but it does not need to, because maxK already encodes how much diversion the app
+		// will tolerate. Inside that bound, saturation is a fact about the lane alone and the
+		// scheduler can read it directly.
+		//
+		// THE SIGNAL: every hot worker advertising a backlog at once, i.e.
+		//     popcount(stealHintLane & lowKbits) == K
+		// which means each of them is holding at least kLaneStealDepth. That is the one condition a
+		// larger K actually fixes -- capacity. It is deliberately NOT "the lane is busy": a busy lane
+		// that is keeping up needs nothing.
+		//
+		// THE MASK IS LOAD-BEARING. Bits above K-1 can linger from a previous, higher K, so a bare
+		// popcount would read a stale worker as evidence and ramp on it.
+		//
+		// ASYMMETRIC ON PURPOSE. Up is fast (kHotUpIntervalNs) because a saturated lane is losing
+		// latency every microsecond. Down is slow and requires a SUSTAINED quiet period, because
+		// down is the direction that can thrash, and because an idle hot worker costs only spin --
+		// the bounded cost K-hot already accepts by design. Cheap to be late, expensive to be wrong.
+		//
+		// DOWN IS SAFE WHILE WORK IS QUEUED, which is the part that sounds like it should not be.
+		// The demotion is applied by the worker itself AFTER an execute pass, when it holds nothing
+		// in flight -- only its queues, which the drain logic already sees. So there is no window in
+		// which work can be dropped. A demoted worker keeps serving its lane until its inbox and
+		// deque are both empty (Thread.cpp's hiPriStray), then parks. And it cannot be held open by
+		// new arrivals: steering routes over 1 + (w % hotN) and the completion thread re-reads hotN
+		// every flush, so the instant K drops the producer stops aiming there and the queue only
+		// drains. THAT ORDERING IS LOAD-BEARING -- the producer's view of K must fall before the
+		// worker stops serving. It is automatic today because both read the same atomic; caching K
+		// producer-side would break it.
+		// THERE IS NO POLICY FLAG, and that is the better design rather than a shortcut: min == max
+		// IS static, by construction. SetHotWorkers(k) pins the range to [k, k], the default range
+		// is (0, 0) which is exactly the pre-existing K=0 default, and scaling is opt-in purely by
+		// WIDENING the range. So "I want exactly K cores and complete control over their lifetime"
+		// is expressible, it is still the default, and there is no second knob that can fall out of
+		// step with the bounds.
+		//
+		// minK is forced to >= 1 only when the range can actually move. At K=0 the lane does not
+		// exist at all -- hiPri routes to the ordinary lane and no worker serves it -- so a
+		// controller starting there has nothing to observe and could never ramp up. Absorbing under
+		// scaling; perfectly fine as a fixed point, which is what (0,0) means.
+		//
+		// maxK inherits SetHotWorkers' pool clamp, so at least one ORDINARY worker always survives:
+		// a pool that is entirely hot has no legal destination for ordinary work and hangs.
+		static void SetHotWorkerRange(size_t minK, size_t maxK) noexcept;
+		static void GetHotWorkerRange(size_t& minK, size_t& maxK) noexcept;
+
+		// Evaluated by ONE worker, sampled rather than every pass -- a clock read per pass per
+		// worker would cost more than the mechanism saves. Public only so Thread.cpp can call it.
+		static void MaybeAdjustHotWorkers() noexcept;
 		// WHO MAY DRAIN A BACKLOGGED LANE.
 		//
 		//   0  nobody -- the lane is strictly private to its hot worker

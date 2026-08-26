@@ -559,7 +559,26 @@ static std::atomic<size_t> g_hotWorkers{ 0 };
 // 0 and there is nothing to clamp against, so StartPool re-applies it once the pool exists.
 static std::atomic<size_t> g_hotWorkersRequested{ 0 };
 
+// NO POLICY ENUM. min == max IS static, by construction rather than by a flag that has to agree
+// with the bounds. The default range is (0,0), which is exactly the pre-existing K=0 default, so
+// scaling is opt-in by WIDENING the range and by nothing else -- and there is no state in which a
+// Static flag and a (1,8) range disagree about what the app asked for.
+static std::atomic<size_t> g_hotMin{ 0 };
+static std::atomic<size_t> g_hotMax{ 0 };
+
+// PINS THE RANGE TO [k, k]. "Set K to exactly k" is a request for a FIXED k, and leaving a wider
+// range in place would mean the controller quietly moved K away from what was just asked for. So
+// this is the static spelling, it is what every existing caller already means by it, and it is why
+// no policy flag is needed: SetHotWorkers(k) IS SetHotWorkerRange(k, k).
 void TaskScheduler::SetHotWorkers(size_t k) {
+	g_hotMin.store(k, std::memory_order_relaxed);
+	g_hotMax.store(k, std::memory_order_relaxed);
+	SetHotWorkersEffective(k);
+}
+
+// The move itself, without touching the bounds -- used by SetHotWorkers, by the range clamp, and by
+// the controller, which must not rewrite the bounds it is being steered by.
+void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	g_hotWorkersRequested.store(k, std::memory_order_relaxed);
 	size_t eff = k;
 	if (instance) {
@@ -569,6 +588,80 @@ void TaskScheduler::SetHotWorkers(size_t k) {
 	g_hotWorkers.store(eff, std::memory_order_relaxed);
 }
 size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
+
+// ---- DYNAMIC K ---------------------------------------------------------------------------------
+// See the SetHotScaling block in TaskScheduler.h for the design; this is only the mechanism.
+static std::atomic<long long> g_lastHotChangeNs{ 0 };
+static std::atomic<long long> g_laneQuietSinceNs{ 0 };
+
+// Up fast, down slow, and the asymmetry is the anti-thrash. A saturated lane loses latency every
+// microsecond it stays saturated; an idle hot worker loses only a spinning core, which is the cost
+// K-hot already accepts by design. Cheap to be late going down, expensive to be wrong.
+static constexpr long long kHotUpIntervalNs   =   2'000'000;   // 2 ms
+static constexpr long long kHotDownIntervalNs = 200'000'000;   // 200 ms of sustained quiet
+
+void TaskScheduler::SetHotWorkerRange(size_t minK, size_t maxK) noexcept {
+	if (maxK < minK) maxK = minK;
+	// minK >= 1 ONLY WHEN THE RANGE CAN MOVE. At K=0 the lane does not exist -- hiPri routes to the
+	// ordinary lane, no worker serves it, no hint bit is ever set -- so a controller starting there
+	// has nothing to observe and could never ramp up. K=0 is absorbing under scaling, but perfectly
+	// fine as a fixed point, which is what (0,0) asks for and what every existing user already has.
+	if (maxK > minK && minK < 1) minK = 1;
+	g_hotMin.store(minK, std::memory_order_relaxed);
+	g_hotMax.store(maxK, std::memory_order_relaxed);
+
+	size_t k = GetHotWorkers();
+	if (k < minK) SetHotWorkersEffective(minK);        // carries the pool clamp
+	else if (k > maxK) SetHotWorkersEffective(maxK);
+}
+void TaskScheduler::GetHotWorkerRange(size_t& minK, size_t& maxK) noexcept {
+	minK = g_hotMin.load(std::memory_order_relaxed);
+	maxK = g_hotMax.load(std::memory_order_relaxed);
+}
+
+void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
+	if (!instance) return;
+	// SCALING IS ENABLED BY THE RANGE ITSELF -- max > min. No flag to fall out of step with it.
+	const size_t lo = g_hotMin.load(std::memory_order_relaxed);
+	const size_t hi = g_hotMax.load(std::memory_order_relaxed);
+	if (hi <= lo) return;
+	const size_t k = GetHotWorkers();
+	if (k == 0) return;   // no lane exists, so there is nothing to observe -- see SetHotWorkerRange
+
+	// THE MASK IS NOT DEFENSIVE. Bits above k-1 survive a previous, higher K -- nothing clears a
+	// hint for a worker that stopped being hot except that worker's own threshold path, which no
+	// longer runs for it. Without the mask a stale bit reads as live evidence and ramps on it.
+	const unsigned long long mask = (k >= 64) ? ~0ull : ((1ull << k) - 1);
+	const unsigned long long adv  = instance->stealHintLane.load(std::memory_order_acquire) & mask;
+
+	const long long now  = MonotonicNs();
+	const long long last = g_lastHotChangeNs.load(std::memory_order_relaxed);
+
+	if (adv == mask) {                      // EVERY hot worker buried: capacity, which K fixes
+		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
+		if (k < hi && now - last >= kHotUpIntervalNs) {
+			SetHotWorkersEffective(k + 1);
+			g_lastHotChangeNs.store(now, std::memory_order_relaxed);
+		}
+		return;
+	}
+	if (adv != 0) {                         // busy but keeping up: exactly what K is already for
+		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
+		return;
+	}
+
+	// Nothing advertised. Require it SUSTAINED before giving a core back -- a lane that is quiet
+	// for one sample is between batches, not idle.
+	const long long since = g_laneQuietSinceNs.load(std::memory_order_relaxed);
+	if (since == 0) { g_laneQuietSinceNs.store(now, std::memory_order_relaxed); return; }
+	if (k > lo
+	    && now - since >= kHotDownIntervalNs
+	    && now - last  >= kHotDownIntervalNs) {
+		SetHotWorkersEffective(k - 1);
+		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
+		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
+	}
+}
 
 // Re-apply the clamp once the pool size is known -- see SetHotWorkers.
 void TaskScheduler::ClampHotWorkersToPool() {

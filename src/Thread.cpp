@@ -447,6 +447,11 @@ void Thread::Worker() {
 	// being hot keeps the priority until the pool shuts down, which is acceptable for a knob that
 	// is off by default and set once at startup, and avoids thrashing the OS call in the idle loop.
 	bool hotPriorityRaised = false;
+	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
+	unsigned hotCtlTick = 0;
+	// "This worker may have a lane bit set." Lets a demoted worker retire a bit nobody else can
+	// clear, exactly once, without an atomic on every pass of every ordinary worker.
+	bool laneBitMayBeSet = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
 	// on a genuine change. Meaningless unless hotPriorityRaised.
 	bool atCriticalPriority = false;
@@ -491,8 +496,63 @@ void Thread::Worker() {
 			// drained its own backlog by popping. ONCE PER PASS, not per pickup -- that frequency
 			// difference is the entire cost argument, and a pass is exactly when this worker has
 			// nothing better to do anyway.
-			if (isHotWorker)
+			if (isHotWorker) {
 				scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
+				laneBitMayBeSet = true;      // we are the only writer while hot; assume we set it
+			}
+			// ---- RETIRING A BIT LEFT BEHIND BY A DEMOTION -----------------------------------
+			//
+			// THE LEAK THIS CLOSES, and it only exists once K can move. The line above is a worker's
+			// own bit, maintained while it is hot. The moment it stops being hot that line stops
+			// running -- so a bit set during the hot era is never cleared by anyone, and every thief
+			// keeps probing an empty lane on that worker forever.
+			//
+			// The drain path covers the case where the demoted worker still HOLDS lane work (it is
+			// gated on `servesHiPri || hiPriStray` and calls UpdateLaneHint(count - 1)). What it
+			// cannot cover is the end: once the queues are empty the drain stops running, and the
+			// last value it published may still have been above the threshold.
+			//
+			// Edge-triggered, so an ordinary worker that was never hot and holds nothing -- which is
+			// almost every worker, almost always -- pays one bool compare and no atomic.
+			//
+			// FOUND BY A TEST PRECONDITION, not by reading: SchedulerDynamicKTest asserts worker 3's
+			// bit is clear before its push, and that assertion failed against a bit left over from
+			// an earlier section of the same run.
+			else if (hiPriStray) {
+				laneBitMayBeSet = true;
+			}
+			else if (laneBitMayBeSet) {
+				scheduler->UpdateLaneHint((size_t)qIndex, 0);
+				laneBitMayBeSet = false;
+			}
+			// ---- WHY A K TRANSITION NEEDS NO HAND-OFF, which is NOT obvious ------------------
+			//
+			// Demoting a worker that still holds lane work looks like it must strand or at least
+			// hide it. It also looks like a transition-time check would fix that -- and such a
+			// check would itself race the producer: hotN drops, the demoted worker looks at its
+			// queues, finds them empty and advertises nothing, and only THEN does an in-flight push
+			// land on it.
+			//
+			// NOTHING IS NEEDED, and this was established with a negative control rather than by
+			// reading. The section-5 drain is gated on `servesHiPri || hiPriStray`, so it runs for a
+			// STRAY worker too, and it already calls UpdateLaneHint(count - 1). A demoted worker
+			// therefore advertises whatever it is left holding, no matter how or when that work
+			// arrived. An explicit hand-off was written here, tested, and found REDUNDANT --
+			// SchedulerDynamicKTest passes unchanged with it removed, which is exactly how it was
+			// caught, after two earlier versions of that test passed with it removed for the wrong
+			// reason.
+			//
+			// The hand-off only ever reached depths BELOW kLaneStealDepth. Chasing those was
+			// measured on 8-26 and loses: at set=2 the tail got worse in three rows of four and
+			// steal probes roughly doubled. So the one case not covered here is a case the design
+			// declines on purpose.
+
+			// ONE worker drives the controller, and it is SAMPLED. A clock read on every pass of
+			// every worker would cost more than the mechanism saves. Worker 0 is always hot under
+			// Dynamic (minK >= 1), so it never parks and the down-ramp still gets evaluated on a
+			// completely quiet lane -- which is the case the whole down direction exists for.
+			if (qIndex == 0 && ((++hotCtlTick & 0xFF) == 0))
+				TaskScheduler::MaybeAdjustHotWorkers();
 		}
 
 		ready.store(true, std::memory_order_release);
