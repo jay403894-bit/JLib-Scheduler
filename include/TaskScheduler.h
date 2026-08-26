@@ -331,14 +331,6 @@ namespace JLib {
 		void ClampHotWorkersToPool();
 		static size_t GetHotWorkers();
 
-		// Incremented whenever K actually moves. A worker caches it and compares per pass; a mismatch
-		// means "K changed, re-derive your lane state," which is a LOCAL and self-contained reason to
-		// act. The alternative it replaces was a per-worker bool meaning "my bit might be set" --
-		// cheaper still, but its invariant was maintained across four UpdateLaneHint call sites,
-		// including the two where a THIEF writes the victim's bit. An invariant you have to trace
-		// through four sites to verify is the exact shape that has drifted in this codebase before.
-		static unsigned long long GetHotGeneration();
-
 		// Moves K WITHOUT touching the bounds. SetHotWorkers pins [k,k]; this is the move on its own,
 		// used by the range clamp and by the controller -- which must not rewrite the bounds it is
 		// being steered by. Public only so the controller can reach it; apps want SetHotWorkers.

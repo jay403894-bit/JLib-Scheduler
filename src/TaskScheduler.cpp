@@ -559,9 +559,6 @@ static std::atomic<size_t> g_hotWorkers{ 0 };
 // 0 and there is nothing to clamp against, so StartPool re-applies it once the pool exists.
 static std::atomic<size_t> g_hotWorkersRequested{ 0 };
 
-// Bumped whenever K actually moves. A worker compares it per pass and re-derives its lane state on
-// a mismatch -- see the reconciliation in Thread.cpp.
-static std::atomic<unsigned long long> g_hotGeneration{ 0 };
 
 // NO POLICY ENUM. min == max IS static, by construction rather than by a flag that has to agree
 // with the bounds. The default range is (0,0), which is exactly the pre-existing K=0 default, so
@@ -595,7 +592,6 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// even under scaling (2 ms up, 200 ms down), so the line is written rarely and the reads do not
 	// ping-pong -- unlike stealHintLane, which hot workers rewrite thousands of times a second and
 	// which is therefore the wrong thing for an ordinary worker to poll.
-	if (prev != eff) g_hotGeneration.fetch_add(1, std::memory_order_release);
 
 	// A NEWLY PROMOTED WORKER MUST BE WOKEN, or the promotion does nothing at all.
 	//
@@ -622,13 +618,26 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// need for one: a worker created later reads its hot status on its first pass. Missing this
 	// guard segfaulted the dispatch bench before its first line of output.
 	if (!instance) return;
-	for (size_t i = prev; i < eff && i < instance->workers.size(); ++i) {
+
+	// BOTH DIRECTIONS, and the demote half is not symmetry for its own sake.
+	//
+	// A promoted worker must wake or the promotion does nothing. A DEMOTED worker must wake for a
+	// different reason: it owes one reconciliation pass -- clearing a lane hint bit that only it can
+	// clear, since its threshold path stops running the moment it stops being hot. If it is parked
+	// when the demotion lands it never takes that pass, and the bit stays set forever, so every
+	// thief keeps probing an empty lane on it.
+	//
+	// FOUND BY A FLAKY TEST, 1 run in 3 -- which is exactly what it should look like, because
+	// whether the bit leaks depends on whether that worker happened to be awake. A stale bit is a
+	// performance leak rather than a correctness fault, so nothing else would have caught it.
+	const size_t loEnd = (prev < eff) ? prev : eff;
+	const size_t hiEnd = (prev < eff) ? eff  : prev;
+	for (size_t i = loEnd; i < hiEnd && i < instance->workers.size(); ++i) {
 		instance->workers[i]->MarkLaneWake();
 		instance->workers[i]->NotifyWorker(/*force*/ true);
 	}
 }
 size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
-unsigned long long TaskScheduler::GetHotGeneration() { return g_hotGeneration.load(std::memory_order_acquire); }
 
 // ---- DYNAMIC K ---------------------------------------------------------------------------------
 // See the SetHotScaling block in TaskScheduler.h for the design; this is only the mechanism.

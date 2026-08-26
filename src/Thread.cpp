@@ -454,8 +454,9 @@ void Thread::Worker() {
 	unsigned laneDutyTick = 0;
 	// Generation-driven lane reconciliation. Seeded from the current generation so a worker that
 	// starts life after a K change does not treat its own startup as a transition.
-	unsigned long long hotGenSeen = TaskScheduler::GetHotGeneration();
-	bool hotChangePending = false;
+	// "This worker may have raised its OWN lane bit." Set while hot, and by the stray drain; cleared
+	// when the bit is retired. Sound because nobody else can raise this worker`s bit from zero.
+	bool ownsLaneBit = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 	// Did this worker execute a LANE task on the previous pass? The occupancy numerator. A worker
 	// busy bit is the wrong thing here: general help and pure spin must read as not-lane-busy, or
 	// demotion never fires.
@@ -508,6 +509,7 @@ void Thread::Worker() {
 			if (isHotWorker) {
 				const size_t laneDepth = scheduler->hiPri[qIndex]->size();
 				scheduler->UpdateLaneHint((size_t)qIndex, laneDepth);
+				ownsLaneBit = true;   // while hot, this worker is the one maintaining its bit
 
 				// ---- DUTY CYCLE, and both halves of it were wrong once ------------------------
 				//
@@ -567,12 +569,31 @@ void Thread::Worker() {
 			// until the queues are actually empty, at which point no further generation bump would
 			// ever come.
 			else {
-				const unsigned long long g = TaskScheduler::GetHotGeneration();
-				if (g != hotGenSeen) { hotGenSeen = g; hotChangePending = true; }
-				if (hotChangePending && !hiPriStray) {
+				// LEVEL-TRIGGERED ON MY OWN STATE, and the generation counter it replaces was the
+				// wrong instrument -- it fires once per K CHANGE, and the bit can be set again
+				// afterwards by something that is not a K change:
+				//
+				//   1. K drops. The generation bumps, this worker wakes and reconciles, bit clear.
+				//   2. hiPri work now arrives at this NON-hot worker, and the hiPriStray drain
+				//      publishes UpdateLaneHint(q, count - 1) -- count is the batch size, so the bit
+				//      is SET again.
+				//   3. The worker pops those items one at a time. Pops never touch the hint.
+				//   4. The queues go empty and no further K change ever comes, so the one-shot
+				//      reconcile never runs again. The bit is stale forever.
+				//
+				// That is a 1-in-3 flake, because it depends on whether work lands before or after
+				// the reconcile. Caught by a pool dump showing workers SLEEPING with 0/0 queues and
+				// their bits set -- which also disproved the "still holding work" reading.
+				//
+				// A LOCAL FLAG IS SOUND HERE, though it was rejected earlier for a reason that turns
+				// out not to apply: worker q's bit is only ever set by q itself. A thief can write a
+				// victim's hint, but only after PROBING it, and probing requires the bit to be set
+				// already -- so no thief can raise a bit from zero. The invariant is two sites in
+				// this worker's own loop, not four across the file.
+				if (ownsLaneBit && !hiPriStray) {
 					// Clears if set, and early-outs without a write if it is not.
 					scheduler->UpdateLaneHint((size_t)qIndex, 0);
-					hotChangePending = false;
+					ownsLaneBit = false;
 				}
 			}
 			// ---- WHY A K TRANSITION NEEDS NO HAND-OFF, which is NOT obvious ------------------
@@ -1375,10 +1396,14 @@ void Thread::Worker() {
 						// so `count - 1` is the depth, not an increment to it.
 						const int _lhm = TaskScheduler::GetLaneHintMode();
 						if (_lhm == 1 || _lhm == 3 || _lhm == 4) scheduler->UpdateLaneHint((size_t)qIndex, count - 1);
-						// A MISS: this drain moved more than one lane task, so at least one completion
+						else if (_lhm == 2) scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
+						// This drain just published a depth, so the bit may now be up -- including on
+						// a NON-hot worker draining strays, which is the case the generation-based
+						// reconcile could not see.
+						ownsLaneBit = true;
+						// A MISS: the drain moved more than one lane task, so at least one completion
 						// waited behind another. Free -- count is already here.
 						if (count > 1) TaskScheduler::NoteLaneMiss(count - 1);
-						else if (_lhm == 2) scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
 						task_to_run = *opt;
 						JLIBSCHED_LATENCY_MARK(Found);
 						continue;

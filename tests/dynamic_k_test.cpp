@@ -147,6 +147,17 @@ int main() {
         const bool clean = WaitUntil([&] {
             return (JLib::TaskScheduler::LaneBacklogMask() & (1ull << 3)) == 0;
         }, 3000);
+        // DUMP ON FAILURE, and it stays. This exact assertion has failed twice for two different
+        // reasons, and BOTH times the pool dump settled in one line what reading the code could not:
+        // the first showed stranded ORDINARY work while every hypothesis was about lane work, and
+        // the second showed workers SLEEPING with 0/0 queues and their bits set, which disproved the
+        // "they must still be holding work" reading I would otherwise have kept defending.
+        if (!clean) {
+            std::printf("      DIAG mask=0x%llx K=%zu\n",
+                        (unsigned long long)JLib::TaskScheduler::LaneBacklogMask(),
+                        JLib::TaskScheduler::GetHotWorkers());
+            s.DumpPoolState("stale lane bit");
+        }
         Check(clean, "precondition: worker 3's lane bit is clear before the push");
         g_ran.store(0);
 
