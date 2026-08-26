@@ -517,6 +517,9 @@ void Thread::Worker() {
 		// missed. That is why the park decision consults the inboxes directly; this just removes the
 		// reordering that made the window easy to hit.
 		hasQueuedWork.store(false, std::memory_order_seq_cst);
+		// Same clear, same place, same reason -- and for laneWake the once-per-pass clear is also what
+		// BOUNDS it: a lane wake buys exactly one search pass. See its declaration in Thread.h.
+		laneWake.store(false, std::memory_order_seq_cst);
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
 			// CANCELLATION, OBSERVED AT PICKUP. One flag in the scope; every task carrying a token
@@ -1414,6 +1417,7 @@ void Thread::Worker() {
 				|| immediate.load(std::memory_order_seq_cst)
 				|| (!scheduler->paused.load(std::memory_order_seq_cst)
 					&& (hasQueuedWork.load(std::memory_order_seq_cst)
+						|| laneWake.load(std::memory_order_seq_cst)
 						|| !scheduler->hiPriInboxes[qIndex]->empty()
 						|| !scheduler->loPriInboxes[qIndex]->empty()))) {
 				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
@@ -1437,6 +1441,7 @@ void Thread::Worker() {
 					|| immediate.load(std::memory_order_acquire)
 					|| (!scheduler->paused.load(std::memory_order_acquire)
 						&& (hasQueuedWork.load(std::memory_order_acquire)
+							|| laneWake.load(std::memory_order_acquire)
 							|| !scheduler->hiPriInboxes[qIndex]->empty()
 							|| !scheduler->loPriInboxes[qIndex]->empty()));
 				});

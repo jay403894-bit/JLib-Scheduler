@@ -409,6 +409,50 @@ void TaskScheduler::NotifyAll() {
 	for (auto& w : workers)
 		w->NotifyWorker();
 }
+
+// Pull parked ORDINARY workers up to come and steal a buried hot worker's lane backlog. Called from
+// UpdateLaneHint on the 0->1 edge only; see the SetLaneWake block in TaskScheduler.h for why this
+// needs a predicate input rather than just a notify.
+void TaskScheduler::WakeForLane(size_t depth) noexcept {
+	int budget = laneWakeCount.load(std::memory_order_relaxed);
+	if (budget <= 0) return;
+
+	// A woken ordinary worker can only help if it is ALLOWED to touch the lane, and that is exactly
+	// what laneHintMode 4 grants. Under any other mode the wake would be pure waste: the worker
+	// comes up, runs a search that structurally skips hiPri, finds nothing, and parks again having
+	// spent a kernel wake to do it.
+	if (GetLaneHintMode() != 4) return;
+
+	// Scale with how buried the owner is, capped by the caller's budget. One wake is the right
+	// answer for a queue of 4; it is not for a queue of 40, where the woken worker takes one task
+	// and the rest still waits behind the handler.
+	int want = (int)(depth / (size_t)kLaneStealDepth);
+	if (want < 1)      want = 1;
+	if (want > budget) want = budget;
+
+	// ORDINARY WORKERS ONLY. Hot workers do not park (that is what makes them hot), so notifying one
+	// is a guaranteed no-op that still pays NotifyWorker's seq_cst load.
+	const size_t hot = GetHotWorkers();
+	const size_t n   = workers.size();
+	if (n <= hot) return;
+
+	// Rotate the starting point so a run of burials spreads over the pool instead of repeatedly
+	// waking the same worker -- which would keep one core hot and leave the rest cold, i.e. K-hot
+	// again but chosen by accident.
+	size_t i = nextLaneWake.fetch_add(1, std::memory_order_relaxed);
+	for (size_t scanned = 0; scanned < n - hot && want > 0; ++scanned, ++i) {
+		Thread* w = workers[hot + (i % (n - hot))].get();
+		// Spend the budget on workers that are actually parked. NotifyWorker skips an awake worker
+		// for free, but "wake 2" should mean two sleepers, not two attempts.
+		if (!w->Parked()) continue;
+		// ORDER IS THE PROOF: publish the flag, THEN notify. NotifyWorker's awake-skip loads
+		// workerState seq_cst and pairs with this seq_cst store -- the same StoreLoad handshake as
+		// MarkQueuedWork, and unsound in the other order. tests/verify/sleepwake_model.c.
+		w->MarkLaneWake();
+		w->NotifyWorker();
+		--want;
+	}
+}
 // ---- THE REMOVED GATE, and two findings from it worth keeping -------------------------------
 //
 // ParallelFor used to refuse to parallelize below ~75 us of estimated serial work. The threshold,

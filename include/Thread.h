@@ -237,6 +237,23 @@ namespace JLib {
         // seq_cst. Note it would still run correctly on x86 either way, because `lock cmpxchg`
         // incidentally drains the store buffer -- AArch64 is where the weaker version breaks.
         void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
+
+        // THE FOURTH PREDICATE INPUT. Set by TaskScheduler::WakeForLane when a HOT worker publishes
+        // a lane backlog, to pull a parked ordinary worker up to come and steal it.
+        //
+        // seq_cst for exactly the reason MarkQueuedWork is, and the reason is not defensive: this
+        // store and NotifyWorker's load of workerState are a StoreLoad pair on DIFFERENT objects,
+        // and NotifyWorker's awake-skip is only sound for flags that sit in the single total order.
+        // The 1.2.0 hang was a predicate input left at release/acquire while its neighbour was
+        // promoted. tests/verify/sleepwake_model.c carries this flag and a -DWEAK_LANEWAKE negative
+        // control that MUST fail.
+        void MarkLaneWake() { laneWake.store(true, std::memory_order_seq_cst); }
+
+        // Is this worker parked or on its way there? Used to aim a lane wake at a worker that will
+        // actually pay for one -- NotifyWorker already skips an awake worker for free, but a wake
+        // budget of N should be spent on N SLEEPING workers, not burned on awake ones.
+        bool Parked() const { return workerState.load(std::memory_order_seq_cst) != WS_AWAKE; }
+
         bool Ready();
 
         // DIAGNOSTIC ONLY, for TaskScheduler::DumpPoolState(). Reads are relaxed and unsynchronised
@@ -287,6 +304,19 @@ namespace JLib {
         // OTHER workers' deques is already found for free by the unconditional steal-attempt
         // phase every awake worker runs each loop pass, with no predicate involved at all.
         std::atomic<bool> hasQueuedWork{ false };
+
+        // EDGE-TRIGGERED, and that is the whole safety argument for it. Cleared once per Worker()
+        // loop iteration in the same place as hasQueuedWork, so ONE wake buys ONE search pass and
+        // the worker parks again unless it actually found something.
+        //
+        // The level-triggered version -- reading TaskScheduler::stealHintLane straight from the
+        // sleep predicate -- is the obvious implementation and it is wrong twice over. It would put
+        // a line shared with every hot worker inside every parked worker's predicate, and worse, a
+        // worker that woke and lost the steal race would find the predicate STILL true and never
+        // park: N-K workers spinning for as long as one hot worker stays buried, which is NoSleep
+        // arrived at by accident and with none of NoSleep's bounds. A flag the worker consumes
+        // cannot do that.
+        std::atomic<bool> laneWake{ false };
 
         // Worker sleep state, so a push can skip the wake entirely when this worker is already
         // running. Three states rather than a bool because the interesting window is between

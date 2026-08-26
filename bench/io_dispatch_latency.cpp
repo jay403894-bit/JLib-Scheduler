@@ -478,6 +478,112 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- LANE WAKES: can a parked worker be pulled up in time to matter? ------------------------
+    //
+    // laneHintMode 4 lets an ordinary worker drain a backlogged lane, and under the DEFAULT Sleep
+    // policy it is inert -- the ordinary workers are parked exactly when the lane backs up. Every
+    // number that made mode 4 look good came from NoSleep runs. So this arm asks whether the hint
+    // can also be a reason to WAKE somebody, and get NoSleep's lane behaviour for the cost of a
+    // wake per burial instead of N cores never sleeping.
+    //
+    // THE THING THAT DECIDES IT IS THE ~90us WAKE. A woken worker runs nothing for about that long
+    // (measured 8-24), so this can only pay where the burial it is racing lasts LONGER than the
+    // wake. That is the whole reason burn is swept rather than fixed:
+    //
+    //     burn = 20us    the backlog is gone before the sleeper is running. Expect nothing, or
+    //                    worse than nothing -- a woken core that finds an empty lane.
+    //     burn = 200us   the sleeper can arrive with 100us of queue still in front of it.
+    //
+    // A result at 200us only is not a disappointment, it is the mechanism working exactly as its
+    // cost model says it must. A result at 20us would mean the wake is cheaper than 90us and the
+    // README is wrong about something.
+    //
+    // n = how many parked workers one burial pulls up. 0 is off. Above 1 is the thundering-herd
+    // question: they all steal from the SAME victim deque, so the second and third pay a wake to
+    // lose a CAS. Swept rather than argued.
+    //
+    // == MEASURED 8-25, Sleep policy, 29 workers, median of 3, TWO independent runs ==
+    //
+    //   200us burials, 1-in-8            p50            p90             p99
+    //     K=1  wake 0                284.3 / 273.8   757.5 / 756.2  1152.8 / 1089.6
+    //          wake 1                190.4 / 183.3   476.4 / 499.3   866.4 /  810.0
+    //          wake 2                131.2 / 134.2   415.8 / 359.6   683.2 /  598.5
+    //          wake 4                145.9 / 135.5   442.7 / 383.5   724.8 /  638.4
+    //     K=4  wake 0                 39.9 /  37.0   241.1 / 239.2   438.6 /  449.2
+    //          wake 2                 46.5 /  53.3   244.2 / 243.8   454.8 /  436.7
+    //
+    // BOTH RUNS AGREE INSIDE A FEW PERCENT, which is what makes this readable at all -- the earlier
+    // steering sweep found this row's noise floor at 5-9%, and the K=1 effect is five times that.
+    //
+    // AT K=1 IT IS THE LARGEST SINGLE WIN MEASURED ON THIS LANE: p50 -52%, p90 -49%, p99 -45% at
+    // wake=2. At K=4 it is a pure LOSS -- p50 +30%, replicated, with the tail unchanged.
+    //
+    // The split is not a tuning accident, it is the mechanism's own precondition. At K=1 there IS no
+    // hot sibling, so hot->hot stealing cannot exist and a parked ordinary worker is the only thing
+    // in the process that can help. By K=4 the hot set absorbs the backlog itself, so the wake buys
+    // nothing and still costs a notify on the hot worker plus a cold core arriving to contend for
+    // tasks that already had an owner.
+    //
+    // wake=2 beats wake=4 in both runs, so the herd is real above two: the third and fourth wake
+    // pay ~90us to lose a CAS on the same victim deque.
+    //
+    // NOTE WHAT THIS COMPLEMENTS. Hot->hot stealing needs K>=2 to mean anything and does nothing at
+    // K=1; this does everything at K=1 and nothing at K=4. They cover disjoint configurations. And
+    // K=1 is the configuration this project actually recommends -- one hot core carries NoSleep's
+    // p50 win without 29 cores spinning -- so the case with no other repair available is the case
+    // most likely to be running.
+    //
+    // SHIPS AT 0 ANYWAY, because a default that helps K=1 and costs K=4 is a policy decision and not
+    // a measurement. The obvious follow-up is to gate the wake on GetHotWorkers() <= 1 inside
+    // WakeForLane, which is not a tuning knob but the precondition above written down.
+    {
+        const int n = 32, iters = 100;
+        std::printf("\n  lane wakes -- a buried hot worker pulls parked workers up to steal\n");
+        std::printf("    Sleep policy. wake=0 is today's behaviour (mode 4 inert while parked).\n");
+        std::printf("    K=1 is NOT a control here: one hot worker can bury itself, so wakes fire.\n");
+        std::printf("      K    burn   skew   wake      p50      p90      p99\n");
+
+        constexpr int kReps = 3;
+        const int wakeArms[] = { 0, 1, 2, 4 };
+        constexpr int kNW = 4;
+
+        for (long long burn : { 20000LL, 200000LL }) {
+          for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+            std::vector<double> p50[kNW], p90[kNW], p99[kNW];
+            for (int rep = 0; rep < kReps; ++rep) {
+              for (int a = 0; a < kNW; ++a) {
+                JLib::TaskScheduler::SetLaneHintMode(4);      // the wake is a no-op under any other
+                JLib::TaskScheduler::SetSteerSkip(false);
+                JLib::TaskScheduler::SetLaneWake(wakeArms[a]);
+                JLib::TaskScheduler::SetHotWorkers(k);
+                g_skewEveryNth = 8;
+                g_skewBurnNs   = burn;
+
+                double secs = 0.0;
+                std::vector<long long> v = SoakRun(n, iters, secs);
+                if (v.empty()) continue;
+                const auto pk = [&](double p) {
+                    return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                };
+                p50[a].push_back(pk(0.50)); p90[a].push_back(pk(0.90)); p99[a].push_back(pk(0.99));
+              }
+            }
+            const auto med = [](std::vector<double> x) {
+                if (x.empty()) return -1.0;
+                std::sort(x.begin(), x.end());
+                return x[x.size() / 2];
+            };
+            for (int a = 0; a < kNW; ++a)
+                std::printf("    %3zu  %6.0f  %5d  %5d  %7.2f  %7.2f  %7.2f\n",
+                            k, burn / 1000.0, 8, wakeArms[a],
+                            med(p50[a]), med(p90[a]), med(p99[a]));
+          }
+        }
+        g_skewEveryNth = 0;
+        JLib::TaskScheduler::SetLaneWake(0);
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+
     // ---- STEERING: is it cheaper to AVOID a buried hot worker than to STEAL BACK OFF one? -------
     //
     // stealHintLane is published by the buried worker so an idle sibling can find it. The completion

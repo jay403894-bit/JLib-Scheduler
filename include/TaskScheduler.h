@@ -383,6 +383,38 @@ namespace JLib {
 		static void SetSteerSkip(bool on) noexcept { steerSkipOn.store(on, std::memory_order_relaxed); }
 		static bool GetSteerSkip() noexcept { return steerSkipOn.load(std::memory_order_relaxed); }
 
+		// ============================ WAKING SLEEPERS FOR THE LANE ==================================
+		//
+		// How many PARKED ordinary workers to pull up when a hot worker publishes a lane backlog.
+		// 0 disables it, which is the behaviour before this existed.
+		//
+		// THE GAP THIS CLOSES. laneHintMode 4 lets an ordinary worker drain a backlogged lane, and
+		// under the default Sleep policy it is INERT -- an ordinary worker with no bulk work is
+		// parked exactly when the lane backs up, so the valve is welded shut in the configuration
+		// that ships. Everything mode 4 measured came from NoSleep runs. This is the missing half:
+		// the hint is already the one signal in the system that says "lane work is sitting still,"
+		// so let it also be a reason to wake somebody.
+		//
+		// WHY A BARE NOTIFY CANNOT WORK, since that is the obvious version. cv.wait re-evaluates the
+		// sleep predicate on every wake, and the predicate knows nothing about the lane: the worker
+		// would wake, re-check, still see an empty own-inbox and no hasQueuedWork, and park again
+		// WITHOUT EVER REACHING THE STEAL LOOP. The predicate change is the mechanism; the notify is
+		// only what delivers it. That is why this costs a fourth flag and a re-proof rather than one
+		// line at the publisher.
+		//
+		// AND WHY IT IS A FLAG AND NOT A READ OF stealHintLane -- see Thread::laneWake. Level
+		// triggering would leave a worker that lost the steal race unable to park at all.
+		//
+		// COST MODEL, which is what decides the default. A wake is ~90us of wall clock before the
+		// woken worker runs anything (measured 8-24). So this can only pay where the thing it is
+		// racing is LONGER than that -- a buried hot worker with a 200us handler and a queue behind
+		// it. Against a 20us handler the wake arrives after the backlog is already gone, and all it
+		// bought was a woken core. kLaneStealDepth (4) is the throttle: the hint only sets when a
+		// worker is genuinely buried, so this is a far narrower trigger than NoSleep's "never park".
+		static inline std::atomic<int> laneWakeCount{ 0 };
+		static void SetLaneWake(int n) noexcept { laneWakeCount.store(n, std::memory_order_relaxed); }
+		static int  GetLaneWake() noexcept { return laneWakeCount.load(std::memory_order_relaxed); }
+
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
 		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
@@ -1483,9 +1515,20 @@ namespace JLib {
 			const unsigned long long bit = 1ull << w;
 			const bool want = depth >= (size_t)kLaneStealDepth;
 			if (want == ((stealHintLane.load(std::memory_order_relaxed) & bit) != 0)) return;
-			if (want) stealHintLane.fetch_or(bit, std::memory_order_release);
+			if (want) {
+				stealHintLane.fetch_or(bit, std::memory_order_release);
+				// THE 0->1 EDGE IS THE EVENT, not the level, and only the owner writes this bit --
+				// so this fires once per burial rather than once per push. That rarity is what makes
+				// it affordable to do here, on the hot worker itself, microseconds before it
+				// disappears into a long handler.
+				WakeForLane(depth);
+			}
 			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
 		}
+
+		// Defined out of line in TaskScheduler.cpp: it touches Thread, which is only forward
+		// declared at this point.
+		void WakeForLane(size_t depth) noexcept;
 		bool LaneStealable(size_t w) const noexcept {
 			if (w >= 64) return false;
 			return (stealHintLane.load(std::memory_order_acquire) & (1ull << w)) != 0;
@@ -1495,6 +1538,9 @@ namespace JLib {
 		// Separate cursor for the hot set, so lane traffic and ordinary traffic do not perturb each
 		// other's rotation -- and so the hot rotation stays over 0..K-1 rather than the whole pool.
 		std::atomic<size_t> nextHotWorker{ 0 };
+		// Cursor for lane wakes, separate from both of the above so a burst of burials spreads over the
+		// ordinary workers instead of repeatedly waking the same one.
+		std::atomic<size_t> nextLaneWake{ 0 };
 		// P/E routing (see PickNextWorker): worker qIndices split by efficiency class (from isPCore),
 		// each with its own round-robin cursor. Built in StartPool. Preference is a HINT -- PickNextWorker
 		// spills to the other class if the preferred one has no available worker, and an empty set (non-
