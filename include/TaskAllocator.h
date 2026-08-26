@@ -191,6 +191,18 @@ namespace JLib {
 
         // Prints per-class shared-tier contention when built with -DJLIBSCHED_ALLOC_STATS=ON.
         // The number that matters is refill-blocked as a fraction of refills -- see SlabPool.
+        // Per-class counters as DATA rather than as text -- see SlabPool::ReadStats.
+        struct StatsProfile {
+            SlabPool<SMALL_SLOT>::Stats s64;
+            SlabPool<SLOT80>::Stats     s80;
+            SlabPool<MID_SLOT>::Stats   s128;
+            SlabPool<SLOT>::Stats       s256;
+        };
+        static StatsProfile ReadStats() {
+            return StatsProfile{ SlabPool<SMALL_SLOT>::ReadStats(), SlabPool<SLOT80>::ReadStats(),
+                                 SlabPool<MID_SLOT>::ReadStats(),   SlabPool<SLOT>::ReadStats() };
+        }
+
         static void ReportStats() {
             SlabPool<SLOT>::ReportStats("256B (tasks)");
             SlabPool<MID_SLOT>::ReportStats("128B");
@@ -198,5 +210,36 @@ namespace JLib {
             SlabPool<SMALL_SLOT>::ReportStats("64B");
         }
         std::size_t MidCapacity()    const { return pool128.Capacity(); }
+
+        // ---- SLAB USAGE PROFILE, for sizing SetSlabSizes against a real workload ---------------
+        //
+        // Per class: what was configured, what the pool actually had to make resident, and whether
+        // it had to grow past the configuration. Free -- the high-water mark is the bump cursor
+        // refill already maintains, so nothing was added to the allocation path to produce it.
+        struct ClassUsage {
+            std::size_t slotBytes;
+            std::size_t capacity;      // slots configured (plus any grown extents)
+            std::size_t highWater;     // slots ever made resident -- SIZE TO THIS
+            long long   live;          // checked out right now
+            std::size_t extents;       // times this class had to grow; non-zero = under-configured
+        };
+        struct Usage { ClassUsage c64, c80, c128, c256; };
+
+        Usage UsageProfile() const {
+            return Usage{
+                { 64,  pool64.Capacity(),  pool64.HighWaterSlots(),  pool64.LiveCount(),  pool64.ExtentCount()  },
+                { 80,  pool80.Capacity(),  pool80.HighWaterSlots(),  pool80.LiveCount(),  pool80.ExtentCount()  },
+                { 128, pool128.Capacity(), pool128.HighWaterSlots(), pool128.LiveCount(), pool128.ExtentCount() },
+                { 256, pool256.Capacity(), pool256.HighWaterSlots(), pool256.LiveCount(), pool256.ExtentCount() },
+            };
+        }
+
+        // Bytes the slab actually made resident, across all four classes. NOT the reserved figure --
+        // `new Block[n]` default-initializes a trivial type and therefore writes nothing, so an
+        // untouched slot costs address space and no page.
+        std::size_t HighWaterBytes() const {
+            return pool64.HighWaterBytes() + pool80.HighWaterBytes()
+                 + pool128.HighWaterBytes() + pool256.HighWaterBytes();
+        }
     };
 }

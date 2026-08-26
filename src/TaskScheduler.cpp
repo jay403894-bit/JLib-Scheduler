@@ -217,6 +217,54 @@ bool TaskScheduler::ReserveTimerCore() noexcept { return TimersEnabled(); }
 void TaskScheduler::SetReserveIoCore(bool reserve) noexcept { EnableIoReactor(reserve); }
 bool TaskScheduler::ReserveIoCore() noexcept { return IoReactorEnabled(); }
 
+
+// PRINTS WHAT THE SLAB ACTUALLY USED, and the line to paste because of it.
+//
+// HIGH-WATER, NOT LIVE, is the number to configure against: live answers "checked out right now",
+// and by the time it is read the peak has been and gone. The high-water mark costs nothing to
+// maintain -- refill() prefers recycled slots and advances the bump cursor only when the free list
+// could not fill a batch, so that cursor already is the peak the pool had to make resident.
+void TaskScheduler::ReportSlabUsage(const char* label) {
+	if (!instance) { std::printf("[%s] scheduler not initialized\n", label); return; }
+	const auto u = instance->taskAllocator.UsageProfile();
+	const TaskAllocator::ClassUsage* cs[4] = { &u.c64, &u.c80, &u.c128, &u.c256 };
+
+	std::printf("\n=== %s ===\n", label);
+	std::printf("  class  configured    high-water        live  grown\n");
+	std::size_t hwBytes = 0, capBytes = 0;
+	for (const auto* c : cs) {
+		hwBytes  += c->highWater * c->slotBytes;
+		capBytes += c->capacity  * c->slotBytes;
+		std::printf("  %4zuB  %10zu  %10zu (%6.1f MB)  %8lld  %5zu\n",
+			c->slotBytes, c->capacity, c->highWater,
+			(double)(c->highWater * c->slotBytes) / (1024.0 * 1024.0),
+			c->live, c->extents);
+	}
+	std::printf("  reserved %.1f MB, actually resident %.1f MB\n",
+		(double)capBytes / (1024.0 * 1024.0), (double)hwBytes / (1024.0 * 1024.0));
+
+	// THE ACTIONABLE LINE, with headroom. The high-water mark is what THIS run needed; sizing to
+	// the exact peak means growing on the first busier frame, which is a hitch the number was
+	// supposed to avoid.
+	std::printf("  suggested (measured peak +50%%):\n");
+	std::printf("    JLib::TaskScheduler::SlabSizes s;\n");
+	std::printf("    s.slots64 = %zu; s.slots80 = %zu; s.slots128 = %zu; s.slots256 = %zu;\n",
+		u.c64.highWater  + u.c64.highWater  / 2 + 64,
+		u.c80.highWater  + u.c80.highWater  / 2 + 64,
+		u.c128.highWater + u.c128.highWater / 2 + 64,
+		u.c256.highWater + u.c256.highWater / 2 + 64);
+	std::printf("    JLib::TaskScheduler::SetSlabSizes(s);   // before Init()\n");
+
+	for (const auto* c : cs)
+		if (c->extents)
+			std::printf("  NOTE: the %zuB class GREW %zu time(s) -- under-configured for this run.\n",
+				c->slotBytes, c->extents);
+
+	// Per-class alloc/free/refill RATES -- which class is hot, and whether the size-class split
+	// matches the workload. Sharded per thread, and a no-op unless JLIBSCHED_ALLOC_STATS is on.
+	TaskAllocator::ReportStats();
+}
+
 void TaskScheduler::SetReservedCores(unsigned n) noexcept {
 	g_reservedUserCores.store(n, std::memory_order_relaxed);
 }

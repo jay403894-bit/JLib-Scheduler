@@ -403,6 +403,40 @@ namespace JLib {
         // INCLUDES GROWN EXTENTS, because a caller asking "how big is this pool" after it grew wants
         // the truth rather than the configured figure. A test that needs the FIXED ceiling should
         // turn growth off (detail::SlabGrowthEnabled) rather than read a number that lies.
+        // THE HIGH-WATER MARK, and it costs nothing because it is already being tracked.
+        //
+        // WHAT TO SIZE THE POOL TO. LiveCount() answers "how many slots are checked out RIGHT NOW",
+        // which is the wrong question for configuration -- by the time you read it the peak has been
+        // and gone. This is the peak the pool actually had to touch, and it never falls.
+        //
+        // NO NEW COUNTER WAS NEEDED. refill() prefers RECYCLED slots and only advances the bump
+        // cursor when the free list could not fill a batch, so bumpNext already is the high-water
+        // mark -- that preference exists to keep the resident set at peak-live rather than creeping
+        // toward capacity, and the cursor is the record of it. A sharded "bytes used" atomic would
+        // have been a second, costlier way to learn the same thing.
+        //
+        // READ IT AS RESIDENT FOOTPRINT, NOT AS PEAK CONCURRENT LIVE. It rounds up to BATCH
+        // granularity and includes whatever the per-thread caches were holding (up to 2*BATCH each),
+        // so it runs ABOVE true peak live. That is the honest number to configure against anyway:
+        // it is the pages the pool actually made resident.
+        std::size_t HighWaterSlots() const {
+            std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(mtx));
+            std::size_t n = bumpNext;
+            for (Extent* e = extents.load(std::memory_order_acquire); e;
+                 e = e->next.load(std::memory_order_acquire)) n += e->bumpNext;
+            return n;
+        }
+        std::size_t HighWaterBytes() const { return HighWaterSlots() * SLOT; }
+
+        // How many times this class had to grow past its configured size. Non-zero means the
+        // configuration was too small for the workload -- the pool coped, and paid an allocation.
+        std::size_t ExtentCount() const {
+            std::size_t n = 0;
+            for (Extent* e = extents.load(std::memory_order_acquire); e;
+                 e = e->next.load(std::memory_order_acquire)) ++n;
+            return n;
+        }
+
         std::size_t Capacity() const {
             std::size_t n = memSlots;
             for (Extent* e = extents.load(std::memory_order_acquire); e;
@@ -419,6 +453,28 @@ namespace JLib {
         // buy nothing while costing an ABA problem that needs tagged pointers or EBR to solve. High
         // means the lock convoys under burst, and the cheap fix is to SHARD the shared tier -- more
         // lists, chosen by thread -- not to make one list lock-free.
+        // THE GETTER, because every other diagnostic in this library has one and this did not.
+        // ReportStats prints; this returns, so a caller can log it, graph it over time, or assert on
+        // it in a test. Zeroed and inert unless JLIBSCHED_ALLOC_STATS is on.
+        struct Stats {
+            std::uint64_t allocs = 0, frees = 0, refills = 0, refillBlocked = 0;
+            std::uint64_t flushes = 0, flushBlocked = 0;
+        };
+        static Stats ReadStats() {
+            Stats s;
+#ifdef JLIBSCHED_ALLOC_STATS
+            for (std::size_t i = 0; i < kLiveSlots; ++i) {
+                s.allocs        += s_stats[i].allocs.load(std::memory_order_relaxed);
+                s.frees         += s_stats[i].frees.load(std::memory_order_relaxed);
+                s.refills       += s_stats[i].refills.load(std::memory_order_relaxed);
+                s.refillBlocked += s_stats[i].refillBlocked.load(std::memory_order_relaxed);
+                s.flushes       += s_stats[i].flushes.load(std::memory_order_relaxed);
+                s.flushBlocked  += s_stats[i].flushBlocked.load(std::memory_order_relaxed);
+            }
+#endif
+            return s;
+        }
+
         static void ReportStats(const char* label) {
 #ifdef JLIBSCHED_ALLOC_STATS
             std::uint64_t allocs = 0, frees = 0, refills = 0, rBlocked = 0, flushes = 0, fBlocked = 0;

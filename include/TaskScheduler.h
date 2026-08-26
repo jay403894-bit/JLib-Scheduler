@@ -1204,6 +1204,23 @@ namespace JLib {
 		//
 		// Only affects the AUTO size (Init(0) / Init with poolSize == 0). An explicit poolSize is
 		// taken as the caller's own arithmetic and is not adjusted.
+		// PRINT WHAT THE SLAB ACTUALLY USED, and what to configure because of it.
+		//
+		// Call at shutdown, or any time. Per size class it reports the configured capacity, the
+		// HIGH-WATER slots the pool genuinely had to make resident, how many are live right now, and
+		// whether the class had to grow past its configuration -- then prints a ready-to-paste
+		// SetSlabSizes() call sized to what this run measured.
+		//
+		// HIGH-WATER, NOT LIVE, is the number to size against. Live answers "how many slots are
+		// checked out RIGHT NOW", and by the time you read it the peak has been and gone.
+		//
+		// FREE IN EVERY BUILD, because it adds no counter: refill() prefers recycled slots and only
+		// advances the bump cursor when the free list could not fill a batch, so that cursor already
+		// IS the high-water mark. Build with -DJLIBSCHED_ALLOC_STATS=ON to get per-class alloc/free
+		// RATES underneath it -- which class is hot, and whether the size-class split matches the
+		// workload. Those counters are sharded per thread and compiled out otherwise.
+		static void ReportSlabUsage(const char* label = "slab usage");
+
 		static void     SetReservedCores(unsigned n) noexcept;
 		static unsigned GetReservedCores() noexcept;
 		static bool ReserveIoCore() noexcept;

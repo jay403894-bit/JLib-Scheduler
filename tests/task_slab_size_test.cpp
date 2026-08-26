@@ -202,6 +202,22 @@ int main() {
         Check(Tracked::Ctors().load() > 0 && Tracked::Ctors().load() == Tracked::Dtors().load(), what);
     }
 
+    // ---- THE USAGE REPORT ---------------------------------------------------------------------
+    //
+    // Not merely that it prints -- that the HIGH-WATER mark is a real measurement. This binary has
+    // deliberately exhausted and grown a tiny slab, so the peak must be non-zero and the classes
+    // that grew must say so. A report that always printed zeroes would look identical in a passing
+    // run, which is the shape three tests in this file have already failed as.
+    JLib::TaskScheduler::ReportSlabUsage("slab usage after this test");
+    {
+        const auto u = sched.GetAllocator()->UsageProfile();
+        Check(u.c64.highWater > 0 || u.c80.highWater > 0 || u.c256.highWater > 0,
+              "the high-water mark is non-zero after real allocation");
+        const bool grewSomewhere = u.c64.extents || u.c80.extents || u.c128.extents || u.c256.extents;
+        Check(grewSomewhere, "the report identifies the class that had to grow");
+        Check(sched.GetAllocator()->HighWaterBytes() > 0, "resident bytes are reported");
+    }
+
     sched.Join();
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
