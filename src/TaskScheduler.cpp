@@ -815,6 +815,24 @@ void TaskScheduler::ClampHotWorkersToPool() {
 	const size_t k = g_hotWorkersRequested.load(std::memory_order_relaxed);
 	const size_t n = workers.size();
 	g_hotWorkers.store((n && k >= n) ? n - 1 : k, std::memory_order_relaxed);
+
+	// THE BOUNDS NEED THE SAME CLAMP, and leaving them out is a live bug on a small pool.
+	//
+	// K itself was clamped here; the RANGE was not. So SetHotWorkerRange(1, 4) on Init(2) left
+	// hotMax at 4 while K could never exceed n-1 == 1. The controller then sees hi > lo, decides to
+	// promote, SetHotWorkersEffective silently clamps the result back to 1 -- and stamps
+	// lastHotChange anyway. It promotes forever without ever moving K, and because that timestamp
+	// keeps resetting, the DOWN interval never elapses either, so demotion can never fire.
+	//
+	// Clamped here rather than in the setter because the setter is legal BEFORE Init, when there is
+	// no pool to clamp against. Same reason K is re-applied here.
+	if (n) {
+		const size_t cap = n - 1;
+		if (g_hotMax.load(std::memory_order_relaxed) > cap)
+			g_hotMax.store(cap, std::memory_order_relaxed);
+		if (g_hotMin.load(std::memory_order_relaxed) > cap)
+			g_hotMin.store(cap, std::memory_order_relaxed);
+	}
 }
 
 // Read by the hot workers themselves and by the reactor's completion threads, each of which raises
