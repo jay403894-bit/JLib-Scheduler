@@ -449,9 +449,10 @@ void Thread::Worker() {
 	bool hotPriorityRaised = false;
 	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
 	unsigned hotCtlTick = 0;
-	// "This worker may have a lane bit set." Lets a demoted worker retire a bit nobody else can
-	// clear, exactly once, without an atomic on every pass of every ordinary worker.
-	bool laneBitMayBeSet = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
+	// Generation-driven lane reconciliation. Seeded from the current generation so a worker that
+	// starts life after a K change does not treat its own startup as a transition.
+	unsigned long long hotGenSeen = TaskScheduler::GetHotGeneration();
+	bool hotChangePending = false;
 	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
 	// on a genuine change. Meaningless unless hotPriorityRaised.
 	bool atCriticalPriority = false;
@@ -496,10 +497,8 @@ void Thread::Worker() {
 			// drained its own backlog by popping. ONCE PER PASS, not per pickup -- that frequency
 			// difference is the entire cost argument, and a pass is exactly when this worker has
 			// nothing better to do anyway.
-			if (isHotWorker) {
+			if (isHotWorker)
 				scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
-				laneBitMayBeSet = true;      // we are the only writer while hot; assume we set it
-			}
 			// ---- RETIRING A BIT LEFT BEHIND BY A DEMOTION -----------------------------------
 			//
 			// THE LEAK THIS CLOSES, and it only exists once K can move. The line above is a worker's
@@ -512,18 +511,30 @@ void Thread::Worker() {
 			// cannot cover is the end: once the queues are empty the drain stops running, and the
 			// last value it published may still have been above the threshold.
 			//
-			// Edge-triggered, so an ordinary worker that was never hot and holds nothing -- which is
-			// almost every worker, almost always -- pays one bool compare and no atomic.
-			//
 			// FOUND BY A TEST PRECONDITION, not by reading: SchedulerDynamicKTest asserts worker 3's
 			// bit is clear before its push, and that assertion failed against a bit left over from
 			// an earlier section of the same run.
-			else if (hiPriStray) {
-				laneBitMayBeSet = true;
-			}
-			else if (laneBitMayBeSet) {
-				scheduler->UpdateLaneHint((size_t)qIndex, 0);
-				laneBitMayBeSet = false;
+			//
+			// DRIVEN BY A GENERATION COUNTER, not by tracking whether we set the bit. The first
+			// version kept a per-worker "my bit might be set" bool, which was cheaper -- but its
+			// invariant had to be maintained across all four UpdateLaneHint call sites, two of which
+			// are THIEVES writing a victim's bit. Tracing four sites to convince yourself a local
+			// flag is still true is the shape that has drifted in this codebase before. The
+			// generation says only "K moved, re-derive," which is self-contained.
+			//
+			// STICKY UNTIL RESOLVED, because the bump and the fix cannot always happen together: a
+			// worker demoted while still holding lane work must NOT clear its bit yet -- the drain is
+			// still maintaining it and helpers should still see it. So the pending flag survives
+			// until the queues are actually empty, at which point no further generation bump would
+			// ever come.
+			else {
+				const unsigned long long g = TaskScheduler::GetHotGeneration();
+				if (g != hotGenSeen) { hotGenSeen = g; hotChangePending = true; }
+				if (hotChangePending && !hiPriStray) {
+					// Clears if set, and early-outs without a write if it is not.
+					scheduler->UpdateLaneHint((size_t)qIndex, 0);
+					hotChangePending = false;
+				}
 			}
 			// ---- WHY A K TRANSITION NEEDS NO HAND-OFF, which is NOT obvious ------------------
 			//

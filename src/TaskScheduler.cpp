@@ -559,6 +559,10 @@ static std::atomic<size_t> g_hotWorkers{ 0 };
 // 0 and there is nothing to clamp against, so StartPool re-applies it once the pool exists.
 static std::atomic<size_t> g_hotWorkersRequested{ 0 };
 
+// Bumped whenever K actually moves. A worker compares it per pass and re-derives its lane state on
+// a mismatch -- see the reconciliation in Thread.cpp.
+static std::atomic<unsigned long long> g_hotGeneration{ 0 };
+
 // NO POLICY ENUM. min == max IS static, by construction rather than by a flag that has to agree
 // with the bounds. The default range is (0,0), which is exactly the pre-existing K=0 default, so
 // scaling is opt-in by WIDENING the range and by nothing else -- and there is no state in which a
@@ -585,9 +589,16 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 		const size_t n = instance->workers.size();
 		if (n && eff >= n) eff = n - 1;
 	}
-	g_hotWorkers.store(eff, std::memory_order_relaxed);
+	const size_t prev = g_hotWorkers.exchange(eff, std::memory_order_relaxed);
+	// THE GENERATION IS BUMPED ONLY ON A REAL CHANGE, and this line is the reason the whole scheme
+	// is cheap: every worker reads it every pass, so it must stay in shared state. K moves rarely
+	// even under scaling (2 ms up, 200 ms down), so the line is written rarely and the reads do not
+	// ping-pong -- unlike stealHintLane, which hot workers rewrite thousands of times a second and
+	// which is therefore the wrong thing for an ordinary worker to poll.
+	if (prev != eff) g_hotGeneration.fetch_add(1, std::memory_order_release);
 }
 size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
+unsigned long long TaskScheduler::GetHotGeneration() { return g_hotGeneration.load(std::memory_order_acquire); }
 
 // ---- DYNAMIC K ---------------------------------------------------------------------------------
 // See the SetHotScaling block in TaskScheduler.h for the design; this is only the mechanism.
