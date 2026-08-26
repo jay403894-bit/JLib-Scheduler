@@ -3,6 +3,168 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 4.0.1 - 2026-08-27
+
+**Adaptive K, and the memory work that pays for it.** Everything here is opt-in or a default that
+moved; a pool that calls nothing behaves as it did, except where noted under Breaking.
+
+### Breaking
+
+- **`PushImmediate` and `PushToCore` are removed.** They pinned a pool worker to a blocking task --
+  taking a worker out of a *work-stealing* pool and spilling its queue to everyone else. The
+  justification was that a pinned task stays visible to placement, where an outside thread is "a core
+  that quietly went missing". Dynamic K ended that: a pinned worker is neither ordinary nor hot in
+  anything the scheduler tracks, so it became invisible in a second way -- and the hot set could grow
+  *over* it, steering completions into a queue that never drains.
+  **Use `SetReservedCores(n)` and run a `std::thread`.** Same census accounting, none of the
+  invariants, because the scheduler never owns the thread.
+  Net -367 lines: three retry loops and three pinned-core gates existed only to dance around a core
+  that could be unavailable. Nothing can make a worker unavailable now, so explicit affinity always
+  succeeds and `PushLocal` lost its refusal path.
+- **`CoroSafeEpochGuard` is now `EpochGuard`; the old `EpochGuard` is `SlotEpochGuard`.** The guard
+  that is *wrong* for a coroutine had the obvious name and the one correct everywhere had the awkward
+  one -- 15 call sites used the safe form and 1 used the other.
+- **Unserialised stream calls renamed** to `RecvRawAsync` / `SendRawAsync` / `RecvVRawAsync` /
+  `SendVRawAsync`. `SendToAsync` / `RecvFromAsync` are unchanged: datagrams have no framing hazard to
+  warn about.
+- **Default slab: 176 MB -> 4.00 MB.** The old figure was correct when exhaustion was *fatal* -- the
+  only safe default was one nobody could exhaust. Growth (below) made it a warning, so the default
+  now covers the common case and degrades honestly outside it. Profile yours with
+  `ReportSlabUsage()`.
+
+### Adaptive K
+
+`SetHotWorkerRange(min, max)` widens the hot set into a range and lets the scheduler move inside it.
+`SetHotWorkers(k)` pins `[k, k]`, which remains the default and still means exactly *k*.
+
+**There is no policy enum, deliberately.** `min == max` *is* static, by construction, so no second
+knob can fall out of step with the bounds. Two proposed enums were cancelled for the same reason --
+both turned out to be expressible in the range.
+
+The app decides the **ceiling**, not the set point. The scheduler cannot know whether a core is
+better spent on the lane or on frame work, and does not need to: `maxK` already encodes how much
+diversion you tolerate, and inside that bound, saturation is a fact about the lane alone.
+
+**Eager up, patient down** -- 200 us to promote, 200 ms plus three quiet windows to shed. Both halves
+have been broken once by tuning the other's number, so the reasoning sits next to the constants.
+Promotion is event-driven and never waits for a window; demotion is time-averaged occupancy.
+
+Measured against the static rungs it climbs between (200 us burials, 1-in-8 skew):
+
+| arm | p50 | p90 | p99 | endK |
+|---|---|---|---|---|
+| K=1 | 481.8 | 933.0 | 1148.6 | 1.0 |
+| K=4 | 38.4 | 417.4 | 706.0 | 4.0 |
+| **dyn 1-4** | **30.9** | **412.0** | **813.1** | **4.0** |
+
+It starts at 1 and lands on the K=4 row. Do **not** tune it to beat static K=4 on the tail: static
+never sheds, so it never pays ramp. A teens-of-percent p99 on the first wave after a quiet period is
+the fee for getting cores back at all.
+
+- **`SetLaneWake(n)`** (default 0): a buried hot worker pulls parked ordinary workers up to steal.
+  Worth **p50 -52% at K=1**, where no hot sibling exists and stealing structurally cannot help. This
+  needed a **fourth sleep-predicate input**: a bare notify cannot work, because `cv.wait`
+  re-evaluates the predicate and parks again without ever returning to the loop. Re-verified in
+  `sleepwake_model.c` with its own failing negative control.
+- **`SetLaneClearDepth(d)`** (default 3, the old single threshold): hysteresis on the lane hint. Pair
+  it with `SetLaneWake` -- they are coupled, and the wrong pairing doubles steal probes for no gain.
+- **`SetSteerSkip(bool)`** (default off): the completion thread avoids hot workers already
+  advertising a backlog. Real in isolation (21-29% at the tail) but redundant with hot->hot stealing,
+  which covers the same window better. Kept with its measurement rather than deleted.
+- `kLaneStealDepth` stays at 4. Lowering it to 2 was tested, because the occupancy witness showed
+  genuine imbalance sitting below the threshold. It made the tail *worse* in three rows of four and
+  doubled probes: **shallow imbalance is visible without being profitable.**
+
+### Memory
+
+- **The slab grows instead of failing.** Exhaustion allocates a 4096-slot extent and prints a
+  one-time warning naming the class. "No allocations at runtime" was always a *performance* rule, and
+  a performance rule that turns into a crash at its own boundary is the wrong rule.
+  `SetSlabGrowth(false)` restores a hard ceiling.
+- **The 256-byte lambda ceiling is gone.** A capture larger than the biggest slot used to be a
+  *compile error*, which made the task path stricter than the coroutine path for no defensible
+  reason -- an oversized coroutine frame has always fallen back to the heap. Disposal needs no size
+  flag, because `FreeSized` routes by address.
+- **`ReportSlabUsage()`** prints per class: configured, resident, **peak-live**, and whether it grew,
+  followed by a ready-to-paste `SetSlabSizes` call. Size against peak-live; resident equals capacity
+  in a non-lazy build. `UsageProfile()` and `ReadStats()` return the same data as structs.
+- **`SetReservedCores(n)`**: declare threads you run yourself so the pool sizes around them. The
+  general case of `SetReserveTimerCore` / `SetReserveIoCore`, and the replacement for
+  `PushImmediate`.
+
+### Coroutines and reclamation
+
+- **Counted epochs.** A coroutine has no epoch slot: `CurrentEpochSlot()` hands it the *worker's*
+  fallback, and a parked coroutine's announcement is then clobbered by that worker's next guard while
+  its traversal is still live. Fixed by counting readers per epoch rather than locating them, through
+  a gated modular ring. **Model-checked** (`counted_epoch_model.c`, with a `-DNO_ADVANCE_GATE`
+  control that fails as it must), and sharded after an unsharded version measured 61.7x. Both
+  mechanisms run side by side -- slots for fibers and bare threads, counters for coroutines, with
+  `MinActiveEpoch` a minimum over their union.
+- **`Future<T>` / `Promise<T>`**, including `Future<void>` as a generic awaitable. Refcounted and
+  multi-consumer, where `Lazy<T>` remains the single-reader form. Heap-allocated on purpose: *the
+  efficient allocator is the wrong default when the lifetime is not yours.*
+- Hot-thread priority now **stands down** when a worker stops being hot. The one-way raise was
+  correct while the hot set was static; under dynamic K it ratcheted to `maxK` and never returned,
+  which under `NoSleep` means workers spinning at priority 15 -- the configuration measured 5x worse.
+- The `immediate` sleep-predicate input is **removed** along with `PushImmediate`, and the model
+  updated to match. Its `-DWEAK_IMMEDIATE` control is replaced by `-DLANE_ONLY -DWEAK_LANEWAKE`:
+  same shape, same failure, identical execution counts.
+
+### Fixed
+
+- **[CRITICAL]** The K=0 dead-lane optimisation deadlocked `ImmediateDrainTest`. The cause was a
+  *brace*: the gate was added to an `if` that already enclosed the loPri drain, so at K=0 a worker
+  stopped draining its own **ordinary** inbox. Found by a pool dump after reading the code produced
+  three confident wrong answers. The optimisation is now safe and enabled, and the default pool's
+  loop is cheaper than before the lane existed.
+- **[CRITICAL]** `TaskAllocator::Free` fell back to `pool256.Free` for a pointer no pool owned --
+  splicing foreign memory into a free list. Unreachable while every task fit a slot; reachable the
+  moment one did not.
+- A stale lane hint bit was never retired after demotion, so thieves probed an empty lane forever.
+  The generation counter that first fixed it was the wrong instrument: a K change is not the only
+  thing that raises the bit.
+- `SetHotWorkerRange` clamps to the pool. An unclamped `maxK` made the controller promote forever
+  without moving K, which also blocked demotion.
+- The reactor's completion thread died on the first empty poll -- `WAIT_TIMEOUT` was not separated
+  from a dead port.
+- Two `Thread.cpp` free sites called `FreeSized` and ignored its return, which would have leaked a
+  heap-allocated task.
+
+---
+
+## 4.0.0 - 2026-08-25
+
+**The low-latency lane.** `hiPri` stops being a nominal priority and becomes a lane served by *K* hot
+workers. An ABI break rather than a minor bump.
+
+- **`SetHotWorkers(k)`** (default 0). Hot workers never park and serve the lane, and completions are
+  *steered* at them rather than round-robined across the pool. Without steering, K-hot measurably
+  does nothing: at K=2 of 29 workers, only ~7% of completions land on one that is awake.
+  **One hot worker buys all of NoSleep's p50 win for one core instead of 29**, with a 3x better p90.
+- **At K=0 the lane does not exist**, and that path is now *cheaper than before any of this*: hiPri
+  routes to the ordinary lane, nobody probes it, and each worker checks one inbox, one deque and one
+  steal probe per victim.
+- **Two-signal steal hints** (`BACKLOG || PARALLELISM`). Hit rate went from 0.2-0.9% to 72-90% with
+  ~330x fewer probes. The single-signal v1 destroyed `ParallelFor` (7.49x -> 0.93x) and was reverted;
+  the second flag is what made stealing work at all.
+- **Hot workers steal nothing** by default: 20.6M remote cache-line touches to 0 at identical
+  latency. Hot->hot stealing returned later, gated on a backlog hint, once a *skewed* load showed it
+  had a job to do.
+- **Targeted `TIME_CRITICAL`, never process-wide.** Process elevation measured **5x worse** alongside
+  K-hot, because it raises all N workers and N spinning threads then preempt the completion thread
+  feeding them. Applied per task: lane work elevated, ordinary work at Normal.
+- `SetHotWorkerPin` / `SetHotWorkerExclusive`, both measured and both off by default -- pinning
+  *alone* is worse than doing nothing, because it confines the hot worker without excluding anyone
+  else from its core.
+- **`WaitFor(wg, token)`**: cancels the *wait*, never the count.
+
+### Fixed
+
+- **[CRITICAL]** A fourth task-discard site never notified the DAG, hanging POSIX CI.
+- `Init` works after `Join`: both service layers restart from `StartPool`.
+- The POSIX stub was missing `IoReactor::Start()` -- caught by CI, not by review.
+
 ## 3.5.0 - 2026-08-24
 
 **Asynchronous I/O.** `IoReactor` -- a completion-first engine, C++17, compiled into the core -- plus
