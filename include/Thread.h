@@ -361,6 +361,26 @@ namespace JLib {
         // cannot do that.
         std::atomic<bool> laneWake{ false };
 
+        // ---- LANE DUTY CYCLE, sampled BY THE WORKER ITSELF ------------------------------------
+        // How often this worker actually has lane work, counted on its own loop at its own rate.
+        //
+        // THE CENTRAL-SAMPLER VERSION FAILED, and the failure is the reason this lives here. The
+        // controller first polled the top worker from ONE driver worker`s pass counter -- and under
+        // a light trickle that driver barely loops, so a 200 ms window gathered ONE OR TWO samples
+        // where it needed dozens. Measured: s=1, s=2, against s=39348 in a window where the pool
+        // happened to be spinning. A measurement whose density depends on a third party`s loop rate
+        // is not a measurement.
+        //
+        // Counted by the subject instead, so density scales with the thing being measured. Both are
+        // relaxed and live on lines this worker owns; the controller reads them rarely.
+        //
+        // Public because the controller in TaskScheduler.cpp reads and resets them; nothing else
+        // should touch them.
+    public:
+        std::atomic<unsigned> laneCyclesTotal{ 0 };
+        std::atomic<unsigned> laneCyclesBusy{ 0 };
+    private:
+
         // Worker sleep state, so a push can skip the wake entirely when this worker is already
         // running. Three states rather than a bool because the interesting window is between
         // "decided to park" and "actually inside cv.wait": GOING_TO_SLEEP publishes the INTENT, so

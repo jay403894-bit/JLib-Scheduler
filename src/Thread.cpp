@@ -449,6 +449,7 @@ void Thread::Worker() {
 	bool hotPriorityRaised = false;
 	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
 	unsigned hotCtlTick = 0;
+	unsigned laneDutyTick = 0;
 	// Generation-driven lane reconciliation. Seeded from the current generation so a worker that
 	// starts life after a K change does not treat its own startup as a transition.
 	unsigned long long hotGenSeen = TaskScheduler::GetHotGeneration();
@@ -497,8 +498,24 @@ void Thread::Worker() {
 			// drained its own backlog by popping. ONCE PER PASS, not per pickup -- that frequency
 			// difference is the entire cost argument, and a pass is exactly when this worker has
 			// nothing better to do anyway.
-			if (isHotWorker)
-				scheduler->UpdateLaneHint((size_t)qIndex, scheduler->hiPri[qIndex]->size());
+			if (isHotWorker) {
+				const size_t laneDepth = scheduler->hiPri[qIndex]->size();
+				scheduler->UpdateLaneHint((size_t)qIndex, laneDepth);
+
+				// DUTY CYCLE, sampled by the worker being measured. See Thread.h: the central-sampler
+				// version gathered one or two samples per window under a light load, because its
+				// density depended on some other worker's loop rate. Here it scales with this
+				// worker's own loop, which is the thing the ratio is about.
+				//
+				// 1-in-16 because the answer is a RATIO -- every sixteenth pass estimates it just as
+				// well as every pass, at a sixteenth of the cost, and both counters are on lines this
+				// worker already owns.
+				if ((++laneDutyTick & 0xF) == 0) {
+					laneCyclesTotal.fetch_add(1, std::memory_order_relaxed);
+					if (laneDepth != 0 || !scheduler->hiPriInboxes[qIndex]->empty())
+						laneCyclesBusy.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
 			// ---- RETIRING A BIT LEFT BEHIND BY A DEMOTION -----------------------------------
 			//
 			// THE LEAK THIS CLOSES, and it only exists once K can move. The line above is a worker's

@@ -273,6 +273,71 @@ int main() {
         JLib::TaskScheduler::SetHotWorkers(0);   // leave the pool as we found it
     }
 
+    // ============================================================================================
+    // THE DOWN-RAMP UNDER CONTINUOUS-BUT-UNSATURATED I/O, which is the normal shape for a server or
+    // a game and is NOT what the section above tests.
+    //
+    // Above, the load stops dead and the lane goes silent, which is the easy case. A real program
+    // with constant I/O never goes silent -- it just stops being SATURATED. If the controller can
+    // only give a core back during total silence, it never gives one back at all, K ratchets to
+    // maxK, and dynamic K is static maxK with extra steps.
+    //
+    // So: ramp up, then offer a light trickle -- small bursts, well short of saturating four hot
+    // workers -- and ask whether K comes down anyway. A core that is not needed should be returned
+    // while the lane is still in use.
+    std::printf("\ndown-ramp under continuous light load (not silence)\n");
+    {
+        JLib::TaskScheduler::SetHotWorkers(1);
+        JLib::TaskScheduler::SetHotWorkerRange(1, 4);
+        g_ran.store(0);
+        int pushed = 0;
+
+        // Phase 1: saturate, to get K up.
+        {
+            std::vector<JLib::Task*> b;
+            for (int i = 0; i < 256; ++i)
+                if (auto* t = s.CreateTask([](void*) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(300));
+                        g_ran.fetch_add(1, std::memory_order_relaxed); }, nullptr, 1))
+                    b.push_back(t);
+            if (!b.empty()) { s.PushBatch(b.data(), b.size(), 1, 4096, true); pushed += (int)b.size(); }
+        }
+        WaitUntil([&] { return JLib::TaskScheduler::GetHotWorkers() > 1; }, 4000);
+        const size_t ramped = JLib::TaskScheduler::GetHotWorkers();
+
+        // Phase 2: a TRICKLE, for well past the 200 ms down interval. Bursts of 6 are above
+        // kLaneStealDepth, so each one briefly advertises -- which is the point. This is exactly the
+        // traffic that keeps zeroing a "sustained silence" accumulator.
+        int belowSamples = 0, totalSamples = 0;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+        while (std::chrono::steady_clock::now() < until) {
+            std::vector<JLib::Task*> b;
+            for (int i = 0; i < 6; ++i)
+                if (auto* t = s.CreateTask([](void*) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                        g_ran.fetch_add(1, std::memory_order_relaxed); }, nullptr, 1))
+                    b.push_back(t);
+            if (!b.empty()) { s.PushBatch(b.data(), b.size(), 1, 4096, true); pushed += (int)b.size(); }
+            ++totalSamples;
+            if (JLib::TaskScheduler::GetHotWorkers() < ramped) ++belowSamples;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        std::printf("      ramped to %zu; during trickle K was below that on %d of %d samples\n",
+                    ramped, belowSamples, totalSamples);
+        Check(ramped > 1, "precondition: it ramped up first");
+        // SAMPLED, NOT A SINGLE READING. The controller sheds the surplus core and the next burst
+        // re-adds it -- at K=1 a burst above kLaneStealDepth makes the one hot worker look saturated
+        // by definition -- so K oscillates rather than settling. A one-instant check against that is
+        // a coin flip, and it failed as one. What actually matters is whether the core is given back
+        // AT ALL while the lane is still in use, so the assertion is about time spent shed.
+        Check(totalSamples > 0 && belowSamples * 4 > totalSamples,
+              "K spends real time BELOW its peak while the lane is still in use");
+
+        JLib::TaskScheduler::SetHotWorkers(0);
+        WaitUntil([&] { return g_ran.load() == pushed; }, 20000);
+    }
+
     std::printf("\n%s -- %d failure(s)\n", g_fail ? "FAILED" : "ALL CHECKS PASSED", g_fail);
     s.Join();
     return g_fail ? 1 : 0;

@@ -596,6 +596,31 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// ping-pong -- unlike stealHintLane, which hot workers rewrite thousands of times a second and
 	// which is therefore the wrong thing for an ordinary worker to poll.
 	if (prev != eff) g_hotGeneration.fetch_add(1, std::memory_order_release);
+
+	// A NEWLY PROMOTED WORKER MUST BE WOKEN, or the promotion does nothing at all.
+	//
+	// Hot status is read per pass from a worker's own loop -- so a worker that is PARKED cannot
+	// observe it. It sits in cv.wait until something happens to land in its inbox, which for a lane
+	// nobody is steering to yet may be never. The core is nominally hot, is not spinning, is not
+	// serving the lane, and is not even counted as idle.
+	//
+	// FOUND BY INSTRUMENTATION, after two wrong diagnoses of the same symptom: the duty-cycle
+	// counters for the top worker read exactly ZERO forever after its first window. Not "low", which
+	// would have looked like an idle core -- zero, which means the worker was not executing its loop
+	// at all. Same lazy-application shape as NoSleep, and for the same reason.
+	// A BARE NOTIFY IS NOT ENOUGH, and this is the second time tonight that exact trap has appeared.
+	// cv.wait(lock, pred) loops INTERNALLY: the notify wakes the condvar, the predicate still sees no
+	// queued work, and it goes straight back to sleep WITHOUT RETURNING TO THE WORKER LOOP. The
+	// worker therefore never re-reads its hot status, however many times it is signalled.
+	//
+	// So the promotion has to make the PREDICATE true, not just ring the bell -- and laneWake already
+	// is a predicate input, added for lane wakes and carried through the GenMC model with its own
+	// negative control. Reusing it costs no new proof: "come up and look again" is exactly what it
+	// means, and a promoted worker that comes up and looks will find itself hot and spin.
+	for (size_t i = prev; i < eff && i < instance->workers.size(); ++i) {
+		instance->workers[i]->MarkLaneWake();
+		instance->workers[i]->NotifyWorker(/*force*/ true);
+	}
 }
 size_t TaskScheduler::GetHotWorkers() { return g_hotWorkers.load(std::memory_order_relaxed); }
 unsigned long long TaskScheduler::GetHotGeneration() { return g_hotGeneration.load(std::memory_order_acquire); }
@@ -603,7 +628,12 @@ unsigned long long TaskScheduler::GetHotGeneration() { return g_hotGeneration.lo
 // ---- DYNAMIC K ---------------------------------------------------------------------------------
 // See the SetHotScaling block in TaskScheduler.h for the design; this is only the mechanism.
 static std::atomic<long long> g_lastHotChangeNs{ 0 };
-static std::atomic<long long> g_laneQuietSinceNs{ 0 };
+// Duty-cycle window for the MARGINAL hot worker -- see the down branch of MaybeAdjustHotWorkers.
+static std::atomic<unsigned>  g_topSamples{ 0 };
+static std::atomic<unsigned>  g_topBusy{ 0 };
+static std::atomic<long long> g_windowStartNs{ 0 };
+static std::atomic<long long> g_saturatedSinceNs{ 0 };
+static constexpr unsigned     kMinTopSamples = 32;
 
 // Up fast, down slow, and the asymmetry is the anti-thrash. A saturated lane loses latency every
 // microsecond it stays saturated; an idle hot worker loses only a spinning core, which is the cost
@@ -650,32 +680,75 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// relaxed load and two compares. This matters because the caller is sampled off a hot worker's
 	// pass counter, so it runs often.
 	const bool saturated = (adv == mask);
-	const bool quiet     = (adv == 0);
-	if (!saturated && !quiet) { g_laneQuietSinceNs.store(0, std::memory_order_relaxed); return; }
 	if (saturated && k >= hi) return;       // already at the ceiling: nothing to decide
-	if (quiet     && k <= lo) return;       // already at the floor
+	if (!saturated && k <= lo) return;      // already at the floor
 
 	const long long now  = MonotonicNs();
 	const long long last = g_lastHotChangeNs.load(std::memory_order_relaxed);
 
 	if (saturated) {                        // EVERY hot worker buried: capacity, which K fixes
-		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
-		if (k < hi && now - last >= kHotUpIntervalNs) {
+		g_windowStartNs.store(now, std::memory_order_relaxed);
+
+		// SUSTAINED, NOT INSTANTANEOUS -- and the difference is not pedantry, it decides whether the
+		// controller settles or oscillates. "Every hot worker holds at least kLaneStealDepth" is a
+		// weak test at small K: at K=1 it means ONE worker briefly had four items, which is what a
+		// burst looks like, not what being out of capacity looks like. Measured before this clause
+		// existed: under a light trickle of six-task bursts, K shed the surplus core and the very
+		// next burst re-added it, leaving it below its peak on 5 samples out of 160.
+		//
+		// The interval was already here as a RATE LIMIT on changes, which is a different thing and
+		// does not help -- it bounds how often you may act, not whether the condition was real. So
+		// saturation now has to hold continuously for the same interval before it counts, which a
+		// burst that drains in a few hundred microseconds cannot do and a genuine shortfall does
+		// trivially. Symmetric with the duty cycle on the way down.
+		const long long satSince = g_saturatedSinceNs.load(std::memory_order_relaxed);
+		if (satSince == 0) { g_saturatedSinceNs.store(now, std::memory_order_relaxed); return; }
+		if (now - satSince >= kHotUpIntervalNs && now - last >= kHotUpIntervalNs) {
 			SetHotWorkersEffective(k + 1);
 			g_lastHotChangeNs.store(now, std::memory_order_relaxed);
+			g_saturatedSinceNs.store(0, std::memory_order_relaxed);
 		}
 		return;
 	}
-	// Nothing advertised. Require it SUSTAINED before giving a core back -- a lane that is quiet
-	// for one sample is between batches, not idle.
-	const long long since = g_laneQuietSinceNs.load(std::memory_order_relaxed);
-	if (since == 0) { g_laneQuietSinceNs.store(now, std::memory_order_relaxed); return; }
-	if (k > lo
-	    && now - since >= kHotDownIntervalNs
-	    && now - last  >= kHotDownIntervalNs) {
+	g_saturatedSinceNs.store(0, std::memory_order_relaxed);   // the run of saturation is over
+
+	// ---- DOWN: IS THE LAST CORE I ADDED EARNING ITS KEEP? --------------------------------------
+	//
+	// THE PREVIOUS SIGNAL WAS "SUSTAINED SILENCE", AND IT WAS WRONG. Any single hot worker
+	// advertising anywhere reset the accumulator, and transient backlogs fire thousands of times a
+	// second under load. A program with constant I/O never falls silent -- it merely stops being
+	// SATURATED -- so the window could never complete, K ratcheted to maxK and stayed, and dynamic K
+	// degenerated into static maxK with extra machinery. Reproduced before it was fixed: ramped to
+	// 2, then held 2 through 2.5 s of light trickle, twelve times the down interval.
+	//
+	// The right question is not about the lane as a whole. It is about the MARGINAL core -- the one
+	// added last, at index k-1. If that specific worker is mostly empty it is not paying for itself
+	// and should go back, whether or not the rest of the lane is busy.
+	//
+	// A SAMPLED DUTY CYCLE, not an instant test and not a continuous timer. An instant test thrashes
+	// on the gap between two items. A continuous-idle timer has the exact defect being fixed here,
+	// because round-robin steering hands the top worker an item now and then and each one would
+	// restart the clock. COUNTING means transients dilute instead of resetting: the core has to be
+	// busy on a quarter of samples to keep its place, which a needed core manages easily and a
+	// surplus one does not.
+	// The window is a TIME bound on how often we DECIDE; the samples inside it are gathered by the
+	// top worker on its own loop, so their count no longer depends on how often this runs.
+	const long long ws = g_windowStartNs.load(std::memory_order_relaxed);
+	if (ws == 0) { g_windowStartNs.store(now, std::memory_order_relaxed); return; }
+	if (now - ws < kHotDownIntervalNs) return;
+	g_windowStartNs.store(now, std::memory_order_relaxed);
+
+	Thread* topWorker = instance->workers[k - 1].get();
+	const unsigned samples = topWorker->laneCyclesTotal.exchange(0, std::memory_order_relaxed);
+	const unsigned busy    = topWorker->laneCyclesBusy.exchange(0, std::memory_order_relaxed);
+
+	// Enough samples to mean anything. A window that gathered only a handful says the controller was
+	// rarely reached, not that the top core was idle, and acting on it would be reading noise.
+	if (samples < kMinTopSamples) return;
+	// HALF, not a quarter. A core that is idle more than half the time is not earning a core.
+	if (busy * 2 < samples && now - last >= kHotDownIntervalNs) {
 		SetHotWorkersEffective(k - 1);
 		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
-		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
 	}
 }
 
