@@ -439,7 +439,8 @@ void TaskScheduler::WakeForLane(size_t depth) noexcept {
 	// Scale with how buried the owner is, capped by the caller's budget. One wake is the right
 	// answer for a queue of 4; it is not for a queue of 40, where the woken worker takes one task
 	// and the rest still waits behind the handler.
-	int want = (int)(depth / (size_t)kLaneStealDepth);
+	int want = (int)(depth / (size_t)(laneSetDepth.load(std::memory_order_relaxed) > 0
+	                             ? laneSetDepth.load(std::memory_order_relaxed) : 1));
 	if (want < 1)      want = 1;
 	if (want > budget) want = budget;
 

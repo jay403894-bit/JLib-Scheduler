@@ -445,6 +445,21 @@ namespace JLib {
 		static void SetLaneClearDepth(int d) noexcept { laneClearDepth.store(d, std::memory_order_relaxed); }
 		static int  GetLaneClearDepth() noexcept { return laneClearDepth.load(std::memory_order_relaxed); }
 
+		// THE UPPER EDGE. Default kLaneStealDepth (4), i.e. unchanged.
+		//
+		// WHY IT IS A KNOB NOW. 4 was chosen when set and clear were THE SAME NUMBER, to stop a
+		// thief taking the owner's warm task -- the v1 steal-hint failure, 22,000 probes against a
+		// 9,164 baseline. But the occupancy witness then measured, at K=4 with stealing on:
+		// idle% 73.19 with meanDepth 2.45. A hot worker idle 73% of its idle passes beside a sibling
+		// holding ~2.45 tasks -- BELOW the threshold, so never advertised and never stolen. That is
+		// measured, unharvested imbalance, and a lower upper edge is what would reach it.
+		//
+		// The v1 objection has not gone away; it has become testable. With hysteresis, set and clear
+		// are independent, so set=2/clear=0 is a shape that could not be expressed when 4 was picked.
+		static inline std::atomic<int> laneSetDepth{ 4 };   // == kLaneStealDepth; asserted where that is declared
+		static void SetLaneSetDepth(int d) noexcept { laneSetDepth.store(d, std::memory_order_relaxed); }
+		static int  GetLaneSetDepth() noexcept { return laneSetDepth.load(std::memory_order_relaxed); }
+
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
 		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
@@ -1513,7 +1528,8 @@ namespace JLib {
 		static constexpr int kLaneStealDepth = 4;
 		// laneClearDepth`s default must BE the single-threshold behaviour, or the "no hysteresis" arm is
 		// not a control. Asserted rather than commented because the two live 100 lines apart.
-		static_assert(kLaneStealDepth == 4, "laneClearDepth defaults to 3 == kLaneStealDepth - 1; keep them in step");
+		static_assert(kLaneStealDepth == 4,
+			"laneSetDepth defaults to 4 and laneClearDepth to 3 == kLaneStealDepth - 1; keep all three in step");
 
 		std::atomic<unsigned long long> stealHintLane{ 0 };
 
@@ -1563,7 +1579,7 @@ namespace JLib {
 			const unsigned long long bit = 1ull << w;
 			const bool isSet = (stealHintLane.load(std::memory_order_relaxed) & bit) != 0;
 			const bool want  = isSet ? (depth > (size_t)laneClearDepth.load(std::memory_order_relaxed))
-			                         : (depth >= (size_t)kLaneStealDepth);
+			                         : (depth >= (size_t)laneSetDepth.load(std::memory_order_relaxed));
 			if (want == isSet) return;
 			if (want) {
 				stealHintLane.fetch_or(bit, std::memory_order_release);

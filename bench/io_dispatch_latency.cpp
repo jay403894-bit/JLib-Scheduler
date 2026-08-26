@@ -693,6 +693,111 @@ int main(int argc, char** argv) {
         JLib::TaskScheduler::SetHotWorkers(hot);
     }
 
+    // ---- THE UPPER EDGE: can a LOWER set threshold harvest the residual imbalance? --------------
+    //
+    // THE LEAD COMES FROM THE OCCUPANCY WITNESS, not from a hunch. At K=4 with hot->hot stealing on
+    // it measured idle% 73.19 and meanDepth 2.45: a hot worker idle on nearly three quarters of its
+    // idle passes, beside a sibling holding ~2.45 tasks. kLaneStealDepth is 4, so those backlogs are
+    // never advertised and never stolen. Measured imbalance, sitting below the line.
+    //
+    // WHY 4 WAS PICKED, and why the objection is now testable rather than decisive: a thief taking
+    // the owner's warm task is the v1 steal-hint failure -- 22,000 probes against a 9,164 baseline,
+    // and it also defeats the completion steering that put the task there. But 4 was chosen when set
+    // and clear were THE SAME NUMBER. With a Schmitt trigger they are independent, and set=2/clear=0
+    // is a shape that could not be expressed then: advertise sooner, but hold the advertisement
+    // through the whole drain instead of flapping.
+    //
+    // K=2 AND K=4 ONLY. The hypothesis is about work sitting on a SIBLING, so K=1 cannot test it --
+    // there is no sibling, and the witness reads idle% 0.00 there in every arm.
+    //
+    // WATCH probes/s AS HARD AS THE PERCENTILES. A probe explosion at set=2 IS the v1 failure
+    // reproducing, and it would show there before it showed in latency.
+    //
+    // == RESULT 8-26: NO. kLaneStealDepth stays 4, and now it stands on a measurement. ==
+    //
+    // Stealing alone (wake=0), which is the pure test of the hypothesis:
+    //
+    //   K  burn   set/clear      p50      p90      p99   probes/s
+    //   4    20      4/3        25.60    57.30    86.30     91595
+    //   4    20      2/0        23.90    60.70    93.40    210528   2.3x
+    //   4   200      4/3        60.60   266.30   444.90     44364
+    //   4   200      2/0        72.10   245.70   442.00     84987   1.9x
+    //   2   200      4/3       214.80   484.10   717.30     23437
+    //   2   200      2/0       213.50   487.90   804.30     31551   1.3x
+    //
+    // p50 a wash, the TAIL WORSE in three rows of four, probes roughly doubled -- the v1 failure
+    // reproducing in exactly the column it was predicted in.
+    //
+    // WHY THE WITNESS'S 73% IDLE DOES NOT CASH IN, which is the part worth keeping: a sibling
+    // holding ~2.45 tasks is about to run them. Taking one costs a contended CAS against the owner
+    // and discards the steering that placed it there, and those roughly cancel the wait it saves.
+    // Shallow imbalance is VISIBLE WITHOUT BEING PROFITABLE. So the residual idle% is now closed
+    // rather than merely explained -- it is not a missed opportunity, it is the correct amount of
+    // imbalance to tolerate.
+    //
+    // With wakes on, set=2 is mildly better (K=4 200us p99 398.30 -> 357.70) and pays 24100 ->
+    // 39996 wakes/s for it. Same conclusion by a different route.
+    {
+        const int n = 32, iters = 100;
+        std::printf("\n  lane SET threshold -- does advertising sooner reach the shallow imbalance?\n");
+        std::printf("    K=4 witness said: idle 73%%, sibling meanDepth 2.45, below the set depth of 4.\n");
+        std::printf("    probes/s is the v1 steal-hint failure mode; watch it, not just the tail.\n");
+        std::printf("      K    burn    set  clear   wake      p50      p90      p99   edges/s  wakes/s    probes/s\n");
+
+        constexpr int kReps = 3;
+        const int setArms[]   = { 4, 2, 4, 2 };
+        const int clearArms[] = { 3, 0, 0, 0 };
+        const int wakeArms[]  = { 0, 0, 2, 2 };
+        constexpr int kNA = 4;
+
+        for (long long burn : { 20000LL, 200000LL }) {
+          for (std::size_t k : { (std::size_t)2, (std::size_t)4 }) {
+            std::vector<double> p50[kNA], p90[kNA], p99[kNA], eps[kNA], wps[kNA], prb[kNA];
+            for (int rep = 0; rep < kReps; ++rep) {
+              for (int a = 0; a < kNA; ++a) {
+                JLib::TaskScheduler::SetLaneHintMode(4);
+                JLib::TaskScheduler::SetSteerSkip(false);
+                JLib::TaskScheduler::SetLaneSetDepth(setArms[a]);
+                JLib::TaskScheduler::SetLaneClearDepth(clearArms[a]);
+                JLib::TaskScheduler::SetLaneWake(wakeArms[a]);
+                JLib::TaskScheduler::SetHotWorkers(k);
+                g_skewEveryNth = 8;
+                g_skewBurnNs   = burn;
+                JLib::LaneWakeStatsReset();
+                JLib::StealStatsReset();
+
+                double secs = 0.0;
+                std::vector<long long> v = SoakRun(n, iters, secs);
+                if (v.empty() || secs <= 0.0) continue;
+                const auto pk = [&](double p) {
+                    return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
+                };
+                p50[a].push_back(pk(0.50)); p90[a].push_back(pk(0.90)); p99[a].push_back(pk(0.99));
+                long long ed = 0, nf = 0, pr = 0, ht = 0;
+                JLib::LaneWakeStatsRead(ed, nf);
+                JLib::StealStatsRead(pr, ht);
+                eps[a].push_back(ed / secs); wps[a].push_back(nf / secs); prb[a].push_back(pr / secs);
+              }
+            }
+            const auto med = [](std::vector<double> x) {
+                if (x.empty()) return -1.0;
+                std::sort(x.begin(), x.end());
+                return x[x.size() / 2];
+            };
+            for (int a = 0; a < kNA; ++a)
+                std::printf("    %3zu  %6.0f  %5d  %5d  %5d  %7.2f  %7.2f  %7.2f  %8.0f %8.0f  %10.0f\n",
+                            k, burn / 1000.0, setArms[a], clearArms[a], wakeArms[a],
+                            med(p50[a]), med(p90[a]), med(p99[a]),
+                            med(eps[a]), med(wps[a]), med(prb[a]));
+          }
+        }
+        g_skewEveryNth = 0;
+        JLib::TaskScheduler::SetLaneSetDepth(4);
+        JLib::TaskScheduler::SetLaneClearDepth(3);
+        JLib::TaskScheduler::SetLaneWake(0);
+        JLib::TaskScheduler::SetHotWorkers(hot);
+    }
+
     // ---- STEERING: is it cheaper to AVOID a buried hot worker than to STEAL BACK OFF one? -------
     //
     // stealHintLane is published by the buried worker so an idle sibling can find it. The completion
