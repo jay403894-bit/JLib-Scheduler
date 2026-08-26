@@ -226,6 +226,53 @@ int main() {
         JLib::TaskScheduler::SetHotWorkers(0);
     }
 
+    // ============================================================================================
+    // DOES THE CONTROLLER ACTUALLY MOVE K? Everything above tests what happens WHEN K moves, and
+    // nothing above has ever made it move on its own. A mechanism that is only ever driven by hand
+    // is modelled, not tried, and the distinction is the whole point of this section.
+    //
+    // Saturation here is manufactured rather than waited for: enough long hiPri tasks aimed at every
+    // hot worker that each of them is holding at least kLaneStealDepth, which is exactly the
+    // popcount(stealHintLane & lowKbits) == K the controller keys on.
+    std::printf("\nthe controller actually moves K\n");
+    {
+        JLib::TaskScheduler::SetHotWorkers(1);
+        JLib::TaskScheduler::SetHotWorkerRange(1, 4);
+        g_ran.store(0);
+        int pushed = 0;
+
+        // Aim at worker 0 too: under Dynamic it is always hot (minK >= 1), and it is also the worker
+        // that drives the controller -- so if burying it stops the controller running, that is a
+        // finding and not a test bug.
+        std::vector<JLib::Task*> batch;
+        for (int i = 0; i < 256; ++i)
+            if (auto* t = s.CreateTask([](void*) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(300));
+                    g_ran.fetch_add(1, std::memory_order_relaxed);
+                }, nullptr, 1))
+                batch.push_back(t);
+        if (!batch.empty()) { s.PushBatch(batch.data(), batch.size(), 1, 4096, true); pushed = (int)batch.size(); }
+
+        size_t peak = JLib::TaskScheduler::GetHotWorkers();
+        const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(4000);
+        while (std::chrono::steady_clock::now() < dl) {
+            const size_t k = JLib::TaskScheduler::GetHotWorkers();
+            if (k > peak) peak = k;
+            if (peak >= 4) break;
+        }
+        std::printf("      peak K reached = %zu (range 1..4), ran=%d/%d\n", peak, g_ran.load(), pushed);
+        Check(peak > 1, "K RISES on its own when the lane saturates");
+
+        // And comes back. The down interval is 200 ms of sustained quiet by design, so this waits
+        // well past it rather than assuming.
+        WaitUntil([&] { return g_ran.load() == pushed; }, 20000);
+        const bool fell = WaitUntil([&] { return JLib::TaskScheduler::GetHotWorkers() <= 1; }, 8000);
+        std::printf("      after quiet, K = %zu\n", JLib::TaskScheduler::GetHotWorkers());
+        Check(fell, "and FALLS BACK to minK once the lane goes quiet");
+
+        JLib::TaskScheduler::SetHotWorkers(0);   // leave the pool as we found it
+    }
+
     std::printf("\n%s -- %d failure(s)\n", g_fail ? "FAILED" : "ALL CHECKS PASSED", g_fail);
     s.Join();
     return g_fail ? 1 : 0;

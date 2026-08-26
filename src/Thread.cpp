@@ -562,7 +562,7 @@ void Thread::Worker() {
 			// every worker would cost more than the mechanism saves. Worker 0 is always hot under
 			// Dynamic (minK >= 1), so it never parks and the down-ramp still gets evaluated on a
 			// completely quiet lane -- which is the case the whole down direction exists for.
-			if (qIndex == 0 && ((++hotCtlTick & 0xFF) == 0))
+			if (qIndex == 0 && ((++hotCtlTick & 0x3F) == 0))
 				TaskScheduler::MaybeAdjustHotWorkers();
 		}
 

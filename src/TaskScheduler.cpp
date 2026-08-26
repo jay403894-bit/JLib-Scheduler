@@ -645,10 +645,20 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	const unsigned long long mask = (k >= 64) ? ~0ull : ((1ull << k) - 1);
 	const unsigned long long adv  = instance->stealHintLane.load(std::memory_order_acquire) & mask;
 
+	// THE CLOCK IS READ LAST, and only when the state might actually cause a move. The common case
+	// by far is "busy, keeping up" -- neither saturated nor quiet -- and that path now costs one
+	// relaxed load and two compares. This matters because the caller is sampled off a hot worker's
+	// pass counter, so it runs often.
+	const bool saturated = (adv == mask);
+	const bool quiet     = (adv == 0);
+	if (!saturated && !quiet) { g_laneQuietSinceNs.store(0, std::memory_order_relaxed); return; }
+	if (saturated && k >= hi) return;       // already at the ceiling: nothing to decide
+	if (quiet     && k <= lo) return;       // already at the floor
+
 	const long long now  = MonotonicNs();
 	const long long last = g_lastHotChangeNs.load(std::memory_order_relaxed);
 
-	if (adv == mask) {                      // EVERY hot worker buried: capacity, which K fixes
+	if (saturated) {                        // EVERY hot worker buried: capacity, which K fixes
 		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
 		if (k < hi && now - last >= kHotUpIntervalNs) {
 			SetHotWorkersEffective(k + 1);
@@ -656,11 +666,6 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 		}
 		return;
 	}
-	if (adv != 0) {                         // busy but keeping up: exactly what K is already for
-		g_laneQuietSinceNs.store(0, std::memory_order_relaxed);
-		return;
-	}
-
 	// Nothing advertised. Require it SUSTAINED before giving a core back -- a lane that is quiet
 	// for one sample is between batches, not idle.
 	const long long since = g_laneQuietSinceNs.load(std::memory_order_relaxed);

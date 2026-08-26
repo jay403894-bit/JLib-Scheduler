@@ -1659,6 +1659,12 @@ namespace JLib {
 				// it affordable to do here, on the hot worker itself, microseconds before it
 				// disappears into a long handler.
 				WakeForLane(depth);
+				// AND THE PRECISE MOMENT SATURATION CAN BECOME TRUE. The sampled per-pass caller
+				// cannot be relied on for the UP direction: it rides worker 0`s loop, and a worker
+				// buried in a long task is not looping -- which is exactly when the lane saturates.
+				// This edge fires ON the worker that just got buried, so the check happens when the
+				// condition is created rather than whenever somebody next gets around to looking.
+				MaybeAdjustHotWorkers();
 			}
 			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
 		}
