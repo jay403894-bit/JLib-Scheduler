@@ -719,6 +719,24 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// becomes buried -- which is precisely when adv == mask can first become true. The rate limit is
 	// the only brake, and it is what keeps a burst from adding four cores at once while still
 	// allowing 1 -> 4 in a few milliseconds.
+	// ---- NEVER PROMOTE OVER A PINNED WORKER ----------------------------------------------------
+	//
+	// PushToCore already refuses to pin a HOT worker, and that check was correct for static K
+	// because the hot set never moved. It is POINT-IN-TIME, and dynamic K grows the set OVER a
+	// worker that was legally pinned when K was smaller. The damage runs both ways and neither side
+	// can see it:
+	//   - the pinned worker is running a service task that may never return, so it never loops:
+	//     it cannot serve the lane, completions steered to it queue behind work that never ends,
+	//     and it reports laneCyclesTotal == 0 forever
+	//   - which WEDGES THE CONTROLLER, because minTotal is a minimum across the hot set, so one
+	//     permanently-zero worker means minTotal < kMinTopSamples on every window and no decision is
+	//     taken again -- exactly the s=0 symptom that took instrumentation to find the first time
+	//
+	// Refusing to grow past it keeps the hot set a PREFIX, which WorkerServesHiPri, the popcount
+	// mask and pushSteered all assume. A skip-set would be the general fix and a much larger change.
+	if (k < instance->workers.size() && instance->immediateCoresInUse[k]->load(std::memory_order_acquire))
+		return;
+
 	if (k < hi && adv == mask && now - g_lastHotChangeNs.load(std::memory_order_relaxed) >= kHotUpIntervalNs) {
 		g_lowWindows.store(0, std::memory_order_relaxed);
 		SetHotWorkersEffective(k + 1);
@@ -2494,6 +2512,28 @@ bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
 	// them. Refusing is the honest answer; the caller already handles false (the core was busy), and
 	// a silent redirect would violate the "run on THIS core" contract PushImmediate exists for.
 	if (idx < GetHotWorkers()) return false;
+
+	// AND NOT AT ALL WHILE K CAN MOVE. The check above is POINT-IN-TIME, which was sufficient when
+	// the hot set never changed. Under dynamic K the set GROWS OVER a worker that was legally pinned
+	// when K was smaller, and neither side can detect it: the pinned worker runs a service task that
+	// may never return, so it never loops, never serves the lane, and reports zero duty forever --
+	// which also wedges the controller, whose evidence is a MINIMUM across the hot set.
+	//
+	// DEPRECATED, AND THE INTENT IS REMOVAL. This whole API takes a worker out of a WORK-STEALING
+	// pool for a blocking task and spills its queue to everyone else, and the argument that used to
+	// justify it -- "a pinned task is visible to placement, an outside thread is a core that quietly
+	// went missing" -- has stopped being true. A pinned worker is now invisible in a SECOND way: it
+	// is neither ordinary nor hot in anything the scheduler tracks. Run such a subsystem on its own
+	// std::thread and size the pool accordingly, or put it on the reactor.
+	//
+	// Refusing here rather than deleting the API tonight: the removal touches PushToCore,
+	// immediateCoresInUse, three spin sites, the fork cleanup in Worker(), and a dedicated test, and
+	// that is a reviewable change rather than a late edit. This closes the hazard in the meantime.
+	{
+		size_t lo = 0, hi = 0;
+		GetHotWorkerRange(lo, hi);
+		if (hi > lo) return false;
+	}
 
 	if (immediateCoresInUse[idx]->load(std::memory_order_acquire)) return false;
 

@@ -923,6 +923,20 @@ namespace JLib {
 		// a pinned task is visible to placement, an outside thread is a core that quietly went
 		// missing. The core is marked in immediateCoresInUse and excluded from normal placement
 		// until the task finishes.
+		//
+		// DEPRECATED as of 4.0.1, and slated for removal. It takes a worker out of a WORK-STEALING
+		// pool for a blocking task and spills that worker's queue to everyone else -- and the
+		// justification above has stopped holding. A pinned worker is now invisible in a SECOND way:
+		// with a hot set that moves, it is neither ordinary nor hot in anything the scheduler
+		// tracks, so "visible to placement" is no longer the trade being made.
+		//
+		// It also breaks an invariant it used to keep. The "not a hot worker" refusal in PushToCore
+		// is point-in-time; dynamic K grows the hot set OVER an already-pinned worker, after which
+		// completions steer into a queue that may never drain and the controller wedges on a worker
+		// reporting zero duty forever.
+		//
+		// REFUSES while the hot range can move (max > min). Use a std::thread for a blocking
+		// subsystem and size the pool accordingly, or put it on the reactor.
 		bool PushImmediate(uint8_t cpu_affinity, Task* task);
 
 		// PushFork was REMOVED in 1.3.4 -- use Push. It placed a child on the CALLING worker, on the
