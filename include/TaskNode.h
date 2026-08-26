@@ -3,7 +3,6 @@
 
 #pragma once
 #include "Task.h"
-#include "TaskAllocator.h"   // the node only needs the allocator, not the whole scheduler
 #include <stdexcept>
 #include <string>
 
@@ -104,17 +103,24 @@ namespace JLib {
         // WaitForMain, not WaitFor -- see WaitForMain's declaration comment.
         uint8_t isMain   : 1;
 
-        // Takes the allocator purely to keep the call sites unchanged; the node itself no
-        // longer allocates anything. It used to make a SECOND slab allocation here for the
-        // dependents list, which had its own null check because an exhausted pool
-        // placement-new'd a LockFreeList at address nullptr ("Access violation writing
-        // location 0x0"). That whole failure mode is gone with the allocation.
+        // A NODE ALLOCATES NOTHING. It used to make a SECOND slab allocation here for the
+        // dependents list, with its own null check because an exhausted pool placement-new'd a
+        // LockFreeList at address nullptr ("Access violation writing location 0x0"). That whole
+        // failure mode went away with the allocation when edges became DAG-owned chunk storage.
+        //
+        // The allocator parameter went with it, once the change had settled: it was kept for a
+        // day to hold the call sites still while the edge rework landed, and an unnamed parameter
+        // three call sites pass for nothing is a hook for an allocation that no longer exists.
+        // The node's own memory comes from AllocSized at the call site (56 bytes, the 64-byte
+        // class) and edges from the DAG's chunk allocator, so there is no path left where a node
+        // allocates anything itself.
+        //
         // BITFIELDS ARE INITIALIZED HERE, NOT AT THE DECLARATION. C++17 does not allow a default
         // member initializer on a bitfield (that arrived in C++20), and the core of this library
         // is C++17 -- Task.h carries the same note on its flag block for the same reason.
         //
         // Listed in DECLARATION ORDER so the initialization order is the written one.
-        explicit TaskNode(Task* t, TaskAllocator&)
+        explicit TaskNode(Task* t)
             : task(t)
             , gateType(AND), isGate(0), isExternal(0)
             , dependencies_left(0)

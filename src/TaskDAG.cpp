@@ -45,14 +45,15 @@ TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
     // Allocate the node memory from the scheduler's allocator
 
 
-    // TaskNode is 56 bytes -- the 64-byte class, not a 256-byte slot. It falls through to a
-    // larger class if the small pool is dry, so an undersized pool costs memory, not failure.
-    // AllocEdge keeps plain Alloc(): a chunk is deliberately one FULL slot, 16 edges wide.
+    // AllocSized routes by size; the class TaskNode lands in is asserted at its definition
+    // rather than restated here, and it falls through to a larger class if that pool is dry --
+    // an undersized pool costs memory, not failure. (AllocEdge keeps plain Alloc(): a chunk is
+    // deliberately one FULL slot, 16 edges wide.)
     void* mem = scheduler.GetAllocator()->AllocSized(sizeof(TaskNode));
     if (!mem) return nullptr;
 
     // Use placement new
-    TaskNode* node = new (mem) TaskNode(t, *scheduler.GetAllocator());
+    TaskNode* node = new (mem) TaskNode(t);
 
     // Set properties
     node->isLocal = (priority == NONE);
@@ -97,13 +98,14 @@ TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
 TaskNode* TaskDAG::CreateGate(TaskNode::LogicType type) {
 
 
-    // TaskNode is 56 bytes -- the 64-byte class, not a 256-byte slot. It falls through to a
-    // larger class if the small pool is dry, so an undersized pool costs memory, not failure.
-    // AllocEdge keeps plain Alloc(): a chunk is deliberately one FULL slot, 16 edges wide.
+    // AllocSized routes by size; the class TaskNode lands in is asserted at its definition
+    // rather than restated here, and it falls through to a larger class if that pool is dry --
+    // an undersized pool costs memory, not failure. (AllocEdge keeps plain Alloc(): a chunk is
+    // deliberately one FULL slot, 16 edges wide.)
     void* mem = scheduler.GetAllocator()->AllocSized(sizeof(TaskNode));
     if (!mem) return nullptr;
     // A gate carries no task; it just propagates readiness. Same allocator/list as a node.
-    TaskNode* node = new (mem) TaskNode(nullptr, *scheduler.GetAllocator());
+    TaskNode* node = new (mem) TaskNode(nullptr);
     node->isGate = true;
     node->gateType = type;
     nodes.push_back(node);
@@ -113,14 +115,15 @@ TaskNode* TaskDAG::CreateGate(TaskNode::LogicType type) {
 TaskNode* TaskDAG::CreateExternalNode() {
 
 
-    // TaskNode is 56 bytes -- the 64-byte class, not a 256-byte slot. It falls through to a
-    // larger class if the small pool is dry, so an undersized pool costs memory, not failure.
-    // AllocEdge keeps plain Alloc(): a chunk is deliberately one FULL slot, 16 edges wide.
+    // AllocSized routes by size; the class TaskNode lands in is asserted at its definition
+    // rather than restated here, and it falls through to a larger class if that pool is dry --
+    // an undersized pool costs memory, not failure. (AllocEdge keeps plain Alloc(): a chunk is
+    // deliberately one FULL slot, 16 edges wide.)
     void* mem = scheduler.GetAllocator()->AllocSized(sizeof(TaskNode));
     if (!mem) return nullptr;
     // Taskless like a gate, and allocated from the same slab -- but Fire() arms it instead of
     // completing it. See the declaration for the contract and TaskNode::extBits for the rendezvous.
-    TaskNode* node = new (mem) TaskNode(nullptr, *scheduler.GetAllocator());
+    TaskNode* node = new (mem) TaskNode(nullptr);
     node->isExternal = true;
     // Set HERE rather than in Fire(), which is where a task node gets it -- an external node returns
     // from Fire before that line. Having the owner on the node means a signaller only needs the node
