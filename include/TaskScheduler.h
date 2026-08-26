@@ -392,6 +392,12 @@ namespace JLib {
 
 		// Evaluated by ONE worker, sampled rather than every pass -- a clock read per pass per
 		// worker would cost more than the mechanism saves. Public only so Thread.cpp can call it.
+		// TRUE only when the range can actually move. Under static K -- min == max, which is the
+		// DEFAULT and what SetHotWorkers(k) pins -- none of the adaptive machinery has any effect, so
+		// none of it should run: no clock stamps, no per-pass counters, no controller call. One
+		// relaxed load of a line that changes only when the app reconfigures.
+		static bool HotScalingActive() noexcept;
+
 		static void MaybeAdjustHotWorkers() noexcept;
 
 		// Reported by a worker whose inbox drain moved more than one lane task -- i.e. a completion had

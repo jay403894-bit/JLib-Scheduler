@@ -352,25 +352,26 @@ int main() {
                     ramped, kMin, kMax, belowSamples, totalSamples);
         Check(ramped > 1, "precondition: it ramped up first");
 
-        // =========================== OPEN, AND DELIBERATELY NOT ASSERTED ==========================
+        // ================================ NOW ASSERTED, AND WHY ===================================
         //
-        // SHEDDING UNDER CONTINUOUS LIGHT LOAD DOES NOT YET WORK RELIABLY. It works under SILENCE
-        // (the section above: K returns to minK every run), and the occupancy metric is now correct
-        // in principle -- lane-scoped, time-based, closed at task end, at park, and at pass top.
-        // What remains is that the controller's decision WINDOW stretches: it is driven off worker
-        // 0's sampled loop plus the lane-hint edge, and under a light trickle both are rare, so a
-        // 10 ms window becomes 300-400 ms and several windows are skipped for want of samples.
+        // This was an unasserted OPEN note for two days because it genuinely did not work: K pinned
+        // at max under a 6%-duty trickle, 0 samples below peak out of 120 MILLION. Two faults, both
+        // recorded in MaybeAdjustHotWorkers -- the demote path was never REACHED (a min-across-
+        // workers pass-count guard, starved by the busiest worker), and occupancy was the wrong
+        // QUESTION for a deadline lane, since a fully-loaded lane worker sits at single-digit
+        // occupancy because it is paid to be available rather than busy.
         //
-        // THIS IS NOT ASSERTED because softening a check until it passes is how two tests in this
-        // file were already vacuous. The number is PRINTED instead: it should be a large fraction of
-        // totalSamples when this is fixed, and it is currently near zero.
+        // A DELIBERATELY LOW BAR -- 10% -- and that is not softening a check until it passes, which
+        // is how two tests in this file were already vacuous. The measured range across runs is
+        // 27-72%, so 10% sits far below anything observed while still being far above the ZERO that
+        // the broken versions produced. The failure this guards against is a return to pinning at
+        // max, and that failure reads as 0, not as 25%.
         //
-        // PICK UP HERE: the window needs its own clock, not a piggybacked one -- either a periodic
-        // tick independent of worker loop rate, or make the shed decision from the hot worker that
-        // owns the occupancy rather than from a central sampler. The measurement is sound; the thing
-        // that reads it is starved.
-        std::printf("      OPEN: expected a large fraction, got %d/%d -- see the note in this file\n",
-                    belowSamples, totalSamples);
+        // It also asserts kMin < kMax rather than a fixed floor: the point is that surplus cores come
+        // BACK, not that they reach any particular number, which depends on the trickle's shape.
+        Check(kMax > kMin, "K comes back DOWN under continuous light load, not only under silence");
+        Check(totalSamples > 0 && belowSamples * 10 > totalSamples,
+              "and spends a real fraction of the trickle below its peak");
 
         JLib::TaskScheduler::SetHotWorkers(0);
         WaitUntil([&] { return g_ran.load() == pushed; }, 20000);

@@ -661,9 +661,40 @@ static constexpr long long    kMissWindowNs   = 1000000;   // 1 ms
 // Up fast, down slow, and the asymmetry is the anti-thrash. A saturated lane loses latency every
 // microsecond it stays saturated; an idle hot worker loses only a spinning core, which is the cost
 // K-hot already accepts by design. Cheap to be late going down, expensive to be wrong.
+// ================================ THE CONTROL POLICY, LOCKED =====================================
+//
+// EAGER UP, PATIENT DOWN. Both halves were arrived at by measurement and both have been broken once
+// by tuning the other half's number, so the reasoning is recorded rather than just the values.
+//
+//   promote  200 us. The binding constraint on the ramp, found by simply lowering it: at 2 ms a
+//            1 -> 4 climb could not beat 6 ms, which was most of a burst. Dropping it took burn-20
+//            p50 from 35.30 to 26.50 against static K=4's 26.40, with no new mechanism.
+//   window   10 ms of evidence per DECISION. Not a sample rate -- the workers gather the evidence
+//            themselves, which is what stopped it depending on whoever happened to be polling.
+//   demote   200 ms, and three consecutive quiet windows on top.
+//
+// THE 20 ms DEMOTE WAS AN EXPERIMENT AGAINST A BROKEN METRIC, and it does not survive the metric
+// being fixed. While occupancy was wrongly driving demotion, shortening the interval looked like it
+// helped; with an honest signal it only buys chatter and a fatter p99. If someone lowers this again,
+// check first whether the demote SIGNAL is right -- that was the actual fault both times.
+//
+// DO NOT CHASE burn-20 p99 TO EQUAL STATIC K=4. It cannot and should not:
+//
+//   Static K=4 never sheds, so it never pays ramp. Comparing dyn's tail to it is comparing against a
+//   configuration that does not do the job dyn exists to do. Dyn's contract is "= static under load,
+//   cores back on quiet", and a teens-of-percent p99 on the FIRST WAVE after a long quiet period is
+//   the fee for the second half of that. The 200 ms floor is what keeps the fee rare.
+//
+// Tightening the tail by speeding demotion inverts the policy and gives back the p50 win. That has
+// now happened once; it is written here so it does not happen twice.
+//
+// Two polish options exist if a real workload ever cares, and NEITHER is needed while interleaved
+// runs stay within a few percent on p50/p90: refuse to demote below K=2 when a small trickle is
+// always present, or hold min K for one extra window after a demote. Both cut the worst ramp without
+// touching promote.
 static constexpr long long kHotUpIntervalNs   =    200000;     // 200us between promotions
 static constexpr long long kHotWindowNs       =  10000000;     // 10 ms of evidence per decision
-static constexpr long long kHotDownIntervalNs = 200000000;      // 200 ms between demotions
+static constexpr long long kHotDownIntervalNs = 200000000;     // 200 ms between demotions
 
 void TaskScheduler::SetHotWorkerRange(size_t minK, size_t maxK) noexcept {
 	if (maxK < minK) maxK = minK;
@@ -704,6 +735,10 @@ void TaskScheduler::NoteLaneMiss(size_t waiting) noexcept {
 	if (!instance || waiting == 0) return;
 	g_laneMisses.fetch_add(1, std::memory_order_relaxed);
 	MaybeAdjustHotWorkers();
+}
+
+bool TaskScheduler::HotScalingActive() noexcept {
+	return g_hotMax.load(std::memory_order_relaxed) > g_hotMin.load(std::memory_order_relaxed);
 }
 
 void TaskScheduler::MaybeAdjustHotWorkers() noexcept {

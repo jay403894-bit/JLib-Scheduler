@@ -491,6 +491,10 @@ void Thread::Worker() {
 		const bool hiPriStray = !servesHiPri &&
 			(!scheduler->hiPriInboxes[qIndex]->empty() || scheduler->hiPri[qIndex]->size() != 0);
 		const bool isHotWorker = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
+		// Read once per pass beside isHotWorker: one relaxed load of a line the app touches only when
+		// it reconfigures. Gates every piece of adaptive-K bookkeeping, so static K -- the default --
+		// runs none of it.
+		const bool adaptiveK = TaskScheduler::HotScalingActive();
 
 		// Steal hints, maintained here and nowhere else: this is the one place the owner of this
 		// deque reliably passes, and size() reads a line it already owns. Both writes are
@@ -529,7 +533,8 @@ void Thread::Worker() {
 				// stealHintLane is already for; utilisation is what decides whether a core is
 				// earning its keep. The flag is set after the search, so this counts the PREVIOUS
 				// pass, which is the only point at which the answer is known.
-				laneCyclesTotal.fetch_add(1, std::memory_order_relaxed);
+				// adaptiveK-gated: under static K nobody reads this, so nobody should pay for it.
+				if (adaptiveK) laneCyclesTotal.fetch_add(1, std::memory_order_relaxed);
 			}
 			// CLOSED OUTSIDE THE HOT GUARD, and that is not tidiness. Inside it, a worker demoted
 			// between setting the flag and reading it keeps the flag set until it is promoted again
@@ -636,7 +641,7 @@ void Thread::Worker() {
 			// idle hot set is what the demote path is looking for. Concurrent evaluations are already
 			// safe: both directions are rate-limited on their own clocks and the window gate admits
 			// one decision at a time.
-			if (isHotWorker && ((++hotCtlTick & 0x3F) == 0))
+			if (isHotWorker && adaptiveK && ((++hotCtlTick & 0x3F) == 0))
 				TaskScheduler::MaybeAdjustHotWorkers();
 		}
 
@@ -675,7 +680,11 @@ void Thread::Worker() {
 			// that never demotes: the core looks busy while the deadline path it was provisioned
 			// for is empty. K exists for the deadline path, so the numerator has to be the deadline
 			// path.
-			if (task_to_run->hiPri != 0 && isHotWorker) {
+			// adaptiveK FIRST, so static K -- min == max, the DEFAULT and what SetHotWorkers(k)
+			// pins -- pays nothing for a mechanism that cannot act. A clock read per lane task plus
+			// three counters is not much, but it is charged on the latency path, to every user who
+			// never asked for scaling, to be discarded by the controller's first early-out.
+			if (adaptiveK && task_to_run->hiPri != 0 && isHotWorker) {
 				laneStartNs = MonotonicNs();
 				ranLaneTaskLastPass = true;
 				laneTasksRun.fetch_add(1, std::memory_order_relaxed);
