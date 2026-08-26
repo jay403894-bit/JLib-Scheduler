@@ -702,6 +702,22 @@ void TaskScheduler::SetHotWorkerRange(size_t minK, size_t maxK) noexcept {
 	// ordinary lane, no worker serves it, no hint bit is ever set -- so a controller starting there
 	// has nothing to observe and could never ramp up. K=0 is absorbing under scaling, but perfectly
 	// fine as a fixed point, which is what (0,0) asks for and what every existing user already has.
+	//
+	// ADAPTIVE-FROM-ZERO IS NOT A MISSING FEATURE. It was designed (a Mode enum, a special rule
+	// letting worker 0 keep a hiPri inbox and self-promote on pickup) and then CANCELLED, because it
+	// makes the case it exists to serve strictly worse than not opting into K at all:
+	//
+	//   the first hiPri push after a quiet period would have to WAKE worker 0 (~90 us), PROMOTE it,
+	//   and only then run the task -- and worker 0 at K=0 is an ORDINARY worker, so it may already
+	//   be mid-task, leaving the lane task queued behind arbitrary work of unbounded length.
+	//
+	// That is worse than the pre-K-hot behaviour it was meant to improve on. If you want a lane at
+	// all you want it staffed, so opting in MUST mean at least one worker that is already spinning
+	// and takes the completion immediately. minK = 1 is the whole point of having a lane.
+	//
+	// (0,0) covers "no lane, give me the whole pool as one queue" -- and the dead-lane optimisation
+	// already makes that cheaper than before K-hot existed: one inbox, one deque, one steal probe
+	// per victim. There is no third mode to add.
 	if (maxK > minK && minK < 1) minK = 1;
 	g_hotMin.store(minK, std::memory_order_relaxed);
 	g_hotMax.store(maxK, std::memory_order_relaxed);
