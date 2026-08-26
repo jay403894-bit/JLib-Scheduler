@@ -319,7 +319,8 @@ int main() {
         // Phase 2: a TRICKLE, for well past the 200 ms down interval. Bursts of 6 are above
         // kLaneStealDepth, so each one briefly advertises -- which is the point. This is exactly the
         // traffic that keeps zeroing a "sustained silence" accumulator.
-        int belowSamples = 0, totalSamples = 0;
+        long long belowSamples = 0, totalSamples = 0;
+        size_t kMin = 64, kMax = 0;
         const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
         while (std::chrono::steady_clock::now() < until) {
             std::vector<JLib::Task*> b;
@@ -329,13 +330,26 @@ int main() {
                         g_ran.fetch_add(1, std::memory_order_relaxed); }, nullptr, 1))
                     b.push_back(t);
             if (!b.empty()) { s.PushBatch(b.data(), b.size(), 1, 4096, true); pushed += (int)b.size(); }
-            ++totalSamples;
-            if (JLib::TaskScheduler::GetHotWorkers() < ramped) ++belowSamples;
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            // SAMPLED TIGHTLY between bursts, not once per burst. A shed that lasts less than the
+            // inter-burst gap is invisible to a 5 ms sampler, and "invisible" and "not happening"
+            // are different claims.
+            const auto gapEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+            while (std::chrono::steady_clock::now() < gapEnd) {
+                ++totalSamples;
+                const size_t kNow = JLib::TaskScheduler::GetHotWorkers();
+                if (kNow < kMin) kMin = kNow;
+                if (kNow > kMax) kMax = kNow;
+                if (kNow < kMax) ++belowSamples;
+            }
         }
 
-        std::printf("      ramped to %zu; during trickle K was below that on %d of %d samples\n",
-                    ramped, belowSamples, totalSamples);
+        // RANGE, NOT "BELOW THE FIRST VALUE SEEN". `ramped` comes from WaitUntil(K > 1), so it is
+        // whatever K happened to be at the instant the wait tripped -- 2. Asserting "below ramped"
+        // therefore demanded shedding all the way to the FLOOR, not shedding at all, and reported 0
+        // while the controller was in fact moving K between 4 and 2 the whole time. The question is
+        // whether surplus cores come back, so the answer is a range.
+        std::printf("      ramped to %zu; during trickle K ranged %zu..%zu, below peak on %lld of %lld\n",
+                    ramped, kMin, kMax, belowSamples, totalSamples);
         Check(ramped > 1, "precondition: it ramped up first");
 
         // =========================== OPEN, AND DELIBERATELY NOT ASSERTED ==========================

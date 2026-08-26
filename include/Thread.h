@@ -384,6 +384,13 @@ namespace JLib {
         // measured as 32/64, 18/36, 14/28, structurally rather than statistically. A pass is not a
         // unit of time, so the ratio it produces is not an occupancy.
         std::atomic<long long> laneBusyNs{ 0 };
+        // LANE TASKS RUN in the window. For a DEADLINE lane this is the honest "is this core earning
+        // its keep" signal, and occupancy is not: a hot worker resuming an I/O completion does a few
+        // microseconds of work and suspends again, so a fully-loaded lane worker can sit at single-
+        // digit occupancy. It is paid to be AVAILABLE, not busy. Counting tasks separates "this core
+        // takes a share of the arrival rate" from "this core is surplus", which is the actual
+        // question, and it does not punish a lane for being fast.
+        std::atomic<unsigned> laneTasksRun{ 0 };
     private:
 
         // Worker sleep state, so a push can skip the wake entirely when this worker is already

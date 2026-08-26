@@ -652,13 +652,18 @@ static std::atomic<unsigned>  g_lowWindows{ 0 };
 static std::atomic<long long> g_lastDemoteNs{ 0 };
 // Lane MISSES: completions that had to queue behind another. See NoteLaneMiss.
 static std::atomic<unsigned>  g_laneMisses{ 0 };
+static std::atomic<long long> g_missWindowNs{ 0 };
+// Misses must cross this INSIDE kMissWindowNs, or they are forgotten. Two is the smallest number
+// that distinguishes "a burst arrived" from "the lane is behind" -- see MaybeAdjustHotWorkers.
+static constexpr unsigned     kMissesToPromote = 1;
+static constexpr long long    kMissWindowNs   = 1000000;   // 1 ms
 
 // Up fast, down slow, and the asymmetry is the anti-thrash. A saturated lane loses latency every
 // microsecond it stays saturated; an idle hot worker loses only a spinning core, which is the cost
 // K-hot already accepts by design. Cheap to be late going down, expensive to be wrong.
 static constexpr long long kHotUpIntervalNs   =    200000;     // 200us between promotions
 static constexpr long long kHotWindowNs       =  10000000;     // 10 ms of evidence per decision
-static constexpr long long kHotDownIntervalNs = 200'000'000;   // 200 ms of sustained quiet
+static constexpr long long kHotDownIntervalNs = 200000000;      // 200 ms between demotions
 
 void TaskScheduler::SetHotWorkerRange(size_t minK, size_t maxK) noexcept {
 	if (maxK < minK) maxK = minK;
@@ -774,11 +779,42 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// A MISS PROMOTES ON ITS OWN, without waiting for adv == mask. This is the fast half of the fast
 	// half: saturation says "every hot worker is four deep", a miss says "somebody just had to wait",
 	// and the second is true far earlier in a burst than the first.
-	const bool missed = g_laneMisses.exchange(0, std::memory_order_relaxed) != 0;
+	// A MISS RATE, NOT A SINGLE MISS, and the difference decides whether cores ever come back.
+	//
+	// One burst of six completions produces exactly one miss. That is a real queue and promoting on
+	// it is right for latency -- but it is NOT evidence of pressure, and treating it as such is what
+	// made shedding useless: the demote path worked perfectly (measured lows climbing to 19 and a
+	// clean demotion at 201 ms) and the very next burst, 5 ms later, took the core straight back.
+	// The core was returned for one window out of every two hundred milliseconds.
+	//
+	// A trickle and a genuine burst are indistinguishable at the first miss but not at the second.
+	// A 6%-duty trickle produces ~0.2 misses/ms; a loaded lane produces them continuously. So the
+	// counter has to cross a threshold INSIDE a short window, and misses older than that window are
+	// forgotten rather than accumulated -- otherwise any trickle eventually reaches any threshold.
+	unsigned misses = g_laneMisses.load(std::memory_order_relaxed);
+	const long long missWs = g_missWindowNs.load(std::memory_order_relaxed);
+	if (missWs == 0 || now - missWs >= kMissWindowNs) {
+		g_missWindowNs.store(now, std::memory_order_relaxed);
+		g_laneMisses.store(0, std::memory_order_relaxed);
+		misses = 0;
+	}
+	const bool missed = misses >= kMissesToPromote;
+	if (missed) g_laneMisses.store(0, std::memory_order_relaxed);
 
+	// DOES NOT RESET THE LOW-WINDOW COUNTER, and that asymmetry is the fix for a load that bursts
+	// forever without ever being busy.
+	//
+	// A burst proves MOMENTARY demand. It does not prove the core is SUSTAINABLY needed, and those
+	// are different claims that the counter was conflating: every promote zeroed the demote evidence,
+	// so a trickle arriving every 5 ms could re-promote faster than three 10 ms windows could ever
+	// accumulate. K ratcheted to max and stayed there under a load with a 6% duty cycle -- measured
+	// at 0 of 160 samples below peak.
+	//
+	// Occupancy is the only thing that answers "sustainably needed", so only the OCCUPANCY promote
+	// below clears this. Event-driven promotes take the core immediately, as they should, and then
+	// have to survive the same time-based scrutiny as everything else to keep it.
 	if (k < hi && (missed || adv == mask)
 	    && now - g_lastHotChangeNs.load(std::memory_order_relaxed) >= kHotUpIntervalNs) {
-		g_lowWindows.store(0, std::memory_order_relaxed);
 		SetHotWorkersEffective(k + 1);
 		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
 		return;
@@ -799,18 +835,32 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 
 	unsigned minTotal = ~0u;
 	long long minBusyNs = 0, topBusyNs = 0;
+	unsigned topTasks = 0;
 	for (size_t i = 0; i < k && i < instance->workers.size(); ++i) {
 		Thread* w = instance->workers[i].get();
 		const unsigned  t  = w->laneCyclesTotal.exchange(0, std::memory_order_relaxed);
 		const long long ns = w->laneBusyNs.exchange(0, std::memory_order_relaxed);
+		const unsigned  tr = w->laneTasksRun.exchange(0, std::memory_order_relaxed);
 		if (t < minTotal) minTotal = t;
-		if (i == k - 1) topBusyNs = ns;
+		if (i == k - 1) { topBusyNs = ns; topTasks = tr; }
 		if (i == 0 || ns < minBusyNs) minBusyNs = ns;
 	}
 
 	// Not enough evidence. A window in which some hot worker barely looped says the pool was busy
 	// elsewhere, not that the lane was saturated or idle, and deciding on it is reading noise.
-	if (minTotal == ~0u || minTotal < kMinTopSamples) return;
+	// NO SAMPLE-COUNT GUARD. There used to be one -- `minTotal < kMinTopSamples` -- and it was
+	// vestigial from the era when occupancy was a COUNT of passes. Occupancy is nanoseconds now, so
+	// a worker's busy time is valid however few passes it made.
+	//
+	// Worse, the guard was a MINIMUM across the hot set, which is the same starvation bug as the
+	// central sampler and the pinned worker: the BUSIEST worker makes the fewest passes, one per
+	// task. At six 50 us tasks per 5 ms that is ~12 passes per 10 ms window against a threshold of
+	// 16, so every window was discarded and the demote path was never reached at all. K ratcheted
+	// 2 -> 4 under a 6%-duty trickle and never came back.
+	//
+	// THIRD TIME A MINIMUM-ACROSS-WORKERS STATISTIC HAS BEEN STARVED BY THE THING IT MEASURES. If a
+	// future guard here is a min over workers, check first whether being busy REDUCES the quantity.
+	if (minTotal == ~0u) return;
 
 	const long long last = g_lastHotChangeNs.load(std::memory_order_relaxed);
 
@@ -838,7 +888,26 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// genuinely surplus is low in all of them. Counting consecutive windows rather than widening the
 	// window keeps the UP path's reaction time short -- one evidence stream serves both directions,
 	// and only the down side has to be patient.
-	const bool low = topBusyNs * 5 < windowNs;      // the marginal core under 20%% lane-occupied
+	// IDLE MEANS "RECEIVED NO LANE WORK", NOT "SPENT LITTLE TIME ON IT".
+	//
+	// Occupancy was the wrong question for a DEADLINE lane, and using it demoted during genuine load.
+	// A hot worker resuming an I/O completion does a few microseconds of work and suspends again, so
+	// a fully-loaded lane worker sits at single-digit occupancy -- it is paid to be AVAILABLE, not
+	// busy. Measured: with occupancy driving demotion, dyn p50 on the 200us burn went 29.30 -> 40.80
+	// against static K=4, because the controller kept shedding cores that were doing their job.
+	//
+	// Task COUNT answers the real question -- is this core taking a share of the arrival rate? -- and
+	// it separates the two cases the occupancy metric conflated:
+	//   trickle : steering aims everything at the low indices, so the marginal core runs ZERO. Shed.
+	//   loaded  : steering spreads, so every hot worker runs something. Keep, at any occupancy.
+	//
+	// It also refuses to punish a lane for being fast, which occupancy structurally does.
+	const bool low = (topTasks == 0);
+	(void)topBusyNs;
+	std::fprintf(stderr, "[dn] k=%zu low=%d topBusy=%lld win=%lld lows=%u dtDem=%lld\n",
+	             k, (int)low, (long long)topBusyNs, (long long)windowNs,
+	             g_lowWindows.load(std::memory_order_relaxed),
+	             (long long)(now - g_lastDemoteNs.load(std::memory_order_relaxed)));
 	unsigned lows = 0;
 	if (low) lows = g_lowWindows.fetch_add(1, std::memory_order_relaxed) + 1;
 	else     g_lowWindows.store(0, std::memory_order_relaxed);

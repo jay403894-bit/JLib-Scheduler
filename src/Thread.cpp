@@ -622,7 +622,21 @@ void Thread::Worker() {
 			// every worker would cost more than the mechanism saves. Worker 0 is always hot under
 			// Dynamic (minK >= 1), so it never parks and the down-ramp still gets evaluated on a
 			// completely quiet lane -- which is the case the whole down direction exists for.
-			if (qIndex == 0 && ((++hotCtlTick & 0x3F) == 0))
+			// ANY hot worker drives the controller, not worker 0.
+			//
+			// Pinning it to worker 0 starved it in exactly the case it exists for. Worker 0 is the
+			// LOWEST hot index, so under a lane that is not yet saturated it is the one actually
+			// running tasks -- one loop pass per task -- while the higher hot workers spin freely.
+			// The driver was therefore slowest precisely when the surplus workers above it were most
+			// idle. Measured: THIRTEEN controller evaluations in an entire test run, and none during
+			// a 2.5 s trickle, so the demote path was never reached and K could not shed.
+			//
+			// Letting every hot worker drive it costs nothing extra per worker and makes evaluation
+			// frequency scale with how idle the hot set is -- which is the right way round, since an
+			// idle hot set is what the demote path is looking for. Concurrent evaluations are already
+			// safe: both directions are rate-limited on their own clocks and the window gate admits
+			// one decision at a time.
+			if (isHotWorker && ((++hotCtlTick & 0x3F) == 0))
 				TaskScheduler::MaybeAdjustHotWorkers();
 		}
 
@@ -664,6 +678,7 @@ void Thread::Worker() {
 			if (task_to_run->hiPri != 0 && isHotWorker) {
 				laneStartNs = MonotonicNs();
 				ranLaneTaskLastPass = true;
+				laneTasksRun.fetch_add(1, std::memory_order_relaxed);
 			}
 			// CANCELLATION, OBSERVED AT PICKUP. One flag in the scope; every task carrying a token
 			// to it reads the new value the next time it is touched, and this is one of those
