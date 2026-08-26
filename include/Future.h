@@ -93,15 +93,24 @@
 // exception was an inconsistency rather than a considered trade -- a frame that touches the CRT
 // allocator has taken a lock the rest of the design spent real effort avoiding.
 //
-// IT FALLS BACK TO THE HEAP for a Promise created before Init(), or a slab exhausted across every
-// class. Provenance rides in a bool inside the state rather than being re-derived from the address
+// IT FALLS BACK TO THE HEAP, and the case that matters is a Promise created BEFORE Init() -- a
+// normal, non-failure path, and the reason the C++17 producer side still works with no scheduler at
+// all. (It also covers total slab exhaustion, but that is not much of a rescue: at that point tasks
+// cannot be created either.) Provenance rides in a bool inside the state rather than being re-derived from the address
 // at free time: FreeSized() can answer by address, but only while the allocator is reachable, and a
 // Future may outlive Join(). A bit that travels WITH the object cannot go stale.
 //
-// THE COST, stated because it is real: the 128-byte class is shared with coroutine frames at a FIXED
-// capacity chosen by SlabSizes, so an app making very many Futures spends frame budget on them and
-// would hit the cap sooner. `new` had no cap. The fallback above is what keeps that a memory
-// question rather than a failure.
+// THE RISK IS OCCUPANCY, NOT CAPACITY, and the obvious worry is the wrong one. Exhausting the
+// 128-byte class takes roughly 131,000 concurrent Futures (128K slots); ten thousand in flight is
+// about 8% of it. And if you ever did exhaust it, tasks could not be created either -- so the heap
+// fallback would be rescuing a process that is already finished, which is why the pre-Init case is
+// the one that actually justifies it.
+//
+// What the slab assumes is CHURN. A task is created, runs, and is freed inside a frame. A Future is
+// a HANDLE, alive as long as any consumer holds it -- so an application that caches resolved
+// Futures (an asset handle kept for the session, say) holds slab slots indefinitely, which is a
+// lifetime shape the pool was not sized for. That is a plausible thing to write, unlike exhaustion,
+// and it is the case to watch.
 //
 // A LARGER OPTION LEFT ON THE TABLE: std::mutex is 80 of these 96 bytes. A spinlock would take the
 // void form to about 24 and drop everything into the 64-byte class. The lock is held only for
