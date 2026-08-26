@@ -234,15 +234,6 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 std::thread::id Thread::GetID() {
 	return thread.get_id();
 }
-bool Thread::SetImmediateTask(Task* new_task) {
-	if (!new_task) return false;
-	{
-		immediateTask = new_task;
-		immediate.store(true, std::memory_order_seq_cst);
-	}
-	cv.notify_one();
-	return true;
-}
 void Thread::SetQueueIndex(size_t index)
 {
 	qIndex = index;
@@ -251,7 +242,6 @@ void Thread::SetQueueIndex(size_t index)
 bool Thread::DrainOwnInboxesToDeques() {
 	// Pushes to our OWN deque, and NOT via Requeue the way Worker()'s pre-immediate drain does. That
 	// difference is about THIS caller, not about Requeue -- the other drain is correct:
-	// PushToCore stores immediateCoresInUse BEFORE SetImmediateTask, so by the time that worker sees
 	// an immediate task its own core is already flagged, and PickNextWorker skips flagged workers.
 	// Requeue there provably cannot hand a task back into the inbox being emptied.
 	//
@@ -440,7 +430,6 @@ void Thread::Worker() {
 	const size_t BATCH_SIZE = 64;
 	Task* batch[BATCH_SIZE];
 	static thread_local Task* task_to_run = nullptr;
-	static thread_local bool is_handling_fork = false;
 	// IdlePolicy spin state for THIS worker. Both are reset the moment work is found, not only on
 	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
 	// task would carry that count into its next idle episode and park early ever after.
@@ -803,17 +792,6 @@ void Thread::Worker() {
 					task_to_run = nullptr;
 				}
 
-				// Release the core claimed by PushImmediate/PushToCore. Sound because an immediate
-				// task goes into THIS worker's immediate slot and cannot be stolen, so the worker
-				// that releases the claim is always the one it was made against. Task::isForked was
-				// a second, unsound way in -- a queued, stealable task releasing whatever core the
-				// worker that happened to run it had claimed -- and went with PushFork in 1.3.4.
-				if (is_handling_fork) {
-					if (qIndex < (int)scheduler->immediateCoresInUse.size()) {
-						scheduler->immediateCoresInUse[qIndex]->store(false, std::memory_order_release);
-					}
-					is_handling_fork = false;
-				}
 				if (EpochManager::Instance().ShouldSelfReclaim()) {
 					EpochManager::Instance().Tick();
 				}
@@ -831,17 +809,10 @@ void Thread::Worker() {
 			else {
 				f = AcquireFiber(task_to_run);
 				if (!f) {
-					// No fiber available right now (transient -- fibers are in use and will
-					// free up). Re-queue WITHOUT losing the task's origin:
-					//  - A forked/immediate task is pinned to THIS core, so restore it as the
-					//    immediate task and leave immediateCoresInUse[qIndex] set (it's still
-					//    pending here, and that flag also stops a new fork from clobbering it).
-					//  - A regular task goes back on the local deque to be retried or stolen.
-					if (is_handling_fork) {
-						immediateTask = task_to_run;
-						immediate.store(true, std::memory_order_seq_cst);
-					}
-					else {
+					// No fiber available right now (transient -- fibers are in use and will free
+					// up). Re-queue rather than lose it. The forked/immediate arm that used to sit
+					// here went with PushImmediate in 4.0.1 -- there is only one kind of task now.
+					{
 						// NOT push_bottom on our own deque. That end is LIFO for the owner (see
 						// TaskDeque's header), so the next pop_bottom takes THE SAME TASK back and
 						// this worker spins pop -> no fiber -> push -> pop forever on one task. It
@@ -900,8 +871,6 @@ void Thread::Worker() {
 				// Free(), not FreeSized() -- see the Native path above.
 				scheduler->GetAllocator()->Free(task_to_run);
 
-				// No core release here: the is_handling_fork clear below this whole block covers the
-				// fiber path for PushImmediate. The isForked clear that used to sit here went with
 				// PushFork in 1.3.4.
 
 				currentFiber = nullptr;
@@ -932,13 +901,6 @@ void Thread::Worker() {
 				currentRunningTask = nullptr;
 			}
 
-			if (is_handling_fork) {
-				if (qIndex < (int)scheduler->immediateCoresInUse.size()) {
-					scheduler->immediateCoresInUse[qIndex]->store(false, std::memory_order_release);
-				}
-				is_handling_fork = false;
-			}
-
 			if (EpochManager::Instance().ShouldSelfReclaim()) {
 				EpochManager::Instance().Tick();
 			}
@@ -959,116 +921,14 @@ void Thread::Worker() {
 
 			task_to_run = nullptr;
 		}
-		// --- 2. Immediate task execution ---
-		{
-			if (immediateTask != nullptr) {
-				// Finish this worker's own queued inbox work FIRST, rather than dumping it for
-				// others to steal -- forking isn't urgent, and relying on a peer happening to
-				// steal it loses efficiency and risks unbounded latency if the pool is busy
-				// elsewhere. Native tasks (the common case, and the default) are GUARANTEED to
-				// never suspend, so they're executed to completion right here, no fiber needed
-				// -- genuinely finished, not just relocated. A fiber-backed task COULD
-				// legitimately suspend on an external event; forcing it to finish inline isn't
-				// possible without duplicating the whole fiber/status state machine, so THOSE
-				// still fall back to the deque for stealing (the old behavior) as the safety
-				// net for that rarer case. Only the INBOX needs this treatment -- anything
-				// already sitting in this worker's own deque was already directly stealable via
-				// steal(), it was never actually at risk.
-				// DRAINS UNTIL EMPTY, not one BATCH_SIZE pass. It used to take at most 64 and stop,
-				// which was fine while an inbox rarely held more: PushLocal round-robins one task at
-				// a time. PushBatch now deliberately hands a large contiguous RUN to a single inbox
-				// (~645 tasks for a 20k batch at the default minPerSegment), so the 64 cap would leave
-				// hundreds behind -- in the inbox of a worker that is about to pin, where nothing can
-				// steal them. For a short fork that is latency; for a PERSISTENT pinned service, which
-				// is what this mechanism exists for (an audio mixer, a network poll loop), the pin
-				// never ends and those tasks are stranded for the life of the process. That is the
-				// particle-demo deadlock again, needing >64 queued instead of >0.
-				//
-				// TERMINATION rests on an invariant, since this no longer has a count bound: PushBatch's
-				// segment loop routes through PickNextWorker, which SKIPS any core whose
-				// immediateCoresInUse is set -- and PushToCore stores that flag BEFORE SetImmediateTask,
-				// so by the time this worker observes immediateTask its own core is already marked.
-				// PushBatch therefore cannot hand a task back to the inbox being drained. The one
-				// exception is every worker being pinned at once, where PushBatch's segment loop already
-				// spins on its own while(immediateCoresInUse) loop regardless of this drain -- a
-				// pre-existing hazard, not one introduced here. Do NOT "fix" this loop by re-adding a
-				// cap: the cap is what stranded the overflow in the first place.
-				//
-				// ONE PushBatch CALL PER ROUND, not a per-task Requeue loop (that was this function
-				// until 2.2.0). Each Requeue call pays its own PickNextWorker + spin-check + single-item
-				// push + NotifyWorker (a mutex lock); PushBatch amortizes that cost across a segmented,
-				// spread submission -- measured 7.5-8.2x faster at these sizes (SchedulerBench's
-				// "requeue vs pushbatch" sweep, interleaved with a same-vs-same control; BATCH_SIZE=64 is
-				// the size a single round actually sees). minPerSegment=8 is sized for a round this
-				// small -- ParallelFor's default would over-segment it and pay more notifies than the
-				// spread is worth (see PushBatch's own header on that regression).
-				//
-				// PushBatch places a whole call as ONE class (see its own corePref note) -- so a
-				// drained inbox that actually mixes P/E/Default tasks (2.1.0+ allows this; class
-				// routing is opt-in but no longer hypothetical once one caller uses it) needs
-				// splitting into homogeneous runs FIRST, one PushBatch call per run. Done in place on
-				// batch[] itself (Dutch-flag 3-way partition), not via separate scratch arrays or
-				// heap vectors -- this is a hot path and the common case (everything Default, which
-				// is 100% of it today) must still cost exactly one PushBatch call, not three.
-				//
-				// batch[] can hold null entries (see the pop loops in section 5 below, which guard the
-				// same way) -- PushBatch links tasks[i]->next contiguously and cannot tolerate a hole,
-				// so nulls are compacted out before the call, unlike the old loop's per-task `if (!t)`.
-				auto drainInbox = [&](TaskMPSCQueue* inbox, bool inboxIsHiPri) {
-					for (;;) {
-						size_t count = 0;
-						while (count < BATCH_SIZE && inbox->pop(batch[count])) count++;
-						if (count == 0) break;
-						size_t live = 0;
-						for (size_t i = 0; i < count; ++i)
-							if (batch[i]) batch[live++] = batch[i];
-						if (live == 0) continue;
-
-						// [0, pEnd) = P, [pEnd, eStart) = Default/Wide/Any (all route identically --
-						// see CorePref's own comment), [eStart, live) = E.
-						size_t pEnd = 0, mid = 0, eStart = live;
-						while (mid < eStart) {
-							CorePref pr = batch[mid]->corePref;
-							if (pr == CorePref::P) {
-								std::swap(batch[pEnd], batch[mid]);
-								++pEnd; ++mid;
-							}
-							else if (pr == CorePref::E) {
-								--eStart;
-								std::swap(batch[mid], batch[eStart]);
-							}
-							else {
-								++mid;
-							}
-						}
-						if (pEnd > 0)
-							scheduler->PushBatch(batch, pEnd, /*cpuaffinity*/0, /*minPerSegment*/8,
-								inboxIsHiPri, CorePref::P);
-						if (eStart > pEnd)
-							scheduler->PushBatch(batch + pEnd, eStart - pEnd, /*cpuaffinity*/0,
-								/*minPerSegment*/8, inboxIsHiPri, CorePref::Default);
-						if (live > eStart)
-							scheduler->PushBatch(batch + eStart, live - eStart, /*cpuaffinity*/0,
-								/*minPerSegment*/8, inboxIsHiPri, CorePref::E);
-					}
-				};
-				// HALF THE LOOP FOR N-K WORKERS: an ordinary worker never touches the lane, so it
-				// skips this inbox entirely. At K=0 nobody serves the lane and nothing is routed to
-				// it, so every worker takes the cheap path -- cheaper than before the lane existed.
-				if (servesHiPri || hiPriStray) drainInbox(scheduler->hiPriInboxes[qIndex].get(), /*inboxIsHiPri*/true);
-				drainInbox(scheduler->loPriInboxes[qIndex].get(), /*inboxIsHiPri*/false);
-
-				if (EpochManager::Instance().ShouldSelfReclaim()) {
-					EpochManager::Instance().Tick();
-				}
-
-				task_to_run = immediateTask;
-				immediateTask = nullptr;
-				immediate.store(false, std::memory_order_seq_cst);
-				is_handling_fork = true;
-				continue;
-			}
-		}
+		// --- 2. (was: immediate task execution) ---
+		//
+		// REMOVED IN 4.0.1 along with PushImmediate. A worker had a single-slot bypass around the
+		// queues, written only by PushToCore, plus a drain that emptied this worker's own inboxes
+		// first so a pinned task could not strand them. With no writer left the whole section was
+		// unreachable, and both sites that released the core claim went with it.
+		//
+		// See TaskScheduler::SetReservedCores for the replacement: reserve a core, run a std::thread.
 		{
 			// --- 3. Local  queues ---
 			if (!task_to_run && (servesHiPri || hiPriStray)) {

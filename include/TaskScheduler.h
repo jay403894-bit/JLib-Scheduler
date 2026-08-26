@@ -919,28 +919,18 @@ namespace JLib {
 				PushBatch(ts.data(), ts.size(), 0, /*minPerSegment*/64, hiPri);
 			return ts.size();
 		}
-		// Hand a task to a SPECIFIC core via that worker's immediate slot, bypassing the queues
-		// entirely. For a persistent service running inside the pool rather than beside it -- an
-		// audio mixer, a network poll loop. Running such a thing as a plain std::thread would work,
-		// but the scheduler could not see it and the pool would silently oversubscribe the machine;
-		// a pinned task is visible to placement, an outside thread is a core that quietly went
-		// missing. The core is marked in immediateCoresInUse and excluded from normal placement
-		// until the task finishes.
+		// PushImmediate was REMOVED in 4.0.1 -- use TaskScheduler::SetReservedCores and run a plain
+		// std::thread. It handed a task to a SPECIFIC worker`s immediate slot and marked that core
+		// in-use until the task finished, which for a persistent subsystem meant forever: a worker
+		// taken out of a WORK-STEALING pool, its queue spilled to everyone else.
 		//
-		// DEPRECATED as of 4.0.1, and slated for removal. It takes a worker out of a WORK-STEALING
-		// pool for a blocking task and spills that worker's queue to everyone else -- and the
-		// justification above has stopped holding. A pinned worker is now invisible in a SECOND way:
-		// with a hot set that moves, it is neither ordinary nor hot in anything the scheduler
-		// tracks, so "visible to placement" is no longer the trade being made.
+		// Its justification was that a pinned task stays VISIBLE TO PLACEMENT where an outside thread
+		// is a core that quietly went missing. Dynamic K ended that: a pinned worker is neither
+		// ordinary nor hot in anything the scheduler tracks, so it became invisible in a second way --
+		// and the hot set could grow OVER it, steering completions into a queue that never drains.
 		//
-		// It also breaks an invariant it used to keep. The "not a hot worker" refusal in PushToCore
-		// is point-in-time; dynamic K grows the hot set OVER an already-pinned worker, after which
-		// completions steer into a queue that may never drain and the controller wedges on a worker
-		// reporting zero duty forever.
-		//
-		// REFUSES while the hot range can move (max > min). Use a std::thread for a blocking
-		// subsystem and size the pool accordingly, or put it on the reactor.
-		bool PushImmediate(uint8_t cpu_affinity, Task* task);
+		// SetReservedCores buys the same census accounting with none of the invariants, because the
+		// scheduler never owns the thread: nothing can promote it, steal from it, or wait on it.
 
 		// PushFork was REMOVED in 1.3.4 -- use Push. It placed a child on the CALLING worker, on the
 		// theory that the parent was about to WaitFor and free that core, so the child would run
@@ -1386,12 +1376,6 @@ namespace JLib {
 			auto* t = CreateTask(std::forward<F>(f));
 			PushLocal(t, cpu_affinity);
 		}
-		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
-		void PushImmediate(size_t coreID, F&& f) {
-			auto* t = CreateTask(std::forward<F>(f));
-			PushToCore(coreID, t);
-		}
-
 	private:
 		explicit TaskScheduler(size_t poolSize);
 
@@ -1399,7 +1383,6 @@ namespace JLib {
 		// (`nextId` removed in 1.3.4: a process-wide atomic counter whose only reader,
 		//  Thread::GenerateID(), had no callers anywhere. Never executed, so it cost no time -- but
 		//  it sat in the shared struct implying task IDs existed. Nothing assigns or reads one.)
-		std::vector<std::unique_ptr<std::atomic<bool>>> immediateCoresInUse;
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> loPri;
 		std::vector<std::unique_ptr<TaskDeque>> hiPri;
@@ -1407,7 +1390,7 @@ namespace JLib {
 		// ---------- the NON-WORKER LANE ----------
 		// loPri/hiPri carry ONE EXTRA deque pair past the workers, at index `nonWorkerLane`
 		// (== workers.size(), fixed by StartPool). Everything else -- inboxes,
-		// immediateCoresInUse, the P/E sets, PickNextWorker -- stays worker-indexed.
+		// the P/E sets and PickNextWorker -- stays worker-indexed.
 		//
 		// WHY IT EXISTS. Demand-driven splitting (ParallelFor since 1.4) works by publishing a split onto
 		// the SPLITTER'S OWN deque and taking it straight back if nobody stole it -- measured at
@@ -1483,7 +1466,6 @@ namespace JLib {
 		// workers only; everything else rotates the ordinary ones only. One branch, one place, and
 		// no caller can route a lane task somewhere nothing serves it.
 		int PickNextWorker(CorePref pref = CorePref::Default, bool hiPri = false);
-		bool PushToCore(size_t core_id, Task* task);
 		// Picks a worker from the requested class set (P/E), SPILLING to the other class if unavailable;
 		// Default/Any/Wide (and non-hybrid / all-pinned) use the original full-pool round-robin. Placement
 		// is governed SOLELY by CorePref -- hiPri is queue order only, never consulted for placement.
@@ -1491,8 +1473,8 @@ namespace JLib {
 
 		// NOTE: an external-submitter fan-out cap was tried here and REMOVED. See CHANGELOG 1.1.1.
 		// It made single-producer submission much faster and burst parallelism much worse, and it
-		// could livelock: PushLocal spins on `while (immediateCoresInUse[chosen])` with no yield and
-		// no widening, which is safe with thirty-one candidates and is not with four. If you are
+		// could livelock against the pinned-core retry loop PushLocal used to carry, which was safe
+		// with thirty-one candidates and not with four (that loop went with PushImmediate). If you are
 		// tempted to reintroduce it, the useful version is preferring workers that are already
 		// AWAKE, not capping how many exist.
 

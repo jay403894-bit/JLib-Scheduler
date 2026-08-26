@@ -238,7 +238,6 @@ namespace JLib {
         // workers.size() alone and could not, which is how it ended up as a constant by accident.
         void StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity);
         std::thread::id GetID();
-        bool SetImmediateTask(Task* task_);
 
         int GetQueueLoad();
         void SetQueueIndex(size_t index);
@@ -413,7 +412,6 @@ namespace JLib {
         std::condition_variable cv;
         std::condition_variable cvAffinity;
         Task* task = nullptr;
-        Task* immediateTask = nullptr;
         std::thread thread;
         std::thread::native_handle_type nativeHandle;
 

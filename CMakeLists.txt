@@ -492,10 +492,6 @@ target_compile_features(SchedulerTaskSlabSizeTest PRIVATE cxx_std_17)
 # PushBatch() call in 2.2.0. PushImmediate() had zero test coverage before this -- standalone for
 # the same isolation reason as the two tests above, and because it needs an exact 2-worker pool to
 # make the drain deterministic, which a shared-binary test can't assume.
-add_executable(SchedulerImmediateDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/immediate_drain_test.cpp")
-target_link_libraries(SchedulerImmediateDrainTest PRIVATE Scheduler)
-target_compile_features(SchedulerImmediateDrainTest PRIVATE cxx_std_17)
-
 # Pure-logic tests for the >64-CPU path: mask math, the flat-id split, and the worker-to-CPU
 # assignment on unevenly sized processor groups. Runs anywhere, which is the point -- it is the only
 # check on the wide path that does not require hardware nobody here has.

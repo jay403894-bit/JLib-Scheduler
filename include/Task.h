@@ -56,7 +56,7 @@ namespace JLib {
     // SCOPE OF ENFORCEMENT (deliberate): corePref is vetted at PUSH placement (PickNextWorker) and at
     // STEAL (TaskDeque::steal_if via StealClassCompatible) -- but an OWNER always runs whatever is in
     // its own deque/inboxes unvetted: spill (preferred class unavailable at push) transfers ownership,
-    // and explicit CPU affinity (Push(cpu,..)/PushImmediate/PushToCore/DAG isFork/isMain) OVERRIDES
+    // and explicit CPU affinity (Push(cpu,..) / DAG isLocal / isFork / isMain) OVERRIDES
     // corePref entirely -- pinning to a specific core is a stronger, more explicit request than a
     // class preference. Do not add owner-pop vetting: a task a worker owns must run, else it strands.
     enum class CorePref : uint8_t {

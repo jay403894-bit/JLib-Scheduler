@@ -347,7 +347,7 @@ void TaskScheduler::Join() {
 	//
 	// Join() used to take down `workers` and nothing else, so a reactor completion thread and the
 	// timer thread outlived it. That is not merely untidy: both PUSH TASKS, and the block below
-	// clears `workers`, `mainQ` and `immediateCoresInUse`. A completion landing in that window
+	// clears `workers` and `mainQ`. A completion landing in that window
 	// indexes vectors that are being emptied. The window is small, which is the worst kind -- it
 	// makes the failure rare enough to look like something else.
 	//
@@ -380,7 +380,6 @@ void TaskScheduler::Join() {
 		poolMutex.lock();
 		workers.clear();
 		mainQ.clear();
-		immediateCoresInUse.clear();
 		poolMutex.unlock();
 	}
 
@@ -828,24 +827,6 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// becomes buried -- which is precisely when adv == mask can first become true. The rate limit is
 	// the only brake, and it is what keeps a burst from adding four cores at once while still
 	// allowing 1 -> 4 in a few milliseconds.
-	// ---- NEVER PROMOTE OVER A PINNED WORKER ----------------------------------------------------
-	//
-	// PushToCore already refuses to pin a HOT worker, and that check was correct for static K
-	// because the hot set never moved. It is POINT-IN-TIME, and dynamic K grows the set OVER a
-	// worker that was legally pinned when K was smaller. The damage runs both ways and neither side
-	// can see it:
-	//   - the pinned worker is running a service task that may never return, so it never loops:
-	//     it cannot serve the lane, completions steered to it queue behind work that never ends,
-	//     and it reports laneCyclesTotal == 0 forever
-	//   - which WEDGES THE CONTROLLER, because minTotal is a minimum across the hot set, so one
-	//     permanently-zero worker means minTotal < kMinTopSamples on every window and no decision is
-	//     taken again -- exactly the s=0 symptom that took instrumentation to find the first time
-	//
-	// Refusing to grow past it keeps the hot set a PREFIX, which WorkerServesHiPri, the popcount
-	// mask and pushSteered all assume. A skip-set would be the general fix and a much larger change.
-	if (k < instance->workers.size() && instance->immediateCoresInUse[k]->load(std::memory_order_acquire))
-		return;
-
 	// A MISS PROMOTES ON ITS OWN, without waiting for adv == mask. This is the fast half of the fast
 	// half: saturation says "every hot worker is four deep", a miss says "somebody just had to wait",
 	// and the second is true far earlier in a burst than the first.
@@ -1754,18 +1735,16 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	globalPool = GlobalFiberPool::Create(standardFiberCount, heavyFiberCount);
 	workers.clear();
 	loPri.clear();
-	immediateCoresInUse.clear();
 	loPriInboxes.clear();
 	hiPri.clear();
 	stealHintLane.store(0, std::memory_order_relaxed);
 	hiPriInboxes.clear();
 	workers.reserve(num_workers);
 	// +1 for the NON-WORKER LANE (see nonWorkerLane's declaration). Only the deques get it --
-	// inboxes and immediateCoresInUse stay worker-indexed, because nothing ever pushes to a
+	// inboxes stay worker-indexed, because nothing ever pushes to a
 	// non-worker's inbox or pins a core to it.
 	loPri.reserve(num_workers + 1);
 	hiPri.reserve(num_workers + 1);
-	immediateCoresInUse.reserve(num_workers);
 	loPriInboxes.reserve(num_workers);
 	hiPriInboxes.reserve(num_workers);
 
@@ -1778,7 +1757,6 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	mainQ.init(&taskAllocator);
 
 	for (unsigned int i = 0; i < num_workers; ++i) {
-		immediateCoresInUse.push_back(std::make_unique<std::atomic<bool>>(false));
 		loPri.push_back(std::make_unique<TaskDeque>());
 		hiPri.push_back(std::make_unique<TaskDeque>());
 		loPriInboxes.push_back(std::make_unique<TaskMPSCQueue>());
@@ -2095,11 +2073,7 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// Explicit affinity is an explicit request: honour it and do not spread. Falls back to
 		// PickNextWorker(pref), not the unpinned target, if that exact core is stuck -- pre-existing
 		// behaviour, now at least routed toward the right class instead of always Default.
-		int chosen = cpuaffinity - 1;
-		while (immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-			chosen = PickNextWorker(pref);
-		}
+		const int chosen = cpuaffinity - 1;
 		submitRun(0, count, chosen);
 		return;
 	}
@@ -2148,11 +2122,7 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// applies to ordinary placement only; PickNextWorker settles a fully-claimed hot set itself,
 		// and yielding in a loop here on K = 1 would never terminate.
 		const bool useHiSeg = hiPri && HiPriLaneActive();
-		int chosen = PickNextWorker(pref, useHiSeg);
-		while (!useHiSeg && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-			chosen = PickNextWorker(pref, false);
-		}
+		const int chosen = PickNextWorker(pref, useHiSeg);
 		submitRun(first, len, chosen);
 		first += len;
 	}
@@ -2160,11 +2130,6 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 
 bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 	return PushLocal(task, cpu_affinity);
-}
-
-bool TaskScheduler::PushImmediate(uint8_t cpu_affinity, Task* task) {
-	if (!task) return false;
-	return PushToCore(cpu_affinity, task);
 }
 
 void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& arm) {
@@ -2657,28 +2622,23 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 	size_t num_workers = workers.size();
 	if (cpuaffinity > 0 && (size_t)(cpuaffinity - 1) < num_workers) {
 		size_t idx = (size_t)(cpuaffinity - 1);
-		if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
-			loPriInboxes[idx]->push(task);
-			// Targeted at worker idx specifically, not NotifyAll() -- only that one worker's
-			// inbox actually changed. MarkQueuedWork() (release-ordered, matching
-			// Thread.h's hasQueuedWork comment) pairs with the worker's own acquire-load in its
-			// sleep predicate, closing the same notify-loss race the old blanket approach
-			// happened to also close, just without waking every other worker for nothing.
-			workers[idx]->MarkQueuedWork();
-			workers[idx]->NotifyWorker();
-		}
-		else
-			return false;
+		// EXPLICIT AFFINITY NOW ALWAYS SUCCEEDS. It used to be refusable -- if that core was pinned
+		// by PushImmediate this returned false and the caller had to cope. With pinning gone
+		// (4.0.1) there is no way for a worker to be unavailable, so the refusal path and the
+		// retry loops that danced around it are unreachable and removed. See SetReservedCores.
+		loPriInboxes[idx]->push(task);
+		// Targeted at worker idx specifically, not NotifyAll() -- only that one worker's
+		// inbox actually changed. MarkQueuedWork() (release-ordered, matching
+		// Thread.h's hasQueuedWork comment) pairs with the worker's own acquire-load in its
+		// sleep predicate, closing the same notify-loss race the old blanket approach
+		// happened to also close, just without waking every other worker for nothing.
+		workers[idx]->MarkQueuedWork();
+		workers[idx]->NotifyWorker();
 	}
 	else {
 		const size_t hotN = GetHotWorkers();
 		const bool useHi = task->hiPri && hotN;
 		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
-		// The claimed-core retry applies to ORDINARY placement only. PickNextWorker already handles
-		// a fully-claimed hot set internally, and re-rolling there could spin forever on K = 1.
-		while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-			chosen = (uint8_t)PickNextWorker(task->corePref, false);
-		}
 		if (useHi) hiPriInboxes[chosen]->push(task);
 		else
 			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
@@ -2698,71 +2658,12 @@ bool TaskScheduler::Requeue(Task* task) {
 	// an ordinary worker would strand it just as surely as a fresh one.
 	const size_t hotN = GetHotWorkers();
 	const bool useHi = task->hiPri && hotN;
-	uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
-	while (!useHi && immediateCoresInUse[chosen]->load(std::memory_order_acquire)) {
-		chosen = (uint8_t)PickNextWorker(task->corePref, false);
-	}
+	const uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
 	if (useHi) hiPriInboxes[chosen]->push(task);
 	else
 		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 	workers[chosen]->MarkQueuedWork();
 	workers[chosen]->NotifyWorker();
-	return true;
-}
-bool TaskScheduler::PushToCore(size_t core_id, Task* task) {
-	if (core_id < 1) return false;
-	if (!poolActive) return false;
-	if (!task) return false;
-
-	size_t idx = (core_id - 1) % workers.size();
-
-	// A HOT WORKER IS NOT AVAILABLE FOR PINNING. PushImmediate/fork hands a worker a task and marks
-	// its core in-use until that task returns -- which for a long-lived pinned subsystem is
-	// FOREVER. Doing that to a lane server silently deletes it: every completion steered there
-	// queues behind work that may never finish, and nobody may steal from a hot worker to rescue
-	// them. Refusing is the honest answer; the caller already handles false (the core was busy), and
-	// a silent redirect would violate the "run on THIS core" contract PushImmediate exists for.
-	if (idx < GetHotWorkers()) return false;
-
-	// AND NOT AT ALL WHILE K CAN MOVE. The check above is POINT-IN-TIME, which was sufficient when
-	// the hot set never changed. Under dynamic K the set GROWS OVER a worker that was legally pinned
-	// when K was smaller, and neither side can detect it: the pinned worker runs a service task that
-	// may never return, so it never loops, never serves the lane, and reports zero duty forever --
-	// which also wedges the controller, whose evidence is a MINIMUM across the hot set.
-	//
-	// DEPRECATED, AND THE INTENT IS REMOVAL. This whole API takes a worker out of a WORK-STEALING
-	// pool for a blocking task and spills its queue to everyone else, and the argument that used to
-	// justify it -- "a pinned task is visible to placement, an outside thread is a core that quietly
-	// went missing" -- has stopped being true. A pinned worker is now invisible in a SECOND way: it
-	// is neither ordinary nor hot in anything the scheduler tracks. Run such a subsystem on its own
-	// std::thread and size the pool accordingly, or put it on the reactor.
-	//
-	// Refusing here rather than deleting the API tonight: the removal touches PushToCore,
-	// immediateCoresInUse, three spin sites, the fork cleanup in Worker(), and a dedicated test, and
-	// that is a reviewable change rather than a late edit. This closes the hazard in the meantime.
-	{
-		size_t lo = 0, hi = 0;
-		GetHotWorkerRange(lo, hi);
-		if (hi > lo) return false;
-	}
-
-	if (immediateCoresInUse[idx]->load(std::memory_order_acquire)) return false;
-
-	// Marks this core busy-with-a-fork until Thread::Worker() clears it on completion (see
-	// the is_handling_fork cleanup in both the Native and fiber-DEAD paths). If the forked
-	// task never returns (a long-running subsystem pinned here for the program's lifetime),
-	// this correctly STAYS true forever -- which is what makes PickNextWorker()'s existing
-	// skip-if-busy check actually mean something: without setting this, a never-returning fork
-	// would leave this worker's INBOX (not its deque -- that's still fully stealable) silently
-	// accepting new round-robin-dispatched work that nothing would ever drain again.
-	immediateCoresInUse[idx]->store(true, std::memory_order_release);
-
-	// Deliberately does NOT call MarkQueuedWork(): a forked/immediate task bypasses the shared
-	// deques/inboxes entirely (goes straight into workers[idx]->immediateTask below) and wakes
-	// ONLY that one targeted worker via SetImmediateTask's own `immediate` flag + notify --
-	// hasQueuedWork is specifically for the deque/inbox case, which this isn't.
-	workers[idx]->SetImmediateTask(task);
-	workers[idx]->NotifyWorker();
 	return true;
 }
 int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
@@ -2778,14 +2679,9 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	if (hiPri && hotN) {
 		const size_t n = workers.size();
 		const size_t m = (hotN < n) ? hotN : n;
-		for (size_t i = 0; i < m; ++i) {
-			const size_t j = (nextHotWorker.fetch_add(1, std::memory_order_relaxed)) % m;
-			if (!immediateCoresInUse[j]->load(std::memory_order_acquire))
-				return (int)j;
-		}
-		// Every hot worker is claimed by a PushImmediate. Return one anyway rather than spilling to
-		// an ordinary worker: spilling would strand the task, which is strictly worse than queueing
-		// behind a claim that is by definition temporary.
+		// One rotation step. This used to scan for the first UNPINNED hot worker and fall through to
+		// the same expression when every one of them was claimed; with pinning gone (4.0.1) the scan
+		// could only ever return on its first iteration, so it collapsed into its own fallback.
 		return (int)(nextHotWorker.fetch_add(1, std::memory_order_relaxed) % m);
 	}
 
@@ -2793,8 +2689,8 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	// here; the two axes are fully orthogonal by design. Default/Any/Wide all mean "no class preference"
 	// and fall through to the original full-pool round-robin below.
 
-	// Round-robin a worker subset, returning the first NON-pinned worker (immediateCoresInUse = a
-	// persistent PushImmediate claim), or -1 if the set is empty or every worker in it is pinned
+	// Round-robin a worker subset, returning the next worker in that subset (pinning is gone as of
+	// or -1 if the set is empty
 	// -- which tells the caller to SPILL to the other class rather than block on an unavailable core.
 	// DEDICATED HOT WORKERS: ordinary work must never be ROUTED to one. A hot worker exists to have
 	// nothing else to do -- that is the entire latency guarantee. Letting a bulk task land there
@@ -2812,10 +2708,8 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 		for (size_t i = 0; i < m; ++i) {
 			int idx = set[(start + i) % m];
 			if ((size_t)idx < hotN) continue;          // reserved for the low-latency lane
-			if (!immediateCoresInUse[idx]->load(std::memory_order_acquire)) {
-				cur.store((start + i + 1) % m, std::memory_order_relaxed);
-				return idx;
-			}
+			cur.store((start + i + 1) % m, std::memory_order_relaxed);
+			return idx;
 		}
 		return -1;
 	};
@@ -2836,7 +2730,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	// SEQ_CST, explicitly, and deliberately NOT relaxed. These were bare `nextWorker + i` /
 	// `nextWorker = ...`, which default to seq_cst; on 2026-08-16 they were made explicitly RELAXED
 	// on the reasoning that this is only a round-robin HINT (true -- nothing reads it for
-	// correctness, and the loop re-checks immediateCoresInUse on whatever it picks).
+	// correctness).
 	//
 	// REVERTED the same day. That change measured EXACTLY ZERO on throughput/mp (mean 3.06 -> 3.07
 	// M tasks/sec over 6 runs each) -- and the very next CI run hung the primitives test on macOS
@@ -2856,10 +2750,8 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	for (size_t i = 0; i < n; ++i) {
 		size_t j = (nextWorker.load(std::memory_order_seq_cst) + i) % n;
 		if (j < hotN) continue;                        // reserved; see the note on pickFrom
-		if (!immediateCoresInUse[j]->load(std::memory_order_acquire)) {
-			nextWorker.store((int)((j + 1) % n), std::memory_order_seq_cst);
-			return static_cast<int>(j);
-		}
+		nextWorker.store((int)((j + 1) % n), std::memory_order_seq_cst);
+		return static_cast<int>(j);
 	}
 	// Every eligible worker is pinned. Rotate among the NON-hot ones -- returning a hot worker here
 	// would put bulk work on the lane precisely when the pool is most loaded, which is the worst

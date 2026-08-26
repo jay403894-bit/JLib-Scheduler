@@ -423,7 +423,17 @@ void TaskDAG::Fire(TaskNode* node, TaskNode::Outcome outcome) {
         scheduler.PushMain(node->task);
     }
     else if (node->isFork) {
-        scheduler.PushImmediate(node->cpuID, node->task);
+        // isFork USED TO PIN the target worker out of the pool via PushImmediate. That API is gone
+        // (4.0.1): it removed a worker from a WORK-STEALING pool for the duration of a task and
+        // spilled its queue to everyone else, which a hot set that moves could not be kept
+        // consistent with. See TaskScheduler::SetReservedCores for the replacement.
+        //
+        // ROUTED TO A PLAIN AFFINITY PUSH rather than deleted outright. Nothing in this tree sets
+        // isFork -- it is not settable through CreateNode and has no test -- but TaskNode is a
+        // public struct with public bitfields, so an application could be writing it directly.
+        // Dropping the branch would silently ignore that intent; this honours the "run on this
+        // core" half and drops only the pinning, which is the part being withdrawn.
+        scheduler.Push(node->cpuID, node->task);
     }
     else if (node->isLocal) {
         if (node->cpuID == 0)
