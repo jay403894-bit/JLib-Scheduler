@@ -62,6 +62,49 @@ namespace JLib {
     inline constexpr bool kStealStatsEnabled = false;
 #endif
 
+    // ================================ LANE WAKE RATE (opt-in) ===================================
+    // Counts what TaskScheduler::WakeForLane actually does:
+    //     edges     0->1 transitions of a lane hint bit -- how often a worker gets buried
+    //     notifies  wakes actually SENT, which is what costs ~90us of core time each
+    //
+    // THIS IS THE COST SIDE, and it is measured by COUNTING rather than by an A/B, deliberately.
+    // The benefit was measured as latency and needed a 5-9% noise floor and two replications to
+    // read. The cost does not need any of that: a wake's price is already known, so the only open
+    // variable is the rate, and a count has no variance. It is also the only form of this question
+    // answerable in an application whose frame timing is unstable -- which is the normal case
+    // without vsync, and clamped to the refresh interval with it.
+    //
+    // Two counters and not one, because they answer different questions. `edges` says how often the
+    // pool reaches the buried state at all -- a property of the WORKLOAD, true even at wake=0.
+    // `notifies` says what this mechanism spent. Their ratio is the wake budget actually being used:
+    // far below the configured n means most burials found no parked worker to pull up, which is
+    // itself the finding that the mechanism is inert in that configuration.
+    //
+    // Enable with -DJLIBSCHED_LANE_WAKE_STATS=ON at configure time.
+#ifdef JLIBSCHED_LANE_WAKE_STATS
+    struct alignas(platform::kCacheLine) LaneWakeCounters {
+        std::atomic<long long> edges{ 0 };
+        std::atomic<long long> notifies{ 0 };
+    };
+    inline LaneWakeCounters g_laneWake;
+    #define JLIBSCHED_LANE_WAKE_STAT(field) \
+        ::JLib::g_laneWake.field.fetch_add(1, std::memory_order_relaxed)
+    inline void LaneWakeStatsReset() {
+        g_laneWake.edges.store(0, std::memory_order_relaxed);
+        g_laneWake.notifies.store(0, std::memory_order_relaxed);
+    }
+    inline void LaneWakeStatsRead(long long& edges, long long& notifies) {
+        edges    = g_laneWake.edges.load(std::memory_order_relaxed);
+        notifies = g_laneWake.notifies.load(std::memory_order_relaxed);
+    }
+    inline constexpr bool kLaneWakeStatsEnabled = true;
+#else
+    #define JLIBSCHED_LANE_WAKE_STAT(field) ((void)0)
+    inline void LaneWakeStatsReset() {}
+    inline void LaneWakeStatsRead(long long& e, long long& n) { e = n = 0; }
+    inline constexpr bool kLaneWakeStatsEnabled = false;
+#endif
+
     // ============================ HOT-WORKER OCCUPANCY WITNESS (opt-in) =========================
     // Answers exactly one question, and it is the question that decides whether hot->hot stealing
     // has a job at all: WHEN A HOT WORKER IS LATE, IS A SIBLING HOT WORKER IDLE AT THAT MOMENT?

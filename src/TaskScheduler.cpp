@@ -414,6 +414,19 @@ void TaskScheduler::NotifyAll() {
 // UpdateLaneHint on the 0->1 edge only; see the SetLaneWake block in TaskScheduler.h for why this
 // needs a predicate input rather than just a notify.
 void TaskScheduler::WakeForLane(size_t depth) noexcept {
+	// EDGES, counted before any early-out, because the rate is the whole cost model.
+	//
+	// A wake is ~90us of core time. That number is known; what is NOT known is how often this fires,
+	// and rate x known cost is the tax -- computable without an A/B against a noisy end-to-end
+	// metric, and with no noise floor of its own.
+	//
+	// THE FAILURE MODE THIS EXISTS TO CATCH. By design this is one wake per burial: the hint sets at
+	// depth >= kLaneStealDepth and stays set until the owner drains below it. But a lane oscillating
+	// AROUND that threshold produces an edge per oscillation, i.e. a wake storm at the rate the pool
+	// churns. A steady soak cannot show that -- there the hint sets once and stays set -- so the
+	// harness that measured the win is structurally blind to this particular way of losing.
+	JLIBSCHED_LANE_WAKE_STAT(edges);
+
 	int budget = laneWakeCount.load(std::memory_order_relaxed);
 	if (budget <= 0) return;
 
@@ -450,6 +463,7 @@ void TaskScheduler::WakeForLane(size_t depth) noexcept {
 		// MarkQueuedWork, and unsound in the other order. tests/verify/sleepwake_model.c.
 		w->MarkLaneWake();
 		w->NotifyWorker();
+		JLIBSCHED_LANE_WAKE_STAT(notifies);   // wakes actually SENT, which is what costs
 		--want;
 	}
 }

@@ -546,23 +546,73 @@ int main(int argc, char** argv) {
         std::printf("\n  lane wakes -- a buried hot worker pulls parked workers up to steal\n");
         std::printf("    Sleep policy. wake=0 is today's behaviour (mode 4 inert while parked).\n");
         std::printf("    K=1 is NOT a control here: one hot worker can bury itself, so wakes fire.\n");
-        std::printf("      K    burn   skew   wake      p50      p90      p99\n");
+        if (JLib::kLaneWakeStatsEnabled)
+            std::printf("      K    burn   skew   wake  clear      p50      p90      p99   edges/s  wakes/s   core%%\n");
+        else
+            std::printf("      K    burn   skew   wake  clear      p50      p90      p99\n");
 
         constexpr int kReps = 3;
-        const int wakeArms[] = { 0, 1, 2, 4 };
-        constexpr int kNW = 4;
+        // THE 2x3. `clear` is the lower edge of the Schmitt trigger; 3 == kLaneStealDepth-1 is a
+        // single threshold, i.e. no hysteresis, i.e. the control.
+        //
+        // == MEASURED 8-26, and it refuted the reason the hysteresis was built ==
+        //
+        // THE HYPOTHESIS WAS CHATTER: that the bit oscillated across a single threshold, so widening
+        // the gap would cut the edge rate. IT DID NOT. Edges/s barely moved and if anything rose:
+        //
+        //   K=1  20us  wake=2   clear 3 -> 16814/s   clear 1 -> 17275/s   clear 0 -> 17557/s
+        //   K=1 200us  wake=2   clear 3 ->  5053/s   clear 1 ->  5159/s   clear 0 ->  5522/s
+        //
+        // So the deque is not hovering at the line. It swings from a full batch to EMPTY and back --
+        // UpdateLaneHint is called from the inbox->deque drain with depth = count-1, the worker then
+        // runs the deque dry, and the next batch re-arms it. A gap between 4 and 1 lives entirely
+        // inside that swing. The edge rate is the BATCH ARRIVAL RATE of the workload, not an
+        // artifact, and no threshold tuning will reduce it.
+        //
+        // BUT IT IS A LARGE WIN ANYWAY, for a different reason, with the wake COUNT unchanged:
+        //
+        //   K=1 200us wake=2      p50      p90      p99    wakes/s
+        //     clear 3           214.40   437.10   653.60     9998
+        //     clear 1           196.60   260.60   449.50    10210
+        //     clear 0            67.70   243.50   443.90    10777
+        //
+        // Same number of wakes, a third of the p50. So each wake is doing more, and the reason is
+        // the PERMISSION WINDOW: a wake takes ~90us to land, and an ordinary worker may only touch
+        // the lane while LaneStealable says so. With clear=3 the owner often drains below 4 during
+        // those 90us, the bit clears, and the worker that was woken specifically to help arrives to
+        // find itself no longer allowed to -- it parks again, having cost a wake and delivered
+        // nothing. Holding the bit until the deque is empty keeps the permission alive long enough
+        // for the helper it summoned to actually arrive. (Inference from equal wakes + better
+        // latency, not a direct count of productive wakes.)
+        //
+        // AND IT COSTS THIEVES NOTHING, which was the risk of widening a bit they also read. The
+        // wake=0 rows vary the gap with the wake path off, and they are flat in all four
+        // configurations -- 487/490/484 at K=1 200us, 25.7/25.6/25.1 at K=4 20us. No regression.
+        //
+        // clear=0 wins nearly every row. The default stays 3 pending a decision, since it is a
+        // change to a hint that ships ON.
+        //
+        // THE wake=0 ROWS ARE NOT PADDING. The hint bit is read by thieves as well as by the wake
+        // path, so widening it changes hot->hot stealing too -- a mechanism that is default ON and
+        // already measured. With the wake path switched off, those three rows vary ONLY what thieves
+        // see, which is the one way to tell a stealing regression from a wake improvement.
+        const int wakeArms[]  = { 0, 0, 0, 2, 2, 2 };
+        const int clearArms[] = { 3, 1, 0, 3, 1, 0 };
+        constexpr int kNW = 6;
 
         for (long long burn : { 20000LL, 200000LL }) {
-          for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
-            std::vector<double> p50[kNW], p90[kNW], p99[kNW];
+          for (std::size_t k : { (std::size_t)1, (std::size_t)4 }) {
+            std::vector<double> p50[kNW], p90[kNW], p99[kNW], eps[kNW], wps[kNW];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNW; ++a) {
                 JLib::TaskScheduler::SetLaneHintMode(4);      // the wake is a no-op under any other
                 JLib::TaskScheduler::SetSteerSkip(false);
                 JLib::TaskScheduler::SetLaneWake(wakeArms[a]);
+                JLib::TaskScheduler::SetLaneClearDepth(clearArms[a]);
                 JLib::TaskScheduler::SetHotWorkers(k);
                 g_skewEveryNth = 8;
                 g_skewBurnNs   = burn;
+                JLib::LaneWakeStatsReset();
 
                 double secs = 0.0;
                 std::vector<long long> v = SoakRun(n, iters, secs);
@@ -571,6 +621,10 @@ int main(int argc, char** argv) {
                     return v[std::min(v.size() - 1, size_t(v.size() * p))] / 1000.0;
                 };
                 p50[a].push_back(pk(0.50)); p90[a].push_back(pk(0.90)); p99[a].push_back(pk(0.99));
+
+                long long ed = 0, nf = 0;
+                JLib::LaneWakeStatsRead(ed, nf);
+                if (secs > 0.0) { eps[a].push_back(ed / secs); wps[a].push_back(nf / secs); }
               }
             }
             const auto med = [](std::vector<double> x) {
@@ -578,14 +632,25 @@ int main(int argc, char** argv) {
                 std::sort(x.begin(), x.end());
                 return x[x.size() / 2];
             };
-            for (int a = 0; a < kNW; ++a)
-                std::printf("    %3zu  %6.0f  %5d  %5d  %7.2f  %7.2f  %7.2f\n",
-                            k, burn / 1000.0, 8, wakeArms[a],
+            for (int a = 0; a < kNW; ++a) {
+                std::printf("    %3zu  %6.0f  %5d  %5d  %6d  %7.2f  %7.2f  %7.2f",
+                            k, burn / 1000.0, 8, wakeArms[a], clearArms[a],
                             med(p50[a]), med(p90[a]), med(p99[a]));
+                if (JLib::kLaneWakeStatsEnabled) {
+                    // core% = wakes/sec x ~90us. An UPPER BOUND, not a measurement: 90us is the
+                    // cold-wake LATENCY, not CPU burn, and the woken worker goes on to do real work.
+                    // It is here for one comparison only -- against NoSleep's 29 spinning cores,
+                    // i.e. 2900% -- because that is what decides whether this is a bargain.
+                    const double w = med(wps[a]);
+                    std::printf("  %8.0f %8.0f  %6.2f", med(eps[a]), w, w * 90e-6 * 100.0);
+                }
+                std::printf("\n");
+            }
           }
         }
         g_skewEveryNth = 0;
         JLib::TaskScheduler::SetLaneWake(0);
+        JLib::TaskScheduler::SetLaneClearDepth(3);
         JLib::TaskScheduler::SetHotWorkers(hot);
     }
 

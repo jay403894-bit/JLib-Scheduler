@@ -415,6 +415,18 @@ namespace JLib {
 		static void SetLaneWake(int n) noexcept { laneWakeCount.store(n, std::memory_order_relaxed); }
 		static int  GetLaneWake() noexcept { return laneWakeCount.load(std::memory_order_relaxed); }
 
+		// THE LOWER EDGE OF THE SCHMITT TRIGGER in UpdateLaneHint: once a worker is advertising a
+		// lane backlog, it keeps advertising until its depth drops to THIS, rather than until it
+		// drops below kLaneStealDepth.
+		//
+		// Default 3 == kLaneStealDepth - 1, which is exactly a single threshold and therefore the
+		// behaviour before hysteresis existed. Lower it to open the gap. It is a runtime knob and
+		// not a constant so the arms interleave INSIDE one process -- comparing them as two builds is
+		// how a 1.8x drift on a control arm got read as a result twice in two days.
+		static inline std::atomic<int> laneClearDepth{ 3 };
+		static void SetLaneClearDepth(int d) noexcept { laneClearDepth.store(d, std::memory_order_relaxed); }
+		static int  GetLaneClearDepth() noexcept { return laneClearDepth.load(std::memory_order_relaxed); }
+
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
 		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
@@ -1481,6 +1493,9 @@ namespace JLib {
 		// higher stakes, because here it also defeats the placement. Four is above the depth a
 		// keeping-up worker reaches and well below the 8-13 measured when one is buried.
 		static constexpr int kLaneStealDepth = 4;
+		// laneClearDepth`s default must BE the single-threshold behaviour, or the "no hysteresis" arm is
+		// not a control. Asserted rather than commented because the two live 100 lines apart.
+		static_assert(kLaneStealDepth == 4, "laneClearDepth defaults to 3 == kLaneStealDepth - 1; keep them in step");
 
 		std::atomic<unsigned long long> stealHintLane{ 0 };
 
@@ -1510,11 +1525,28 @@ namespace JLib {
 		//   1  hint maintained at the DRAIN only, from a local count
 		//   2  hint maintained per pickup, from hiPri->size()  (touches the thief-written line)
 
+		// A SCHMITT TRIGGER, not a threshold. Sets at kLaneStealDepth, clears at laneClearDepth, and
+		// the gap between them is the whole point.
+		//
+		// WHY, MEASURED 8-26. With one threshold the bit chatters: a helper drains the lane below the
+		// line, it refills, the line is crossed again -- and the crossing RATE rose from 6,934/s to
+		// 17,731/s once lane wakes were switched on, because the wakes are what does the draining.
+		// Positive feedback on the edge count. Each edge fires up to n wakes, so a mechanism designed
+		// as "one wake per burial" measured 3,600-92,000 wakes/s.
+		//
+		// The bit is read by THIEVES as well as by the wake path, so widening it changes both. A
+		// worker that was never buried never sets the bit and is untouched either way; a worker that
+		// WAS buried now keeps advertising down to laneClearDepth, so a thief may take its
+		// second-to-last task. That is the trade the gap buys, and it is measured rather than
+		// assumed -- see the bench's wake=0 rows, which vary the gap with the wake path switched off
+		// and therefore isolate the effect on stealing alone.
 		void UpdateLaneHint(size_t w, size_t depth) noexcept {
 			if (w >= 64) return;
 			const unsigned long long bit = 1ull << w;
-			const bool want = depth >= (size_t)kLaneStealDepth;
-			if (want == ((stealHintLane.load(std::memory_order_relaxed) & bit) != 0)) return;
+			const bool isSet = (stealHintLane.load(std::memory_order_relaxed) & bit) != 0;
+			const bool want  = isSet ? (depth > (size_t)laneClearDepth.load(std::memory_order_relaxed))
+			                         : (depth >= (size_t)kLaneStealDepth);
+			if (want == isSet) return;
 			if (want) {
 				stealHintLane.fetch_or(bit, std::memory_order_release);
 				// THE 0->1 EDGE IS THE EVENT, not the level, and only the owner writes this bit --

@@ -39,6 +39,7 @@ set(JLIBSCHED_VERSION "4.0.0")
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
 option(JLIBSCHED_HOT_OCCUPANCY_STATS "Witness whether an idle hot worker has a backlogged sibling (diagnostic; scans hot deques)" OFF)
+option(JLIBSCHED_LANE_WAKE_STATS "Count lane-hint edges and the wakes they send (diagnostic; two relaxed counters)" OFF)
 
 # Latency breakdown: where a push->run->wait round trip actually spends its time -- OS wake vs
 # Worker()'s own loop order (local deque + steal scan run before the inbox a cold wake was FOR).
@@ -355,6 +356,10 @@ endif()
 if(JLIBSCHED_HOT_OCCUPANCY_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_HOT_OCCUPANCY_STATS=1)
     message(STATUS "JLib::Scheduler: hot-occupancy witness ON (diagnostic build, not for perf numbers)")
+endif()
+if(JLIBSCHED_LANE_WAKE_STATS)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_LANE_WAKE_STATS=1)
+    message(STATUS "JLib::Scheduler: lane-wake rate counters ON (two relaxed counters; cost side of SetLaneWake)")
 endif()
 
 if(JLIBSCHED_LATENCY_STATS)
