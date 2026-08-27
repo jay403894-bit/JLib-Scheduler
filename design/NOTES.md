@@ -62,6 +62,11 @@ reader holding hazards pins only the nodes it named.
 
 That is not a 1.41x difference. It is bounded against unbounded.
 
+**WHY THE COUNTED PATH WAS ACCEPTED DESPITE THE COST.** Not performance -- MEMORY SAFETY. Without
+it a coroutine had no correct epoch story at all, and the owner took the slower mechanism rather
+than leave a footgun where a user could get memory corruption. Read the cost figures in that light:
+they were a price paid knowingly, not a regression.
+
 **A COROUTINE CANNOT HAVE A SLOT, and that is why counted epochs exist -- not the suspend.** Slots
 are indexed by a stable identity: a fiber has `poolIndex`, a coroutine frame has nothing, because
 frames are not a bounded pool. Borrowing the worker's slot is not having one -- it is the unsafe
@@ -72,9 +77,15 @@ thousands.
 So counted epochs are THE epoch mechanism for coroutines, not a fallback for a narrow case. The
 choice below is between two VALID schemes for a coroutine, and it is decided by the park.
 
+**HAZARDS VS COUNTED EPOCHS ON A COROUTINE IS NOT MEASURED.** The park argument above is a
+MECHANISM argument -- global stall against per-node pin -- and it is sound, but nobody has benched
+the two schemes against each other on a coroutine workload. The expectation is that hazards win;
+treat it as an expectation. `bench/epoch_mechanisms.cpp` is where such a comparison would go.
+
 An earlier version of this note hedged that "a single protect probably favours the counted epoch".
-That compared guard costs and ignored what a park does to everyone else's reclamation — which is the
-entire reason hazard pointers exist here.
+That compared GUARD COSTS and ignored what a park does to everyone else's reclamation, which is the
+entire reason hazard pointers exist here. The hedge was not wrong to exist -- it was attached to the
+wrong axis.
 
 ### What this rules out
 

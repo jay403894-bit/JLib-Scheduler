@@ -161,7 +161,12 @@ namespace JLib {
 		// identity -- a fiber has poolIndex, a frame has nothing, and a fixed slot pool was built and
 		// reverted because any bound reintroduces the ceiling coroutines exist to escape. So counted
 		// epochs are THE epoch mechanism for a coroutine, not a fallback; the branch above chooses
-		// between two VALID schemes, on the park. See design/NOTES.md.
+		// between two VALID schemes, on the park.
+		//
+		// The counted path was accepted DESPITE its cost for MEMORY SAFETY, not performance -- without
+		// it a coroutine had no correct epoch story, and a footgun that hands users memory corruption
+		// is worse than a slower mechanism. And hazards-vs-counted-epochs on a coroutine is NOT YET
+		// MEASURED: the park argument is mechanism, not a benchmark. See design/NOTES.md.
 		static TaskType CurrentTaskType() noexcept;
 		void CleanupTaskMetadata(Task* task);
 
