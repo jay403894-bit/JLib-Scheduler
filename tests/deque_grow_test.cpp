@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
-// A FULL LANE MUST NOT LOSE A TASK -- it GROWS, and overflow is the backstop past that.
+// A FULL LANE MUST NOT LOSE A TASK -- IT GROWS.
 //
 // A TaskDeque is a FIXED 32,768 slots and push_bottom returns false when it is full. That return
 // was honoured at exactly one of its three call sites. The other two ignored it, and neither
@@ -43,7 +43,7 @@ int main() {
     JLib::TaskScheduler::Init(1);            // ONE worker: one lane to overflow, no stealing to hide it
     auto& sched = JLib::TaskScheduler::Instance();
 
-    std::printf("deque overflow -- workers=%zu, lane capacity=32768\n\n", sched.GetWorkerCount());
+    std::printf("deque growth -- workers=%zu, initial lane capacity=32768\n\n", sched.GetWorkerCount());
 
     // REACHING THE PATH IS THE WHOLE TRICK, and the first version of this test did not.
     //
@@ -88,9 +88,8 @@ int main() {
     // and the first version of this file did exactly that, confirmed by deleting the overflow call
     // and watching it still report ALL CHECKS PASSED. Assert the path was ENTERED, not merely that
     // the outcome looked right.
-    const size_t overflowed = sched.OverflowTotal(false) + sched.OverflowTotal(true);
-    const size_t grew       = JLib::TaskDeque::GrowCount() - growsBefore;
-    std::printf("      lane grew %zu time(s); overflow lane took %zu task(s)\n", grew, overflowed);
+    const size_t grew = JLib::TaskDeque::GrowCount() - growsBefore;
+    std::printf("      lane grew %zu time(s)\n", grew);
 
     // THE CHECK THAT MAKES "nothing was lost" MEAN SOMETHING. That is equally true of a run where
     // the lane never filled, and the first version of this file passed with its mechanism removed

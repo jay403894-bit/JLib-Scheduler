@@ -109,31 +109,37 @@ namespace JLib {
         }
 
         // OWNER ONLY, called from push_bottom having already observed the deque full with the same
-        // b and t the push will use. Returns false if it cannot grow, and the caller then falls
-        // back exactly as it did before.
+        // b and t the push will use.
+        //
+        // IT DOES NOT RETURN A FAILURE, because there is nowhere left to put the task. The overflow
+        // lanes that used to catch a refusal are gone -- growth made them unreachable at any size
+        // short of the ceiling, and a mechanism that only runs in the case it cannot handle is worse
+        // than not having it. So the two ways growth can fail are both FATAL, deliberately:
+        //
+        //   PAST kMaxCapacity. 4M tasks queued on ONE lane is not load, it is an infinitely
+        //   self-spawning task. Aborting with a message naming the cause is the standard policy for
+        //   this and is vastly better than an OOM with no explanation -- which is exactly what
+        //   unbounded doubling would give instead.
+        //
+        //   bad_alloc. The process is out of memory. Nothing this function can do is better than
+        //   saying so; silently dropping the task would turn it into a hang somewhere else, which
+        //   is what the old ignored `return false` did at two of its call sites.
         //
         // top_ AND bottom_ ARE NOT TOUCHED. That is what leaves the existing Chase-Lev proof
         // intact: the CAS on top_ stays the sole arbiter of who owns a slot, and this only changes
         // WHERE that slot lives. Copying by LOGICAL index is what makes the two rings agree -- a
         // thief reading old->slots[t & oldMask] and one reading new->slots[t & newMask] read the
         // SAME VALUE -- so a grow racing a steal cannot change WHICH task is claimed.
-        bool grow(Ring* old, size_t t, size_t b) {
+        void grow(Ring* old, size_t t, size_t b) {
             const size_t newCap = old->capacity * 2;
-
-            // A CEILING, DELIBERATELY, and the reason the overflow lane still exists. Doubling
-            // without a bound turns an infinitely self-spawning task from a diagnosable failure
-            // into an OOM with no message. 4M slots is 32MB of pointers on one lane, which no real
-            // workload reaches; past it the caller overflows and the assert there names the cause.
-            if (newCap > kMaxCapacity) return false;
+            if (newCap > kMaxCapacity) FatalGrow(old->capacity, "ceiling reached");
 
             Ring* r = nullptr;
             try {
                 r = MakeRing(newCap);
             }
             catch (const std::bad_alloc&) {
-                // NOTHING HAS BEEN PUBLISHED, so the deque is still entirely on `old` and the
-                // caller's fallback is correct. Refusing to grow is not an error state.
-                return false;
+                FatalGrow(old->capacity, "out of memory");
             }
 
             // COPY BY LOGICAL INDEX. i is the absolute index, so the same i lands at a different
@@ -150,7 +156,21 @@ namespace JLib {
             // dies -- see the note on retired_ for why that beats reclaiming it properly here.
             retired_.push_back(old);
             g_growCount.fetch_add(1, std::memory_order_relaxed);
-            return true;
+        }
+
+        // Says what happened, names the knob, then stops -- the same shape as
+        // HazardDomain::FatalCellOverflow, and for the same reason: continuing here means guessing
+        // on the caller's behalf about work it still believes is queued.
+        [[noreturn]] static void FatalGrow(size_t capacity, const char* why) {
+            std::fprintf(stderr,
+                "[JLib::Scheduler] FATAL: a work-stealing deque could not grow past %zu slots -- %s.\n"
+                "  A lane holds this many tasks only if something is spawning without bound; the\n"
+                "  ceiling is kMaxCapacity in TaskDeque.h. This is fatal rather than dropped because\n"
+                "  a dropped task never signals its WaitGroup, and the failure would surface as a\n"
+                "  hang somewhere else entirely.\n",
+                capacity, why);
+            std::fflush(stderr);
+            std::abort();
         }
         // ---- tag encoding -------------------------------------------------------------------
         // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bits 2-3: TaskType
@@ -196,9 +216,9 @@ namespace JLib {
             // stale one. Thieves load it acquire, pairing with grow's releasing store.
             Ring* r = ring_.load(std::memory_order_relaxed);
             if (b - t >= r->capacity) {
-                // GROW INSTEAD OF REFUSING. Only when it declines -- past kMaxCapacity, or the
-                // allocation failed -- does the caller still see false and take its fallback.
-                if (!grow(r, t, b)) return false;   // Full and cannot grow
+                // GROW. No failure return -- both ways it can fail are fatal, because there is
+                // nowhere left to put the task and dropping it surfaces as a hang elsewhere.
+                grow(r, t, b);   // fatal if it cannot -- see grow()
                 r = ring_.load(std::memory_order_relaxed);
             }
             r->slots[b & r->mask].store(tag(item), std::memory_order_relaxed);
@@ -216,8 +236,9 @@ namespace JLib {
             Ring* r = ring_.load(std::memory_order_relaxed);
             while ((b + count) - t > r->capacity) {
                 // A LOOP, NOT AN IF: one doubling may not cover a whole batch, where a single push
-                // only ever needs one. grow() returning false terminates it, so this cannot spin.
-                if (!grow(r, t, b)) return false;
+                // only ever needs one. It terminates because capacity DOUBLES and grow() aborts at
+                // the ceiling rather than returning, so this cannot spin.
+                grow(r, t, b);
                 r = ring_.load(std::memory_order_relaxed);
             }
 

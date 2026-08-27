@@ -806,11 +806,12 @@ add_executable(SchedulerTeardownDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/tea
 target_link_libraries(SchedulerTeardownDrainTest PRIVATE Scheduler)
 target_compile_features(SchedulerTeardownDrainTest PRIVATE cxx_std_17)
 
-# A full lane must not lose a task. Covers the two push_bottom call sites that used to ignore the
-# bool -- both of which failed as a HANG rather than as a visible drop, which is why they survived.
-add_executable(SchedulerDequeOverflowTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_overflow_test.cpp")
-target_link_libraries(SchedulerDequeOverflowTest PRIVATE Scheduler)
-target_compile_features(SchedulerDequeOverflowTest PRIVATE cxx_std_17)
+# A full lane must not lose a task -- it GROWS. Covers the two push_bottom call sites that used to
+# ignore the bool, both of which failed as a HANG rather than a visible drop, which is why they
+# survived. Named deque_overflow_test until growth replaced the overflow lanes it was checking.
+add_executable(SchedulerDequeGrowTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_grow_test.cpp")
+target_link_libraries(SchedulerDequeGrowTest PRIVATE Scheduler)
+target_compile_features(SchedulerDequeGrowTest PRIVATE cxx_std_17)
 
 # A thread that exits with a non-empty retire bag must not take its contents with it. Retire holds a
 # deleter over the CALLER's memory, so an abandoned bag is a leak whose destructors never run.
