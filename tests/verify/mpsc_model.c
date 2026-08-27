@@ -37,45 +37,48 @@
 //   go wrong. pop() re-appends the stub when it drains the last item, and the awkward-looking
 //   `tail != head_` check is how it distinguishes "genuinely empty" from "a producer is mid-append".
 //
-//   NEGATIVE CONTROLS, because a model that cannot fail proves nothing:
+//   NEGATIVE CONTROLS -- all three, and the third one is the reason this file was almost wrong:
 //
 //     -DNO_APPEND_RELEASE   the `prev->next = n` store drops to relaxed. The consumer can then
 //                           follow the link and read a node whose payload is not yet visible.
 //     -DNO_POP_ACQUIRE      the consumer's `next` loads drop to relaxed, losing the other half of
 //                           that same pair.
+//     -DRELAXED_XCHG        the head_ exchange drops from acq_rel to relaxed. An item is LOST.
 //
-//   AND ONE COMPARISON, WHICH IS NOT A CONTROL AND IS LABELLED THAT WAY DELIBERATELY:
+//   READ THIS BEFORE TRUSTING A CLEAN RESULT ANYWHERE. The first version of this model had a
+//   BOUNDED consumer -- pop a fixed number of times and stop -- and under it RELAXED_XCHG reported
+//   NO ERRORS over 14,840 executions. It was written up as "a comparison, not a control": the
+//   exchange is an RMW, RMWs on one location share a total modification order whatever ordering
+//   they carry, so producers linearize regardless and acq_rel looked stronger than necessary.
 //
-//     -DRELAXED_XCHG        the head_ exchange drops from acq_rel to relaxed. It checks CLEAN, and
-//                           that is the correct answer rather than a hole in the harness. An
-//                           exchange is an RMW, and every RMW on one location participates in that
-//                           location's total modification order whatever ordering it carries -- so
-//                           producers still linearize. What acq_rel would additionally buy is
-//                           ordering against OTHER memory, and the payload does not need it: it is
-//                           published by the release store on prev->next and read by the acquire
-//                           load, which are the two controls above.
+//   That reasoning is correct about LINEARIZATION and irrelevant to what actually breaks. With a
+//   bounded consumer a `false` from pop() is AMBIGUOUS -- it may mean "a producer is mid-append",
+//   which is correct and expected, or "this item is never coming out", which is the bug. The model
+//   could not tell them apart, so it could not see the bug, so the ordering looked free.
 //
-//                           SO acq_rel HERE IS STRONGER THAN THESE PROPERTIES REQUIRE, exactly as
-//                           deque_model.c found for the steal CAS. IT STAYS ANYWAY, for the reason
-//                           recorded there: on x86-64 the weaker form emits identical code, so the
-//                           weakening buys nothing where this runs, and it differs only on AArch64
-//                           -- the least-exercised port -- where the gain is unmeasured and the
-//                           risk is a queue that silently drops a task. Measure the barrier on ARM
-//                           before touching it.
+//   Adding the post-join drain (see main) makes "nothing is lost" a decidable safety property, and
+//   RELAXED_XCHG immediately fails with a SAFETY VIOLATION in 3 executions. acq_rel on the exchange
+//   IS load-bearing. The consumer's `tail != head_` test -- the one that distinguishes a genuinely
+//   empty queue from a producer mid-append -- is what needs it.
+//
+//   THE LESSON IS ABOUT HARNESSES, NOT ABOUT THIS QUEUE: an assertion too weak to fail makes the
+//   thing it was supposed to test look unnecessary. "No errors" from a model is worth exactly as
+//   much as the strongest property it asserts.
 //
 //   RESULT, GenMC v0.17.0 (LLVM 15.0.7), 2026-08-27, two producers + one consumer, 2 items each:
 //
 //     default (as shipped)   no errors, 2478 complete executions
 //     -DNO_APPEND_RELEASE    NON-ATOMIC RACE -- the consumer reads a payload racing its write
 //     -DNO_POP_ACQUIRE       NON-ATOMIC RACE -- same pair, other half
-//     -DRELAXED_XCHG         no errors, 14840 complete executions (see above: expected)
+//     -DRELAXED_XCHG         SAFETY VIOLATION, 3 executions -- an item is lost
+//                            (reported NO ERRORS before the drain existed; see above)
 //
 //   RUN THEM -- -unroll is a GenMC option and goes BEFORE the --, the -D defines after:
 //
 //     genmc -unroll=8 -- tests/verify/mpsc_model.c
 //     genmc -unroll=8 -- -DNO_APPEND_RELEASE tests/verify/mpsc_model.c   # MUST fail
 //     genmc -unroll=8 -- -DNO_POP_ACQUIRE    tests/verify/mpsc_model.c   # MUST fail
-//     genmc -unroll=8 -- -DRELAXED_XCHG      tests/verify/mpsc_model.c   # comparison: passes
+//     genmc -unroll=8 -- -DRELAXED_XCHG      tests/verify/mpsc_model.c   # MUST fail
 //
 // SCOPE: two producers, one consumer, two items each. Two producers is the minimum that makes the
 // exchange contended -- with one, head_ is never raced and the linearization point is untested.
@@ -222,20 +225,51 @@ int main(void) {
     pthread_join(p1, NULL);
     pthread_join(c,  NULL);
 
+    // ---- THE POST-JOIN DRAIN, and it is not a liveness assertion --------------------------------
+    //
+    // WHAT THE BOUNDED CONSUMER ABOVE CANNOT TELL YOU. It pops a fixed number of times and stops, so
+    // a `false` from pop() is ambiguous: it may mean "a producer is mid-append", which is correct
+    // and expected, or it may mean "this queue is now permanently wedged" -- a stranded tail_ from a
+    // mishandled stub re-append, which is exactly what the `tail != head_` branch and append(&g_stub)
+    // exist to get right. Without this the model tests the ordering and not the structure.
+    //
+    // WHY IT IS SAFETY AND NOT LIVENESS. Every producer has been JOINED, so every exchange AND every
+    // link store has happened -- the window that makes "empty" ambiguous is closed by construction.
+    // At that point "pop until it returns false" is a terminating, deterministic operation, and
+    // "everything that went in came out" is a plain safety property over the final state. No spin
+    // loop, no retry bound, no claim about what happens at any earlier instant.
+    //
+    // THIS IS THE ASSERTION THAT WOULD CATCH A WEDGED QUEUE. If the stub logic can strand tail_,
+    // some item never comes out here and the count is short.
+    for (;;) {
+        struct Node *n = pop();
+        if (!n) break;
+        assert(n->value >= 1 && n->value <= NITEMS);
+        atomic_fetch_add_explicit(&g_claims[n->value], 1, memory_order_relaxed);
+    }
+
     /* PROPERTY 1 -- NO DUPLICATION. Two consumers running one task is the failure that matters;
        here there is one consumer, so this catches the queue handing the same node out twice, which
        a mishandled stub re-append does. */
     for (int i = 1; i <= NITEMS; ++i)
         assert(atomic_load(&g_claims[i]) <= 1);
 
-    /* PROPERTY 2 -- NOTHING FABRICATED. Every claim was a node a producer actually published; the
-       payload assert in the consumer is the real check and this is its aggregate form.
+    /* PROPERTY 2 -- NOTHING IS LOST, now that the drain above makes that a safety claim. Every item
+       every producer pushed must have come out exactly once, counting the concurrent consumer and
+       the post-join drain together.
 
-       NOT ASSERTED: that everything pushed came out. See the header -- that is liveness, it is
-       false for a bounded run, and demanding it would be a bug report against correct code. */
+       THIS IS NOT THE LIVENESS CLAIM THE HEADER WARNS ABOUT. That one is "everything pushed is
+       eventually popped", asserted at an arbitrary instant, and it is FALSE -- a consumer can
+       legitimately see an empty queue while a producer sits between its exchange and its link
+       store. This one is evaluated after every producer has been JOINED, so that window is closed
+       by construction and the queue's final state is fully determined.
+
+       IT IS ALSO THE ONLY ASSERTION HERE THAT CAN CATCH A WEDGED QUEUE -- a stranded tail_ from a
+       mishandled stub re-append shows up as a missing item and nothing else in this file would
+       notice. Combined with PROPERTY 1 it says: exactly once, no more and no fewer. */
     int total = 0;
     for (int i = 1; i <= NITEMS; ++i) total += atomic_load(&g_claims[i]);
-    assert(total <= NITEMS);
+    assert(total == NITEMS);
 
     return 0;
 }

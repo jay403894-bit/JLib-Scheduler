@@ -286,12 +286,14 @@ jobs:
           run_negative -DNO_RETIRE          tests/verify/deque_grow_model.c
           run_negative -DSPLIT_PTR_MASK     tests/verify/deque_grow_model.c
 
-          # The MPSC inbox -- Vyukov. Two controls, both halves of the publication pair. There is
-          # deliberately NO control for the head exchange: relaxed checks clean there and that is
-          # the correct answer, not a hole -- see the note in the model.
+          # The MPSC inbox -- Vyukov. THREE controls: both halves of the publication pair, and the
+          # head exchange. That last one reported NO ERRORS until the model gained a post-join
+          # drain, because a bounded consumer cannot tell "a producer is mid-append" from "this item
+          # is never coming out" -- see the note in the model before weakening anything here.
           run_positive tests/verify/mpsc_model.c
           run_negative -DNO_APPEND_RELEASE tests/verify/mpsc_model.c
           run_negative -DNO_POP_ACQUIRE    tests/verify/mpsc_model.c
+          run_negative -DRELAXED_XCHG      tests/verify/mpsc_model.c
 
           run_positive tests/verify/event_model.c
           run_negative -DNO_RELEASE tests/verify/event_model.c
