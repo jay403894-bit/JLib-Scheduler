@@ -1,6 +1,7 @@
 # Hazard pointers — design note
 
-**Status: PROPOSAL. Nothing is built.** Written to be shot at.
+**Status: phases 1-2 and 4 SHIPPED (include/Hazard.h, src/Hazard.cpp, tests/hazard_test.cpp).**
+**Phase 3 (coroutines) DESIGNED, NOT BUILT -- see the section at the end.**
 
 ## The hole
 
@@ -132,10 +133,20 @@ only while the frame still owns the cells.
 ## Implementation order
 
 1. **Fiber-owned cells + a scan set that includes parked fibers.** Both bugs, first, before
-   `Protect()` is written.
-2. Native-task cells on the worker.
-3. Coro registry.
-4. Retire batching (`R = k × live_cells`), deleter-based.
+   `Protect()` is written. — **DONE**
+2. Native-task cells on the worker. — **DONE**
+3. Coro registry. — **DESIGNED, NOT BUILT** (section at the end of this file)
+4. Retire batching (`R = k × live_cells`), deleter-based. — **DONE**
+
+Two things fell out of building 1–2 that were not in this plan and are worth knowing before 3:
+
+- **The retire bag must be flushed when a worker goes to sleep.** The bag is per-thread on purpose —
+  protection follows the reader, but the deferred free list must never sleep — and the corollary is
+  that an idle worker would otherwise sit on retired nodes until its own next `Retire()`, which may
+  be never.
+- **The table must be built in `TaskScheduler::Init`, not lazily.** Lazy racing `Init` is real: a
+  worker reaching its sleep path flushes the bag, which builds the table, while the pool is still
+  coming up — baking in zero fibers and putting every later `poolIndex` out of range.
 
 **The first test must force migration and a park**, not just concurrency. A thread-local HP passes a
 unit test in which nothing migrates — it will go green in CI and smash in the mutex test. This
@@ -169,3 +180,88 @@ dynamically acquired records, never freed, released back for reuse.
   invariant is enforceable.
 - Not a smart pointer. It protects a traversal, not ownership.
 - Not slab-backed.
+
+---
+
+# Phase 3 — coroutines (DESIGNED, NOT BUILT)
+
+Layering first: **no promise types in the C++17 core.** The core exposes a hook; the C++20 header
+owns everything coroutine-shaped.
+
+## Core API
+
+```
+registerExternalCells(std::atomic<void*>* cells, uint32_t n) -> RecordId
+unregisterExternalCells(RecordId)
+```
+
+`Scan()` walks the fiber table, then the registry. A record is `{ cells, n, gen, state }`.
+
+**Records are NEVER deleted.** `FREE -> LIVE -> RETIRED -> FREE` with a bumped generation. That is
+Michael's answer to the registry's own reclamation problem: you cannot protect the hazard registry
+with the hazard domain it serves.
+
+## Coro side
+
+The promise owns `std::atomic<void*> cells[kCellsPerReader]` and holds the `RecordId`.
+
+**Register only frames that actually `Protect()`** -- not every frame. The registry then sizes to
+PEAK CONCURRENT HP-USING coroutines, not to total coroutines spawned. Registering in every promise
+ctor makes the registry a peak-load leak of records for cells nobody ever published into.
+
+## The lifetime that will bite
+
+`final_suspend` does **not** run on every path that already exists here:
+
+- discarded before start
+- cancelled in the queue (the non-lazy waiter drop)
+- an exception before the first suspend
+- `destroy()` from the scheduler, bypassing the promise's normal done path
+
+These are the same discard sites that have drifted three times in this codebase.
+
+So: **unregister must be valid if EITHER `final_suspend` or the destructor runs, and safe if BOTH
+do.** `RecordId` + generation + a single `compare_exchange` `LIVE -> RETIRED` makes it idempotent.
+
+**Put it in the frame destructor, not only in a scheduler hook** -- a discarded frame can be
+destroyed on a worker that never ran the coroutine, and the fifth discard path is the one nobody
+remembers to call the hook from.
+
+## Ordering against Scan()
+
+- **Register must COMPLETE** -- record visible, cells zeroed -- **before** the first store that
+  publishes a pointer into those cells.
+- **Unregister must COMPLETE after** the last unprotect, and after the frame can never again load
+  that pointer.
+
+Invert either edge and this is the fiber bug again: a scan misses a live block, or a scan treats a
+recycled block as protecting the wrong node.
+
+## Record reuse needs a GRACE PERIOD, not just a generation
+
+**A RETIRED record must stay out of FREE until a scan that STARTED AFTER its unregistration has
+FINISHED.** Hand the same `cells*` straight back and a scanner still walking that block sees a new
+coroutine's pointer -- or a `nullptr` -- and frees under the old frame. **A generation on the record
+is not sufficient**, because the scanner is reading the CELLS, not the record header.
+
+Mechanism: a global scan counter bumped at scan entry and exit. A record retired at counter `c`
+becomes FREE only once a scan that began at `> c` has completed. That is a grace period, i.e. the
+reclamation problem one level up, solved with a counter rather than with hazard pointers.
+
+## Do NOT
+
+- Give frames a fake `poolIndex` and punch them into the fiber table.
+- Allocate a registry node per `Protect`/`Unprotect`.
+- Free registry nodes with the same HP domain they serve.
+
+## The minimum test IS the spec
+
+> `Protect` on a coroutine, `co_await` the mutex, **cancel/destroy that frame from another worker**,
+> retire the node from a **third**.
+
+Unregister late -> smash immediately. Unregister early with the record reused -> smash later. Both
+failure directions are covered by one scenario, which is why this is the acceptance test and not an
+addition to it.
+
+**Summary: the layering is sound; the work is making discard and `final_suspend` the SAME
+unregister, once, with a generation, on every path already known to be forgettable.**
