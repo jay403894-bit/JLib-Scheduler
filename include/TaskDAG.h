@@ -217,8 +217,12 @@ namespace JLib {
         // own edge lists and dereferencing that same node. The guard is what keeps it alive across
         // this walk. See the retire comment at the end of OnTaskFinished.
         //
-        // The EDGES need no protection -- they belong to the DAG and outlive every node. Only the
-        // TaskNode* each one points at does.
+        // THE EDGES NEED IT TOO, and the comment here used to say they did not -- "they belong to the
+        // DAG and outlive every node". True only if the DAG outlives this walk, and it need not:
+        // ~TaskDAG can run while a worker is inside here, because OnTaskFinished walks AFTER the
+        // node's body has already made completion observable. So the chunks are EBR-retired in
+        // ~TaskDAG rather than freed, and this guard covers them as well as the TaskNode* each
+        // edge points at. ASan caught the old version reading kFreeCanary; see ~TaskDAG.
         template <typename F>
         void ForEachDependent(TaskNode* node, F fn) {
             EpochGuard guard;
@@ -228,6 +232,7 @@ namespace JLib {
     private:
         void Fire(TaskNode* node, TaskNode::Outcome outcome = TaskNode::Outcome::Completed);
         static void NodeDeleter(void* p);   // EBR deleter: ~TaskNode + return its slot to the slab
+        static void EdgeChunkDeleter(void* p);   // EBR deleter: return one edge chunk to the slab
     };
 
     // SignalExternal reachable from a TaskNode* alone, without naming TaskDAG.

@@ -279,10 +279,38 @@ JLib::DagEdge* JLib::TaskDAG::AllocEdge() {
 }
 
 JLib::TaskDAG::~TaskDAG() {
-    // Raw slots holding trivially-destructible DagEdge cells, so there is nothing to destroy --
-    // just hand the memory back.
-    TaskAllocator* a = scheduler.GetAllocator();
-    for (DagEdge* chunk : edgeChunks) a->Free(chunk);
+    // RETIRE THE CHUNKS, DO NOT FREE THEM. The comment above ForEachDependent used to say the edges
+    // "belong to the DAG and outlive every node", and that is only true if the DAG outlives the
+    // completion walk. It need not: OnTaskFinished runs the node's body FIRST and walks the edges
+    // AFTER, so anything a caller observes from inside a task -- a counter, a flag -- is visible
+    // while the walk is still in flight. A caller that treats that observation as "the graph is
+    // done" and lets this destructor run frees chunks out from under a worker mid-walk.
+    //
+    // FOUND BY ADDRESS SANITIZER, not by reasoning: ForEachDependent reading SlabPool's
+    // kFreeCanary, 2 runs in 40 of tests/dag_external_test.cpp. Without ASan it is a ~5% segfault
+    // that had gone unattributed for weeks, because freed slab memory stays MAPPED -- the bad read
+    // only faults once the slot is reused, so widening the race window does not reliably raise the
+    // crash rate and a fault count is the wrong instrument for it.
+    //
+    // ForEachDependent already holds an EpochGuard, for the nodes. Retiring the chunks under the
+    // same guard costs nothing on the read side and makes the free wait for every walk that could
+    // still be looking, which is the same reclamation the nodes have had all along. Only the free
+    // side was inconsistent.
+    //
+    // NOT A CALLER-DISCIPLINE PROBLEM. Waiting on a WaitGroup covering every task in the graph IS
+    // sufficient -- the worker decrements it after Execute() returns, hence after OnTaskFinished --
+    // but "you may not destroy a TaskDAG until you have proven no worker is inside its completion
+    // path" is not a rule a caller can reasonably check. Close it here instead of documenting it.
+    EpochManager& em = EpochManager::Instance();
+    const auto epoch = em.CurrentEpoch();
+    for (DagEdge* chunk : edgeChunks) em.RetirePtr(chunk, epoch, &TaskDAG::EdgeChunkDeleter);
+}
+
+void TaskDAG::EdgeChunkDeleter(void* p) {
+    // Raw slots of trivially-destructible DagEdge cells, so there is nothing to destroy -- just
+    // hand the memory back. Free(), not FreeSized(), matching what this destructor did before and
+    // for the reason given on the cycle path.
+    TaskScheduler::Instance().GetAllocator()->Free(static_cast<DagEdge*>(p));
 }
 
 
