@@ -769,3 +769,12 @@ if(WIN32 AND JLIBSCHED_COROUTINES)
     target_compile_features(SchedulerUdpRect PRIVATE cxx_std_20)
     set_target_properties(SchedulerUdpRect PROPERTIES OUTPUT_NAME udp_rect)
 endif()
+
+# Staged-timestamp latency bench for the udp_rect pipeline. --plain runs the same pipeline with a
+# blocking recvfrom thread instead of the reactor, which is the control the numbers are read against.
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerUdpLatencyBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/udp_latency_bench.cpp")
+    target_link_libraries(SchedulerUdpLatencyBench PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerUdpLatencyBench PRIVATE cxx_std_20)
+    set_target_properties(SchedulerUdpLatencyBench PROPERTIES OUTPUT_NAME udp_latency_bench)
+endif()

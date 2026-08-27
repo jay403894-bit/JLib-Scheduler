@@ -1042,10 +1042,6 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// It also refuses to punish a lane for being fast, which occupancy structurally does.
 	const bool low = (topTasks == 0);
 	(void)topBusyNs;
-	std::fprintf(stderr, "[dn] k=%zu low=%d topBusy=%lld win=%lld lows=%u dtDem=%lld\n",
-	             k, (int)low, (long long)topBusyNs, (long long)windowNs,
-	             g_lowWindows.load(std::memory_order_relaxed),
-	             (long long)(now - g_lastDemoteNs.load(std::memory_order_relaxed)));
 	unsigned lows = 0;
 	if (low) lows = g_lowWindows.fetch_add(1, std::memory_order_relaxed) + 1;
 	else     g_lowWindows.store(0, std::memory_order_relaxed);
