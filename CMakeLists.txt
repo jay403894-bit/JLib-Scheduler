@@ -831,3 +831,9 @@ target_compile_features(SchedulerSubmitLimitTest PRIVATE cxx_std_17)
 add_executable(SchedulerDequeCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_ceiling_test.cpp")
 target_link_libraries(SchedulerDequeCeilingTest PRIVATE Scheduler)
 target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)
+
+# The hazard domain's fatal paths must actually fire. Same pattern and same reason as
+# SchedulerDequeCeilingTest: an abort path nothing executes is the vacuous shape again.
+add_executable(SchedulerHazardCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_ceiling_test.cpp")
+target_link_libraries(SchedulerHazardCeilingTest PRIVATE Scheduler)
+target_compile_features(SchedulerHazardCeilingTest PRIVATE cxx_std_17)

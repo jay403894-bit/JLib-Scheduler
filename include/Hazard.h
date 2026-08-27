@@ -268,6 +268,10 @@ namespace JLib {
         // Never set this outside a test.
         static void ForceWorkerCellsForTest(bool on);
 
+        // Makes AcquireRecord always refuse, so a coroutine taking a guard hits the exhausted-registry
+        // branch deterministically. Test-only -- see the note at the definition.
+        static void ExhaustRecordsForTest(bool on);
+
         // Builds the table. Called by TaskScheduler::Init once the workers and the fiber pool are
         // actually up -- the lazy path cannot be trusted alone, because a worker reaching the sleep
         // path flushes the retire bag DURING Init and would otherwise bake in an empty table.

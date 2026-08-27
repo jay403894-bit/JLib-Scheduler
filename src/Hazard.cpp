@@ -86,6 +86,7 @@ namespace JLib {
 
         std::mutex g_tableInit;
         std::atomic<bool> g_forceWorkerCells{ false };
+        std::atomic<bool> g_exhaustRecords{ false };
 
         // ---- the external-record registry ------------------------------------------------------
         //
@@ -222,8 +223,11 @@ namespace JLib {
                                                           std::memory_order_acquire))
                 return fiberCount + workerCount + i;
         }
-        assert(false && "hazard: ran out of external reader slots (kExternalReaders)");
-        return kNoReader;
+        // NOT AN assert, WHICH IS WHAT THIS WAS. It evaporates under /O2, and returning kNoReader in
+        // Release leaves the guard with null cells -- so the first Protect is fatal ANYWAY, just one
+        // step later and with a message blaming the wrong thing ("no reader slot") instead of naming
+        // kExternalReaders. Same failure, worse diagnosis, and only in the build nobody is watching.
+        FatalCellOverflow(0, "ran out of external reader slots -- raise kExternalReaders");
     }
 
     void HazardDomain::FatalCellOverflow(std::size_t k, const char* what) {
@@ -246,6 +250,12 @@ namespace JLib {
     }
 
     HazardDomain::RecordId HazardDomain::AcquireRecord() {
+        // TEST HOOK, same shape and same reason as g_forceWorkerCells. Filling kMaxRecords (1024)
+        // genuinely would need 1024 live coroutines each holding a guard, which is a heavy and
+        // timing-dependent way to reach a deterministic branch -- and a fatal path nothing exercises
+        // is the same vacuous shape as a negative control that cannot fail.
+        if (g_exhaustRecords.load(std::memory_order_relaxed)) return kNoRecord;
+
         const std::uint64_t now = g_scanSeq.load(std::memory_order_acquire);
 
         for (std::uint32_t i = 0; i < kMaxRecords; ++i) {
@@ -305,6 +315,10 @@ namespace JLib {
             r.retiredAtScan.store(g_scanSeq.load(std::memory_order_acquire),
                                   std::memory_order_release);
         }
+    }
+
+    void HazardDomain::ExhaustRecordsForTest(bool on) {
+        g_exhaustRecords.store(on, std::memory_order_relaxed);
     }
 
     void HazardDomain::ForceWorkerCellsForTest(bool on) {
