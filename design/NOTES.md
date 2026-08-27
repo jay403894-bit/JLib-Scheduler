@@ -7,129 +7,75 @@ make it wrong.
 
 ---
 
-## 2026-08-27 — APPROVED PATTERN: pick the reclamation scheme from the task type
+## 2026-08-27 — Choosing a reclamation scheme: epochs or hazards
 
-**In a lock-free section that coroutines can reach, implement BOTH guards and branch on the task
-type.** Not one or the other.
+**This is a PERFORMANCE choice, not a safety one.** Both schemes are safe for all three execution
+modes. Counted epochs made coroutines safe under EBR — that was the entire point of building them,
+and the cost was accepted deliberately (see below). Nothing here is about avoiding corruption.
 
-> **UNSAFE AS STATED UNTIL RETIRE ALSO BRANCHES -- READ THIS FIRST.**
+### The rule
+
+> **If coroutines will use the structure, hazards are likely the faster choice. Otherwise epochs.**
 >
-> The branch below is only the READER half. Mixed readers on ONE structure make retire unsound:
->
-> - a fiber takes an `EpochGuard`, announces, and is traversing node N;
-> - a writer unlinks N and calls `HazardRetire(N)`;
-> - the scan finds no hazard CELL naming N -- the fiber used an epoch -- and frees it under the fiber.
->
-> The mirror fails too: a parked coroutine holding a hazard on N does not stall epoch advancement, so
-> an epoch-based retire frees N underneath it.
->
-> **THE RULE, sharpened: hazards when a coroutine can SUSPEND inside the section -- not merely when
-> one can ENTER it.**
->
-> A coroutine that enters and runs the section to completion is indistinguishable from a native task
-> for epoch purposes: same worker throughout, so the borrowed worker slot is never clobbered. That is
-> not "having a slot" -- it is getting away without one, and it is sound exactly while nothing
-> suspends. The `Epochs.h` tripwire is what keeps that honest.
->
-> **Worked example: TaskDAG stays on epochs and needs no change.** A coroutine reaches
-> `ForEachDependent` through `SignalExternalNode` -> `SignalExternal`, and that walk takes a plain
-> `EpochGuard`. It is a bare `for (DagEdge* e = node->firstEdge; e; e = e->next) fn(e->dep);` with no
-> `co_await` in it, so the coroutine cannot migrate mid-walk. Add a suspend there and the tripwire
-> fires -- which is the design working, not a latent bug.
->
-> **So pick one of these before using the pattern:**
->
-> 1. **Per-structure scheme.** Every reader of a structure uses the SAME one. If coroutines can touch
->    it, hazards for everyone -- fibers pay a fence they did not need. Obviously safe, and it makes
->    the task-type branch unnecessary for that structure.
-> 2. **Mixed readers + DUAL-CONDITION RETIRE.** Free a node only when BOTH agree: no hazard cell
->    names it AND its retire generation is epoch-safe. One conjunction, in the hazard `Scan`. Readers
->    each pay only their own scheme; retire pays a little more. This is what makes the branch sound
->    rather than merely faster. NOT BUILT.
+> **One scheme per structure. Do not mix.**
 
-```cpp
-if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
-    HazardGuard g;                                  // survives a suspend
-    Node* n = g.Protect(0, head);
-    ...
-} else {
-    EpochGuard g;                                   // cheaper, and cannot suspend here
-    Node* n = head.load(std::memory_order_acquire);
-    ...
-}
-```
+### Why coroutines are the deciding factor
 
-`TaskScheduler::CurrentTaskType()` is static and reads the thread-local directly -- no `Instance()`,
-because this sits on the hot path. It reads `currentRunningTask`, not `currentFiber`, since a
-coroutine has no fiber and that is precisely the case being distinguished. No task at all (a bare
-thread) reports `Native`, which is the right answer rather than a fallback: a bare thread does not
-change stack mid-section either.
+A coroutine cannot have an epoch SLOT. Slots need a stable identity — a fiber has `poolIndex`, a
+frame has nothing, and frames are not a bounded pool. A fixed slot pool was built and reverted: any
+bound reintroduces the exact ceiling coroutines exist to escape, and a reactor parks thousands.
 
-### Why both arms rather than just hazards everywhere
+So a coroutine takes the COUNTED path, and counted is slower than slots:
 
-Epochs are cheaper for the contexts that can use them -- one announce per traversal against a store
-plus a fence plus a validate-reload PER HOP. A fiber or native task pays nothing for the coroutine
-case if the branch keeps them out of it.
-
-### Why both arms rather than just epochs
-
-A coroutine cannot hold an `EpochGuard` across a `co_await` -- the tripwire in `Epochs.h` says so --
-and the counted-epoch machinery that makes coroutine EBR safe at all is **1.41x the cost of the slot
-path** (measured; sharding the counter took it from 61.7x to 1.41x, and that sharding is why it is
-usable). SRCU-shaped safety is not free.
-
-### The deciding term is the PARK, not the per-guard cost
-
-Do not reason about this from guard throughput. On that axis epochs win, and win by more per hop:
-
-| | per guard / protect |
+| | guards/sec |
 |---|---|
-| slot epoch | 2.52 B/sec |
-| counted epoch (coroutine) | 1.82 B/sec — the 1.41x, and ~0.55 ns |
-| hazard `Protect` | a store + a **seq_cst fence** + a reload, PER POINTER — tens of ns |
+| slot epoch (fiber, native, bare thread) | 2.52 B |
+| counted epoch (coroutine) | 1.82 B — the 1.41x |
 
-**And it does not matter, because a parked reader is what the choice is actually about.**
+That is the whole reason to reach for hazards on a coroutine-facing structure. Fibers and native
+tasks get slots and have no such penalty, which is why a structure they alone touch should stay on
+epochs.
 
-Counted epochs let a coroutine hold protection across a suspend — 312 parked readers, 0 lost — but
-the advance gate then **refuses to advance the ring while anyone is parked in it**. One parked
-coroutine stalls reclamation FOR EVERYONE: nothing anywhere is freed until it leaves. A parked
-reader holding hazards pins only the nodes it named.
+### Why the counted path was accepted despite the cost
 
-That is not a 1.41x difference. It is bounded against unbounded.
+**Memory safety, not performance.** Without it a coroutine had no correct epoch story at all, and
+the owner took the slower mechanism rather than leave a footgun where a user gets memory corruption.
+Read the 1.41x in that light: a price paid knowingly, not a regression to optimise away.
 
-**WHY THE COUNTED PATH WAS ACCEPTED DESPITE THE COST.** Not performance -- MEMORY SAFETY. Without
-it a coroutine had no correct epoch story at all, and the owner took the slower mechanism rather
-than leave a footgun where a user could get memory corruption. Read the cost figures in that light:
-they were a price paid knowingly, not a regression.
+### NOT MEASURED
 
-**A COROUTINE CANNOT HAVE A SLOT, and that is why counted epochs exist -- not the suspend.** Slots
-are indexed by a stable identity: a fiber has `poolIndex`, a coroutine frame has nothing, because
-frames are not a bounded pool. Borrowing the worker's slot is not having one -- it is the unsafe
-thing, since the worker's next guard overwrites the announcement. A fixed slot pool was built and
-reverted: any bound reintroduces the exact ceiling coroutines exist to escape, and a reactor parks
-thousands.
+Hazards versus counted epochs on a coroutine workload has not been benched. The expectation is that
+hazards win; treat it as an expectation. `bench/epoch_mechanisms.cpp` is where the comparison goes.
 
-So counted epochs are THE epoch mechanism for coroutines, not a fallback for a narrow case. The
-choice below is between two VALID schemes for a coroutine, and it is decided by the park.
+A second reason to expect it, beyond the guard cost: the epoch advance gate refuses to advance the
+ring while a reader is parked in it, so one parked coroutine stalls reclamation for everyone, where
+a parked hazard reader pins only the nodes it named. Bounded against unbounded. That is a MECHANISM
+argument, not a measurement.
 
-**HAZARDS VS COUNTED EPOCHS ON A COROUTINE IS NOT MEASURED.** The park argument above is a
-MECHANISM argument -- global stall against per-node pin -- and it is sound, but nobody has benched
-the two schemes against each other on a coroutine workload. The expectation is that hazards win;
-treat it as an expectation. `bench/epoch_mechanisms.cpp` is where such a comparison would go.
+### Why not to mix, concretely
 
-An earlier version of this note hedged that "a single protect probably favours the counted epoch".
-That compared GUARD COSTS and ignored what a park does to everyone else's reclamation, which is the
-entire reason hazard pointers exist here. The hedge was not wrong to exist -- it was attached to the
-wrong axis.
+Neither scheme can see the other's readers, so a structure with both makes RETIRE unsound:
 
-### What this rules out
+- a fiber takes an `EpochGuard`, announces, is traversing node N;
+- a writer unlinks N and calls `HazardRetire(N)`;
+- the scan finds no hazard CELL naming N and frees it under the fiber.
 
-- **"Just use hazards everywhere"** -- taxes fibers and native tasks for a case they never hit.
-- **"Just use epochs everywhere"** -- illegal the moment a coroutine suspends inside the guard.
-- **Leaving the branch out and documenting a rule** -- the tripwire only fires in Debug, and the
-  failure it catches is silent in Release.
+The mirror fails too: a parked coroutine holding a hazard on N does not stall epoch advancement, so
+an epoch-based retire frees N underneath it.
 
----
+Mixing is only sound with a **dual-condition retire** — free when no cell names the node AND its
+retire generation is epoch-safe. That is one conjunction in the hazard `Scan`, and it is **NOT
+BUILT**, because one scheme per structure is simpler and costs nothing worth measuring.
+
+`TaskScheduler::CurrentTaskType()` exists for code that genuinely must branch, but the intended use
+is choosing a structure's scheme when you write it, not per traversal.
+
+### TaskDAG stays on epochs
+
+No coroutine builds a DAG, so the question does not arise. (A coroutine can *complete* an external
+node via `SignalExternalNode`, which reaches `ForEachDependent` — a bare edge walk under a plain
+`EpochGuard`, with no `co_await` in it.)
+
 
 ## 2026-08-27 — Teardown drains parked work instead of abandoning it
 

@@ -128,59 +128,31 @@ namespace JLib {
 		// Priority inheritance methods (public for SchedulerMutex access)
 		Task* GetCurrentTask() const;
 
-		// WHICH RECLAMATION SCHEME AM I ALLOWED TO USE? That is the only question this exists to
-		// answer, and it is why it is static and does not go through Instance(): it sits in
-		// lock-free sections, on the hot path, and must cost one thread-local load and a field read.
+		// The execution mode of the task running on this thread. Static and straight to the
+		// thread-local -- no Instance(), which throws when uninitialised and would put a branch plus
+		// a global load in front of every caller. Reads currentRunningTask, not currentFiber,
+		// because a coroutine HAS no fiber and that is the case worth distinguishing.
 		//
-		// Returns TaskType::Native when no task is running -- a bare thread. That is the correct
-		// answer for the question being asked, not a fallback: a bare thread does not change stack
-		// mid-section any more than a native task does.
+		// Returns TaskType::Native when no task is running -- a bare thread. Correct rather than a
+		// fallback: a bare thread does not change stack mid-section either.
 		//
-		// THE APPROVED PATTERN for a lock-free section that coroutines can reach:
+		// WHAT IT IS FOR: choosing a reclamation scheme. That choice is PERFORMANCE, not safety --
+		// epochs are safe for all three modes, which is what counted epochs were built to give
+		// coroutines. The rule:
 		//
-		//     if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
-		//         HazardGuard g;                       // survives the suspend
-		//         Node* n = g.Protect(0, head);
-		//         ...
-		//     } else {
-		//         EpochGuard g;                        // cheaper, and cannot suspend here
-		//         Node* n = head.load(std::memory_order_acquire);
-		//         ...
-		//     }
+		//     If coroutines will use the structure, hazards are likely faster. Otherwise epochs.
+		//     ONE SCHEME PER STRUCTURE -- do not mix.
 		//
-		// Both arms, gated on one branch, so the path is covered whichever context enters it.
+		// Coroutines are the deciding factor because a coroutine cannot have an epoch SLOT (slots
+		// need a stable identity; a frame has none), so it takes the COUNTED path: 1.82 B guards/sec
+		// against slots' 2.52 B. Fibers and native tasks get slots and pay no such penalty.
 		//
-		// THE RULE: hazards when a coroutine can SUSPEND inside the section -- not merely when one can
-		// ENTER it. A coroutine that runs the section to completion never migrates inside it, so the
-		// borrowed worker slot holds and a plain EpochGuard is correct. That is how TaskDAG works today
-		// and why it needs no change: a coroutine reaches ForEachDependent, but that walk has no
-		// co_await in it. The Epochs.h tripwire is what keeps the assumption honest.
+		// DO NOT MIX: neither scheme sees the other's readers, so a hazard scan frees a node an
+		// epoch reader is traversing, and epoch advance frees a node a parked hazard reader names.
+		// Sound mixing needs a dual-condition retire, which is NOT BUILT.
 		//
-		// !! THE READER BRANCH ALONE IS NOT SUFFICIENT. Mixed readers on one structure make RETIRE
-		// unsound: a fiber holding an EpochGuard names no hazard cell, so a hazard scan frees the node
-		// it is traversing -- and a parked coroutine holding a hazard does not stall epoch advancement,
-		// so an epoch retire frees the node underneath IT. Either give one structure ONE scheme (if
-		// coroutines can touch it, hazards for everyone), or make retire dual-condition: free only when
-		// no cell names the node AND its retire generation is epoch-safe. The second is NOT BUILT.
-		// See design/NOTES.md before using this pattern on a structure with both kinds of reader.
-		//
-		// WHY HAZARDS FOR THE COROUTINE and not counted epochs, which would also be correct: it is
-		// NOT the per-guard cost -- a counted epoch guard is ~0.55 ns and beats a hazard Protect,
-		// which pays a seq_cst fence per pointer. It is what a PARK costs everyone else. The epoch
-		// advance gate refuses to advance the ring while a reader is parked in it, so ONE parked
-		// coroutine stalls reclamation globally; a parked hazard reader pins only the nodes it named.
-		// Bounded against unbounded.
-		//
-		// NOTE what counted epochs are FOR: a coroutine cannot have a SLOT. Slots need a stable
-		// identity -- a fiber has poolIndex, a frame has nothing, and a fixed slot pool was built and
-		// reverted because any bound reintroduces the ceiling coroutines exist to escape. So counted
-		// epochs are THE epoch mechanism for a coroutine, not a fallback; the branch above chooses
-		// between two VALID schemes, on the park.
-		//
-		// The counted path was accepted DESPITE its cost for MEMORY SAFETY, not performance -- without
-		// it a coroutine had no correct epoch story, and a footgun that hands users memory corruption
-		// is worse than a slower mechanism. And hazards-vs-counted-epochs on a coroutine is NOT YET
-		// MEASURED: the park argument is mechanism, not a benchmark. See design/NOTES.md.
+		// So the intended use is choosing a structure's scheme WHEN YOU WRITE IT, not branching per
+		// traversal. See design/NOTES.md.
 		static TaskType CurrentTaskType() noexcept;
 		void CleanupTaskMetadata(Task* task);
 
