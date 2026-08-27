@@ -469,6 +469,36 @@ int main(int argc, char** argv) {
         if (g_log) std::fprintf(g_log, "log: %s\n", path);
     }
 
+    // ---- REFUSE TO BE READ WITHOUT ITS CONDITIONS -------------------------------------------------
+    //
+    // Two INDEPENDENT things decide this machine's dispatch latency, and they stack:
+    //
+    //   1. HOW THE PROCESS WAS BORN. A child spawned by a background/agent process can inherit
+    //      background QoS (EcoQoS): no foreground window, threads eligible for E cores from the
+    //      first instruction, and a throttled power state. A run like that can never match a
+    //      double-clicked exe no matter what the scheduler does.
+    //   2. WHO HAS FOCUS during the timed section, which is a separate boost on top.
+    //
+    // Measured spread between the good and bad cases: dispatch p90 1.5 us against 259.8 us. That is
+    // larger than any effect this bench has ever been used to measure, so a number printed without
+    // these two facts beside it is not a result. Printed FIRST so it lands even if the run is cut
+    // short, and printed unconditionally so it cannot be forgotten.
+    {
+        PROCESS_POWER_THROTTLING_STATE pt{};
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        const BOOL gotQos = ::GetProcessInformation(::GetCurrentProcess(), ProcessPowerThrottling,
+                                                    &pt, sizeof pt);
+        const DWORD pc = ::GetPriorityClass(::GetCurrentProcess());
+        const bool  eco = gotQos && (pt.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+                                 && (pt.StateMask   & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
+        Out("conditions: priority class 0x%lX%s, EcoQoS %s\n",
+            (unsigned long)pc,
+            pc == NORMAL_PRIORITY_CLASS ? " (NORMAL)"
+              : pc == IDLE_PRIORITY_CLASS ? " (IDLE -- THROTTLED, do not report this run)"
+              : pc == HIGH_PRIORITY_CLASS ? " (HIGH)" : "",
+            eco ? "ON -- THROTTLED, do not report this run" : (gotQos ? "off" : "unknown"));
+    }
+
     BuildTopology();
     {
         // PRINTED, not assumed. Every conclusion below rests on this mapping being right, and
