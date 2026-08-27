@@ -351,15 +351,19 @@ exhaustive rather than lucky. Models live in `tests/verify/`.
   uses `acq_rel`. Both check clean, so the weaker ordering is sufficient here and the `seq_cst`
   fences are what carry the ordering.
 - **Deque resize** (`deque_grow_model.c`) - the owner-only `grow()` that replaces `push_bottom`'s
-  `return false`, which `deque_model.c` deliberately leaves out. Three negative controls, because the
-  algorithm makes three separate claims: the copy must be published with **release** (a thief that
-  acquires the new pointer must see it), the old buffer must be **retired, not freed** (a thief may
-  still be reading through it), and the pointer and its mask must be **one atomic object** (two
-  independent atomics let a thief pair a new pointer with an old mask). `top` and `bottom` are not
-  touched, so the CAS stays the sole arbiter and the existing proof is undisturbed.
-  **NOT YET RUN - no results to report.** It compiles and runs natively, which proves only that the
-  harness is not broken; a single x86 execution cannot exhibit any of the three bugs. Treat the
-  algorithm as unverified until the CI job has gone green once.
+  `return false`, which `deque_model.c` deliberately leaves out. One owner, two thieves, capacity
+  2 - 4: **210 executions, no errors**. Three negative controls, because the algorithm makes three
+  separate claims, and all three fail as they must: the copy must be published with **release**, the
+  old buffer must be **retired, not freed**, and the pointer and its mask must be **one atomic
+  object** (two independent atomics let a thief pair a new pointer with an old mask and index off
+  the end). `top` and `bottom` are untouched by the resize, so the CAS stays the sole arbiter and
+  the existing proof is undisturbed.
+  It also found something about the *existing* model: with plain (non-atomic) slots the default
+  build fails a data race that has nothing to do with resizing - an owner pushing at `b` writes the
+  same physical slot a thief reads at a stale `t` whenever the two logical indices are congruent mod
+  capacity. Benign in outcome, since the thief discards the value when its CAS fails, but a race on
+  a plain object nonetheless, which is why the verified Chase-Lev stores the array as atomics.
+  `deque_model.c` misses it only because its owner thread never *pushes*.
 - **Event waiter stack** (`event_model.c`) - two pushers, one drainer, 24 executions, no errors. No
   waiter lost, none woken twice, no race on the plain `nextWaiter` field.
 - **Worker sleep/wake predicate** (`sleepwake_model.c`) - the `workerState`/`hasQueuedWork`/
