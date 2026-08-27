@@ -75,11 +75,30 @@ namespace JLib {
 
     class HazardDomain {
     public:
-        // Cells per reader. FIXED, because the scan is O(readers * this) and an unbounded budget
-        // would make retire unbounded. Two is enough for hand-over-hand list traversal (current +
-        // next); four leaves room for a skip-list style hop without another design pass. Exceeding
-        // it asserts rather than silently failing to protect.
-        static constexpr std::size_t kCellsPerReader = 4;
+        // Cells per reader. A BUDGET, not a derived number, and a compile-time knob
+        // (-DJLIBSCHED_HAZARD_CELLS=n) because a structure that needs six should SAY so rather than
+        // hope four is lucky. What actually consumes them:
+        //
+        //     one payload pointer                                     1
+        //     lock-free list walk (prev / curr, sometimes next)        2-3
+        //     mutex wait plus "I still name this node"                 +1
+        //     a nested HP section on the same fiber                    +depth
+        //
+        // So 4 = "list walk plus one extra protect, no nesting". That covers a SchedulerMutex wait
+        // plus a list node. It does NOT cover two nested walks or a tree descent. If this library's
+        // own mutex/semaphore/event paths ever nest HP walks, count them once and freeze this at
+        // that count + 1 -- not at a round number.
+        //
+        // The scan is O(readers * this), so raising it is not free; readers is in the thousands.
+#ifndef JLIBSCHED_HAZARD_CELLS
+    #define JLIBSCHED_HAZARD_CELLS 4
+#endif
+        static constexpr std::size_t kCellsPerReader = JLIBSCHED_HAZARD_CELLS;
+        static_assert(kCellsPerReader >= 1, "a reader needs at least one hazard cell");
+
+        // Running out of cells, or failing to resolve a reader, is a PROGRAMMING ERROR and is
+        // reported here rather than absorbed. Never returns.
+        [[noreturn]] static void FatalCellOverflow(std::size_t k, const char* what);
 
         // Reserved reader ids for threads that are neither a fiber nor a worker -- the main thread,
         // an app's own threads. Claimed lazily and never released, so a program churning thousands
@@ -122,6 +141,11 @@ namespace JLib {
         // Never set this outside a test.
         static void ForceWorkerCellsForTest(bool on);
 
+        // Builds the table. Called by TaskScheduler::Init once the workers and the fiber pool are
+        // actually up -- the lazy path cannot be trusted alone, because a worker reaching the sleep
+        // path flushes the retire bag DURING Init and would otherwise bake in an empty table.
+        void Init();
+
     private:
         void EnsureTable();
 
@@ -148,6 +172,17 @@ namespace JLib {
         // the point at which a retire either saw the cell or had not yet freed the node.
         template <typename T>
         T* Protect(std::size_t k, const std::atomic<T*>& src) {
+            // FAIL OUT LOUD, and never by overwriting cell 0. A silent slide onto another cell is
+            // the same class of bug as worker-owned cells -- protection quietly moves off the node
+            // it was guarding -- just relocated onto the fiber.
+            //
+            // Fatal in BOTH configurations, unlike the coroutine tripwire, because the failure mode
+            // here is not "wrong on some paths": returning a pointer this never published hands the
+            // caller something it believes is protected and is not. A use-after-free with a
+            // confident comment above it is strictly worse than a stop.
+            if (!cells || k >= HazardDomain::kCellsPerReader)
+                HazardDomain::FatalCellOverflow(k, cells ? "cell index out of range"
+                                                         : "no reader slot (external slots exhausted?)");
             for (;;) {
                 T* p = src.load(std::memory_order_acquire);
                 Set(k, static_cast<void*>(p));

@@ -5,6 +5,7 @@
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Timer.h"   // MonotonicNs -- lane occupancy stamps
+#include "../include/Hazard.h"  // retire-bag flush on the way into sleep
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -1536,6 +1537,19 @@ void Thread::Worker() {
 			// Publish the INTENT to park before the final check. From here until this worker is
 			// awake again, a pusher observing the state will signal rather than assume this worker
 			// will notice on its own. Model checked: tests/verify/sleepwake_model.c.
+			// FLUSH THE HAZARD RETIRE BAG BEFORE PARKING, and this is not an optimisation.
+			//
+			// The retire bag is per-THREAD, deliberately -- protection follows the reader because a
+			// protected pointer survives a park, but the deferred FREE LIST must never sleep. Put
+			// the bag on the fiber and a park freezes reclamation exactly the way an epoch pin does,
+			// which is the stall hazard pointers exist to escape.
+			//
+			// The corollary is this call. A worker that retired some nodes and then goes properly
+			// idle would otherwise sit on them until its OWN next retire() -- which on an idle
+			// worker may be never. So the bag is drained on the way in, where "on the way in" is
+			// before the park is even advertised, so nothing is holding memory it could have freed.
+			HazardDomain::Instance().Scan();
+
 			int expected = WS_AWAKE;
 			workerState.compare_exchange_strong(expected, WS_GOING_TO_SLEEP,
 				std::memory_order_seq_cst, std::memory_order_relaxed);

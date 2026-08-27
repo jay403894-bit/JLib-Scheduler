@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 
@@ -40,6 +42,15 @@ namespace JLib {
     void HazardDomain::EnsureTable() {
         if (cells.load(std::memory_order_acquire)) return;
 
+        // REFUSE TO BUILD BEFORE THE POOL EXISTS. The table is sized from the fiber pool and the
+        // worker count, and a worker reaches the sleep path -- which flushes the retire bag, which
+        // lands here -- while Init is still bringing the pool up. Building then bakes in a table of
+        // zero fibers and zero workers, and every later poolIndex is out of range.
+        //
+        // Left unbuilt instead: Scan() no-ops, Retire() keeps accumulating, and Init calls Init()
+        // below once the workers are actually up.
+        if (!TaskScheduler::IsInitialized()) return;
+
         std::lock_guard<std::mutex> lk(g_tableInit);
         if (cells.load(std::memory_order_relaxed)) return;
 
@@ -71,8 +82,15 @@ namespace JLib {
         cells.store(fresh, std::memory_order_release);
     }
 
+    void HazardDomain::Init() { EnsureTable(); }
+
     std::size_t HazardDomain::CurrentReader() {
         EnsureTable();
+
+        // Pre-Init, or Init still running. Cells stay null, and a HazardGuard built here will fatal
+        // on its first Protect with a message naming the cause -- which is the right outcome, since
+        // protecting a pointer before the domain exists cannot be honoured.
+        if (!cells.load(std::memory_order_acquire)) return kNoReader;
 
         Thread* w = Thread::GetCurrent();
         if (w) {
@@ -122,6 +140,21 @@ namespace JLib {
         }
         assert(false && "hazard: ran out of external reader slots (kExternalReaders)");
         return kNoReader;
+    }
+
+    void HazardDomain::FatalCellOverflow(std::size_t k, const char* what) {
+        // Matches TaskDAG::CreateNode's handling of a Coroutine task: say what happened, name the
+        // knob, then stop. A library that keeps going here is guessing on the caller's behalf about
+        // memory it does not own.
+        std::fprintf(stderr,
+            "[JLib::Scheduler] FATAL: hazard cell %zu -- %s.\n"
+            "  kCellsPerReader is %zu. Raise it with -DJLIBSCHED_HAZARD_CELLS=n, or restructure\n"
+            "  the traversal to hold fewer pointers live at once. This is fatal rather than\n"
+            "  ignored because continuing would return a pointer that was never published --\n"
+            "  protected in the caller's belief and not in fact.\n",
+            k, what, kCellsPerReader);
+        std::fflush(stderr);
+        std::abort();
     }
 
     void HazardDomain::ForceWorkerCellsForTest(bool on) {
