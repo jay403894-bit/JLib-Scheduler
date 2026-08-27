@@ -167,11 +167,19 @@ int main() {
         // ~HazardGuard releases the record on the way out.
         // ORDER IS LOAD-BEARING: Cancel, then UNLOCK, then wait.
         //
-        // SchedulerMutex cancellation is SKIP-AT-RELEASE, not eager -- unlike Event, semaphore and
-        // the condition variable, cancelling a mutex waiter does not wake it. The cancelled waiter
-        // is only walked past when the lock is RELEASED. Waiting before unlocking therefore hangs
-        // forever, which is what the first version of this did and which reads exactly like a
+        // WHY, and note this is NOT "the mutex has no eager cancel" -- it has one now.
+        // SchedulerMutex::CancelWaiters(tok) ejects matching waiters and wakes them. But that is a
+        // call ON THE PRIMITIVE, and cancelling a SCOPE does not go and find the primitives its
+        // tasks are parked on. Nothing walks that way; it would have to, to be automatic.
+        //
+        // So a test that only calls scope.Cancel() gets the skip-at-release path: the cancelled
+        // waiter is walked past when the lock is RELEASED, and waiting before unlocking hangs
+        // forever. That is what the first version of this did, and it reads exactly like a
         // hazard-record leak. Nothing to fix in the library; the test had the order wrong.
+        //
+        // Deliberately left this way, because the unlock is the path an application actually takes.
+        // g_gate.CancelWaiters(scope.Token()) before the wait would also work and would not need
+        // the unlock -- that is the two-phase shape the I/O reactor needs as well.
         scope.Cancel();
         g_gate.Unlock();
         sched.WaitFor(wg2);

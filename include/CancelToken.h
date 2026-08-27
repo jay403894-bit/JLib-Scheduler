@@ -19,11 +19,23 @@
 // that is mid-body and not looking.
 //
 // WAKING AN ALREADY-PARKED WAITER IS IMPLEMENTED as of 3.1.0/3.2.0, and this note used to say it was
-// not. Event, SchedulerSemaphore and SchedulerConditionVariable each have an eager CancelWaiters
-// that wakes matching waiters with no signal at all. SchedulerMutex deliberately does not: a binary
-// SchedulerSemaphore(1, 1) already is an eagerly cancellable lock, and a second lock type would be a
-// worse copy of it. Every one of those paths removes a waiter from its structure BEFORE waking it,
-// because the queue entries point into suspended stack frames.
+// not. Event, SchedulerSemaphore, SchedulerConditionVariable and SchedulerMutex each have an eager
+// CancelWaiters that wakes matching waiters with no signal at all. Every one of those paths removes
+// a waiter from its structure BEFORE waking it, because the queue entries point into suspended
+// stack frames.
+//
+// SchedulerMutex WAS the exception, on the argument that a binary SchedulerSemaphore(1, 1) already
+// is an eagerly cancellable lock and a second lock type would be a worse copy of it. That was
+// wrong, and for a reason the argument did not consider: a frame parked on a mutex whose holder is
+// itself abandoned cannot be woken by ANYTHING, so its stack never unwinds and nothing it holds is
+// released -- RAII, its WaitGroup slot, a hazard record. Teardown, not consistency, is what settled
+// it. See SchedulerMutex::CancelWaiters.
+//
+// EAGER IS A CALL ON THE PRIMITIVE, NOT SOMETHING A SCOPE PERFORMS. Cancelling a scope sets a flag
+// that every observation point walks; it does NOT go and find the primitives that scope's tasks are
+// parked on, because nothing indexes waiters by scope. A caller that needs a parked waiter out
+// right now names the primitive: mutex.CancelWaiters(tok). Same two-phase shape the I/O reactor
+// needs, and for the same reason -- see RequestCancel there.
 //
 // STILL MISSING: timers and timeouts, which is the only real gap. See the CHANGELOG for 3.2.0.
 //

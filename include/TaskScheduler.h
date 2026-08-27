@@ -2017,8 +2017,8 @@ namespace JLib {
 		Fiber* fiber = nullptr;
 		Task*  coro  = nullptr;
 
-		// SKIP-AT-RELEASE. A cancellable waiter carries a pointer to a result slot it owns -- a
-		// local on the suspended fiber's stack, or a member of the awaiter inside a coroutine
+		// CANCELLABLE WAITERS, both paths. A cancellable waiter carries a pointer to a result slot it
+		// owns -- a local on the suspended fiber's stack, or a member of the awaiter inside a coroutine
 		// frame. Both are stable precisely because a waiter cannot leave before it is resumed, and
 		// resuming it is what lets it leave.
 		//

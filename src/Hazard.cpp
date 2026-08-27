@@ -122,19 +122,28 @@ namespace JLib {
                 assert(fb->poolIndex < fiberCount && "fiber poolIndex outside the hazard table");
                 return fb->poolIndex;
             }
-            // A COROUTINE ONLY REACHES HERE IF THE REGISTRY WAS EXHAUSTED. The guard takes a record
-            // before ever calling this, so arriving with a Coroutine task means AcquireRecord
-            // returned kNoRecord -- every one of kMaxRecords is LIVE or still inside its grace.
+            // UNREACHABLE BACKSTOP, and that is a promotion, not dead code.
             //
-            // Falling through to worker cells would be correct until this frame's first co_await and
-            // catastrophically wrong after, so it does not: this asserts, and in Release the guard's
-            // cells stay null and Protect is fatal. Raise kMaxRecords, or find the frames that take
-            // a guard and never release it.
+            // A coroutine cannot arrive here at all: HazardGuard's constructor gates on the task
+            // type BEFORE calling this, takes a record on success, and RETURNS on exhaustion rather
+            // than falling through. This function has exactly one caller, and that caller has
+            // already excluded coroutines.
+            //
+            // It used to be the real gate, which was the defect: the refusal lived in a different
+            // function from the decision, and its own fiber branch above ran FIRST -- so a coroutine
+            // with a non-null currentFiber would have taken FIBER cells and never been seen here.
+            //
+            // So this now means something stronger than it did. Firing is no longer "the registry
+            // filled up", which is an expected operating condition; it is "the constructor's gate
+            // was bypassed", which is a broken invariant. Keep it, and keep it fatal-shaped: worker
+            // cells are correct until the frame's first co_await and a use-after-free after it, so
+            // a silent downgrade here passes every test that does not suspend inside a protected
+            // section -- precisely the case the record path exists for.
             assert((w->currentRunningTask == nullptr ||
                     w->currentRunningTask->type != TaskType::Coroutine) &&
-                   "hazard: coroutine record registry exhausted (kMaxRecords). Worker cells are NOT "
-                   "a fallback -- they stop protecting at the first co_await. See "
-                   "design/hazard-pointers.md");
+                   "hazard: a Coroutine reached CurrentReader(), which HazardGuard's ctor should "
+                   "have made impossible. Worker cells are NOT a fallback -- they stop protecting "
+                   "at the first co_await. See design/hazard-pointers.md");
             if (w->currentRunningTask && w->currentRunningTask->type == TaskType::Coroutine)
                 return kNoReader;
 
@@ -336,7 +345,7 @@ namespace JLib {
         // by vigilance.
         //
         // Detected the same way the old tripwire detected it: a Coroutine task with no fiber.
-        if (Thread* w = Thread::GetCurrent()) {
+        if (Thread::GetCurrent()) {
             if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
                 record = d.AcquireRecord();
                 if (record != HazardDomain::kNoRecord) {
@@ -344,8 +353,31 @@ namespace JLib {
                     reader = HazardDomain::kNoReader;
                     return;
                 }
-                // Registry exhausted. Deliberately NOT falling back to worker cells -- that is the
-                // exact bug this exists to prevent, and Protect's fatal beats a silent downgrade.
+                // REGISTRY EXHAUSTED -- STOP HERE. Do NOT fall through to CurrentReader().
+                //
+                // cells stays null and reader stays kNoReader, so the first Protect is fatal with a
+                // message naming kMaxRecords. That is the intended outcome, and this early return is
+                // what makes it STRUCTURAL rather than a claim.
+                //
+                // The previous version fell through and relied on CurrentReader() to refuse a second
+                // time. Two problems with that, and only one of them was live:
+                //
+                //   THE REFUSAL LIVED IN ANOTHER FUNCTION. CurrentReader() re-derived "is this a
+                //   coroutine" from w->currentRunningTask->type -- the same source this ctor reads,
+                //   so they agreed, but the guarantee depended on two call sites continuing to. This
+                //   codebase has lost that bet before (the discard sites, the PushBatch stamp).
+                //
+                //   ITS FIBER BRANCH CAME FIRST. CurrentReader() returns fb->poolIndex whenever
+                //   w->currentFiber is set, BEFORE it ever looks at the task type -- so a coroutine
+                //   running with a non-null currentFiber would have taken FIBER cells and never
+                //   reached the assert. Not reachable today (the three fiber exits all clear it),
+                //   but reachable is not the bar for a silent memory-safety downgrade.
+                //
+                // Worker or fiber cells are correct until this frame's first co_await and a
+                // use-after-free after it, so the downgrade would pass every test that does not
+                // suspend inside a protected section -- exactly the case the record path exists for.
+                // Raise kMaxRecords, or find the frames that take a guard and never release it.
+                return;
             }
         }
 

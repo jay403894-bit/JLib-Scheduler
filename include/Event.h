@@ -211,12 +211,17 @@ namespace JLib {
         // Cancels every task waiting here AND WAKES THEM, rather than leaving them parked until
         // somebody signals.
         //
-        // WHY EAGER, when every other primitive in this library is skip-at-release: an Event is the
-        // one place a wait may never end. A mutex or a semaphore is released by whoever holds it,
+        // WHY EAGER, and why this was the FIRST primitive to get it: an Event is the one place a
+        // wait may never end on its own. A mutex or a semaphore is released by whoever holds it,
         // usually soon; an Event is signalled by an outside condition -- an asset finishing, a
         // socket completing, a level finishing loading -- and if that condition never comes, a
         // skip-at-release waiter sits there forever. That is precisely the case cancellation exists
         // for, so here it does not wait for a release.
+        //
+        // The rest followed: semaphore and condition variable in 3.2.0, SchedulerMutex later, once
+        // teardown showed that a frame parked on an abandoned holder cannot be woken by anything.
+        // Skip-at-release still exists alongside eager in each of them -- it is what a waiter
+        // cancelled between the release and the wake takes.
         //
         // CLAIM BEFORE TOUCHING THE TASK, and that ordering is the whole safety argument. It also
         // FIXES A LATENT RACE in the marking-only version this replaces: that one loaded the slot
