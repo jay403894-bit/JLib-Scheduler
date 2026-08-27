@@ -276,6 +276,16 @@ jobs:
           run_positive tests/verify/deque_model.c
           run_negative -DNO_POP_FENCE tests/verify/deque_model.c
 
+          # The OWNER-ONLY RESIZE, which deque_model.c deliberately leaves out. Three negative
+          # controls because the algorithm makes three separate claims: the copy must be published
+          # with release, the old buffer must be RETIRED rather than freed, and the pointer and its
+          # mask must be one atomic object. Any one of them failing to fail means that claim is
+          # untested.
+          run_positive tests/verify/deque_grow_model.c
+          run_negative -DNO_PUBLISH_RELEASE tests/verify/deque_grow_model.c
+          run_negative -DNO_RETIRE          tests/verify/deque_grow_model.c
+          run_negative -DSPLIT_PTR_MASK     tests/verify/deque_grow_model.c
+
           run_positive tests/verify/event_model.c
           run_negative -DNO_RELEASE tests/verify/event_model.c
 
