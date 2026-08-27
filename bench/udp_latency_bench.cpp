@@ -518,14 +518,20 @@ int main(int argc, char** argv) {
                                 kWinW, kWinH, nullptr, nullptr, wc.hInstance, nullptr);
     // --noactivate MAKES THE FOREGROUND QUESTION AN EXPERIMENT INSTEAD OF AN ACCIDENT.
     //
-    // Shown normally, this window TAKES foreground on creation -- so a run is "focused" unless a
-    // human happens to click elsewhere mid-run. That made focus an uncontrolled variable that
-    // tracked whether anyone was using the machine, and it is the single largest term in every
-    // latency number this bench has produced: dispatch p90 1.5 us focused against 433 us not.
+    // Shown normally, this window TAKES foreground on creation, so a run is "focused" unless a human
+    // clicks elsewhere mid-run. SW_SHOWNOACTIVATE plus WS_EX_NOACTIVATE makes it appear without ever
+    // stealing focus, giving a repeatable unfocused run with nobody touching the mouse.
     //
-    // SW_SHOWNOACTIVATE plus WS_EX_NOACTIVATE means the window appears and never steals focus, so
-    // whatever the user was already in keeps it. That gives a repeatable UNFOCUSED run with nobody
-    // touching the mouse, which is the only way to A/B this honestly.
+    // WHAT THIS ACTUALLY ESTABLISHED, which is less than it first looked. A user-run measurement
+    // showed dispatch p90 1.5 us at 100% foreground against 259.8 us at 2.7% -- but six runs through
+    // THIS flag then measured 0% foreground at 1.7 us, i.e. fast. So losing the foreground boost is
+    // NOT sufficient to cause the slow mode.
+    //
+    // The variable that tracked it was a human ACTIVELY USING the machine: a competing foreground
+    // application spending its boost, rather than us merely lacking one. Preemption is still the
+    // mechanism; the source is active competition. Focus is a correlate, and this flag exists to
+    // hold it constant so that the remaining variable can be isolated -- not because focus is the
+    // answer. Report the foreground share with every number either way.
     if (noActivate) {
         ::SetWindowLongPtrA(hwnd, GWL_EXSTYLE,
                             ::GetWindowLongPtrA(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
