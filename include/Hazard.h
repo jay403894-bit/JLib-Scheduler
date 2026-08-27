@@ -50,14 +50,6 @@
 // fibers BY CONSTRUCTION: a parked fiber's index still addresses its cells, and the scan walks the
 // table rather than walking "who is running". Same perfect-hash property Event's waiter index uses.
 //
-// == WHAT IS NOT SUPPORTED YET ==
-//
-// COROUTINES MUST NOT HOLD A GUARD ACROSS A co_await. A coroutine resumes as a call on whatever
-// worker takes it, so it resolves to worker-owned cells -- correct while it does not suspend, wrong
-// the moment it does. Cells for coroutines belong on the PROMISE, unregistered at final_suspend,
-// and that registry is deliberately not built here: coro frames are not a bounded pool, so it
-// cannot reuse this table. See design/hazard-pointers.md.
-//
 // == ALLOCATION ==
 //
 // Retire takes a DELETER and defaults to `delete`. This never touches the task slab. The slab is

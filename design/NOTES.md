@@ -9,48 +9,60 @@ make it wrong.
 
 ## 2026-08-27 — Choosing a reclamation scheme: epochs or hazards
 
-**This is a PERFORMANCE choice, not a safety one.** Both schemes are safe for all three execution
-modes. Counted epochs made coroutines safe under EBR — that was the entire point of building them,
-and the cost was accepted deliberately (see below). Nothing here is about avoiding corruption.
+**FIRST, THE CASE WHERE THERE IS NO CHOICE.** A structure behind a fiber-aware LOCK gets hazards,
+full stop: the reader SUSPENDS on the acquire, and `EpochGuard` forbids suspending. Epochs are not
+slower there, they are ILLEGAL. That is what hazard pointers were built for and the numbers below do
+not bear on it at all.
+
+**The rest of this section is about lock-free sections, where both schemes are legal.** There it is a
+PERFORMANCE choice, not a safety one: both are safe for all three execution modes, and counted
+epochs made coroutines safe under EBR -- the entire point of building them.
 
 ### The rule
 
-> **If coroutines will use the structure, hazards are likely the faster choice. Otherwise epochs.**
+> **Epochs by default, for every mode.** The coroutine penalty is 0.15 ns per guard.
+>
+> **Hazards when a reader can PARK inside the protected section** — that is the only thing the
+> per-guard numbers do not capture.
 >
 > **One scheme per structure. Do not mix.**
 
-### Why coroutines are the deciding factor
+### The numbers, absolute — and they invert the obvious reading of "1.41x"
 
-A coroutine cannot have an epoch SLOT. Slots need a stable identity — a fiber has `poolIndex`, a
-frame has nothing, and frames are not a bounded pool. A fixed slot pool was built and reverted: any
-bound reintroduces the exact ceiling coroutines exist to escape, and a reactor parks thousands.
-
-So a coroutine takes the COUNTED path, and counted is slower than slots:
-
-| | guards/sec |
+| | per guard / protect |
 |---|---|
-| slot epoch (fiber, native, bare thread) | 2.52 B |
-| counted epoch (coroutine) | 1.82 B — the 1.41x |
+| slot epoch (fiber, native, bare thread) | **0.40 ns** |
+| counted epoch (coroutine) | **0.55 ns** — the 1.41x, i.e. **0.15 ns** absolute |
+| hazard `Protect` | store + **seq_cst fence** + reload, **PER POINTER** |
 
-That is the whole reason to reach for hazards on a coroutine-facing structure. Fibers and native
-tasks get slots and have no such penalty, which is why a structure they alone touch should stay on
-epochs.
+A seq_cst fence is an `mfence` or a locked op: order 20-40 cycles, ~10 ns. That is roughly **18x a
+whole counted-epoch guard**, and the epoch is paid ONCE PER TRAVERSAL where the hazard is paid PER
+POINTER.
+
+**So epochs beat hazards on guard cost for coroutines too, and not narrowly.** 1.41x reads like a
+reason to switch; 0.15 ns is not one. (The hazard figure is an ESTIMATE from the instruction cost --
+not measured in this tree. The epoch figures are measured.)
+
+### The one thing guard cost does not capture: a parked reader
+
+Counted epochs keep a parked coroutine SAFE -- 312 parked readers, 0 lost protection. But the advance
+gate then refuses to advance the ring while anyone is parked in it, so **one parked reader stalls
+reclamation for everyone**. A parked hazard reader pins only the nodes it named.
+
+Unbounded against bounded, and no per-guard number reaches it. That is the whole case for hazards,
+and it is why the rule keys on PARKING rather than on execution mode.
+
+### Why a coroutine pays the counted path at all
+
+It cannot have a SLOT. Slots need a stable identity -- a fiber has `poolIndex`, a frame has nothing,
+and frames are not a bounded pool. A fixed slot pool was built and REVERTED: any bound reintroduces
+the exact ceiling coroutines exist to escape, and a reactor parks thousands.
 
 ### Why the counted path was accepted despite the cost
 
-**Memory safety, not performance.** Without it a coroutine had no correct epoch story at all, and
-the owner took the slower mechanism rather than leave a footgun where a user gets memory corruption.
-Read the 1.41x in that light: a price paid knowingly, not a regression to optimise away.
-
-### NOT MEASURED
-
-Hazards versus counted epochs on a coroutine workload has not been benched. The expectation is that
-hazards win; treat it as an expectation. `bench/epoch_mechanisms.cpp` is where the comparison goes.
-
-A second reason to expect it, beyond the guard cost: the epoch advance gate refuses to advance the
-ring while a reader is parked in it, so one parked coroutine stalls reclamation for everyone, where
-a parked hazard reader pins only the nodes it named. Bounded against unbounded. That is a MECHANISM
-argument, not a measurement.
+**Memory safety, not performance.** Without it a coroutine had no correct epoch story at all, and the
+owner took the slower mechanism rather than leave a footgun where a user gets memory corruption. Read
+the 1.41x in that light: a price paid knowingly.
 
 ### Why not to mix, concretely
 
@@ -63,17 +75,19 @@ Neither scheme can see the other's readers, so a structure with both makes RETIR
 The mirror fails too: a parked coroutine holding a hazard on N does not stall epoch advancement, so
 an epoch-based retire frees N underneath it.
 
-Mixing is only sound with a **dual-condition retire** — free when no cell names the node AND its
-retire generation is epoch-safe. That is one conjunction in the hazard `Scan`, and it is **NOT
-BUILT**, because one scheme per structure is simpler and costs nothing worth measuring.
+Sound mixing needs a **dual-condition retire** -- free only when no cell names the node AND its
+retire generation is epoch-safe. One conjunction in the hazard `Scan`, and **NOT BUILT**: one scheme
+per structure is simpler and, given the numbers above, costs nothing worth measuring.
 
-`TaskScheduler::CurrentTaskType()` exists for code that genuinely must branch, but the intended use
-is choosing a structure's scheme when you write it, not per traversal.
+### Still not measured
+
+Hazards versus counted epochs on a real coroutine workload with a parked reader. That is the case the
+rule turns on, and the guard costs above do not decide it. `bench/epoch_mechanisms.cpp`.
 
 ### TaskDAG stays on epochs
 
 No coroutine builds a DAG, so the question does not arise. (A coroutine can *complete* an external
-node via `SignalExternalNode`, which reaches `ForEachDependent` — a bare edge walk under a plain
+node via `SignalExternalNode`, reaching `ForEachDependent` -- a bare edge walk under a plain
 `EpochGuard`, with no `co_await` in it.)
 
 

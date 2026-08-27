@@ -143,7 +143,7 @@ namespace JLib {
 
     public:
         Event() = default;
-        ~Event() { delete table.load(std::memory_order_acquire); }
+        ~Event() { LeaveRegistry(); delete table.load(std::memory_order_acquire); }   // FIRST
 
         Event(const Event&) = delete;
         Event& operator=(const Event&) = delete;

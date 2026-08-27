@@ -464,16 +464,29 @@ void TaskScheduler::Join() {
 	// because unwinding is work and needs workers alive to run it. Draining after the join would
 	// re-push frames onto a pool that is gone.
 	//
-	// The list is copied under the lock and walked outside it: DrainForShutdown resumes frames,
-	// which can run immediately, destroy their primitives, and re-enter ~WaitPrimitive -- which
-	// takes this same mutex.
+	// POP THE HEAD, one at a time, rather than copying the list and walking the copy. The copy is
+	// what the re-entrancy comment above demands -- DrainForShutdown resumes frames, and a resumed
+	// frame runs IMMEDIATELY, destroys its primitives, and re-enters LeaveRegistry(), which takes
+	// this same mutex -- but a copy holds raw pointers to objects that resumption is free to
+	// destroy. Drain N unwinding a stack that owns primitive N+1 leaves a dangling entry that drain
+	// N+1 then calls a virtual on.
+	//
+	// Unlinking each primitive BEFORE draining it fixes both at once: the mutex is not held across
+	// the resume, a re-entrant LeaveRegistry() on the same object finds it already out and returns,
+	// and anything the resumed frame destroys unlinks itself so this loop never reaches it.
 	{
-		std::vector<WaitPrimitive*> live;
-		{
-			std::lock_guard<std::mutex> lk(primitivesMtx);
-			for (WaitPrimitive* p = primitivesHead; p; p = p->nextPrimitive_) live.push_back(p);
+		for (;;) {
+			WaitPrimitive* p = nullptr;
+			{
+				std::lock_guard<std::mutex> lk(primitivesMtx);
+				p = primitivesHead;
+				if (!p) break;
+				primitivesHead = p->nextPrimitive_;
+				if (primitivesHead) primitivesHead->prevPrimitive_ = nullptr;
+				p->nextPrimitive_ = p->prevPrimitive_ = nullptr;
+			}
+			p->DrainForShutdown();
 		}
-		for (WaitPrimitive* p : live) p->DrainForShutdown();
 	}
 
 	{
@@ -3026,15 +3039,22 @@ WaitPrimitive::WaitPrimitive() {
 	s.primitivesHead = this;
 }
 
-WaitPrimitive::~WaitPrimitive() {
-	// UNLINK ONLY IF LINKED. A primitive constructed before Init never entered the chain, and one
-	// destroyed after Join cleared it is already out -- both leave the pointers null, so this is a
-	// no-op rather than a corrupt splice.
-	if (!nextPrimitive_ && !prevPrimitive_ && !TaskScheduler::IsInitialized()) return;
+WaitPrimitive::~WaitPrimitive() { LeaveRegistry(); }
+
+void WaitPrimitive::LeaveRegistry() noexcept {
+	// IDEMPOTENT BY DESIGN, because it is called twice on every primitive: once as the first
+	// statement of the derived destructor (while the derived vtable is still installed, so a
+	// concurrent drain that races us either sees a fully-formed object or does not see us at all)
+	// and once from ~WaitPrimitive for anything that forgot.
+	//
+	// A primitive constructed before Init never entered the chain and one destroyed after Join
+	// cleared it is already out -- both leave the pointers null, so this is a no-op rather than a
+	// corrupt splice.
 	if (!TaskScheduler::IsInitialized()) return;
 	TaskScheduler& s = TaskScheduler::Instance();
 	std::lock_guard<std::mutex> lk(s.primitivesMtx);
-	if (prevPrimitive_)              prevPrimitive_->nextPrimitive_ = nextPrimitive_;
+	if (!nextPrimitive_ && !prevPrimitive_ && s.primitivesHead != this) return;   // not linked
+	if (prevPrimitive_)                prevPrimitive_->nextPrimitive_ = nextPrimitive_;
 	else if (s.primitivesHead == this) s.primitivesHead = nextPrimitive_;
 	if (nextPrimitive_) nextPrimitive_->prevPrimitive_ = prevPrimitive_;
 	nextPrimitive_ = prevPrimitive_ = nullptr;

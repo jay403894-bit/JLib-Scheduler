@@ -2004,7 +2004,7 @@ namespace JLib {
 
 	public:
 		SchedulerMutex() = default;
-		~SchedulerMutex() = default;
+		~SchedulerMutex() { LeaveRegistry(); }   // FIRST -- see WaitPrimitive
 
 		// EAGER CANCELLATION, matching Event / SchedulerSemaphore / SchedulerConditionVariable.
 		//
@@ -2142,6 +2142,8 @@ namespace JLib {
 		explicit SchedulerSemaphore(int initialPermits, int maxPermits = INT_MAX)
 			: permits(initialPermits), maxPermits(maxPermits) {}
 
+		~SchedulerSemaphore() { LeaveRegistry(); }   // FIRST -- see WaitPrimitive
+
 		void Wait();
 
 		// Cancellable Wait. Returns Cancelled if this task's scope was cancelled while parked, and
@@ -2242,7 +2244,7 @@ namespace JLib {
 
 	public:
 		SchedulerConditionVariable() = default;
-		~SchedulerConditionVariable() = default;
+		~SchedulerConditionVariable() { LeaveRegistry(); }   // FIRST -- see WaitPrimitive
 
 		// Fibers suspend here; Native tasks spin and steal work
 		void Wait(SchedulerMutex& mutex);
