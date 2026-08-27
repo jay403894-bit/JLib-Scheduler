@@ -2889,6 +2889,18 @@ uint64_t TaskScheduler::GetCurrentTimeMs() const {
 }
 
 // ---- Priority inheritance implementation ----
+TaskType TaskScheduler::CurrentTaskType() noexcept {
+	// Straight to the thread-local: no Instance(), which throws when uninitialised and would put a
+	// branch plus a global load in front of every lock-free section that asks.
+	//
+	// currentRunningTask is the right source rather than currentFiber, because it is set for ALL
+	// three modes -- a coroutine has no fiber, which is exactly the case this must distinguish.
+	if (Thread* w = Thread::GetCurrent())
+		if (Task* t = w->currentRunningTask)
+			return t->type;
+	return TaskType::Native;
+}
+
 Task* TaskScheduler::GetCurrentTask() const {
 	// Access the current worker thread via thread-local storage (Thread::GetCurrent() returns
 	// the thread_local Thread::instance if this is a worker thread, nullptr otherwise).

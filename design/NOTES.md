@@ -7,6 +7,60 @@ make it wrong.
 
 ---
 
+## 2026-08-27 — APPROVED PATTERN: pick the reclamation scheme from the task type
+
+**In a lock-free section that coroutines can reach, implement BOTH guards and branch on the task
+type.** Not one or the other.
+
+```cpp
+if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
+    HazardGuard g;                                  // survives a suspend
+    Node* n = g.Protect(0, head);
+    ...
+} else {
+    EpochGuard g;                                   // cheaper, and cannot suspend here
+    Node* n = head.load(std::memory_order_acquire);
+    ...
+}
+```
+
+`TaskScheduler::CurrentTaskType()` is static and reads the thread-local directly -- no `Instance()`,
+because this sits on the hot path. It reads `currentRunningTask`, not `currentFiber`, since a
+coroutine has no fiber and that is precisely the case being distinguished. No task at all (a bare
+thread) reports `Native`, which is the right answer rather than a fallback: a bare thread does not
+change stack mid-section either.
+
+### Why both arms rather than just hazards everywhere
+
+Epochs are cheaper for the contexts that can use them -- one announce per traversal against a store
+plus a fence plus a validate-reload PER HOP. A fiber or native task pays nothing for the coroutine
+case if the branch keeps them out of it.
+
+### Why both arms rather than just epochs
+
+A coroutine cannot hold an `EpochGuard` across a `co_await` -- the tripwire in `Epochs.h` says so --
+and the counted-epoch machinery that makes coroutine EBR safe at all is **1.41x the cost of the slot
+path** (measured; sharding the counter took it from 61.7x to 1.41x, and that sharding is why it is
+usable). SRCU-shaped safety is not free.
+
+### The consequence that is easy to miss
+
+**If coroutines run through a section that uses `EpochGuard`, giving them the HAZARD path is
+expected to be faster than making them pay counted epochs.** That is the reasoning behind the
+recommendation. NOT YET MEASURED as a crossover: hazards cost per protected pointer, so a single
+protect probably still favours the counted epoch while a multi-hop traversal favours hazards. If
+this ever matters for a real structure, measure that structure -- do not assume the rule holds at
+both ends.
+
+### What this rules out
+
+- **"Just use hazards everywhere"** -- taxes fibers and native tasks for a case they never hit.
+- **"Just use epochs everywhere"** -- illegal the moment a coroutine suspends inside the guard.
+- **Leaving the branch out and documenting a rule** -- the tripwire only fires in Debug, and the
+  failure it catches is silent in Release.
+
+---
+
 ## 2026-08-27 — Teardown drains parked work instead of abandoning it
 
 ### The chain, and why all three pieces were needed

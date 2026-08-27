@@ -337,8 +337,7 @@ namespace JLib {
         //
         // Detected the same way the old tripwire detected it: a Coroutine task with no fiber.
         if (Thread* w = Thread::GetCurrent()) {
-            if (!w->currentFiber && w->currentRunningTask &&
-                w->currentRunningTask->type == TaskType::Coroutine) {
+            if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
                 record = d.AcquireRecord();
                 if (record != HazardDomain::kNoRecord) {
                     cells  = d.RecordCells(record);

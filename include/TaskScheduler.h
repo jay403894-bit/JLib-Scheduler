@@ -127,6 +127,30 @@ namespace JLib {
 	public:
 		// Priority inheritance methods (public for SchedulerMutex access)
 		Task* GetCurrentTask() const;
+
+		// WHICH RECLAMATION SCHEME AM I ALLOWED TO USE? That is the only question this exists to
+		// answer, and it is why it is static and does not go through Instance(): it sits in
+		// lock-free sections, on the hot path, and must cost one thread-local load and a field read.
+		//
+		// Returns TaskType::Native when no task is running -- a bare thread. That is the correct
+		// answer for the question being asked, not a fallback: a bare thread does not change stack
+		// mid-section any more than a native task does.
+		//
+		// THE APPROVED PATTERN for a lock-free section that coroutines can reach:
+		//
+		//     if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
+		//         HazardGuard g;                       // survives the suspend
+		//         Node* n = g.Protect(0, head);
+		//         ...
+		//     } else {
+		//         EpochGuard g;                        // cheaper, and cannot suspend here
+		//         Node* n = head.load(std::memory_order_acquire);
+		//         ...
+		//     }
+		//
+		// Both arms, gated on one branch, so the path is covered whichever context enters it. See
+		// design/NOTES.md for why this is the recommendation rather than "just use one".
+		static TaskType CurrentTaskType() noexcept;
 		void CleanupTaskMetadata(Task* task);
 
 		// Cancellation, observed wherever a task is about to RUN. True means the task was cancelled
