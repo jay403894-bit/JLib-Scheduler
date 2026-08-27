@@ -47,6 +47,7 @@
 #include "TaskDeque.h"
 #include "TaskAllocator.h"
 #include "Topology.h"   // topology::CpuMask -- llcMaskOfWorker is one per worker
+#include "concurrentqueue.h"   // the two overflow lanes; see hiPriOverflow
 #include <cstdio>   // the stale-library guard reports through stderr
 #include <cstdlib>  // ...and aborts rather than corrupting the heap
 #include <atomic>
@@ -1017,6 +1018,21 @@ namespace JLib {
 		// all -- a control child sharing NO data with its parent saved just as much. Against that,
 		// it was 1.5x-4.6x SLOWER for any fork-join-shaped spawn, worst on small trees. To place a
 		// task on a known worker, Push(cpu_affinity, task) -- one-based, 0 meaning round-robin.
+		// HOW MANY TASKS ARE SITTING IN AN OVERFLOW LANE RIGHT NOW. Zero in every healthy run --
+		// overflow means a 32,768-slot deque was full, which is a defect, not load. Exposed because a
+		// test that asserts "no task was lost" cannot tell a working overflow lane from a deque that
+		// never filled, and the first version of tests/deque_overflow_test.cpp could not: it PASSED
+		// with the fix removed. An assertion that cannot fail is not an assertion.
+		size_t OverflowDepth(bool hiPri) const {
+			return (hiPri ? hiPriOverflowCount : loPriOverflowCount).load(std::memory_order_relaxed);
+		}
+
+		// Cumulative, never decremented -- OverflowDepth goes back to 0 as the lane drains, so it
+		// cannot answer "did this ever happen" after the fact, which is exactly what a test needs.
+		size_t OverflowTotal(bool hiPri) const {
+			return (hiPri ? hiPriOverflowTotal : loPriOverflowTotal).load(std::memory_order_relaxed);
+		}
+
 		static bool IsInitialized() {
 			return instance != nullptr;
 		}
@@ -1559,6 +1575,51 @@ namespace JLib {
 		std::atomic<bool> paused{ false };
 		std::vector<std::unique_ptr<TaskDeque>> loPri;
 		std::vector<std::unique_ptr<TaskDeque>> hiPri;
+
+		// ---------- OVERFLOW: where a full deque puts a task instead of losing it ----------
+		//
+		// A TaskDeque is a FIXED 32,768 slots and push_bottom returns false when it is full. That
+		// return was honoured at exactly one of its three call sites; the other two dropped the task
+		// on the floor. Neither failure was memory corruption -- both were HANGS, which is worse to
+		// diagnose: a lost task never decrements its WaitGroup, and a yielded fiber that fails to
+		// requeue is never resumed, so its stack never unwinds and nothing it holds is released.
+		//
+		// moodycamel rather than another TaskMPSCQueue: this is MPMC by nature -- any worker may
+		// push into it (a full deque is discovered by whoever is pushing) and any worker may drain
+		// it. It is already vendored and already used by Epochs, GlobalFiberPool and DirectEvent.
+		//
+		// PRIORITY IS PRESERVED AS FAR AS IT CAN BE: two queues, and a worker checks hiPriOverflow
+		// before it touches ANY deque. An overflowed hiPri task is by definition more urgent than
+		// anything sitting in a lane, and it is already late. loPriOverflow is drained only by
+		// workers that were going to do loPri work anyway, plus one check on the idle path so it
+		// cannot be stranded when every worker is K-hot.
+		//
+		// THE COUNTERS ARE NOT DIAGNOSTICS, THEY ARE THE FAST PATH. An empty-queue try_dequeue is
+		// not one load -- it walks producer blocks -- and this is checked by every worker on every
+		// pass for a queue that should always be empty. The counter is a relaxed load of a line that
+		// is almost always 0 and read-shared, so it stays in S state across all workers and the
+		// never-case costs one load. Non-zero is the only thing that touches the queue.
+		//
+		// AND OVERFLOW IS A DEFECT, NOT A MODE. Unbounded overflow trades a hang for unbounded
+		// memory growth, which is better but still the runaway quietly not-failing. 32,768 in-flight
+		// tasks on ONE lane is essentially always an infinite spawn, so the depth is asserted in
+		// debug: loud where it can be fixed, graceful where it cannot.
+		moodycamel::ConcurrentQueue<Task*> hiPriOverflow;
+		moodycamel::ConcurrentQueue<Task*> loPriOverflow;
+		std::atomic<size_t> hiPriOverflowCount{ 0 };
+		std::atomic<size_t> loPriOverflowCount{ 0 };
+
+		// CUMULATIVE, so "did a lane ever overflow" survives the lane draining back to empty. The
+		// depth counters above are the fast path and go back to zero; these are the record.
+		std::atomic<size_t> hiPriOverflowTotal{ 0 };
+		std::atomic<size_t> loPriOverflowTotal{ 0 };
+
+		// Push to the overflow lane matching the task's priority. Only ever called after a deque
+		// refused, so it must not fail: this is the path that exists so a refusal is never a loss.
+		void PushOverflow(Task* t, bool hiPri);
+
+		// Take one task from an overflow lane, or nullptr. Cheap when empty -- see the counters.
+		Task* TryTakeOverflow(bool hiPri);
 
 		// ---------- the NON-WORKER LANE ----------
 		// loPri/hiPri carry ONE EXTRA deque pair past the workers, at index `nonWorkerLane`

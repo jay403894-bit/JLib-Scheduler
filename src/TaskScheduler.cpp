@@ -2449,6 +2449,22 @@ void TaskScheduler::Stop(Task* worker_task) {
 // behind a stream of hiPri steals. Single-item steal() is the only correct steal in the lock-free
 // deque (see TaskDeque.h). Returns nullptr if nothing was stealable anywhere.
 Task* TaskScheduler::GetTask() {
+	// OVERFLOW FIRST, AND HERE RATHER THAN AT EACH CALLER. A task in an overflow lane is only there
+	// because a deque was full when somebody tried to push it, so it is late by construction and
+	// belongs ahead of anything that is merely queued.
+	//
+	// This function is the funnel for "find me work that is not my own deque", and putting the check
+	// anywhere else was a bug I wrote and this test caught. The overflow drain first went into
+	// Worker()'s loop only -- so the SPIN-HELP path (TryRunStolenNativeTask, reached from WaitFor /
+	// SchedulerMutex / the condition variable) could not see overflow at all. With one worker that
+	// deadlocks outright: the worker spins in WaitFor, its own drain pushed the excess to overflow,
+	// and nothing it can reach ever looks there.
+	//
+	// Same shape as every other invariant in this file that got added to N-1 of N call sites. The
+	// funnel is the fix; the per-caller check is the bug.
+	if (Task* t = TryTakeOverflow(/*hiPri*/ true))  return t;
+	if (Task* t = TryTakeOverflow(/*hiPri*/ false)) return t;
+
 	bool forceLoPri = (consecutiveHiPriSteals >= kStealFairnessWindow);
 
 	// NATIVE- AND CLASS-VETTED at the deque (steal_if): GetTask's ONLY caller is TryRunStolenNativeTask,
@@ -3838,4 +3854,61 @@ void TaskScheduler::ParallelFor(int begin, int end, std::function<void(int, int)
 	const size_t leaves = std::max<size_t>(1, workers.size() * 8);
 	const int grain = (int)std::max<size_t>(1, ((size_t)n + leaves - 1) / leaves);
 	ParallelFor(begin, end, grain, std::move(func));
+}
+
+// ---- overflow lanes ----------------------------------------------------------------------------
+
+void TaskScheduler::PushOverflow(Task* t, bool hiPri) {
+	if (!t) return;
+
+	// COUNT BEFORE ENQUEUE, so a consumer's non-zero read is never later than the item being
+	// visible. The reverse order lets a worker enqueue, a consumer take it, the consumer decrement
+	// to -1 (wrapping), and the producer then increment back to 0 -- a queue with an item in it and
+	// a counter saying empty, which is exactly the stranding this counter exists to prevent. An
+	// over-count is harmless: it costs one wasted try_dequeue that returns nothing.
+	(hiPri ? hiPriOverflowCount : loPriOverflowCount).fetch_add(1, std::memory_order_release);
+	(hiPri ? hiPriOverflow : loPriOverflow).enqueue(t);
+	(hiPri ? hiPriOverflowTotal : loPriOverflowTotal).fetch_add(1, std::memory_order_relaxed);
+
+	// WAKE THROUGH THE EXISTING HANDSHAKE, and do NOT add an overflow term to the sleep predicate.
+	//
+	// The park predicate and the recheck above it are model-checked together
+	// (tests/verify/sleepwake_model.c) and must mirror each other exactly; a term added to one and
+	// not the other is a lost wakeup, which is the failure this scheduler is most careful about. So
+	// overflow does not become a fifth input. It marks hasQueuedWork, which the predicate already
+	// reads, and the ORDER IS THE PROOF exactly as it is for a lane wake: publish the flag, THEN
+	// notify, because NotifyWorker's awake-skip loads workerState seq_cst and pairs with that store.
+	//
+	// EVERY WORKER, not one. Round-robin is right for an ordinary push because more work is coming
+	// and the next push picks the next worker. Overflow is a defect path that may deliver a burst
+	// with nothing behind it, so notifying one worker can leave the rest of the burst sitting while
+	// everybody else is parked. This costs a full notify sweep on a path that should never execute,
+	// which is the correct place to spend it.
+	for (auto& w : workers) {
+		if (!w) continue;
+		w->MarkQueuedWork();
+		w->NotifyWorker();
+	}
+
+	// 32,768 in-flight on one lane is already past any real workload, so arriving here at all is a
+	// signal. The assert fires on the DEPTH rather than on the first overflow because a burst that
+	// briefly exceeds a lane is survivable and is precisely what this path is for; a queue that
+	// keeps growing is a task spawning itself.
+	assert((hiPri ? hiPriOverflowCount : loPriOverflowCount).load(std::memory_order_relaxed) < 65536
+	       && "TaskDeque overflow lane exceeded 65,536 tasks -- almost always an infinitely "
+	          "self-spawning task. The lane holds 32,768; overflow past that is a defect, not load.");
+}
+
+Task* TaskScheduler::TryTakeOverflow(bool hiPri) {
+	std::atomic<size_t>& n = hiPri ? hiPriOverflowCount : loPriOverflowCount;
+
+	// THE WHOLE POINT OF THE COUNTER. Every worker asks this on every pass about a queue that should
+	// always be empty, and an empty-queue try_dequeue walks producer blocks rather than doing one
+	// load. This line is ~always 0 and only ever read, so it sits in S state across every worker.
+	if (n.load(std::memory_order_acquire) == 0) return nullptr;
+
+	Task* t = nullptr;
+	if (!(hiPri ? hiPriOverflow : loPriOverflow).try_dequeue(t) || !t) return nullptr;
+	n.fetch_sub(1, std::memory_order_acq_rel);
+	return t;
 }

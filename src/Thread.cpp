@@ -322,21 +322,25 @@ bool Thread::DrainOwnInboxesToDeques() {
 	Task* batch[BATCH];
 	bool moved = false;
 
-	auto drain = [&](TaskMPSCQueue* inbox, TaskDeque* deque) {
+	auto drain = [&](TaskMPSCQueue* inbox, TaskDeque* deque, bool hiPriLane) {
 		for (;;) {
 			size_t count = 0;
 			while (count < BATCH && inbox->pop(batch[count])) count++;
 			if (count == 0) break;
 			for (size_t i = 0; i < count; ++i) {
 				if (!batch[i]) continue;
-				deque->push_bottom(batch[i]);
+				// THE POP ALREADY HAPPENED, so a refusal here cannot be retried -- the inbox no
+				// longer has it. Ignoring the bool (which this did) LOST the task: its WaitGroup
+				// never decremented and whoever waited on it hung. Overflow instead.
+				if (!deque->push_bottom(batch[i]))
+					scheduler->PushOverflow(batch[i], hiPriLane);
 				moved = true;
 			}
 		}
 	};
 
-	drain(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get());
-	drain(scheduler->loPriInboxes[qIndex].get(), scheduler->loPri[qIndex].get());
+	drain(scheduler->hiPriInboxes[qIndex].get(), scheduler->hiPri[qIndex].get(), true);
+	drain(scheduler->loPriInboxes[qIndex].get(), scheduler->loPri[qIndex].get(), false);
 	return moved;
 }
 void Thread::Join() {
@@ -945,7 +949,13 @@ void Thread::Worker() {
 			else if (fs == FiberStatus::WANTS_YIELD) {
 				// Yielded. The switch above already saved the fiber's context
 				f->status.store(FiberStatus::READY, std::memory_order_release);
-				scheduler->loPri[qIndex]->push_bottom(task_to_run);
+				// REQUEUE OR OVERFLOW, NEVER DROP. Ignoring this bool (which this did) was the
+				// worse of the two lost-task sites: a yielded fiber that is never requeued is never
+				// RESUMED, so its stack never unwinds and nothing it holds is released -- RAII, its
+				// WaitGroup slot, a hazard record. That is the same abandonment teardown was taught
+				// to avoid, arriving by a different road.
+				if (!scheduler->loPri[qIndex]->push_bottom(task_to_run))
+					scheduler->PushOverflow(task_to_run, /*hiPri*/ false);
 				currentFiber = nullptr;
 				currentRunningTask = nullptr;
 			}
@@ -996,7 +1006,26 @@ void Thread::Worker() {
 		//
 		// See TaskScheduler::SetReservedCores for the replacement: reserve a core, run a std::thread.
 		{
-			// --- 3. Local  queues ---
+			// --- 3. Local queues and overflow, in this order ---
+			//
+			//   HOT worker (serves the hiPri lane): own hiPri deque -> hiPri overflow -> loPri
+			//                                       deque -> loPri overflow -> steal
+			//   NORMAL worker:                      hiPri overflow -> loPri deque -> loPri
+			//                                       overflow -> steal
+			//
+			// ONE GATE PRODUCES BOTH, because the hiPri-deque block below is already conditional on
+			// servesHiPri || hiPriStray: a hot worker takes its own lane first and reaches overflow
+			// after, a normal worker skips straight to overflow. No separate branch on hotness.
+			//
+			// WHY A HOT WORKER CHECKS ITS OWN DEQUE FIRST rather than overflow. Overflow is global
+			// and MPMC; the hiPri deque is this worker's own line, uncontended at the bottom, and it
+			// is the latency path the K-hot lane exists to serve. Putting a shared queue in front of
+			// it taxes every hiPri pickup to service a queue that is empty in every healthy run. A
+			// normal worker has no such lane to protect, so for it overflow IS the most urgent thing
+			// it can reach, and it goes first.
+			//
+			// EITHER WAY hiPri overflow precedes ALL loPri work and all stealing. Cheap when empty:
+			// TryTakeOverflow reads a counter before touching the queue.
 			if (!task_to_run && (servesHiPri || hiPriStray)) {
 				auto opt = scheduler->hiPri[qIndex]->pop_bottom();
 				if (opt) {
@@ -1014,6 +1043,16 @@ void Thread::Worker() {
 						continue;
 					}
 				}
+			}
+			// HOT: this is the step after its own hiPri deque. NORMAL: this is its FIRST step, since
+			// the block above is gated on serving the lane. Either way, before any loPri work.
+			if (!task_to_run) {
+				if (Task* t = scheduler->TryTakeOverflow(/*hiPri*/ true)) { task_to_run = t; continue; }
+			}
+			// loPri overflow, ahead of the loPri deque so an overflowed task is not stuck behind the
+			// lane that displaced it.
+			if (!task_to_run) {
+				if (Task* t = scheduler->TryTakeOverflow(/*hiPri*/ false)) { task_to_run = t; continue; }
 			}
 			if (!task_to_run) {
 				auto opt = scheduler->loPri[qIndex]->pop_bottom();

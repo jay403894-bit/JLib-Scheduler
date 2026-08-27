@@ -805,3 +805,9 @@ target_compile_features(SchedulerMutexCancelTest PRIVATE cxx_std_17)
 add_executable(SchedulerTeardownDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/teardown_drain_test.cpp")
 target_link_libraries(SchedulerTeardownDrainTest PRIVATE Scheduler)
 target_compile_features(SchedulerTeardownDrainTest PRIVATE cxx_std_17)
+
+# A full lane must not lose a task. Covers the two push_bottom call sites that used to ignore the
+# bool -- both of which failed as a HANG rather than as a visible drop, which is why they survived.
+add_executable(SchedulerDequeOverflowTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_overflow_test.cpp")
+target_link_libraries(SchedulerDequeOverflowTest PRIVATE Scheduler)
+target_compile_features(SchedulerDequeOverflowTest PRIVATE cxx_std_17)
