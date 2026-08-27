@@ -452,6 +452,30 @@ void TaskScheduler::Join() {
 	if (TimersEnabled())
 		TimerQueue::Instance().Stop();
 
+	// DRAIN EVERY REGISTERED PRIMITIVE, BEFORE THE WORKERS ARE JOINED.
+	//
+	// This is what makes teardown a drain rather than an abandonment. Each primitive releases its
+	// waiters with Cancelled; every parked frame is re-pushed, resumes, observes the cancellation,
+	// and UNWINDS -- which is the only way anything it holds gets released. RAII objects run, its
+	// WaitGroup slot is decremented, a hazard record goes back. None of that happens to a frame that
+	// is simply left parked.
+	//
+	// ORDER: after the service threads stop (nothing new arrives) and BEFORE the workers are joined,
+	// because unwinding is work and needs workers alive to run it. Draining after the join would
+	// re-push frames onto a pool that is gone.
+	//
+	// The list is copied under the lock and walked outside it: DrainForShutdown resumes frames,
+	// which can run immediately, destroy their primitives, and re-enter ~WaitPrimitive -- which
+	// takes this same mutex.
+	{
+		std::vector<WaitPrimitive*> live;
+		{
+			std::lock_guard<std::mutex> lk(primitivesMtx);
+			for (WaitPrimitive* p = primitivesHead; p; p = p->nextPrimitive_) live.push_back(p);
+		}
+		for (WaitPrimitive* p : live) p->DrainForShutdown();
+	}
+
 	{
 		registryMtx.lock();
 		for (auto& pair : eventRegistry)
@@ -2976,6 +3000,34 @@ void SchedulerMutex::Lock() {
 // A NULL RESULT SLOT IS NOT CANCELLABLE, and that is deliberate rather than an oversight -- plain
 // Lock() passes null, and a waiter with nowhere to report Cancelled cannot be told it did not get
 // the lock. Those are left queued, exactly as skip-at-release leaves them.
+// ---- the primitive registry ---------------------------------------------------------------------
+//
+// Registration is skipped entirely when there is no scheduler yet. That is the file-scope primitive
+// case and it is a genuine limitation, not a bug to paper over: such a primitive works normally but
+// Join() cannot find it, so anything parked on it at teardown is abandoned exactly as before.
+WaitPrimitive::WaitPrimitive() {
+	if (!TaskScheduler::IsInitialized()) return;
+	TaskScheduler& s = TaskScheduler::Instance();
+	std::lock_guard<std::mutex> lk(s.primitivesMtx);
+	nextPrimitive_ = s.primitivesHead;
+	if (s.primitivesHead) s.primitivesHead->prevPrimitive_ = this;
+	s.primitivesHead = this;
+}
+
+WaitPrimitive::~WaitPrimitive() {
+	// UNLINK ONLY IF LINKED. A primitive constructed before Init never entered the chain, and one
+	// destroyed after Join cleared it is already out -- both leave the pointers null, so this is a
+	// no-op rather than a corrupt splice.
+	if (!nextPrimitive_ && !prevPrimitive_ && !TaskScheduler::IsInitialized()) return;
+	if (!TaskScheduler::IsInitialized()) return;
+	TaskScheduler& s = TaskScheduler::Instance();
+	std::lock_guard<std::mutex> lk(s.primitivesMtx);
+	if (prevPrimitive_)              prevPrimitive_->nextPrimitive_ = nextPrimitive_;
+	else if (s.primitivesHead == this) s.primitivesHead = nextPrimitive_;
+	if (nextPrimitive_) nextPrimitive_->prevPrimitive_ = prevPrimitive_;
+	nextPrimitive_ = prevPrimitive_ = nullptr;
+}
+
 void SchedulerMutex::CancelWaiters(CancelToken tok) {
 	constexpr size_t kBuf = 64;
 	for (;;) {

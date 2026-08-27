@@ -799,3 +799,9 @@ endif()
 add_executable(SchedulerMutexCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/mutex_cancel_test.cpp")
 target_link_libraries(SchedulerMutexCancelTest PRIVATE Scheduler)
 target_compile_features(SchedulerMutexCancelTest PRIVATE cxx_std_17)
+
+# Teardown drains parked work instead of abandoning it. The assertion is an RAII destructor running
+# on a parked fiber's stack -- which can only happen if that stack was actually unwound.
+add_executable(SchedulerTeardownDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/teardown_drain_test.cpp")
+target_link_libraries(SchedulerTeardownDrainTest PRIVATE Scheduler)
+target_compile_features(SchedulerTeardownDrainTest PRIVATE cxx_std_17)

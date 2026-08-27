@@ -32,6 +32,7 @@
 // Fiber.h instead, which is all it ever needed.
 #include "DirectEvent.h"
 #include "WaitGroup.h"
+#include "WaitPrimitive.h"
 #include "Event.h"
 namespace JLib {
 	class Thread;
@@ -118,6 +119,8 @@ namespace JLib {
 
 	class TaskScheduler {
 		friend class Thread;
+		// Registers and unlinks itself in the chain below. Only these two pointers are touched.
+		friend class WaitPrimitive;
 		friend class GlobalFiberPool;
 
 
@@ -1671,6 +1674,12 @@ namespace JLib {
 		AbiCanary abiCanary{};
 
 	private:
+		// Head of the intrusive primitive chain -- see WaitPrimitive. Guarded by its own mutex
+		// because construction and destruction of locks happen on any thread at any time, and this
+		// must not contend with anything on the task path.
+		WaitPrimitive* primitivesHead = nullptr;
+		std::mutex     primitivesMtx;
+
 		std::unordered_map<std::string, std::unique_ptr<Event>> eventRegistry;
 		std::mutex registryMtx;
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
@@ -1958,7 +1967,7 @@ namespace JLib {
 		uint32_t    token  = 0xFFFFFFFFu;   // CancelToken::kNone
 	};
 
-	class SchedulerMutex {
+	class SchedulerMutex : public WaitPrimitive {
 	private:
 		std::atomic_flag spinLock = ATOMIC_FLAG_INIT;
 		bool locked = false;
@@ -1990,6 +1999,11 @@ namespace JLib {
 		//
 		// An invalid token means "everything", which is what a teardown drain wants.
 		void CancelWaiters(CancelToken tok = CancelToken{});
+
+	protected:
+		// Teardown only: release everyone, unconditionally, so their frames can unwind.
+		void DrainForShutdown() override { CancelWaiters(); }
+	public:
 
 		// Acquires the lock. (No priority boost happens on contention despite what this line used to
 		// say -- see the class comment above for when that stopped being true and why it is fine.)
@@ -2088,7 +2102,7 @@ namespace JLib {
 		bool LockAsyncEnqueue(Task* coroTask, WaitResult* result);
 	};
 
-	class SchedulerSemaphore {
+	class SchedulerSemaphore : public WaitPrimitive {
 	private:
 		std::mutex mtx;
 		std::queue<Waiter> waiters;        // suspended fibers AND coroutines; see Waiter
@@ -2119,6 +2133,11 @@ namespace JLib {
 		// Waiters that used plain Wait() are never ejected: they have nowhere to report Cancelled, so
 		// waking one would hand its caller a permit it does not hold.
 		void CancelWaiters(CancelToken tok = CancelToken{});
+
+	protected:
+		// Teardown only: release everyone, unconditionally, so their frames can unwind.
+		void DrainForShutdown() override { CancelWaiters(); }
+	public:
 
 		bool Try_Wait();
 
@@ -2173,7 +2192,7 @@ namespace JLib {
 		};
 	};
 
-	class SchedulerConditionVariable {
+	class SchedulerConditionVariable : public WaitPrimitive {
 	private:
 		// User-space spinlock protecting the internal CV queue
 		std::atomic_flag spinLock = ATOMIC_FLAG_INIT;
@@ -2220,6 +2239,11 @@ namespace JLib {
 		// teardown. Waiters that used plain Wait() are never woken: they have nowhere to report
 		// Cancelled.
 		void CancelWaiters(CancelToken tok = CancelToken{});
+
+	protected:
+		// Teardown only: release everyone, unconditionally, so their frames can unwind.
+		void DrainForShutdown() override { CancelWaiters(); }
+	public:
 
 		// Unblocks one waiting fiber context
 		void Notify_One();

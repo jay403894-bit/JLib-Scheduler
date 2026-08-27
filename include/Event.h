@@ -10,6 +10,7 @@
 // Event -- so GetEvent() returned a reference callers could not use without separately including
 // this file. Breaking the cycle lets TaskScheduler.h include Event.h like it already includes
 // DirectEvent.h, and the papercut goes away.
+#include "WaitPrimitive.h"
 #include "Fiber.h"
 #include "platform.h"   // CountTrailingZeros64 for the occupancy scan
 namespace JLib {
@@ -73,7 +74,7 @@ namespace JLib {
     // guarantee callers actually rely on is weaker and still holds -- REGISTERED BEFORE THE SIGNAL
     // BEGAN IMPLIES WOKEN, since every word is scanned. WaitOnEventArmed depends on exactly that
     // and no more: it registers, then arms whatever can signal, so the signal cannot begin first.
-    class Event {
+    class Event : public WaitPrimitive {
     private:
         // The cost is paid per EVENT rather than per WAITER: one pointer plus one bit per fiber in
         // the pool, so ~8 KB at a 1,024-fiber budget. Allocated LAZILY, so an event that is only
@@ -227,6 +228,11 @@ namespace JLib {
         // Losing either half of the claim is not a failure. It means SignalAll (or another
         // CancelWaiters) owns that waiter and will resume it; the flag it observes at pickup is the
         // one we set, or the one that thread set, and both say cancelled.
+    protected:
+        // Teardown only. Event's CancelWaiters takes no token -- it cancels every waiter, which is
+        // exactly what a drain wants.
+        void DrainForShutdown() override { CancelWaiters(); }
+    public:
         void CancelWaiters() {
             WaiterTable* tb = table.load(std::memory_order_acquire);
             if (!tb) return;
