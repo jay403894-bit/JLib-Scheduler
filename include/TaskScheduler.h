@@ -150,6 +150,14 @@ namespace JLib {
 		//
 		// Both arms, gated on one branch, so the path is covered whichever context enters it.
 		//
+		// !! THE READER BRANCH ALONE IS NOT SUFFICIENT. Mixed readers on one structure make RETIRE
+		// unsound: a fiber holding an EpochGuard names no hazard cell, so a hazard scan frees the node
+		// it is traversing -- and a parked coroutine holding a hazard does not stall epoch advancement,
+		// so an epoch retire frees the node underneath IT. Either give one structure ONE scheme (if
+		// coroutines can touch it, hazards for everyone), or make retire dual-condition: free only when
+		// no cell names the node AND its retire generation is epoch-safe. The second is NOT BUILT.
+		// See design/NOTES.md before using this pattern on a structure with both kinds of reader.
+		//
 		// WHY HAZARDS FOR THE COROUTINE and not counted epochs, which would also be correct: it is
 		// NOT the per-guard cost -- a counted epoch guard is ~0.55 ns and beats a hazard Protect,
 		// which pays a seq_cst fence per pointer. It is what a PARK costs everyone else. The epoch

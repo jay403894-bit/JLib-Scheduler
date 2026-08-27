@@ -12,6 +12,27 @@ make it wrong.
 **In a lock-free section that coroutines can reach, implement BOTH guards and branch on the task
 type.** Not one or the other.
 
+> **UNSAFE AS STATED UNTIL RETIRE ALSO BRANCHES -- READ THIS FIRST.**
+>
+> The branch below is only the READER half. Mixed readers on ONE structure make retire unsound:
+>
+> - a fiber takes an `EpochGuard`, announces, and is traversing node N;
+> - a writer unlinks N and calls `HazardRetire(N)`;
+> - the scan finds no hazard CELL naming N -- the fiber used an epoch -- and frees it under the fiber.
+>
+> The mirror fails too: a parked coroutine holding a hazard on N does not stall epoch advancement, so
+> an epoch-based retire frees N underneath it.
+>
+> **So pick one of these before using the pattern:**
+>
+> 1. **Per-structure scheme.** Every reader of a structure uses the SAME one. If coroutines can touch
+>    it, hazards for everyone -- fibers pay a fence they did not need. Obviously safe, and it makes
+>    the task-type branch unnecessary for that structure.
+> 2. **Mixed readers + DUAL-CONDITION RETIRE.** Free a node only when BOTH agree: no hazard cell
+>    names it AND its retire generation is epoch-safe. One conjunction, in the hazard `Scan`. Readers
+>    each pay only their own scheme; retire pays a little more. This is what makes the branch sound
+>    rather than merely faster. NOT BUILT.
+
 ```cpp
 if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
     HazardGuard g;                                  // survives a suspend
