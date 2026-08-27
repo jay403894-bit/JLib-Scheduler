@@ -51,6 +51,14 @@ struct Node { int magic = 0xA11E; };
 std::atomic<Node*> g_head{ nullptr };
 SchedulerMutex     g_gate;
 std::atomic<bool>  g_reached{ false };
+std::atomic<bool>  g_mainDone{ false };
+std::atomic<bool>  g_sawAlive{ false };
+std::atomic<int>   g_freed{ 0 };
+
+// NEGATIVE CONTROL SWITCH. With this set the coroutine takes NO guard, so the node it names is
+// unprotected and main's scan must free it. Without this the "heldOff" assertion could not be shown
+// to fail, and an assertion that cannot fail is not an assertion.
+std::atomic<bool>  g_skipProtect{ false };
 
 void SuppressCrashDialogs() {
 #if defined(_WIN32)
@@ -90,6 +98,25 @@ Coro CarriesGuardAcrossAwait() {
     co_return;
 }
 
+// PROTECTS WITHOUT EVER SUSPENDING. The guard is held across a SPIN, not a co_await, so this is
+// the supported path -- and while it spins, main retires the node it named and scans. If the
+// announcement in the worker's cells is doing its job, the node survives.
+Coro ProtectsWhileSpinning() {
+    Node* n = g_head.load(std::memory_order_acquire);
+    HazardGuard g;
+    if (!g_skipProtect.load(std::memory_order_acquire)) n = g.Protect(0, g_head);
+    g_reached.store(true, std::memory_order_release);
+
+    // SPIN, DO NOT co_await. Suspending here is the violation the death test covers; this child is
+    // about whether the protection WORKS on the path that is allowed.
+    while (!g_mainDone.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    // Read through the pointer AFTER main retired and scanned it. Reachable only because the guard
+    // held it off; without protection this is a use-after-free.
+    g_sawAlive.store(n && n->magic == 0xA11E, std::memory_order_release);
+    co_return;
+}   // ~HazardGuard here -- the node becomes freeable
+
 // THE STANDARD PATTERN. Guard scoped to the synchronous lookup and released before suspending, so
 // the check must let this through untouched.
 Coro DropsGuardBeforeAwait() {
@@ -116,6 +143,49 @@ int main(int argc, char** argv) {
         TaskScheduler::Init(0);
         auto& sched = TaskScheduler::Instance();
         g_head.store(new Node{}, std::memory_order_release);
+
+        // DOES A COROUTINE'S GUARD ACTUALLY PROTECT ANYTHING? The death test above proves the CHECK
+        // fires. It says nothing about whether the protection works, which is the claim that
+        // matters -- and those are different things, so this is the one that tests the feature.
+        //
+        // NO SUSPENSION ANYWHERE IN THE GUARDED SPAN, which is what makes this the supported path
+        // rather than the forbidden one. The coroutine SPINS while main retires and scans, so it
+        // stays on its worker and its worker-cell announcement stays valid the whole time.
+        //
+        // BOTH DIRECTIONS, because "not freed" alone passes on a domain that never frees anything:
+        //   protected + retire + scan  ->  MUST NOT be freed
+        //   guard dropped + scan       ->  MUST be freed
+        if (std::strcmp(mode, "coro-protects") == 0 || std::strcmp(mode, "coro-control") == 0) {
+            if (std::strcmp(mode, "coro-control") == 0)
+                g_skipProtect.store(true, std::memory_order_release);
+            WaitGroup wg;
+            Spawn(ProtectsWhileSpinning(), &wg);
+
+            while (!g_reached.load(std::memory_order_acquire)) std::this_thread::yield();
+
+            // RETIRE FROM MAIN, i.e. a different thread from the one announcing it -- which is the
+            // only arrangement that tests anything. The coroutine is inside its guarded span.
+            Node* victim = g_head.exchange(nullptr, std::memory_order_acq_rel);
+            HazardDomain::Instance().Retire(victim, [](void* p) {
+                g_freed.fetch_add(1, std::memory_order_relaxed);
+                delete static_cast<Node*>(p);
+            });
+            HazardDomain::Instance().Scan();
+
+            const bool heldOff = (g_freed.load(std::memory_order_acquire) == 0);
+            g_mainDone.store(true, std::memory_order_release);
+            sched.WaitFor(wg);                    // the coroutine drops its guard as it returns
+
+            HazardDomain::Instance().Scan();
+            HazardDomain::Instance().Scan();
+            const bool freedAfter = (g_freed.load(std::memory_order_acquire) == 1);
+            const bool sawAlive   = g_sawAlive.load(std::memory_order_acquire);
+
+            std::printf("heldOff=%d sawAlive=%d freedAfter=%d\n",
+                        (int)heldOff, (int)sawAlive, (int)freedAfter);
+            sched.Join();
+            return (heldOff && sawAlive && freedAfter) ? 0 : 1;
+        }
 
         if (std::strcmp(mode, "suspend-with-guard") == 0) {
             g_gate.Lock();                       // force the await to actually suspend
@@ -179,6 +249,14 @@ int main(int argc, char** argv) {
     Check(rc != 0, "carrying a guard across a co_await ABORTS at the suspension point");
     Check(named,   "and it is the SUSPENSION handler that fired, named in the message");
     Check(hasFix,  "and the message carries the fix, not just the diagnosis");
+
+    rc = RunChild(argv[0], "coro-protects", err);
+    std::printf("      coroutine guard protects:    exit=%d  %s", rc, err.c_str());
+    Check(rc == 0, "a node named by a coroutine survived a retire+scan, and freed once dropped");
+
+    rc = RunChild(argv[0], "coro-control", err);
+    std::printf("      NEGATIVE CONTROL, no guard:  exit=%d  %s", rc, err.c_str());
+    Check(rc != 0, "without the guard the node IS freed -- the check above can fail");
 
     rc = RunChild(argv[0], "drop-then-await", err);
     std::printf("      guard dropped before await:  exit=%d\n", rc);
