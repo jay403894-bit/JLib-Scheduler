@@ -148,8 +148,16 @@ namespace JLib {
 		//         ...
 		//     }
 		//
-		// Both arms, gated on one branch, so the path is covered whichever context enters it. See
-		// design/NOTES.md for why this is the recommendation rather than "just use one".
+		// Both arms, gated on one branch, so the path is covered whichever context enters it.
+		//
+		// WHY HAZARDS FOR THE COROUTINE and not counted epochs, which would also be correct: it is
+		// NOT the per-guard cost -- a counted epoch guard is ~0.55 ns and beats a hazard Protect,
+		// which pays a seq_cst fence per pointer. It is what a PARK costs everyone else. The epoch
+		// advance gate refuses to advance the ring while a reader is parked in it, so ONE parked
+		// coroutine stalls reclamation globally; a parked hazard reader pins only the nodes it named.
+		// Bounded against unbounded. And the only reason a coroutine needs a special path at all is
+		// that it can suspend here -- so the case where this choice arises is exactly the case where
+		// the park dominates. See design/NOTES.md.
 		static TaskType CurrentTaskType() noexcept;
 		void CleanupTaskMetadata(Task* task);
 

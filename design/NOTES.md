@@ -43,14 +43,33 @@ and the counted-epoch machinery that makes coroutine EBR safe at all is **1.41x 
 path** (measured; sharding the counter took it from 61.7x to 1.41x, and that sharding is why it is
 usable). SRCU-shaped safety is not free.
 
-### The consequence that is easy to miss
+### The deciding term is the PARK, not the per-guard cost
 
-**If coroutines run through a section that uses `EpochGuard`, giving them the HAZARD path is
-expected to be faster than making them pay counted epochs.** That is the reasoning behind the
-recommendation. NOT YET MEASURED as a crossover: hazards cost per protected pointer, so a single
-protect probably still favours the counted epoch while a multi-hop traversal favours hazards. If
-this ever matters for a real structure, measure that structure -- do not assume the rule holds at
-both ends.
+Do not reason about this from guard throughput. On that axis epochs win, and win by more per hop:
+
+| | per guard / protect |
+|---|---|
+| slot epoch | 2.52 B/sec |
+| counted epoch (coroutine) | 1.82 B/sec — the 1.41x, and ~0.55 ns |
+| hazard `Protect` | a store + a **seq_cst fence** + a reload, PER POINTER — tens of ns |
+
+**And it does not matter, because a parked reader is what the choice is actually about.**
+
+Counted epochs let a coroutine hold protection across a suspend — 312 parked readers, 0 lost — but
+the advance gate then **refuses to advance the ring while anyone is parked in it**. One parked
+coroutine stalls reclamation FOR EVERYONE: nothing anywhere is freed until it leaves. A parked
+reader holding hazards pins only the nodes it named.
+
+That is not a 1.41x difference. It is bounded against unbounded.
+
+**And the argument closes itself:** the only reason a coroutine needs a special path at all is that
+it can suspend inside the section. If it provably cannot, it does not need the counted path either —
+slots would do. So the case where this choice arises is exactly the case where the park cost
+dominates, and hazards win there regardless of the per-guard arithmetic.
+
+An earlier version of this note hedged that "a single protect probably favours the counted epoch".
+That compared guard costs and ignored what a park does to everyone else's reclamation — which is the
+entire reason hazard pointers exist here.
 
 ### What this rules out
 
