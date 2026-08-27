@@ -424,6 +424,7 @@ bool Thread::DrainOwnInboxesToDeques() {
 			size_t count = 0;
 			while (count < BATCH && inbox->pop(batch[count])) count++;
 			if (count == 0) break;
+			TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
 			for (size_t i = 0; i < count; ++i) {
 				if (!batch[i]) continue;
 				// THE POP ALREADY HAPPENED, so a refusal here cannot be retried -- the inbox no
@@ -1473,6 +1474,7 @@ void Thread::Worker() {
 			while (count < BATCH_SIZE && scheduler->hiPriInboxes[qIndex]->pop(batch[count])) {
 				count++;
 			}
+			TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
 			if (count > 0) {
 				if (scheduler->hiPri[qIndex]->push_bottom_batch(batch, count)) {
 					auto opt = scheduler->hiPri[qIndex]->pop_bottom();
@@ -1520,6 +1522,7 @@ void Thread::Worker() {
 				while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count])) {
 					count++;
 				}
+				TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
 				if (count > 0) {
 					if (scheduler->loPri[qIndex]->push_bottom_batch(batch, count)) {
 						auto opt = scheduler->loPri[qIndex]->pop_bottom();

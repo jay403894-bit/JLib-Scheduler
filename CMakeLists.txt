@@ -817,3 +817,9 @@ target_compile_features(SchedulerDequeOverflowTest PRIVATE cxx_std_17)
 add_executable(SchedulerHazardOrphanTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_orphan_test.cpp")
 target_link_libraries(SchedulerHazardOrphanTest PRIVATE Scheduler)
 target_compile_features(SchedulerHazardOrphanTest PRIVATE cxx_std_17)
+
+# Ingress backpressure: a flooding external producer is slowed, a WORKER never is (that would
+# deadlock -- a task pushing chunks is a consumer of the inbox it would wait on).
+add_executable(SchedulerSubmitLimitTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/submit_limit_test.cpp")
+target_link_libraries(SchedulerSubmitLimitTest PRIVATE Scheduler)
+target_compile_features(SchedulerSubmitLimitTest PRIVATE cxx_std_17)

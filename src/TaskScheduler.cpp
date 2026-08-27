@@ -2770,6 +2770,11 @@ Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri,
 bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 	if (!task) return false;
 
+	// BEFORE THE PUSH, not after: the point is to slow this producer down before it adds to a
+	// backlog, and a no-op unless a submit limit is set. Non-worker callers only -- see the
+	// declaration for why a worker can never be held here.
+	ApplyIngressBackpressure();
+
 	size_t num_workers = workers.size();
 	if (cpuaffinity > 0 && (size_t)(cpuaffinity - 1) < num_workers) {
 		size_t idx = (size_t)(cpuaffinity - 1);
@@ -2778,6 +2783,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// (4.0.1) there is no way for a worker to be unavailable, so the refusal path and the
 		// retry loops that danced around it are unreachable and removed. See SetReservedCores.
 		loPriInboxes[idx]->push(task);
+		NoteInboxPush(1);
 		// Targeted at worker idx specifically, not NotifyAll() -- only that one worker's
 		// inbox actually changed. MarkQueuedWork() (release-ordered, matching
 		// Thread.h's hasQueuedWork comment) pairs with the worker's own acquire-load in its
@@ -2793,6 +2799,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		if (useHi) hiPriInboxes[chosen]->push(task);
 		else
 			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
+		NoteInboxPush(1);
 		workers[chosen]->MarkQueuedWork();
 		workers[chosen]->NotifyWorker();
 
@@ -2813,6 +2820,7 @@ bool TaskScheduler::Requeue(Task* task) {
 	if (useHi) hiPriInboxes[chosen]->push(task);
 	else
 		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
+	NoteInboxPush(1);
 	workers[chosen]->MarkQueuedWork();
 	workers[chosen]->NotifyWorker();
 	return true;
@@ -3917,4 +3925,62 @@ Task* TaskScheduler::TryTakeOverflow(bool hiPri) {
 	if (!(hiPri ? hiPriOverflow : loPriOverflow).try_dequeue(t) || !t) return nullptr;
 	n.fetch_sub(1, std::memory_order_acq_rel);
 	return t;
+}
+
+// ---- ingress backpressure -----------------------------------------------------------------------
+
+// ZERO MEANS UNLIMITED, and that is the default -- this changes nothing until an application asks
+// for it. Read on the submit path and on the drain, both gated on this being non-zero, so a process
+// that never calls SetSubmitLimit pays one relaxed load of a line that is read-shared and never
+// written.
+static std::atomic<size_t> g_submitLimit{ 0 };
+
+// QUEUED-BUT-NOT-YET-STARTED, across every inbox. Maintained ONLY while a limit is set, which is
+// why the limit must be set before Init: enabling it mid-run would start counting from a base that
+// already has tasks in flight, and the number would be wrong for the life of the process.
+static std::atomic<size_t> g_inboxDepth{ 0 };
+
+void TaskScheduler::SetSubmitLimit(size_t maxQueued) {
+	g_submitLimit.store(maxQueued, std::memory_order_relaxed);
+}
+size_t TaskScheduler::GetSubmitLimit() { return g_submitLimit.load(std::memory_order_relaxed); }
+size_t TaskScheduler::QueuedDepth()    { return g_inboxDepth.load(std::memory_order_relaxed); }
+
+void TaskScheduler::NoteInboxPush(size_t n) {
+	if (g_submitLimit.load(std::memory_order_relaxed) == 0) return;
+	g_inboxDepth.fetch_add(n, std::memory_order_relaxed);
+}
+void TaskScheduler::NoteInboxDrain(size_t n) {
+	if (g_submitLimit.load(std::memory_order_relaxed) == 0 || n == 0) return;
+	g_inboxDepth.fetch_sub(n, std::memory_order_relaxed);
+}
+
+// APPLIED TO NON-WORKER SUBMITTERS ONLY, and that restriction is the whole safety argument.
+//
+// A WORKER MUST NEVER BE MADE TO WAIT HERE. Bounding a queue means somebody has to stop pushing,
+// and if that somebody is a worker it may be the only thread that can drain the queue it is waiting
+// on -- a Native task inside ParallelFor pushes chunks to every worker INCLUDING itself, so a
+// blocking bound there deadlocks deterministically rather than occasionally. External threads
+// (main, an app thread, a loader) are never consumers of a worker inbox, so they can be held.
+//
+// AND THEY HELP RATHER THAN SLEEP. A flooding producer that is told to wait is a thread doing
+// nothing while the pool it saturated is behind; the same thread running one task is a thread
+// helping. TryRunStolenNativeTask is the same mechanism WaitFor already uses on non-workers, so
+// this adds no new execution path -- only a new reason to enter one.
+//
+// BOUNDED, NOT BLOCKING. One helped task per call, then the caller re-checks and pushes anyway if
+// it still cannot help. A submit that never returns is worse than a deep queue: the point is to
+// slow a producer down to the rate the pool drains at, not to give the runtime a veto on submission.
+void TaskScheduler::ApplyIngressBackpressure() {
+	const size_t limit = g_submitLimit.load(std::memory_order_relaxed);
+	if (limit == 0) return;
+	if (Thread::GetCurrent() != nullptr) return;   // a worker: never held, see above
+	if (g_inboxDepth.load(std::memory_order_relaxed) <= limit) return;
+
+	// Help once. If there was nothing to help with, the backlog is somebody else's to drain and
+	// spinning here would burn a core to no purpose -- yield instead and let the caller proceed.
+	// Instance() rather than a static call: the helper is a member because it steals from THIS
+	// pool's deques. Safe here -- a submit limit can only be set before Init, so by the time any
+	// submission reaches this line the scheduler exists.
+	if (!Instance().TryRunStolenNativeTask()) std::this_thread::yield();
 }

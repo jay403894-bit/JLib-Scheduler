@@ -766,6 +766,39 @@ namespace JLib {
 		static void            SetWorkerPowerThrottling(PowerThrottling p);
 		static PowerThrottling GetWorkerPowerThrottling();
 
+		// INGRESS BACKPRESSURE -- bound how far a producer may run ahead of the pool.
+		//
+		// The deques are capped and overflow to a side lane; the slab grows and says so. The inbox
+		// was the one unbounded path, so a producer thread flooding the runtime grew memory without
+		// limit and nothing said a word. This is the bound.
+		//
+		// ZERO IS UNLIMITED AND IS THE DEFAULT. Nothing changes until an application asks. When it
+		// is off, both the submit check and the drain accounting are one relaxed load of a
+		// read-shared line -- the same gate the overflow lanes use.
+		//
+		// MUST BE SET BEFORE Init. The depth counter is only maintained while a limit is set, so
+		// turning it on mid-run starts counting from a base that already has tasks in flight, and
+		// the number stays wrong for the life of the process.
+		//
+		// NON-WORKER SUBMITTERS ONLY, and that restriction is the entire safety argument. Bounding a
+		// queue means somebody stops pushing, and if that somebody is a WORKER it may be the only
+		// thread able to drain the queue it is waiting on -- a Native task inside ParallelFor pushes
+		// chunks to every worker including itself, so a bound there deadlocks deterministically
+		// rather than occasionally. External threads are never consumers of a worker inbox.
+		//
+		// A HELD PRODUCER HELPS, IT DOES NOT SLEEP. Over the limit, the submitting thread runs one
+		// task itself before continuing -- the same mechanism WaitFor already uses on non-workers.
+		// And it is BOUNDED, not blocking: one task, then the push proceeds regardless. Slowing a
+		// producer to the rate the pool drains at is the goal; giving the runtime a veto on
+		// submission is not, because a submit that never returns is worse than a deep queue.
+		static void   SetSubmitLimit(size_t maxQueued);
+		static size_t GetSubmitLimit();
+
+		// Tasks sitting in inboxes, queued but not yet started. ZERO unless a submit limit is set --
+		// the counter is not maintained otherwise, and reporting a stale zero would be worse than
+		// reporting nothing.
+		static size_t QueuedDepth();
+
 		// Hard-pin ONLY the hot workers to their cores, leaving the rest on the global policy.
 		// MUST be set before Init -- placement happens as each worker starts. OFF BY DEFAULT.
 		//
@@ -1673,6 +1706,11 @@ namespace JLib {
 		// Push to the overflow lane matching the task's priority. Only ever called after a deque
 		// refused, so it must not fail: this is the path that exists so a refusal is never a loss.
 		void PushOverflow(Task* t, bool hiPri);
+
+		// Ingress backpressure bookkeeping. All three are no-ops unless a submit limit is set.
+		static void NoteInboxPush(size_t n);
+		static void NoteInboxDrain(size_t n);
+		static void ApplyIngressBackpressure();
 
 		// Take one task from an overflow lane, or nullptr. Cheap when empty -- see the counters.
 		Task* TryTakeOverflow(bool hiPri);
