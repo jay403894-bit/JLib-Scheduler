@@ -197,7 +197,7 @@ namespace JLib {
         // individually stable and edges hold POINTERS to each other, so a walk in progress never
         // touches the chunk table and growth can never invalidate it. That costs nothing today.
         //
-        // Lifetime: chunks are freed by ~TaskDAG, which "must outlive the work it submitted" -- the
+        // Lifetime: chunks are EBR-RETIRED by ~TaskDAG (they used to be freed outright; see there) -- the
         // same requirement the node pointers already impose. So edges need no reclamation of their
         // own, unlike the nodes they point AT.
         static constexpr size_t kEdgeChunk = TaskAllocator::SLOT / sizeof(DagEdge);
