@@ -422,13 +422,40 @@ namespace JLib {
             // all.
             std::suspend_always initial_suspend() noexcept { return {}; }
 
-            // suspend_never: the frame destroys itself once the body is done. Completion therefore
-            // has to happen in return_void(), which runs BEFORE final_suspend -- by the time the
-            // final awaiter is reached the promise is on borrowed time, and after it the frame (and
-            // this object) is gone.
-            std::suspend_never final_suspend() noexcept { return {}; }
+            // COMPLETION HAPPENS HERE, NOT IN return_void(), and the distinction is load-bearing.
+            //
+            // C++ runs return_void() and THEN destroys the body's automatic objects, and only then
+            // reaches final_suspend(). Completing in return_void() therefore announced "this
+            // coroutine is done" while its own locals were still alive and still running
+            // destructors. Three things were wrong with that, and they were found in that order:
+            //
+            //   WaitFor(wg) WAS NOT A HAPPENS-BEFORE for anything the frame owned. A waiter woke
+            //   while ~HazardGuard, ~SchedulerLock and every other RAII local had yet to run.
+            //   Measured at up to a millisecond on the cancellation path, not a few instructions.
+            //
+            //   HAZARD RECORDS WERE HELD PAST COMPLETION, so kMaxRecords saw pressure from frames
+            //   that were logically finished -- and record exhaustion is a fatal abort, by design.
+            //
+            //   currentRunningTask WENT STALE WHILE USER CODE COULD STILL RUN. Complete() returns
+            //   the Task to the slab, but the worker loop does not clear its pointer until the
+            //   resume returns -- so through the whole unwind window w->currentRunningTask named a
+            //   slab slot that another thread may already have reallocated and re-tagged. Anything
+            //   a destructor called that reads the task type (HazardGuard's constructor does) could
+            //   read Native for a coroutine and silently take worker cells. That is the exact
+            //   memory-safety downgrade Hazard.cpp refuses structurally, arrived at through a lying
+            //   detector rather than through the fallthrough.
+            //
+            // SAFE HERE, which the old comment doubted: final_suspend() is a member call on a LIVE
+            // frame. suspend_never means the frame is destroyed after this returns, not before it
+            // is entered, so the promise is fully valid for the duration of the call. What was true
+            // is that nothing may touch the promise AFTER final_suspend returns -- and nothing does.
+            //
+            // A frame destroyed without completing (destroy() on a suspended one, or an exception,
+            // which terminates) skips this exactly as it previously skipped return_void(). No
+            // change: both are the same set of paths.
+            std::suspend_never final_suspend() noexcept { Complete(); return {}; }
 
-            void return_void() noexcept { Complete(); }
+            void return_void() noexcept {}
 
             // Matches what an exception escaping a Native task does: Task::Execute is noexcept, so
             // this propagates out of resume() and terminates. Deliberately not swallowed -- a
