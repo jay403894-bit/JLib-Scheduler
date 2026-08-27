@@ -1970,6 +1970,27 @@ namespace JLib {
 		SchedulerMutex() = default;
 		~SchedulerMutex() = default;
 
+		// EAGER CANCELLATION, matching Event / SchedulerSemaphore / SchedulerConditionVariable.
+		//
+		// This lock used to be the ONE primitive without it: cancellation was skip-at-release only,
+		// so a cancelled waiter stayed parked until the holder happened to release. That is the odd
+		// one out in two ways, and both have now cost something.
+		//
+		//   CONSISTENCY. Every other blocking primitive can eject a waiter on demand. A caller that
+		//   cancels a scope and expects its waits to end has no way to know one of them is a mutex.
+		//
+		//   TEARDOWN. A frame parked on a mutex whose holder is itself abandoned cannot be woken by
+		//   ANYTHING. Its stack never unwinds, so nothing it holds is released -- RAII, its
+		//   WaitGroup slot, a hazard record. That is the structural reason parked work leaks at
+		//   shutdown, and the mutex was the only primitive with no way out of it.
+		//
+		// Ejected waiters are resumed with WaitResult::Cancelled and DO NOT hold the lock -- the
+		// same rule as everywhere else here: a cancelled acquire took no permit, a cancelled wait
+		// holds no lock.
+		//
+		// An invalid token means "everything", which is what a teardown drain wants.
+		void CancelWaiters(CancelToken tok = CancelToken{});
+
 		// Acquires the lock. (No priority boost happens on contention despite what this line used to
 		// say -- see the class comment above for when that stopped being true and why it is fine.)
 		//

@@ -2968,6 +2968,56 @@ void SchedulerMutex::Lock() {
 	}
 }
 
+// EAGER CANCELLATION FOR THE MUTEX. Modelled directly on SchedulerConditionVariable::CancelWaiters,
+// including the shape that matters: filter the queue UNDER the lock, collect victims, and resume
+// them OUTSIDE it. Resuming under the spinlock would let a woken waiter re-enter this mutex on
+// another worker while this thread still holds the flag.
+//
+// A NULL RESULT SLOT IS NOT CANCELLABLE, and that is deliberate rather than an oversight -- plain
+// Lock() passes null, and a waiter with nowhere to report Cancelled cannot be told it did not get
+// the lock. Those are left queued, exactly as skip-at-release leaves them.
+void SchedulerMutex::CancelWaiters(CancelToken tok) {
+	constexpr size_t kBuf = 64;
+	for (;;) {
+		Waiter victims[kBuf];
+		size_t n = 0;
+
+		while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
+		{
+			std::queue<Waiter> keep;
+			while (!waiters.empty()) {
+				const Waiter w = waiters.front();
+				waiters.pop();
+
+				// An INVALID token means "all of them" -- what a teardown drain asks for. Otherwise
+				// IsWithin, not ==, so cancelling a parent scope reaches waits registered under a
+				// child. Matching with == is the 3.4.1 bug the reactor already had.
+				const bool matches = w.result &&
+				                     (!tok.Valid() || CancelToken(w.token).IsWithin(tok));
+				if (matches && n < kBuf) victims[n++] = w;
+				else                     keep.push(w);
+			}
+			waiters.swap(keep);
+		}
+		spinLock.clear(std::memory_order_release);
+
+		if (n == 0) return;
+
+		// Out of the lock. Each of these may already be running by the time the call returns, so
+		// nothing here may touch the waiter again afterwards.
+		for (size_t i = 0; i < n; ++i) {
+			*victims[i].result = WaitResult::Cancelled;   // resumed WITHOUT the lock
+			if (victims[i].fiber) {
+				Thread::Resume(victims[i].fiber);
+			} else if (victims[i].coro && TaskScheduler::IsInitialized()) {
+				TaskScheduler::Instance().Push(victims[i].coro);
+			}
+		}
+
+		if (n < kBuf) return;   // drained in one pass; otherwise go round for the rest
+	}
+}
+
 void SchedulerMutex::Unlock()
 {
 	// Guarded rather than unconditional: a fiber never incremented (it can migrate mid-hold, so a

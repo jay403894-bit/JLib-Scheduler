@@ -793,3 +793,9 @@ if(JLIBSCHED_COROUTINES)
     target_link_libraries(SchedulerCoroHazardTest PRIVATE Scheduler)
     target_compile_features(SchedulerCoroHazardTest PRIVATE cxx_std_20)
 endif()
+
+# Eager mutex cancellation. Every case holds the lock for its whole duration and never unlocks before
+# asserting, so a waiter that comes back came back because it was EJECTED.
+add_executable(SchedulerMutexCancelTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/mutex_cancel_test.cpp")
+target_link_libraries(SchedulerMutexCancelTest PRIVATE Scheduler)
+target_compile_features(SchedulerMutexCancelTest PRIVATE cxx_std_17)
