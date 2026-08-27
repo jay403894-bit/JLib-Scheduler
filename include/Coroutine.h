@@ -48,6 +48,7 @@
 #endif
 
 #include "TaskScheduler.h"
+#include "Hazard.h"      // the suspension check in ArmResume
 #include "Future.h"      // Future<T>/Promise<T>: the C++17 half; the awaiter for it is at the bottom
 
 #include <coroutine>
@@ -349,6 +350,23 @@ namespace JLib {
             // a co_await is not a fiber suspend. Debug-only; see CoroEpochGuardSuspendCheck for why
             // the coroutine case is a use-after-free rather than the fiber case.s leak.
             JLIB_EPOCH_CHECK_NO_GUARD_CORO();
+
+            // AND THE HAZARD HALF, which is ALWAYS ON rather than debug-only. A coroutine may hold a
+            // HazardGuard -- worker cells are right for a frame that stays put -- but it may not
+            // carry one across this line, because resuming on another worker leaves the
+            // announcement behind and the protection silently stops.
+            //
+            // THIS IS THE EXACT TRANSITION, which is why there are no false positives: a coroutine
+            // whose await_ready() returns true never reaches this function at all, so a
+            // non-suspending guarded span costs nothing and raises nothing. A parked FIBER holding a
+            // guard is legal and is excluded at the guard, not here -- fiber rows never count.
+            //
+            // Compiled in for Release deliberately: one thread-local load, at a point already paying
+            // a re-push and a wake. Leaving it out would make a violation a use-after-free in the
+            // build nobody is watching. See HazardDomain::FatalSuspendWithGuard.
+            if (const std::size_t d = HazardDomain::SuspendUnsafeDepth())
+                HazardDomain::FatalSuspendWithGuard(d);
+
             Task* t = h.promise().task;
             t->data = h.address();
             return t;

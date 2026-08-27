@@ -191,9 +191,6 @@ namespace JLib {
         // reported here rather than absorbed. Never returns.
         [[noreturn]] static void FatalCellOverflow(std::size_t k, const char* what);
 
-        // A coroutine asked for a HazardGuard. See the definition -- there is no safe downgrade, so
-        // there is no downgrade.
-        [[noreturn]] static void FatalCoroutineGuard();
 
         // Reserved reader ids for threads that are neither a fiber nor a worker -- the main thread,
         // an app's own threads. Claimed lazily and never released, so a program churning thousands
@@ -261,6 +258,22 @@ namespace JLib {
     private:
         void EnsureTable();
 
+    public:
+        // TRUE if this reader id is a FIBER row rather than a worker or external one. The suspend
+        // check needs it: a parked fiber legitimately holds a guard across its park -- that is the
+        // entire point of reader-indexed cells -- so fiber guards must NOT count toward the
+        // per-thread depth, or the next coroutine to suspend on that worker trips a false alarm.
+        bool IsFiberReader(std::size_t reader) const { return reader < fiberCount; }
+
+        // A COROUTINE SUSPENDED WHILE HOLDING A WORKER-CELL GUARD. See the definition.
+        [[noreturn]] static void FatalSuspendWithGuard(std::size_t depth);
+
+        // Worker-cell guards live on THIS thread right now. Read by ArmResume at every coroutine
+        // suspension point; incremented and decremented by HazardGuard.
+        static std::size_t& SuspendUnsafeDepth() noexcept;
+
+    private:
+
         std::atomic<std::atomic<void*>*> cells{ nullptr };
         std::atomic<std::uint64_t>*      externalOwners = nullptr;   // thread id claims
         std::size_t fiberCount  = 0;
@@ -298,7 +311,6 @@ namespace JLib {
             // symptom, completely different fix, so they must not share a message. Set() makes the
             // same check for the same reason -- this is the second of the two entry points, not a
             // duplicate of the first.
-            if (coroRefused) HazardDomain::FatalCoroutineGuard();
             if (!cells || k >= HazardDomain::kCellsPerReader)
                 HazardDomain::FatalCellOverflow(k, cells ? "cell index out of range"
                                                          : "no reader slot (external slots exhausted?)");
@@ -324,7 +336,9 @@ namespace JLib {
 
         // Set when this guard was refused because its task is a COROUTINE, which is a different
         // reason for null cells than "external reader slots exhausted" and gets a different message.
-        bool coroRefused = false;
+        // Set when this guard resolved to WORKER cells (native task, coroutine, or external thread)
+        // rather than a fiber row, which is the case that must not span a suspension. See the ctor.
+        bool countsForSuspend = false;
         // Set when this guard is using a coroutine RECORD rather than a table slot. RELEASED BY
         // ~HazardGuard: the guard is a local in the frame, so the language runs that on every path
         // the frame can end, including destroy() on a suspended one.

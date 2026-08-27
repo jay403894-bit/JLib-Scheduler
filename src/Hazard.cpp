@@ -155,30 +155,14 @@ namespace JLib {
                 assert(fb->poolIndex < fiberCount && "fiber poolIndex outside the hazard table");
                 return fb->poolIndex;
             }
-            // UNREACHABLE BACKSTOP, and that is a promotion, not dead code.
+            // A COROUTINE LANDS HERE ON PURPOSE, and gets the worker's cells. That is correct
+            // exactly as long as the frame does not suspend while holding the guard -- and it is
+            // ArmResume, at the suspension point, that enforces it. See FatalSuspendWithGuard.
             //
-            // A coroutine cannot arrive here at all: HazardGuard's constructor gates on the task
-            // type BEFORE calling this, takes a record on success, and RETURNS on exhaustion rather
-            // than falling through. This function has exactly one caller, and that caller has
-            // already excluded coroutines.
-            //
-            // It used to be the real gate, which was the defect: the refusal lived in a different
-            // function from the decision, and its own fiber branch above ran FIRST -- so a coroutine
-            // with a non-null currentFiber would have taken FIBER cells and never been seen here.
-            //
-            // So this now means something stronger than it did. Firing is no longer "the registry
-            // filled up", which is an expected operating condition; it is "the constructor's gate
-            // was bypassed", which is a broken invariant. Keep it, and keep it fatal-shaped: worker
-            // cells are correct until the frame's first co_await and a use-after-free after it, so
-            // a silent downgrade here passes every test that does not suspend inside a protected
-            // section -- precisely the case the record path exists for.
-            assert((w->currentRunningTask == nullptr ||
-                    w->currentRunningTask->type != TaskType::Coroutine) &&
-                   "hazard: a Coroutine reached CurrentReader(), which HazardGuard's ctor should "
-                   "have made impossible. Worker cells are NOT a fallback -- they stop protecting "
-                   "at the first co_await. See design/hazard-pointers.md");
-            if (w->currentRunningTask && w->currentRunningTask->type == TaskType::Coroutine)
-                return kNoReader;
+            // The refusal that used to sit here was broader than the hazard: a coroutine that never
+            // suspends inside the guarded span is indistinguishable from a synchronous call, and
+            // forbidding it also forbade the standard pattern (hazptr the lookup, take a refcount,
+            // drop the guard, then co_await).
 
             // NATIVE TASK: worker-owned cells are correct here and only here. A native task runs to
             // completion on the stack it started on, so it cannot migrate inside a protected span.
@@ -223,24 +207,48 @@ namespace JLib {
         std::abort();
     }
 
-    // A COROUTINE ASKED FOR A HAZARD GUARD. Says what happened, names the alternative, then stops --
-    // the same shape as FatalCellOverflow and for the same reason: continuing means guessing on the
-    // caller's behalf about memory it does not own.
+    // PER-THREAD, NOT PER-READER, and that is correct because it is only ever read by the thread
+    // that would suspend: ArmResume runs on the same worker that constructed the guard, since no
+    // suspension has happened yet. Fiber rows are excluded at construction, so a parked fiber's
+    // guard never appears here.
+    std::size_t& HazardDomain::SuspendUnsafeDepth() noexcept {
+        static thread_local std::size_t d = 0;
+        return d;
+    }
+
+    // A COROUTINE TRIED TO SUSPEND WHILE HOLDING A WORKER-CELL GUARD. Caught at the transition,
+    // before the frame can be re-pushed and picked up by a different worker -- which is the moment
+    // the cells stop meaning what the guard thinks they mean.
     //
-    // FATAL RATHER THAN A SILENT DOWNGRADE, which is the whole argument. Worker or fiber cells are
-    // correct until this frame's first co_await and a use-after-free after it, so a downgrade passes
-    // every test that does not suspend inside a protected section -- exactly the case it would exist
-    // for. There is no safe fallback, so there is no fallback.
-    void HazardDomain::FatalCoroutineGuard() {
+    // ALWAYS ON, NOT DEBUG-ONLY, and the cost is the reason. This is one thread-local load at a
+    // point that already pays a re-push and a wake, so leaving it out of Release buys nothing and
+    // would make a violation a use-after-free in exactly the build nobody is watching. Epochs had to
+    // buy their way out of that with a whole counted scheme; here it is free, so it stays.
+    void HazardDomain::FatalSuspendWithGuard(std::size_t depth) {
         std::fprintf(stderr,
-            "[JLib::Scheduler] FATAL: a coroutine took a HazardGuard.\n"
-            "  Hazard pointers here index cells by the reader, and a coroutine has no dense stable\n"
-            "  index -- frames are not a bounded pool. The record registry that used to cover this\n"
-            "  was removed: its grace period could not be stated precisely and nothing tested\n"
-            "  record reuse. See experimental/hazard/README.md.\n"
-            "  USE COUNTED EPOCHS INSTEAD (Epochs.h). They already cover a reader that suspends --\n"
-            "  that is what the counted scheme was built for -- and they are verified.\n");
-        std::fflush(stderr);
+            "[JLib::Scheduler] FATAL: a coroutine suspended while holding %zu hazard guard(s).\n"
+            "  The guard resolved to the WORKER's cells, which are correct only while the frame\n"
+            "  stays on that worker. Resuming elsewhere leaves the announcement behind and the\n"
+            "  protection silently stops -- a use-after-free with a confident comment above it.\n"
+            "  THE FIX IS THE STANDARD PATTERN. Hazard pointers protect the LOOKUP; a refcount\n"
+            "  protects the await. Hand off inside the guarded span, then drop the guard:\n"
+            "\n"
+            "      Node* safe = nullptr;\n"
+            "      {\n"
+            "          JLib::HazardGuard g;                       // synchronous, no suspend inside\n"
+            "          Node* raw = g.Protect(0, head);\n"
+            "          if (raw && raw->TryAcquireRef()) safe = raw;\n"
+            "      }                                              // guard released HERE\n"
+            "      if (safe) {\n"
+            "          co_await safe->AsyncWork();                // free to migrate now\n"
+            "          safe->ReleaseRef();\n"
+            "      }\n"
+            "\n"
+            "  A guard must not span a suspension point. Nothing else about coroutines is\n"
+            "  restricted -- one that never suspends inside the guarded span is fine, and this\n"
+            "  check never fires for it, because await_ready() == true never reaches ArmResume.\n"
+            "  A FIBER may hold a guard across a park: its cells are indexed by the fiber, not by\n"
+            "  the worker, so this rule is about coroutines only.\n", depth);
         std::abort();
     }
 
@@ -353,32 +361,29 @@ namespace JLib {
     HazardGuard::HazardGuard() {
         HazardDomain& d = HazardDomain::Instance();
 
-        // A COROUTINE MAY NOT TAKE A HAZARD GUARD. Refused structurally, before anything is
-        // resolved -- not downgraded, not deferred to CurrentReader(), not made to work.
+        // A COROUTINE MAY TAKE A GUARD, AND MAY NOT SUSPEND WHILE HOLDING ONE. Those are different
+        // rules, and separating them is what lets the standard production pattern work here:
         //
-        // WHY: cells are indexed by reader, and a coroutine frame has no dense stable index --
-        // frames are not a bounded pool the way fibers, workers and the reserved external block are.
+        //     hazptr the lookup -> take a refcount -> DROP the guard -> co_await freely
         //
-        // AND NO FALLBACK, WHICH IS THE FEATURE. Worker or fiber cells are correct until the frame's
-        // first co_await and a use-after-free after it, so a downgrade would pass every test that
-        // does not suspend inside a protected section -- exactly the case it would exist for.
+        // The blanket refusal this replaced forbade that too. A coroutine that never suspends inside
+        // the guarded span is indistinguishable from a synchronous call: it stays on the worker that
+        // resolved its cells, and worker cells are exactly right for it.
         //
-        // USE COUNTED EPOCHS for a reader that suspends. That is what the counted scheme was built
-        // for, it is verified, and epochs are this engine's reclamation; hazard pointers are extra.
-        //
-        // The registry that used to cover coroutines, and why it was removed rather than repaired:
-        // experimental/hazard/README.md.
-        if (Thread::GetCurrent() && TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
-            // REFUSED AT Protect, NOT HERE. cells stays null and reader stays kNoReader, so
-            // CONSTRUCTING a guard in a coroutine is inert while PROTECTING through one is fatal --
-            // and protecting is the illegal operation. Failing at construction would point the
-            // message at a line that did nothing wrong.
-            coroRefused = true;
-            return;
-        }
-
+        // ENFORCED AT THE SUSPENSION, NOT AT CONSTRUCTION, because that is where the fatal condition
+        // actually materialises. detail::ArmResume is the single choke point -- every awaiter in
+        // Coroutine.h and IoAsync.h routes through it, since that call is how a suspended frame gets
+        // the Task the scheduler resumes it by -- so a coroutine cannot suspend through this runtime
+        // without passing the check. await_ready() == true never reaches it, which is why a
+        // non-suspending coroutine costs nothing and raises no false alarm.
         reader = d.CurrentReader();
         cells  = d.Cells(reader);
+
+        // COUNT ONLY WORKER-CELL GUARDS. A parked FIBER holding a guard is legal and is the whole
+        // point of indexing cells by the thing that migrates, so a fiber row must not contribute --
+        // otherwise the next coroutine to suspend on that worker trips an alarm it did not cause.
+        countsForSuspend = (reader != HazardDomain::kNoReader) && !d.IsFiberReader(reader);
+        if (countsForSuspend) ++HazardDomain::SuspendUnsafeDepth();
     }
 
     HazardGuard::~HazardGuard() {
@@ -386,6 +391,14 @@ namespace JLib {
         // reader, not to the worker that happens to be executing it, so a resume on a different
         // worker still releases the right ones -- which is exactly what a worker-owned design
         // cannot do.
+        // DECREMENT FIRST, and unconditionally -- before the early return below, or a guard with no
+        // cells (external slots exhausted) would leak depth and every later suspension on this
+        // thread would false-alarm.
+        if (countsForSuspend) {
+            countsForSuspend = false;
+            --HazardDomain::SuspendUnsafeDepth();
+        }
+
         if (!cells) return;
         for (std::size_t k = 0; k < HazardDomain::kCellsPerReader; ++k)
             cells[k].store(nullptr, std::memory_order_release);
@@ -396,7 +409,6 @@ namespace JLib {
         // WHY cells IS NULL DECIDES WHICH MESSAGE. A coroutine was refused a reader on purpose; an
         // external thread ran out of reserved slots. Same symptom, different fix, so they must not
         // share a diagnostic.
-        if (coroRefused) HazardDomain::FatalCoroutineGuard();
         assert(k < HazardDomain::kCellsPerReader && "hazard cell index out of range");
         if (!cells || k >= HazardDomain::kCellsPerReader) return;
         cells[k].store(p, std::memory_order_release);
