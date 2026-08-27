@@ -19,6 +19,18 @@ DAGs, the verified concurrency -- builds and runs there. Coroutines live in one 
 The boundary is enforced by the build rather than by discipline: the library target is compiled as
 C++17, so anything that leaked out of that header would fail to compile.
 
+**Practically: include the headers and build your project as C++20 for the full runtime (coroutines
+plus the I/O reactor).** The job system itself -- threads, fibers, DAGs, adaptive K-hot -- does not
+require C++20, and a C++17 translation unit can use that core in full. Coroutine *tasks* are
+rejected unless the TU is C++20. That last check is a runtime `assert` rather than a compile error
+because `TaskType::Coroutine` is an enumerator in `Task.h`, which is C++17: a C++17 TU can always
+NAME it, so the compiler has nothing to object to. It cannot legally MAKE one, because `Spawn()`
+lives in `Coroutine.h` and that header `#error`s below C++20 -- but passing the enumerator straight
+to `CreateTask()` used to slip through both, and produced no crash to trace back. The type is read
+as an ownership signal ("the frame frees itself, do not free the Task"), so a counterfeit coroutine
+ran, leaked, and left its WaitGroup unsignalled. The assert now catches it at the call site.
+
+
 Built for real-time engines that mix compute-heavy loops, dependency-aware pipelines, and I/O-bound
 middleware in the same frame.
 

@@ -2690,7 +2690,7 @@ void JLib::detail::ReportTaskSizesTo(std::FILE* out) {
 }
 #endif
 
-Task* TaskScheduler::CreateTask(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, TaskType type, CorePref corePref) {
+Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, TaskType type, CorePref corePref) {
 	void* mem = taskAllocator.AllocSized(sizeof(Task));   // a bare Task is exactly 64 B
 	if (!mem) return nullptr;
 	detail::RecordTaskSize(sizeof(Task));   // exactly 64 -- a quarter of the slot it just took

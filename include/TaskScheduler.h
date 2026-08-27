@@ -1394,7 +1394,27 @@ namespace JLib {
 			return StealClassCompatible(t->corePref, thiefIsP, degenerateTopology);
 		}
 
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default);
+		// The C++20 gate lives HERE, in the header, and that placement is the whole point.
+		// TaskType::Coroutine is declared in Task.h, which is C++17 -- so a C++17 translation unit
+		// can NAME the enumerator even though it can never legally produce a coroutine task
+		// (Coroutine.h, the only thing that creates one, #errors below C++20). Nothing caught the
+		// mismatch: the worker reads type == Coroutine purely as an OWNERSHIP signal, meaning "the
+		// frame frees itself, do not free the Task". A counterfeit one therefore RUNS, is never
+		// freed, and never signals its WaitGroup -- a leak plus a hang, with no crash to trace back.
+		//
+		// The check CANNOT sit in the impl's definition: that lives in the C++17 core .cpp, so
+		// __cpp_impl_coroutine there reads the LIBRARY's language version and would reject every
+		// legitimate coroutine (Spawn calls this exact overload). Inlined into the header, the same
+		// macro reads the CALLER's TU, which is the thing actually being asked about.
+		Task* CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, TaskType type, CorePref corePref);
+
+		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
+#if !defined(__cpp_impl_coroutine) || __cpp_impl_coroutine < 201902L
+			assert(type != TaskType::Coroutine && "coroutines require a C++20 build");
+#endif
+			return CreateTaskImpl(fn, data, hipri, size, type, corePref);
+		}
+
 
 		template<typename F>
 		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
@@ -1410,7 +1430,14 @@ namespace JLib {
 			// wall. Disposal needs no size flag because TaskAllocator::Free routes by ADDRESS.
 			// Concrete size is a compile-time constant here, which is also why size-classing the
 			// task path would be nearly free: the class could be picked at compile time.
+			// UNCONDITIONAL, unlike the raw overload above -- a lambda is never a coroutine in ANY
+			// language mode. The coroutine path requires fn == ResumeCoroutine and data == a frame
+			// address; a LambdaTask satisfies neither, so tagging one Coroutine just tells the
+			// worker not to free it. Wrong in C++20 for the same reason it is wrong in C++17, so
+			// there is nothing to gate on. Coroutine tasks come from Spawn() in Coroutine.h.
+			assert(type != TaskType::Coroutine && "coroutines require a C++20 build; use Spawn(), not CreateTask()");
 			detail::RecordTaskSize(sizeof(L));
+
 			static_assert(alignof(L) <= 16, "lambda over-aligned for the slot");
 
 			// sizeof(L) is a compile-time constant, so the class is chosen at compile time and is correct
