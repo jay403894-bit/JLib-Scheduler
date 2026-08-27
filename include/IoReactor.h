@@ -447,6 +447,17 @@ namespace JLib {
         // Submitted, not yet completed. Diagnostics and tests; racy by nature.
         std::size_t InFlight() const noexcept;
 
+        // Which logical processors the completion threads woke on, indexed by processor number.
+        // ALL ZERO unless the library was built with JLIBSCHED_IO_LOCK_STATS -- same rule as the
+        // timing stamps in IoResult, and for the same reason.
+        //
+        // Sampled per wake, not once at thread start: the Ideal processor is a hint, and a thread
+        // that parks and wakes this often gets migrated. A start-of-thread reading would name a core
+        // the thread may not have run on since.
+        //
+        // `counts` receives min(max, 64) entries. Returns how many were written.
+        static std::size_t CompletionCoreHistogram(unsigned* counts, std::size_t max) noexcept;
+
         // Idempotent. In-flight operations are cancelled and DRAINED before the thread goes --
         // leaving the kernel holding a buffer whose owner has gone is the corruption this file
         // exists to prevent.

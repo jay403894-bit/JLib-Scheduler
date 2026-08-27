@@ -26,6 +26,15 @@
 
 namespace JLib {
 
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+    namespace detail {
+        // Per-logical-processor wake counts for the completion threads. Diagnostic: it exists to
+        // answer whether the reactor and the hot worker share an efficiency class and a cache
+        // domain, which no latency number can answer on its own.
+        std::atomic<unsigned> g_complCore[64];
+    }
+#endif
+
     // The opaque block in IoRequest really does hold one of these. Checked rather than trusted,
     // because the header cannot see the type and a silent overflow would corrupt whatever follows.
     static_assert(sizeof(OVERLAPPED) <= IoRequest::kNativeBytes,
@@ -392,6 +401,19 @@ namespace JLib {
                 const BOOL ok = (nHi == 0 && nLo == 0)
                     ? GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)
                     : GetQueuedCompletionStatus(port, &bytes, &key, &ov, 0);
+
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+                // WHICH CORE THE COMPLETION THREAD IS ACTUALLY ON, sampled per wake rather than once
+                // at thread start. Startup placement is not the answer to the question: the Ideal
+                // processor is a HINT, and Windows migrates a thread that parks and wakes as often
+                // as this one does. A single start-of-thread reading would report a core this
+                // thread may not have touched since.
+                //
+                // Diagnostic only, and behind the stats define for the usual reason -- this is on
+                // the completion path, and the thing being measured is microsecond-scale.
+                if (const DWORD cpu = ::GetCurrentProcessorNumber(); cpu < 64)
+                    detail::g_complCore[cpu].fetch_add(1, std::memory_order_relaxed);
+#endif
 
                 if ((nHi || nLo) && ov == nullptr && !ok) {
                     Flush(batchHi, nHi, batchLo, nLo);
@@ -844,6 +866,18 @@ namespace JLib {
             }
         }
         return asked;
+    }
+
+    std::size_t IoReactor::CompletionCoreHistogram(unsigned* counts, std::size_t max) noexcept {
+        if (!counts || max == 0) return 0;
+        const std::size_t n = max < 64 ? max : 64;
+#if defined(JLIBSCHED_IO_LOCK_STATS)
+        for (std::size_t i = 0; i < n; ++i)
+            counts[i] = detail::g_complCore[i].load(std::memory_order_relaxed);
+#else
+        for (std::size_t i = 0; i < n; ++i) counts[i] = 0;
+#endif
+        return n;
     }
 
     std::size_t IoReactor::InFlight() const noexcept {

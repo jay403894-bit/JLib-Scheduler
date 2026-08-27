@@ -51,6 +51,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +98,11 @@ std::atomic<int>           g_y{ 0 };
 std::atomic<bool>          g_stop{ false };
 std::atomic<std::uint32_t> g_recvCount{ 0 };
 
+// Where the RESUMED COMPLETION actually ran, indexed by logical processor. Sampled inside the
+// coroutine, which by definition executes on the hot worker that picked it up -- so this half of the
+// placement question needs no scheduler instrumentation at all.
+std::atomic<unsigned>      g_hotCore[64];
+
 std::vector<std::int64_t>  g_paintGaps;         // interval between consecutive paints, for jitter
 std::int64_t               g_lastPaint = 0;
 
@@ -136,8 +142,20 @@ Stats Summarise(std::vector<double>& v) {
     return s;
 }
 
+// EVERYTHING GOES TO A FILE AS WELL AS THE CONSOLE, because the console is not reliably there. Run
+// this from Explorer and the console it opens dies with the process, taking the entire report with
+// it -- the report is printed at the END, so it is exactly the part that is lost. Same failure as
+// ReportSlabUsage in an app with no console.
+FILE* g_log = nullptr;
+
+void Out(const char* fmt, ...) {
+    va_list a;
+    va_start(a, fmt); std::vfprintf(stdout, fmt, a); va_end(a);
+    if (g_log) { va_start(a, fmt); std::vfprintf(g_log, fmt, a); va_end(a); }
+}
+
 void PrintRow(const char* label, const Stats& s, const char* unit) {
-    std::printf("  %-22s %8.3f %8.3f %8.3f %8.3f %8.3f %9.3f  %s\n",
+    Out("  %-22s %8.3f %8.3f %8.3f %8.3f %8.3f %9.3f  %s\n",
                 label, s.mean, s.p50, s.p90, s.p95, s.p99, s.max, unit);
 }
 
@@ -163,6 +181,13 @@ JLib::Coro RecvLoop(JLib::IoSocket s, HWND hwnd, JLib::CancelToken tok) {
         const JLib::IoResult r = co_await JLib::RecvFromAsync(s, buf, sizeof buf, &from, 0, tok);
         if (r.status != JLib::IoStatus::Completed) break;
         const std::int64_t t = Now();                 // stamp FIRST, before any of our own work
+
+        // EVERY resume, not just the first few. Migration is the hypothesis being tested, so a
+        // single early sample would be exactly the wrong instrument -- it would report where the
+        // worker started and say nothing about where it spent the run.
+        if (const DWORD cpu = ::GetCurrentProcessorNumber(); cpu < 64)
+            g_hotCore[cpu].fetch_add(1, std::memory_order_relaxed);
+
         if (r.bytes != sizeof(Packet)) continue;
         Packet p{};
         std::memcpy(&p, buf, sizeof p);
@@ -288,6 +313,64 @@ void InputThread(std::uint32_t packets, int rateHz) {
     ::closesocket(s);
 }
 
+// ---- CPU topology, because a processor NUMBER answers nothing --------------------------------------
+//
+// The question is not "which index did this run on", it is "which efficiency class, and did the hot
+// worker and the completion thread land in the same cache domain". Raw indices cannot be compared
+// across machines or even reasoned about on one: on a hybrid part the P and E cores are interleaved
+// in ways that are not documented and not stable.
+//
+// So everything below maps through GetLogicalProcessorInformationEx: EfficiencyClass from
+// RelationProcessorCore (higher = more performant; 0 is the E class on current Intel hybrids), and
+// an LLC id from RelationCache at the last level, which is what says "same cluster / same CCD".
+
+struct CoreInfo {
+    int efficiency = -1;    // -1 = unknown
+    int llc        = -1;    // index of the last-level cache this processor belongs to
+    int coreId     = -1;    // physical core, so SMT siblings can be spotted
+};
+CoreInfo g_topo[64];
+
+void BuildTopology() {
+    DWORD len = 0;
+    ::GetLogicalProcessorInformationEx(RelationAll, nullptr, &len);
+    if (!len) return;
+    std::vector<char> buf(len);
+    if (!::GetLogicalProcessorInformationEx(RelationAll,
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &len)) return;
+
+    int coreSeq = 0, llcSeq = 0;
+    int maxCacheLevel = 0;
+    // Two passes over caches: the last level is whatever the deepest level present is, and that is
+    // not always 3 (some parts expose an L4/side cache, and small parts stop at 2).
+    for (DWORD off = 0; off < len; ) {
+        auto* p = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+        if (p->Relationship == RelationCache && p->Cache.Level > maxCacheLevel)
+            maxCacheLevel = p->Cache.Level;
+        off += p->Size;
+    }
+
+    for (DWORD off = 0; off < len; ) {
+        auto* p = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + off);
+        if (p->Relationship == RelationProcessorCore) {
+            const int eff = (int)p->Processor.EfficiencyClass;
+            for (WORD g = 0; g < p->Processor.GroupCount; ++g) {
+                KAFFINITY m = p->Processor.GroupMask[g].Mask;
+                for (int b = 0; b < 64; ++b)
+                    if (m & (1ull << b)) { g_topo[b].efficiency = eff; g_topo[b].coreId = coreSeq; }
+            }
+            ++coreSeq;
+        } else if (p->Relationship == RelationCache && p->Cache.Level == maxCacheLevel) {
+            for (WORD g = 0; g < p->Cache.GroupCount; ++g) {
+                KAFFINITY m = p->Cache.GroupMasks[g].Mask;
+                for (int b = 0; b < 64; ++b) if (m & (1ull << b)) g_topo[b].llc = llcSeq;
+            }
+            ++llcSeq;
+        }
+        off += p->Size;
+    }
+}
+
 // ---- where does K actually sit? -------------------------------------------------------------------
 //
 // The controller's behaviour is not inferable from the latency numbers -- "between static K=1 and
@@ -297,10 +380,28 @@ void InputThread(std::uint32_t packets, int rateHz) {
 
 std::atomic<unsigned> g_kHist[16];
 
+// FOREGROUND STATE. Windows gives the foreground window's threads a priority boost and a longer
+// quantum (Win32PrioritySeparation; on client defaults that is roughly 3x). Losing focus costs both
+// -- which is a PREEMPTION change, and preemption is what the dispatch tail was already shown to be.
+//
+// Sampled rather than read once, because focus can change mid-run and the whole question is whether
+// this tracks the fast/slow mode. Counting both halves so a run that changed focus is visible as a
+// fraction rather than silently reported as one or the other.
+HWND                  g_hwnd = nullptr;
+std::atomic<unsigned> g_fgSamples{ 0 };
+std::atomic<unsigned> g_fgForeground{ 0 };
+
 void KSamplerThread() {
     while (!g_stop.load(std::memory_order_relaxed)) {
         const size_t k = JLib::TaskScheduler::GetHotWorkers();
         g_kHist[k < 16 ? k : 15].fetch_add(1, std::memory_order_relaxed);
+
+        // Sampled alongside K so the two can be read against each other on one timeline.
+        if (g_hwnd) {
+            g_fgSamples.fetch_add(1, std::memory_order_relaxed);
+            if (::GetForegroundWindow() == g_hwnd)
+                g_fgForeground.fetch_add(1, std::memory_order_relaxed);
+        }
         ::Sleep(1);
     }
 }
@@ -331,7 +432,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     int  seconds = 60, rate = 60, load = 0;
-    bool plain = false, hipri = false, waittime = false;
+    bool plain = false, hipri = false, waittime = false, pinHot = false, elevate = false, noActivate = false;
     size_t    kmin = 1, kmax = 2;
     long long waitTargetNs = 0;                 // 0 = leave the library default alone
     for (int i = 1; i < argc; ++i) {
@@ -347,11 +448,44 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--kmin") && i + 1 < argc) { kmin = (size_t)std::atoi(argv[++i]); hipri = true; }
         else if (!std::strcmp(argv[i], "--kmax") && i + 1 < argc) { kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
         else if (!std::strcmp(argv[i], "--waittime"))           { waittime = true; hipri = true; }
+        else if (!std::strcmp(argv[i], "--pin"))                  pinHot   = true;
+        else if (!std::strcmp(argv[i], "--prio"))                 elevate  = true;
+        else if (!std::strcmp(argv[i], "--noactivate"))            noActivate = true;
         else if (!std::strcmp(argv[i], "--waittarget") && i + 1 < argc) waitTargetNs = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--headless"))             g_headless = true;
     }
 
     LARGE_INTEGER f; ::QueryPerformanceFrequency(&f); g_qpf = f.QuadPart;
+    // Beside the EXE, not the working directory: launched from Explorer those differ, and the whole
+    // point is that this has to work when nobody is watching a console.
+    {
+        char path[MAX_PATH] = { 0 };
+        if (::GetModuleFileNameA(nullptr, path, MAX_PATH)) {
+            if (char* slash = std::strrchr(path, '\\')) slash[1] = '\0';
+            std::strncat(path, "udp_latency_bench.log", MAX_PATH - std::strlen(path) - 1);
+            g_log = std::fopen(path, "w");
+        }
+        if (!g_log) g_log = std::fopen("udp_latency_bench.log", "w");
+        if (g_log) std::fprintf(g_log, "log: %s\n", path);
+    }
+
+    BuildTopology();
+    {
+        // PRINTED, not assumed. Every conclusion below rests on this mapping being right, and
+        // "efficiency class 0" means nothing until you can see how many processors are in it.
+        int byClass[8] = { 0 };
+        int known = 0, lo = 99, hi = -1;
+        for (int i = 0; i < 64; ++i) {
+            if (g_topo[i].efficiency < 0) continue;
+            ++known;
+            if (g_topo[i].efficiency < 8) ++byClass[g_topo[i].efficiency];
+            if (g_topo[i].efficiency == 0) { if (i < lo) lo = i; if (i > hi) hi = i; }
+        }
+        Out("topology: %d logical processors; ", known);
+        for (int c = 0; c < 8; ++c) if (byClass[c]) Out("class%d=%d ", c, byClass[c]);
+        if (hi >= 0) Out(" (class0 spans cpu%d..cpu%d)", lo, hi);
+        Out("\n");
+    }
 
     WSADATA wsa{};
     ::WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -360,7 +494,7 @@ int main(int argc, char** argv) {
     g_rows.assign(packets, Row{});
     g_paintGaps.reserve(packets);
 
-    std::printf("udp_latency_bench -- %s receive, %d s at %d Hz%s\n",
+    Out("udp_latency_bench -- %s receive, %d s at %d Hz%s\n",
                 plain ? "PLAIN blocking" : (hipri ? (waittime ? "JLib lane WaitTime" : "JLib lane QueueLoad") : "JLib reactor"), seconds, rate,
                 load ? "  [pool under load]" : "");
 
@@ -370,7 +504,7 @@ int main(int argc, char** argv) {
     addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
     addr.sin_port        = ::htons(kPort);
     if (::bind(s, (sockaddr*)&addr, sizeof addr) != 0) {
-        std::printf("bind failed: %d\n", ::WSAGetLastError());
+        Out("bind failed: %d\n", ::WSAGetLastError());
         return 1;
     }
 
@@ -382,7 +516,24 @@ int main(int argc, char** argv) {
     HWND hwnd = ::CreateWindowA("JLibUdpBench", "JLib UDP latency bench",
                                 WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                                 kWinW, kWinH, nullptr, nullptr, wc.hInstance, nullptr);
-    ::ShowWindow(hwnd, g_headless ? SW_MINIMIZE : SW_SHOW);
+    // --noactivate MAKES THE FOREGROUND QUESTION AN EXPERIMENT INSTEAD OF AN ACCIDENT.
+    //
+    // Shown normally, this window TAKES foreground on creation -- so a run is "focused" unless a
+    // human happens to click elsewhere mid-run. That made focus an uncontrolled variable that
+    // tracked whether anyone was using the machine, and it is the single largest term in every
+    // latency number this bench has produced: dispatch p90 1.5 us focused against 433 us not.
+    //
+    // SW_SHOWNOACTIVATE plus WS_EX_NOACTIVATE means the window appears and never steals focus, so
+    // whatever the user was already in keeps it. That gives a repeatable UNFOCUSED run with nobody
+    // touching the mouse, which is the only way to A/B this honestly.
+    if (noActivate) {
+        ::SetWindowLongPtrA(hwnd, GWL_EXSTYLE,
+                            ::GetWindowLongPtrA(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+        ::ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    } else {
+        ::ShowWindow(hwnd, g_headless ? SW_MINIMIZE : SW_SHOW);
+    }
+    g_hwnd = hwnd;
 
     JLib::CancelScope scope;
     JLib::WaitGroup   wg;
@@ -399,12 +550,15 @@ int main(int argc, char** argv) {
         // correct default behaviour and visibly wrong for this particular job.
         // kmax==kmin is STATIC K by construction -- no controller, no oscillation. --k lets the
         // bench separate "the lane helps" from "the controller is stable", which are different claims.
+        // Both MUST precede Init: placement and priority are applied as each worker starts.
+        if (pinHot)  JLib::TaskScheduler::SetHotWorkerPin(true);
+        if (elevate) JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
         if (hipri) JLib::TaskScheduler::SetHotWorkerRange(kmin, kmax);
         if (waittime) JLib::TaskScheduler::SetHotWorkerPolicy(JLib::TaskScheduler::KPolicy::WaitTime);
         if (waitTargetNs > 0) JLib::TaskScheduler::SetLaneWaitTargetNs(waitTargetNs);
         JLib::TaskScheduler::Init(0);
         auto& io = JLib::IoReactor::Instance();
-        if (!io.RegisterSocket(s)) { std::printf("RegisterSocket failed\n"); return 1; }
+        if (!io.RegisterSocket(s)) { Out("RegisterSocket failed\n"); return 1; }
         JLib::Spawn(RecvLoop(s, hwnd, scope.Token()), &wg, hipri ? 1 : 0);
         if (load) loadThread = std::thread(LoadThread, load);
     }
@@ -459,11 +613,11 @@ done:
         inPaint.push_back(Ms(r.tPaint - r.tInput));
     }
 
-    std::printf("\npackets: %zu accepted of %u seq, %zu reached a frame (%zu superseded first)\n",
+    Out("\npackets: %zu accepted of %u seq, %zu reached a frame (%zu superseded first)\n",
                 received, g_recvCount.load(), painted, received - painted);
-    std::printf("\n  %-22s %8s %8s %8s %8s %8s %9s\n",
+    Out("\n  %-22s %8s %8s %8s %8s %8s %9s\n",
                 "stage", "mean", "p50", "p90", "p95", "p99", "max");
-    std::printf("  ---------------------------------------------------------------------------\n");
+    Out("  ---------------------------------------------------------------------------\n");
 
     Stats a = Summarise(inSend);    PrintRow("input -> send", a, "us");
     Stats b = Summarise(sendRecv);  PrintRow("send -> recv", b, "us   <-- wire + reactor");
@@ -480,9 +634,9 @@ done:
     for (double g : gaps) var += (g - j.mean) * (g - j.mean);
     const double sd = gaps.empty() ? 0.0 : std::sqrt(var / (double)gaps.size());
 
-    std::printf("\n  %-22s %8.3f %8.3f %8.3f %8.3f %8.3f %9.3f  ms  <-- frame interval\n",
+    Out("\n  %-22s %8.3f %8.3f %8.3f %8.3f %8.3f %9.3f  ms  <-- frame interval\n",
                 "paint -> paint", j.mean, j.p50, j.p90, j.p95, j.p99, j.max);
-    std::printf("  frame jitter (sd): %.3f ms over %zu frames; target interval %.3f ms\n",
+    Out("  frame jitter (sd): %.3f ms over %zu frames; target interval %.3f ms\n",
                 sd, gaps.size(), 1000.0 / (double)(rate ? rate : 60));
 
     // ---- inside send->recv, when the reactor was built with the stats define ---------------------
@@ -495,10 +649,10 @@ done:
             dispatch.push_back((double)(r.tResumeNs - r.tFlushed) / 1000.0);
         }
         if (!batched.empty()) {
-            std::printf("\n  the dispatch seam, split (needs -DJLIBSCHED_IO_LOCK_STATS):\n");
-            std::printf("  %-22s %8s %8s %8s %8s %8s %9s\n",
+            Out("\n  the dispatch seam, split (needs -DJLIBSCHED_IO_LOCK_STATS):\n");
+            Out("  %-22s %8s %8s %8s %8s %8s %9s\n",
                         "stage", "mean", "p50", "p90", "p95", "p99", "max");
-            std::printf("  ---------------------------------------------------------------------------\n");
+            Out("  ---------------------------------------------------------------------------\n");
             Stats b = Summarise(batched);
             Stats d = Summarise(dispatch);
             PrintRow("reactor held (batch)", b, "us   <-- K cannot touch this");
@@ -506,22 +660,92 @@ done:
         }
     }
 
+    // ---- placement: where the lane and the reactor actually ran ---------------------------------
+    {
+        unsigned compl_[64] = { 0 };
+        JLib::IoReactor::CompletionCoreHistogram(compl_, 64);
+
+        auto summarise = [](const unsigned* h, const char* what) {
+            unsigned total = 0, onE = 0, onP = 0;
+            int      top = -1; unsigned topN = 0;
+            int      llcOfTop = -1;
+            for (int i = 0; i < 64; ++i) {
+                total += h[i];
+                if (h[i] > topN) { topN = h[i]; top = i; }
+                if (g_topo[i].efficiency == 0) onE += h[i];
+                else if (g_topo[i].efficiency > 0) onP += h[i];
+            }
+            if (top >= 0) llcOfTop = g_topo[top].llc;
+            if (!total) { Out("  %-18s (no samples)\n", what); return std::make_pair(-1, -1); }
+            Out("  %-18s cpu%-3d %4.0f%% of %-8u  eff=%d llc=%d   P=%.0f%% E=%.0f%%\n",
+                        what, top, 100.0 * topN / total, total,
+                        top >= 0 ? g_topo[top].efficiency : -1, llcOfTop,
+                        100.0 * onP / total, 100.0 * onE / total);
+            return std::make_pair(top >= 0 ? g_topo[top].efficiency : -1, llcOfTop);
+        };
+
+        unsigned hot_[64] = { 0 };
+        for (int i = 0; i < 64; ++i) hot_[i] = g_hotCore[i].load(std::memory_order_relaxed);
+
+        Out("\n  placement (efficiency class: 0 = E core, higher = P core):\n");
+        const auto h = summarise(hot_,   "resumed on");
+        const auto c = summarise(compl_, "reactor woke on");
+
+        // THE COMPARISON THE TABLE IS FOR. Same efficiency class or not, same last-level cache or
+        // not -- a completion handed across a cache domain costs a great deal more than one handed
+        // within it, and that is invisible in any per-stage latency number.
+        if (h.first >= 0 && c.first >= 0) {
+            Out("  -> hot/reactor: eff %s, llc %s\n",
+                        h.first == c.first ? "SAME" : "DIFFERENT",
+                        h.second == c.second ? "SAME" : "DIFFERENT");
+        }
+    }
+
     unsigned ktot = 0;
     for (int i = 0; i < 16; ++i) ktot += g_kHist[i].load();
     if (ktot) {
-        std::printf("\n  effective K over the run (1 ms samples):\n");
+        Out("\n  effective K over the run (1 ms samples):\n");
         for (int i = 0; i < 16; ++i) {
             const unsigned c = g_kHist[i].load();
-            if (c) std::printf("    K=%d  %5.1f%%  (%u samples)\n",
+            if (c) Out("    K=%d  %5.1f%%  (%u samples)\n",
                                i, 100.0 * (double)c / (double)ktot, c);
         }
     }
 
+    // ---- the one line to read ---------------------------------------------------------------------
+    //
+    // Foreground share against the tail, on one line, because the hypothesis is that these two move
+    // together and nothing else in this report pairs them. Windows gives the foreground window's
+    // threads a priority boost and a longer quantum; losing focus costs both, and that is a
+    // preemption change -- which is what the dispatch tail was already shown to be.
+    {
+        const unsigned fs = g_fgSamples.load(), fg = g_fgForeground.load();
+        const double   pct = fs ? 100.0 * (double)fg / (double)fs : -1.0;
+        Out("\n  ==> FOREGROUND %5.1f%% of the run   |   send->recv p90 %8.3f us  p99 %8.3f us\n",
+                    pct, b.p90, b.p99);
+        if (fs == 0)
+            Out("      (no samples -- foreground is only tracked on the reactor path)\n");
+    }
+
     const double frame = 1000.0 / 60.0;
-    std::printf("\n  VERDICT: input->paint p99 = %.3f ms vs a %.2f ms frame -- %s\n",
+    Out("\n  VERDICT: input->paint p99 = %.3f ms vs a %.2f ms frame -- %s\n",
                 d.p99, frame, d.p99 < frame ? "UNDER" : "OVER");
-    std::printf("  (excludes OS input latency before t_input and DWM compose + scanout after\n"
+    Out("  (excludes OS input latency before t_input and DWM compose + scanout after\n"
                 "   t_paint; neither is this process's to control)\n");
+
+    if (g_log) { std::fclose(g_log); g_log = nullptr; }
+
+    // HOLD THE CONSOLE ONLY IF WE OWN IT. GetConsoleProcessList returning 1 means this process is
+    // the console's only client, which is the Explorer double-click case -- the window dies with us
+    // and takes the report with it. Launched from an existing shell the count is higher and pausing
+    // would just block a script forever, which is why this is a check and not an unconditional wait.
+    {
+        DWORD pids[4] = { 0 };
+        if (::GetConsoleProcessList(pids, 4) == 1) {
+            std::printf("\n  [press Enter to close -- the same report is in udp_latency_bench.log]\n");
+            (void)std::getchar();
+        }
+    }
 
     ::WSACleanup();
     return 0;
