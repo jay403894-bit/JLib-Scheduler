@@ -830,3 +830,11 @@ target_compile_features(SchedulerHazardOrphanTest PRIVATE cxx_std_17)
 add_executable(SchedulerHazardCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_ceiling_test.cpp")
 target_link_libraries(SchedulerHazardCeilingTest PRIVATE Scheduler)
 target_compile_features(SchedulerHazardCeilingTest PRIVATE cxx_std_17)
+
+# THE SUSPENSION CHECK MUST ACTUALLY FIRE. Nothing else in the suite holds a hazard guard across a
+# co_await, so a green suite says nothing about it. C++20: it needs a real coroutine to suspend.
+if(JLIBSCHED_COROUTINES)
+    add_executable(SchedulerHazardCoroSuspendTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_coro_suspend_test.cpp")
+    target_link_libraries(SchedulerHazardCoroSuspendTest PRIVATE Scheduler)
+    target_compile_features(SchedulerHazardCoroSuspendTest PRIVATE cxx_std_20)
+endif()
