@@ -453,6 +453,39 @@ limits; that is the first knob to turn down if you try it.
 
 Open an issue either way. A report that it works is as useful as one that it doesn't.
 
+## Samples
+
+`samples/udp_rect.cpp` -- a rectangle you move over the network, with **both ends in one binary**:
+
+```
+udp_rect            receiver: opens a window, binds 127.0.0.1:45454, draws the rect
+udp_rect --send     sender: arrow keys, one datagram per press, q to quit
+udp_rect --send --drop 5    drop 1 packet in 5, to watch loss happen
+```
+
+Run the first, then the second in another console. Loopback, so there is nothing to configure and
+no second machine to find.
+
+It is the receive-**loop** counterpart to `io_socket_test`, which sends a single datagram and checks
+it arrived -- that proves the plumbing and nothing about the shape real code has. Here the loop
+outlives thousands of packets, publishes to atomics, `PostMessage`s a window it never touches
+directly, and cancels cleanly on close. The coroutine occupies no thread while parked, so the
+message pump keeps the main thread to itself.
+
+The wire format is **absolute position with a sequence number**, not a delta, and that is the point
+of the sample. Deltas are the obvious design and they are wrong over UDP: drop one and the two ends
+disagree about where the rect is permanently, because nothing later corrects it. Absolute state is
+idempotent -- a lost packet costs one frame and the next one repairs it. The sequence number handles
+the other half, since UDP does not promise order either; the receiver keeps the highest it has seen
+and discards anything not newer. `--drop` makes both counters move in the title bar.
+
+**The teardown is worth reading even if you never run it.** Cancelling the scope is enough for every
+other primitive here -- Event, semaphore and condition variable all cancel by waking their waiter --
+and it is *not* enough for a parked read, which is sitting in the kernel's completion queue with the
+kernel holding your buffer. `IoReactor::RequestCancel(token)` is the call that issues `CancelIoEx`;
+without it a receiver with no traffic will not exit. See the comment at the bottom of `RunReceiver`.
+
+
 ## Using it
 Synchronization primitives: JLib provides fiber-aware SchedulerMutex, SchedulerSemaphore, SchedulerConditionVariable, Event, DirectEvent, and WaitGroup primitives.
 ```cpp

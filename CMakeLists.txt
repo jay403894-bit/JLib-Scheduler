@@ -757,3 +757,15 @@ if(WIN32 AND JLIBSCHED_COROUTINES)
     target_link_libraries(SchedulerIoLatencyBench PRIVATE Scheduler ws2_32)
     target_compile_features(SchedulerIoLatencyBench PRIVATE cxx_std_20)
 endif()
+
+# ---- samples -------------------------------------------------------------------------------------
+# udp_rect is the receive-LOOP counterpart to io_socket_test's single datagram: one binary that is
+# both ends of a UDP link on loopback, so there is nothing to configure to try it. C++20 because it
+# co_awaits the reactor. WIN32 executable would hide the console the sender needs, so it stays a
+# console app and creates its window by hand.
+if(WIN32 AND JLIBSCHED_COROUTINES)
+    add_executable(SchedulerUdpRect "${CMAKE_CURRENT_SOURCE_DIR}/samples/udp_rect.cpp")
+    target_link_libraries(SchedulerUdpRect PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerUdpRect PRIVATE cxx_std_20)
+    set_target_properties(SchedulerUdpRect PROPERTIES OUTPUT_NAME udp_rect)
+endif()
