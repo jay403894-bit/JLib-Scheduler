@@ -1255,6 +1255,21 @@ namespace JLib {
 		// IS the high-water mark. Build with -DJLIBSCHED_ALLOC_STATS=ON to get per-class alloc/free
 		// RATES underneath it -- which class is hot, and whether the size-class split matches the
 		// workload. Those counters are sharded per thread and compiled out otherwise.
+		// THE SAME REPORT AS TEXT, because printf is useless in the application that most needs it.
+		//
+		// A windowed game has no console, so stdout goes nowhere -- and even with one, the process
+		// exits before anyone can read the last frame's numbers, which would mean pausing the main
+		// thread just to look. Returning the string removes both problems and lets the caller decide:
+		//
+		//     ImGui::TextUnformatted(TaskScheduler::SlabUsageString().c_str());   // live, in-engine
+		//     std::ofstream("slab.txt") << TaskScheduler::SlabUsageString();      // survives exit
+		//
+		// ReportSlabUsage() below is this plus delivery, and on Windows that includes
+		// OutputDebugStringA -- which needs no console AND persists in the debugger's Output window
+		// after the process is gone. That is the path a GUI app actually wants, and it is the same
+		// one the free-list canary already uses.
+		static std::string SlabUsageString(const char* label = "slab usage");
+
 		static void ReportSlabUsage(const char* label = "slab usage");
 
 		static void     SetReservedCores(unsigned n) noexcept;
