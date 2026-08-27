@@ -778,3 +778,10 @@ if(WIN32 AND JLIBSCHED_COROUTINES)
     target_compile_features(SchedulerUdpLatencyBench PRIVATE cxx_std_20)
     set_target_properties(SchedulerUdpLatencyBench PROPERTIES OUTPUT_NAME udp_latency_bench)
 endif()
+
+# Hazard pointers. The test is worth reading before the implementation: its only meaningful case has
+# a PARK in the middle, and it RUNS its negative control (worker-owned cells must free under the
+# sleeping reader) rather than asserting the control in a comment.
+add_executable(SchedulerHazardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_test.cpp")
+target_link_libraries(SchedulerHazardTest PRIVATE Scheduler)
+target_compile_features(SchedulerHazardTest PRIVATE cxx_std_17)
