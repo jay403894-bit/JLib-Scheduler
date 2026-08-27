@@ -52,3 +52,7 @@ scratchpad/
 x64/
 Scheduler/x64/
 *.user
+
+# Out-of-source build dirs. `build/` was already here; `bld/` was added when a locked `build/`
+# could not be removed, and its artifacts landed in a commit before this line existed.
+bld/
