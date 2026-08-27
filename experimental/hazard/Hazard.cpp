@@ -42,7 +42,7 @@ namespace JLib {
         // the flag is up, Retire goes straight to the orphan store.
         thread_local bool t_retireDead = false;
 
-        // LEAKED ON PURPOSE, exactly like g_records. A thread_local destructor may run during
+        // LEAKED ON PURPOSE. A thread_local destructor may run during
         // process teardown, and a function-local static with a destructor could already be gone by
         // then -- handing objects to a destroyed vector is a worse bug than the one being fixed.
         // Nothing here is large: it holds only what abandoned threads left behind, which is zero in
@@ -86,28 +86,6 @@ namespace JLib {
 
         std::mutex g_tableInit;
         std::atomic<bool> g_forceWorkerCells{ false };
-        std::atomic<bool> g_exhaustRecords{ false };
-
-        // ---- the external-record registry ------------------------------------------------------
-        //
-        // Statically sized and NEVER deleted -- records cycle rather than being allocated and freed,
-        // which is Michael's answer to the registry's own reclamation problem. Sizing to PEAK
-        // CONCURRENT HP-using coroutines, not to total coroutines spawned, is what keeps that
-        // bounded: a record is taken on first Protect and given back in ~promise_type.
-        enum : std::uint32_t { REC_FREE = 0, REC_LIVE = 1, REC_RETIRED = 2 };
-
-        struct alignas(64) ExtRecord {
-            std::atomic<void*>         cells[HazardDomain::kCellsPerReader];
-            std::atomic<std::uint32_t> state{ REC_FREE };
-            std::atomic<std::uint32_t> gen{ 0 };
-            std::atomic<std::uint64_t> retiredAtScan{ 0 };
-        };
-        ExtRecord g_records[HazardDomain::kMaxRecords];
-
-        // Bumped at the START of every scan. A record retired at `c` may be reused only once a scan
-        // that BEGAN after `c` has finished -- see the grace-period note in the header. This counts
-        // SCANS, which run to completion; it never counts readers, which may park.
-        std::atomic<std::uint64_t> g_scanSeq{ 1 };
 
     }
 
@@ -245,81 +223,27 @@ namespace JLib {
         std::abort();
     }
 
-    std::atomic<void*>* HazardDomain::RecordCells(RecordId id) {
-        return (id < kMaxRecords) ? g_records[id].cells : nullptr;
+    // A COROUTINE ASKED FOR A HAZARD GUARD. Says what happened, names the alternative, then stops --
+    // the same shape as FatalCellOverflow and for the same reason: continuing means guessing on the
+    // caller's behalf about memory it does not own.
+    //
+    // FATAL RATHER THAN A SILENT DOWNGRADE, which is the whole argument. Worker or fiber cells are
+    // correct until this frame's first co_await and a use-after-free after it, so a downgrade passes
+    // every test that does not suspend inside a protected section -- exactly the case it would exist
+    // for. There is no safe fallback, so there is no fallback.
+    void HazardDomain::FatalCoroutineGuard() {
+        std::fprintf(stderr,
+            "[JLib::Scheduler] FATAL: a coroutine took a HazardGuard.\n"
+            "  Hazard pointers here index cells by the reader, and a coroutine has no dense stable\n"
+            "  index -- frames are not a bounded pool. The record registry that used to cover this\n"
+            "  was removed: its grace period could not be stated precisely and nothing tested\n"
+            "  record reuse. See experimental/hazard/README.md.\n"
+            "  USE COUNTED EPOCHS INSTEAD (Epochs.h). They already cover a reader that suspends --\n"
+            "  that is what the counted scheme was built for -- and they are verified.\n");
+        std::fflush(stderr);
+        std::abort();
     }
 
-    HazardDomain::RecordId HazardDomain::AcquireRecord() {
-        // TEST HOOK, same shape and same reason as g_forceWorkerCells. Filling kMaxRecords (1024)
-        // genuinely would need 1024 live coroutines each holding a guard, which is a heavy and
-        // timing-dependent way to reach a deterministic branch -- and a fatal path nothing exercises
-        // is the same vacuous shape as a negative control that cannot fail.
-        if (g_exhaustRecords.load(std::memory_order_relaxed)) return kNoRecord;
-
-        const std::uint64_t now = g_scanSeq.load(std::memory_order_acquire);
-
-        for (std::uint32_t i = 0; i < kMaxRecords; ++i) {
-            ExtRecord& r = g_records[i];
-            std::uint32_t st = r.state.load(std::memory_order_acquire);
-
-            // RECLAIM ONLY PAST THE GRACE. `> retiredAt + 1` means a scan that began strictly after
-            // the release has also finished, so no scanner can still be walking this block under
-            // the previous owner's identity. Bumping the generation alone would not do: a scanner
-            // reads the CELLS, not the record header.
-            if (st == REC_RETIRED &&
-                now > r.retiredAtScan.load(std::memory_order_acquire) + 1) {
-                if (r.state.compare_exchange_strong(st, REC_FREE,
-                                                    std::memory_order_acq_rel,
-                                                    std::memory_order_acquire)) {
-                    r.gen.fetch_add(1, std::memory_order_relaxed);
-                    st = REC_FREE;
-                } else {
-                    continue;
-                }
-            }
-
-            if (st == REC_FREE) {
-                std::uint32_t expected = REC_FREE;
-                if (r.state.compare_exchange_strong(expected, REC_LIVE,
-                                                    std::memory_order_acq_rel,
-                                                    std::memory_order_acquire)) {
-                    // ZEROED BEFORE IT IS VISIBLE AS LIVE to anything that will publish into it --
-                    // register must COMPLETE before the first store that names a pointer, or a scan
-                    // reads a stale pointer from the previous owner and over-protects forever.
-                    for (std::size_t k = 0; k < kCellsPerReader; ++k)
-                        r.cells[k].store(nullptr, std::memory_order_relaxed);
-                    std::atomic_thread_fence(std::memory_order_release);
-                    return i;
-                }
-            }
-        }
-        return kNoRecord;   // registry exhausted; caller decides how loud to be
-    }
-
-    void HazardDomain::ReleaseRecord(RecordId id) {
-        if (id >= kMaxRecords) return;
-        ExtRecord& r = g_records[id];
-
-        // ORDER: cells cleared BEFORE the state moves, so a scanner that still sees LIVE reads
-        // nullptr rather than a pointer this frame no longer protects.
-        for (std::size_t k = 0; k < kCellsPerReader; ++k)
-            r.cells[k].store(nullptr, std::memory_order_release);
-
-        // IDEMPOTENT BY CONSTRUCTION -- one CAS LIVE -> RETIRED. ~promise_type is the only caller
-        // today, but the whole point of the state machine is that a second call from any discard
-        // path is a no-op rather than a double release.
-        std::uint32_t expected = REC_LIVE;
-        if (r.state.compare_exchange_strong(expected, REC_RETIRED,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_acquire)) {
-            r.retiredAtScan.store(g_scanSeq.load(std::memory_order_acquire),
-                                  std::memory_order_release);
-        }
-    }
-
-    void HazardDomain::ExhaustRecordsForTest(bool on) {
-        g_exhaustRecords.store(on, std::memory_order_relaxed);
-    }
 
     void HazardDomain::ForceWorkerCellsForTest(bool on) {
         g_forceWorkerCells.store(on, std::memory_order_relaxed);
@@ -371,26 +295,17 @@ namespace JLib {
         // THE SCAN SET IS THE WHOLE TABLE, NOT "WHO IS RUNNING". Walking running workers is bug 2 --
         // it frees under a parked fiber, whose cells are still live and still name their nodes.
         // Indexing by reader makes sleepers unavoidable rather than something to remember.
-        // OPENS THE SCAN. Everything retired at or before this number must survive a full scan
-        // boundary before its record can be reused -- see AcquireRecord. Counting scans and not
-        // readers is what keeps a parked fiber from freezing record reuse.
-        g_scanSeq.fetch_add(1, std::memory_order_acq_rel);
-
+        //
+        // AND THE TABLE IS NOW ALL OF IT. There used to be a second walk over a record registry for
+        // coroutines, plus a scan counter (g_scanSeq) whose only job was gating record reuse. Both
+        // are gone with the registry -- see FatalCoroutineGuard. A reader here is a fiber, a worker
+        // or an external thread, every one of which has a dense stable index, so the flat table is
+        // the entire scan set and there is no second lifecycle to reason about.
         std::vector<void*> named;
         named.reserve(readerCount * kCellsPerReader / 4 + 8);
         for (std::size_t i = 0; i < readerCount * kCellsPerReader; ++i)
             if (void* v = base[i].load(std::memory_order_acquire)) named.push_back(v);
 
-        // THEN THE REGISTRY. RETIRED records are read too, not skipped: the release clears the cells
-        // before moving the state, so a retired record contributes nothing -- but reading it costs
-        // one load and removes any question about a release racing this walk. The cells are
-        // domain-owned, so this can never touch memory a destroyed frame took with it.
-        for (std::uint32_t i = 0; i < kMaxRecords; ++i) {
-            if (g_records[i].state.load(std::memory_order_acquire) == REC_FREE) continue;
-            for (std::size_t k = 0; k < kCellsPerReader; ++k)
-                if (void* v = g_records[i].cells[k].load(std::memory_order_acquire))
-                    named.push_back(v);
-        }
         std::sort(named.begin(), named.end());
 
         std::vector<std::pair<void*, void (*)(void*)>> keep;
@@ -441,56 +356,34 @@ namespace JLib {
     HazardGuard::HazardGuard() {
         HazardDomain& d = HazardDomain::Instance();
 
-        // A COROUTINE TAKES A RECORD, NOT THE WORKER'S CELLS -- and THE GUARD OWNS IT.
+        // A COROUTINE MAY NOT TAKE A HAZARD GUARD. Refused here, structurally, before anything is
+        // resolved -- not downgraded, not deferred to CurrentReader(), not made to work.
         //
-        // This is where the design got simpler than planned. The first attempt kept the RecordId in
-        // the promise and had the C++20 resume trampoline hand the core a pointer to that field.
-        // That was unsound: ResumeCoroutine is generic BY DESIGN, because Task::data holds whichever
-        // frame was last armed -- for a nested Lazy that is the parent, not the Coro -- so typing
-        // the handle to reach `promise().hazardRecord` reads a different promise's storage. It also
-        // required remembering every discard path that skips final_suspend.
+        // THIS REPLACED A RECORD REGISTRY, and the removal is the point rather than a retreat. A
+        // coroutine has no dense stable index (frames are not a bounded pool), so it could not live
+        // in the flat table; it took a record from a pool with its own FREE -> LIVE -> RETIRED ->
+        // FREE lifecycle, a generation counter, and a grace period keyed on a scan sequence.
         //
-        // A HazardGuard is a LOCAL IN THE FRAME, so it already survives the co_await, and destroying
-        // a suspended coroutine runs the destructors of in-scope locals. Owning the record here
-        // gets "released on every path" from the language rather than from a list of call sites --
-        // which is the same class of bug as the PushBatch stamp, closed by construction instead of
-        // by vigilance.
+        // THAT GRACE COULD NOT BE STATED IN ONE SENTENCE, which is the test it failed. Reuse was
+        // gated on `now > retiredAt + 1` -- a scan COUNT -- rather than on no scan that began at or
+        // before retiredAt still being in flight. Nothing tested record reuse at all: every
+        // assertion in tests/ covers protection, none covers a recycled RecordId. And this codebase
+        // has already shipped one generation-wraparound bug that a test looked straight past.
         //
-        // Detected the same way the old tripwire detected it: a Coroutine task with no fiber.
-        if (Thread::GetCurrent()) {
-            if (TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
-                record = d.AcquireRecord();
-                if (record != HazardDomain::kNoRecord) {
-                    cells  = d.RecordCells(record);
-                    reader = HazardDomain::kNoReader;
-                    return;
-                }
-                // REGISTRY EXHAUSTED -- STOP HERE. Do NOT fall through to CurrentReader().
-                //
-                // cells stays null and reader stays kNoReader, so the first Protect is fatal with a
-                // message naming kMaxRecords. That is the intended outcome, and this early return is
-                // what makes it STRUCTURAL rather than a claim.
-                //
-                // The previous version fell through and relied on CurrentReader() to refuse a second
-                // time. Two problems with that, and only one of them was live:
-                //
-                //   THE REFUSAL LIVED IN ANOTHER FUNCTION. CurrentReader() re-derived "is this a
-                //   coroutine" from w->currentRunningTask->type -- the same source this ctor reads,
-                //   so they agreed, but the guarantee depended on two call sites continuing to. This
-                //   codebase has lost that bet before (the discard sites, the PushBatch stamp).
-                //
-                //   ITS FIBER BRANCH CAME FIRST. CurrentReader() returns fb->poolIndex whenever
-                //   w->currentFiber is set, BEFORE it ever looks at the task type -- so a coroutine
-                //   running with a non-null currentFiber would have taken FIBER cells and never
-                //   reached the assert. Not reachable today (the three fiber exits all clear it),
-                //   but reachable is not the bar for a silent memory-safety downgrade.
-                //
-                // Worker or fiber cells are correct until this frame's first co_await and a
-                // use-after-free after it, so the downgrade would pass every test that does not
-                // suspend inside a protected section -- exactly the case the record path exists for.
-                // Raise kMaxRecords, or find the frames that take a guard and never release it.
-                return;
-            }
+        // A grace period nobody can spec is not a safe extra, and the registry was the only part of
+        // this file that was not Michael's. Six of the six bugs found here were in that adaptation
+        // layer. So it is gone, and what remains is the paper plus reader-indexed cells.
+        //
+        // WHAT A COROUTINE USES INSTEAD: counted epochs. Epochs.h already covers a reader that
+        // suspends -- that is exactly what the counted scheme was built for -- and it is verified.
+        // Hazard pointers are the EXTRA here; epochs are the engine's reclamation.
+        if (Thread::GetCurrent() && TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
+            // REFUSED AT Protect, NOT HERE. cells stays null and reader stays kNoReader, so
+            // CONSTRUCTING a guard in a coroutine is inert while PROTECTING through one is fatal --
+            // and protecting is the illegal operation. Failing at construction would point the
+            // message at a line that did nothing wrong.
+            coroRefused = true;
+            return;
         }
 
         reader = d.CurrentReader();
@@ -506,17 +399,13 @@ namespace JLib {
         for (std::size_t k = 0; k < HazardDomain::kCellsPerReader; ++k)
             cells[k].store(nullptr, std::memory_order_release);
 
-        // A coroutine's record goes back HERE, and this destructor runs on every path a frame can
-        // end -- normal return, an exception, or destroy() on a suspended frame, which unwinds
-        // in-scope locals. That is the "same unregister on every discard path" requirement, obtained
-        // from the language instead of from remembering the fifth one.
-        if (record != HazardDomain::kNoRecord) {
-            HazardDomain::Instance().ReleaseRecord(record);
-            record = HazardDomain::kNoRecord;
-        }
     }
 
     void HazardGuard::Set(std::size_t k, void* p) {
+        // WHY cells IS NULL DECIDES WHICH MESSAGE. A coroutine was refused a reader on purpose; an
+        // external thread ran out of reserved slots. Same symptom, different fix, so they must not
+        // share a diagnostic.
+        if (coroRefused) HazardDomain::FatalCoroutineGuard();
         assert(k < HazardDomain::kCellsPerReader && "hazard cell index out of range");
         if (!cells || k >= HazardDomain::kCellsPerReader) return;
         cells[k].store(p, std::memory_order_release);

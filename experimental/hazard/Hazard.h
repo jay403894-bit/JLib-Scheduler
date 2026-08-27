@@ -106,19 +106,34 @@
 // registry cannot be protected by the hazard domain it serves.
 // One known limitation remains and it is a LEAK, NOT A SMASH -- see the note on ReaderCount below.
 //
-// == WHAT A COROUTINE STILL MUST NOT DO ==
+// == COROUTINES: TASKS YES, GUARDS NO ==
 //
-// Two rules, and they are what is left after the record closes the migration problem. Neither is
-// about worker cells: worker cells were never going to save either one, with or without a worker.
+// TWO DIFFERENT FEATURES, and conflating them is what produced the registry. Coroutine TASKS in the
+// pool are fully supported and untouched by this file -- resume, TaskType::Coroutine, all of it. What
+// is refused is a HazardGuard inside a coroutine frame.
 //
-//   1. DO NOT PROTECT WITHOUT A RECORD. If AcquireRecord returns kNoRecord -- every one of
-//      kMaxRecords LIVE or still inside its grace -- the guard's cells stay null and the first
-//      Protect is FATAL, naming the knob. That is deliberate and it is the whole reason the
-//      constructor returns early instead of resolving a reader: there is no downgrade, because
-//      every available downgrade stops protecting at the first co_await. Raise kMaxRecords, or find
-//      the frames that take a guard and never release it.
+//   A HazardGuard IN A COROUTINE IS FATAL AT Protect. The constructor leaves cells null and returns;
+//   protecting through it aborts with a message naming counted epochs as the alternative.
+//   Constructing one is inert, because construction is not the illegal act.
 //
-//   2. DO NOT STASH A RAW T* AND DROP THE GUARD. Protection is the GUARD'S LIFETIME, not the
+//   WHY REFUSAL RATHER THAN SUPPORT. Cells are indexed by reader, and a coroutine frame has no dense
+//   stable index -- frames are not a bounded pool. Covering that took an external record registry
+//   with its own FREE -> LIVE -> RETIRED -> FREE lifecycle and a grace period keyed on a scan count.
+//   That grace could not be stated in one testable sentence, nothing exercised record reuse, and
+//   every one of the six bugs found in this file lived in that adaptation rather than in Michael's
+//   algorithm. It was removed. See experimental/hazard/README.md for what bringing it back requires.
+//
+//   AND NO DOWNGRADE, WHICH IS THE POINT. Worker or fiber cells are correct until the frame's first
+//   co_await and a use-after-free after it -- so a fallback would pass every test that does not
+//   suspend inside a protected section, which is exactly the case it would exist for. Refusal is the
+//   feature.
+//
+//   USE COUNTED EPOCHS for a reader that suspends. That is what the counted scheme was built for and
+//   it is verified; epochs remain this engine's reclamation, and hazard pointers are the extra.
+//
+// == THE ONE RULE THAT SURVIVES FOR EVERY READER ==
+//
+//   DO NOT STASH A RAW T* AND DROP THE GUARD. Protection is the GUARD'S LIFETIME, not the
 //      pointer's. ~HazardGuard clears the cells; a pointer you kept past that point is a plain
 //      pointer with nothing announcing it, and the next retire is free to reclaim it.
 //
@@ -176,6 +191,10 @@ namespace JLib {
         // reported here rather than absorbed. Never returns.
         [[noreturn]] static void FatalCellOverflow(std::size_t k, const char* what);
 
+        // A coroutine asked for a HazardGuard. See the definition -- there is no safe downgrade, so
+        // there is no downgrade.
+        [[noreturn]] static void FatalCoroutineGuard();
+
         // Reserved reader ids for threads that are neither a fiber nor a worker -- the main thread,
         // an app's own threads. Claimed lazily and never released, so a program churning thousands
         // of short-lived threads exhausts them; that asserts rather than corrupting, and is the
@@ -218,44 +237,9 @@ namespace JLib {
         std::size_t OrphanedRetired() const;
         std::size_t OrphanedTotal() const;
 
-        // KNOWN LIMITATION -- A LEAK, NOT A SMASH. A coroutine parked while holding a guard, that is
-        // never re-pushed (teardown that stops resuming before every started frame has unwound),
-        // leaves its record LIVE forever. Nothing is freed under anybody -- the record keeps naming
-        // a node and the scan keeps honouring it -- so the failure is that reclamation of THAT node
-        // stops, and one registry slot is gone. Bounded by kMaxRecords.
-        //
-        // The reason it is only a leak is the discard policy: a STARTED task is never discarded, so
-        // a live frame is resumed and unwound rather than abandoned. If an abort-a-waiter API is ever
-        // added -- destroy WITHOUT resume -- then ~HazardGuard on handle.destroy() becomes
-        // load-bearing and this comment becomes wrong. That API must not exist today.
-        //
-        // ---- external records: the coroutine path (phase 3) --------------------------------------
-        //
-        // A coroutine frame has no dense stable index -- frames are not a bounded pool -- so it
-        // cannot use the flat table. It gets a RECORD instead: acquired on first Protect, released
-        // in ~promise_type, and NEVER DELETED. FREE -> LIVE -> RETIRED -> FREE with a bumped
-        // generation, because a hazard registry cannot be protected by the hazard domain it serves.
-        //
-        // DEVIATION, AND IT IS DELIBERATE: the record OWNS its cells rather than taking a pointer to
-        // storage inside the frame. Frame-owned cells die with the frame, and a DEFERRED grace
-        // cannot protect memory that is already freed -- honouring it would need a synchronous
-        // drain inside ~promise_type, spinning until every scanner left that block. Domain-owned
-        // cells remove the hazard outright and cost the frame 4 bytes (an id) instead of 32 (four
-        // cells). The registry outlives every frame by construction.
-        //
-        // THE GRACE PERIOD WAITS ON SCANS, NOT ON READERS, and that distinction is load-bearing.
-        // A scan runs to completion on one thread and cannot suspend, so waiting for one is bounded.
-        // Waiting for READERS to leave would be the epoch-pin failure again: a parked fiber would
-        // freeze record reuse the way it must never freeze reclamation. A parked reader here delays
-        // freeing THE NODE IT NAMED and nothing else.
-        using RecordId = std::uint32_t;
-        static constexpr RecordId kNoRecord = 0xFFFFFFFFu;
-        static constexpr std::size_t kMaxRecords = 1024;
-
-        RecordId            AcquireRecord();
-        void                ReleaseRecord(RecordId id);
-        std::atomic<void*>* RecordCells(RecordId id);
-
+        // NO KNOWN LIMITATION HERE ANY MORE. There used to be one: a coroutine parked while holding
+        // a guard and never re-pushed leaked its record forever. It went with the registry -- a
+        // coroutine cannot hold a guard at all now, so there is nothing left to leak.
 
         // TEST HOOK, and it exists to make a NEGATIVE CONTROL deterministic rather than lucky.
         //
@@ -268,9 +252,6 @@ namespace JLib {
         // Never set this outside a test.
         static void ForceWorkerCellsForTest(bool on);
 
-        // Makes AcquireRecord always refuse, so a coroutine taking a guard hits the exhausted-registry
-        // branch deterministically. Test-only -- see the note at the definition.
-        static void ExhaustRecordsForTest(bool on);
 
         // Builds the table. Called by TaskScheduler::Init once the workers and the fiber pool are
         // actually up -- the lazy path cannot be trusted alone, because a worker reaching the sleep
@@ -333,10 +314,13 @@ namespace JLib {
 
     private:
         std::atomic<void*>* cells  = nullptr;
+
+        // Set when this guard was refused because its task is a COROUTINE, which is a different
+        // reason for null cells than "external reader slots exhausted" and gets a different message.
+        bool coroRefused = false;
         // Set when this guard is using a coroutine RECORD rather than a table slot. RELEASED BY
         // ~HazardGuard: the guard is a local in the frame, so the language runs that on every path
         // the frame can end, including destroy() on a suspended one.
-        HazardDomain::RecordId record = HazardDomain::kNoRecord;
         std::size_t         reader = HazardDomain::kNoReader;
     };
 
