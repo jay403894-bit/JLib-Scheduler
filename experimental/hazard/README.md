@@ -100,9 +100,26 @@ cohorts). With one global G it degenerates into exactly the failure people attri
 This is a reclamation scheme that sits beside epochs. It is not a hazard-pointer variant and should
 not be built inside `Hazard.cpp`.
 
-### Which, and when
+### Which, and when — and what the refusal actually costs
 
-Neither, until something actually needs hazard protection across a suspend. Nothing in-tree does:
-no structure behind a `SchedulerMutex` recycles nodes yet, which is why the refusal costs nothing
-today. **A is the smaller finish and the one that matches the paper's shape** — once its list
-question is answered.
+**"NOTHING IN-TREE NEEDS IT" IS NOT THE ARGUMENT IT LOOKS LIKE.** Hazard pointers here were never
+for the library. They are a facility for **users** putting node-recycling structures behind
+`SchedulerMutex` / `SchedulerSemaphore` / the condition variable — the exact place `Epochs.h`
+forbids, since a fiber may not suspend inside an `EpochGuard`. No in-tree callers means the library
+will not break. It says nothing about whether the feature is wanted, and a coroutine walking a
+recycling structure under a fiber-aware lock is the *intended* use case, not a hypothetical.
+
+**WHAT THE REFUSAL COSTS, precisely.** Such a user is not blocked: **counted epochs** exist for
+exactly that reader and are verified — a coroutine survives its own suspension there, at ~0.55 ns
+against the slot path's ~0.40. They are correct without hazard pointers.
+
+What they lose is **bounded pinning**. A stalled epoch reader pins *everything* retired since it
+announced; a hazard reader pins only the nodes it *named*. For a coroutine parked on a contended
+lock for a long time, that difference is the entire reason to reach for HP.
+
+So the gap is footprint under a slow reader, not correctness — which is why a documented refusal
+still beats a reclamation scheme whose grace nobody can state, and why this is worth finishing
+properly rather than never.
+
+**A is the smaller finish and the one that matches the paper's shape**, once its list question is
+answered.
