@@ -824,3 +824,10 @@ target_compile_features(SchedulerHazardOrphanTest PRIVATE cxx_std_17)
 add_executable(SchedulerSubmitLimitTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/submit_limit_test.cpp")
 target_link_libraries(SchedulerSubmitLimitTest PRIVATE Scheduler)
 target_compile_features(SchedulerSubmitLimitTest PRIVATE cxx_std_17)
+
+# THE GROWTH CEILING MUST ACTUALLY ABORT. grow() replaced push_bottom's `return false` and the
+# overflow lanes are gone, so this is the only thing between an infinitely self-spawning task and
+# unbounded memory. A death test: the binary re-executes itself and checks how the child died.
+add_executable(SchedulerDequeCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_ceiling_test.cpp")
+target_link_libraries(SchedulerDequeCeilingTest PRIVATE Scheduler)
+target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)

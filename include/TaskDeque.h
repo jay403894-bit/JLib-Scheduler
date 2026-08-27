@@ -66,7 +66,11 @@ namespace JLib {
         };
 
     public:
-        explicit TaskDeque(size_t capacity = 32768) {
+        // maxCapacity is a CEILING on growth, not an allocation -- see kDefaultMaxCapacity. It is a
+        // parameter so an application with a genuinely deeper workload can raise it, and so the
+        // death test can construct a deque whose abort path is actually reachable.
+        explicit TaskDeque(size_t capacity = 32768, size_t maxCapacity = kDefaultMaxCapacity)
+            : maxCapacity_(maxCapacity < capacity ? capacity : maxCapacity) {
             if ((capacity & (capacity - 1)) != 0)
                 throw std::runtime_error("Capacity must be a power of 2");
             ring_.store(MakeRing(capacity), std::memory_order_relaxed);
@@ -88,7 +92,28 @@ namespace JLib {
         // 210 complete executions, no errors, with three negative controls that all fail as they
         // must. Read that file before changing anything below -- each line here corresponds to one
         // of its claims.
-        static constexpr size_t kMaxCapacity = 1u << 22;   // 4M slots; see grow()
+        // THE CEILING, AND WHY IT IS THIS LOW. 65,536 un-stolen tasks on a SINGLE lane is not load:
+        // the frame has already blown its budget, or a task is dispatching itself without bound.
+        // Past it, growing is not the helpful thing to do -- reporting is.
+        //
+        // MEMORY, STATED AS A BOUND RATHER THAN A HOPE. Capacity doubles, and the sum of every
+        // retired ring is one short of the live one:
+        //
+        //     sum(2^i, i = 0..k-1) = 2^k - 1 < 2^k
+        //
+        // so a deque that has grown to its ceiling holds LESS THAN 2x the live buffer in total,
+        // retired history included. At 65,536 slots that is 512 KB live and under 1 MB all-in per
+        // deque. A 64-worker pool has ~130 of them (two lanes each, plus the non-worker pair), so
+        // the whole-process ceiling is ~130 MB -- and only if EVERY lane is simultaneously
+        // pathological. A pool doing normal work never grows at all and pays 256 KB per deque.
+        //
+        // That bound is what makes retire-by-keeping affordable; see the note on retired_.
+        //
+        // PER-DEQUE RATHER THAN A CONSTANT, for two reasons. An application whose workload really
+        // does queue deeper can raise it instead of being told its program is wrong, and the death
+        // test can construct one with a ceiling small enough to actually reach -- an abort path
+        // nothing can trigger is the same vacuous shape as a negative control that cannot fail.
+        static constexpr size_t kDefaultMaxCapacity = 1u << 16;   // 65,536 slots = 512 KB
 
         // HOW MANY TIMES ANY DEQUE HAS GROWN. Process-wide and incremented only inside grow(), so it
         // is free on every path that matters. It exists because a test asserting "no task was lost"
@@ -116,7 +141,7 @@ namespace JLib {
         // short of the ceiling, and a mechanism that only runs in the case it cannot handle is worse
         // than not having it. So the two ways growth can fail are both FATAL, deliberately:
         //
-        //   PAST kMaxCapacity. 4M tasks queued on ONE lane is not load, it is an infinitely
+        //   PAST THE CEILING. 65,536 tasks queued on ONE lane is not load, it is an infinitely
         //   self-spawning task. Aborting with a message naming the cause is the standard policy for
         //   this and is vastly better than an OOM with no explanation -- which is exactly what
         //   unbounded doubling would give instead.
@@ -132,7 +157,7 @@ namespace JLib {
         // SAME VALUE -- so a grow racing a steal cannot change WHICH task is claimed.
         void grow(Ring* old, size_t t, size_t b) {
             const size_t newCap = old->capacity * 2;
-            if (newCap > kMaxCapacity) FatalGrow(old->capacity, "ceiling reached");
+            if (newCap > maxCapacity_) FatalGrow(old->capacity, "ceiling reached");
 
             Ring* r = nullptr;
             try {
@@ -161,13 +186,29 @@ namespace JLib {
         // Says what happened, names the knob, then stops -- the same shape as
         // HazardDomain::FatalCellOverflow, and for the same reason: continuing here means guessing
         // on the caller's behalf about work it still believes is queued.
+        // THE ONLY REMAINING WAY push_bottom RETURNS false IS A NULL ITEM, which every call site
+        // already excludes -- growth removed the "full" case. So this is unreachable by argument,
+        // and it aborts rather than asserting precisely BECAUSE it is unreachable by argument: if
+        // the argument is ever wrong, an assert would evaporate under /O2 and the task would vanish
+        // into a suspended fiber with no stack trace. A crash with a minidump is the better failure.
+        [[noreturn]] static void FatalPushRefused() {
+            std::fprintf(stderr,
+                "[JLib::Scheduler] FATAL: push_bottom refused a non-null item.\n"
+                "  The deque grows rather than filling, so the only documented refusal is a null\n"
+                "  task -- which this call site has already excluded. Reaching here means that\n"
+                "  invariant broke. Stopping rather than dropping the task: a dropped task never\n"
+                "  signals its WaitGroup, and the failure would surface as an unexplained hang.\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+
         [[noreturn]] static void FatalGrow(size_t capacity, const char* why) {
             std::fprintf(stderr,
                 "[JLib::Scheduler] FATAL: a work-stealing deque could not grow past %zu slots -- %s.\n"
                 "  A lane holds this many tasks only if something is spawning without bound; the\n"
-                "  ceiling is kMaxCapacity in TaskDeque.h. This is fatal rather than dropped because\n"
-                "  a dropped task never signals its WaitGroup, and the failure would surface as a\n"
-                "  hang somewhere else entirely.\n",
+                "  ceiling is this deque's maxCapacity (default kDefaultMaxCapacity in TaskDeque.h).\n"
+                "  This is fatal rather than dropped because a dropped task never signals its\n"
+                "  WaitGroup, and the failure would surface as a hang somewhere else entirely.\n",
                 capacity, why);
             std::fflush(stderr);
             std::abort();
@@ -462,6 +503,10 @@ namespace JLib {
         //
         // OWNER-ONLY, and never read by anyone else, so it needs no synchronisation of its own.
         std::vector<Ring*> retired_;
+
+        // Growth ceiling for THIS deque. Const: changing it after construction would let a deque
+        // that already grew past a new lower ceiling sit there in a state grow() says is impossible.
+        const size_t maxCapacity_;
 
         alignas(platform::kCacheLine) std::atomic<size_t> top_;
         alignas(platform::kCacheLine) std::atomic<size_t> bottom_;

@@ -435,9 +435,11 @@ bool Thread::DrainOwnInboxesToDeques() {
 				// message rather than handing back a failure nobody can act on here. The only
 				// remaining false is a null item, which the guard above has already excluded --
 				// hence the assert rather than a fallback path that can never run.
-				const bool pushed = deque->push_bottom(batch[i]);
-				(void)pushed;
-				assert(pushed && "push_bottom refused a non-null item; it grows or aborts now");
+				// NOT AN assert: that evaporates under /O2, and the failure it would have caught is a
+				// SILENTLY DROPPED TASK in exactly the build where nobody is watching -- the fiber
+				// stays suspended forever and the hang has no stack trace pointing here. A crash with
+				// a minidump beats that every time.
+				if (!deque->push_bottom(batch[i])) TaskDeque::FatalPushRefused();
 				moved = true;
 			}
 		}
@@ -1058,9 +1060,10 @@ void Thread::Worker() {
 				// stack never unwinds and nothing it holds is released -- RAII, its WaitGroup slot,
 				// a hazard record. The deque grows now rather than refusing, so the only false left
 				// is a null task, which cannot be one here.
-				const bool requeued = scheduler->loPri[qIndex]->push_bottom(task_to_run);
-				(void)requeued;
-				assert(requeued && "a yielded fiber failed to requeue");
+				// Same reasoning as the inbox drain: a hard stop, not an assert. A yielded fiber that
+				// fails to requeue is never resumed, so its stack never unwinds -- silence here costs
+				// RAII, a WaitGroup slot and a hazard record, and reports none of it.
+				if (!scheduler->loPri[qIndex]->push_bottom(task_to_run)) TaskDeque::FatalPushRefused();
 				currentFiber = nullptr;
 				currentRunningTask = nullptr;
 			}
