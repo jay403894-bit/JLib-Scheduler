@@ -662,22 +662,32 @@ namespace JLib {
 		// of a per-thread one would invite exactly that mistake, so it does not offer one.
 		//
 		//   Normal    leave scheduling alone. The default.
-		//   Elevated  no privilege required. Windows: THREAD_PRIORITY_TIME_CRITICAL, the top of the
-		//             non-realtime range (15) inside a normal-priority process -- this is the
-		//             configuration measured best (HOT p99 4.5-10us against a 144-2416us baseline).
-		//             Linux/BSD would be SCHED_RR per thread; macOS QOS_CLASS_USER_INTERACTIVE.
-		//   Realtime  the privileged tier: Linux/BSD SCHED_FIFO (needs CAP_SYS_NICE), macOS
-		//             THREAD_TIME_CONSTRAINT_POLICY (what CoreAudio uses).
+		//   Elevated  no privilege required, and IMPLEMENTED ON EVERY PLATFORM:
+		//               Windows  THREAD_PRIORITY_TIME_CRITICAL -- top of the non-realtime range (15)
+		//                        inside a normal-priority process. Measured best: HOT p99 4.5-10us
+		//                        against a 144-2416us baseline.
+		//               macOS    QOS_CLASS_USER_INTERACTIVE. QoS, not affinity -- Apple Silicon has
+		//                        no thread affinity at all, and QoS is what steers P vs E there.
+		//               Linux    per-thread nice -10, via syscall(SYS_setpriority, PRIO_PROCESS,
+		//                        gettid). The RAW SYSCALL is load-bearing: glibc's setpriority
+		//                        follows POSIX and applies to the whole PROCESS, which would elevate
+		//                        all N workers -- the configuration measured 5x WORSE.
+		//   Realtime  reserved. BEHAVES AS Elevated on every platform today.
 		//
-		// ON WINDOWS, Realtime BEHAVES AS Elevated, on purpose. The only step above TIME_CRITICAL is
-		// REALTIME_PRIORITY_CLASS, which is PROCESS-wide, needs a privilege, and would let a spin
-		// loop starve the OS itself. Refusing to escalate is the honest mapping; silently giving the
-		// caller a process-wide change they did not ask for is not.
+		// WHY Realtime ESCALATES NOWHERE. On Windows the only step above TIME_CRITICAL is
+		// REALTIME_PRIORITY_CLASS: PROCESS-wide, privileged, and able to let a spin loop starve the
+		// OS. On Linux it would be SCHED_FIFO, which is NOT the analogue of TIME_CRITICAL -- FIFO
+		// sits above nearly everything and will not yield, far closer to the process-wide elevation
+		// recorded above as a regression. A FIFO tier is a deliberate future opt-in, default off and
+		// off the hot path, not a mapping for Realtime. Refusing to escalate is the honest answer;
+		// silently handing the caller a privilege tier they did not ask for is not.
 		//
-		// POSIX IS NOT IMPLEMENTED -- there is no backend yet, so both tiers are a no-op there
-		// rather than a lie. Note that affinity is NOT a substitute: exclusive pinning was measured
-		// and is worse than doing nothing (see SetHotWorkerExclusive). A POSIX port genuinely needs
-		// the privileged call or real core isolation.
+		// ELEVATION CAN BE REFUSED ON POSIX, AND THAT IS NOT AN ERROR. Lowering nice needs
+		// CAP_SYS_NICE or a raised RLIMIT_NICE; EPERM is swallowed rather than reported, because the
+		// unprivileged answer is still an answer. ANDROID IGNORES IT REGARDLESS -- cgroups arbitrate
+		// there -- so never quote an Android measurement as evidence this works. Affinity is not a
+		// substitute either: exclusive pinning was measured and is worse than doing nothing (see
+		// SetHotWorkerExclusive).
 		enum class HotThreadPolicy : uint8_t { Normal = 0, Elevated, Realtime };
 		static void            SetHotThreadPolicy(HotThreadPolicy p);
 		static HotThreadPolicy GetHotThreadPolicy();

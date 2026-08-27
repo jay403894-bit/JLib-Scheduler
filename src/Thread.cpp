@@ -9,9 +9,74 @@
 #include <chrono>
 #include <iostream>
 #include <cstring>   // std::memset -- MSVC pulls this in transitively, libstdc++ does not
-#include <utility>   // std::swap, for drainInbox's in-place corePref partition
+#include <utility>   // std::swap, for drainInbox`s in-place corePref partition
+
+// ApplyHotPriority needs these, and it is defined near the top of this file -- so they cannot live
+// in the !JLIB_PLATFORM_WINDOWS block further down, which comes after it.
+#if !JLIB_PLATFORM_WINDOWS
+#include <sys/resource.h>       // PRIO_PROCESS, setpriority
+#endif
+#if JLIB_PLATFORM_LINUX
+#include <sys/syscall.h>        // SYS_setpriority, SYS_gettid
+#include <unistd.h>
+#endif
+#if JLIB_PLATFORM_DARWIN
+#include <pthread.h>
+#include <sys/qos.h>            // QOS_CLASS_*, pthread_set_qos_class_self_np
+#endif
 using namespace JLib;
 thread_local Thread* Thread::instance = nullptr;
+
+namespace {
+// THE ONLY PLACE PLATFORM DIFFERENCES LIVE for hot-worker priority. The worker loop calls this and
+// stays one protocol on every OS; without that the loop grows three copies of the same state
+// machine and they drift, which is a failure this file has already had.
+//
+// Called on the CURRENT thread only, and only when HotThreadPolicy != Normal -- the callers gate on
+// hotPriorityRaised, which is never set under Normal. So this is a no-op configuration by
+// construction rather than by an extra branch on the per-task path.
+//
+// EVERY BACKEND SWALLOWS FAILURE. Elevation is privileged on POSIX and can be refused at runtime in
+// a way the Win32 call never is; refusing is not an error, it is the unprivileged answer. The
+// caller's flags then say "raised" while the OS says otherwise -- harmless, because the flags exist
+// to suppress redundant syscalls, not to describe the kernel.
+void ApplyHotPriority(bool wantElevated) noexcept {
+#if JLIB_PLATFORM_WINDOWS
+    // TIME_CRITICAL inside a NORMAL_PRIORITY_CLASS process is 15: the top of the non-realtime range,
+    // above the pool and below the OS. True realtime (16-31) needs REALTIME_PRIORITY_CLASS and a
+    // privilege, and would let a spin loop starve the machine, so it is deliberately not asked for.
+    ::SetThreadPriority(::GetCurrentThread(),
+                        wantElevated ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_NORMAL);
+
+#elif JLIB_PLATFORM_DARWIN
+    // QoS, NOT SCHED_FIFO and NOT affinity. Apple Silicon has no thread affinity API at all, and QoS
+    // is the documented lever -- it is also what actually steers P vs E core selection there, which
+    // is the same decision Windows makes off priority.
+    (void)pthread_set_qos_class_self_np(
+        wantElevated ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_DEFAULT, 0);
+
+#elif JLIB_PLATFORM_LINUX
+    // PER-THREAD niceness, and the raw syscall is what makes it per-thread. Linux nice is a
+    // thread attribute, but glibc's setpriority(PRIO_PROCESS, 0, n) follows POSIX and applies to the
+    // whole PROCESS -- which would elevate all 31 workers, the exact configuration measured 5x WORSE
+    // because N runnable threads then preempt the completion thread feeding them. Passing a TID
+    // through the syscall keeps it to this thread.
+    //
+    // -10 rather than -20: enough to win a timeslice contest against ordinary workers without
+    // approaching the range where a spinning thread starves kernel threads. Not SCHED_FIFO -- that
+    // is above nearly everything and will not yield, far closer to the process-wide elevation this
+    // file records as a regression. A FIFO tier stays opt-in and unbuilt; see HotThreadPolicy.
+    //
+    // EPERM IS EXPECTED AND IGNORED. Lowering nice needs CAP_SYS_NICE or a raised RLIMIT_NICE, and
+    // ANDROID IGNORES IT REGARDLESS because cgroups arbitrate there -- so never quote a measured win
+    // from Android on the strength of this call.
+    (void)syscall(SYS_setpriority, PRIO_PROCESS,
+                  (int)syscall(SYS_gettid), wantElevated ? -10 : 0);
+#else
+    (void)wantElevated;
+#endif
+}
+} // namespace
 
 #if !JLIB_PLATFORM_WINDOWS
 #include <sched.h>
@@ -439,12 +504,8 @@ void Thread::Worker() {
 	// again when it stops -- it used to be one-way, which was correct only while the hot set was
 	// static. Dynamic K made "was hot once" permanent while K itself sheds; see the stand-down
 	// branch in the idle section for why that mattered under NoSleep.
-	// GUARDED, because every USE of it is. Both this and atCriticalPriority below exist only for the
-	// Windows priority path; leaving them unguarded left a POSIX build carrying two dead locals and
-	// gave a reader no hint that the feature is absent there rather than merely unused.
-#if defined(_WIN32)
+	// Cross-platform again as of the POSIX port -- ApplyHotPriority has a backend on every OS now.
 	bool hotPriorityRaised = false;
-#endif
 	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
 	unsigned hotCtlTick = 0;
 	unsigned laneDutyTick = 0;
@@ -458,11 +519,9 @@ void Thread::Worker() {
 	// demotion never fires.
 	bool ranLaneTaskLastPass = false;
 	long long laneStartNs = 0;
-	// Tracks what this thread's priority actually IS, so the per-task adjust below is a syscall only
-	// on a genuine change. Meaningless unless hotPriorityRaised. Windows-only, same as that flag.
-#if defined(_WIN32)
+	// Tracks what this thread`s priority actually IS, so the per-task adjust below is a syscall only
+	// on a genuine change. Meaningless unless hotPriorityRaised.
 	bool atCriticalPriority = false;
-#endif
 
 	// EXCLUSIVE MODE: an ORDINARY worker gets off the hot cores. The hot workers themselves are
 	// already pinned to them by StartWorker. Done here, at loop entry, because by now every worker's
@@ -752,7 +811,6 @@ void Thread::Worker() {
 			}
 			task_to_run->started = 1;
 
-#if defined(_WIN32)
 			// DEMOTE BEFORE RUNNING ORDINARY WORK. A hot worker sits at TIME_CRITICAL so it can
 			// take a completion the instant one lands -- but it also steals general work when its
 			// inbox is empty, and running a long ordinary task at priority 15 is exactly the
@@ -769,12 +827,10 @@ void Thread::Worker() {
 			if (hotPriorityRaised) {
 				const bool wantCritical = (task_to_run->hiPri != 0);
 				if (wantCritical != atCriticalPriority) {
-					::SetThreadPriority(::GetCurrentThread(),
-						wantCritical ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_NORMAL);
+					ApplyHotPriority(wantCritical);
 					atCriticalPriority = wantCritical;
 				}
 			}
-#endif
 
 			// Fast path: run directly on THIS worker's own OS-thread stack, no fiber acquired
 			// or ContextSwitch paid at all. Only safe because Native tasks are a CONTRACT --
@@ -1409,12 +1465,9 @@ void Thread::Worker() {
 
 				// ---- WINDOWS ONLY. There is no POSIX implementation of HotThreadPolicy. ----------
 				//
-				// Everything between here and the matching #endif is the thread-priority half of
-				// K-hot, and it exists on Windows alone. On POSIX SetHotThreadPolicy is a documented
-				// no-op -- see the header -- so a Linux build silently gets Normal whatever the
-				// caller asked for. That is deliberate (a no-op beats a lie), but it means the
-				// measured win below is a WINDOWS win and must not be quoted as a portable one.
-#if defined(_WIN32)
+				// PORTABLE PROTOCOL. Every platform difference lives in ApplyHotPriority; the state
+				// machine below is one copy on every OS, because three copies of it would drift.
+				//
 				// TARGETED priority, and the targeting is the point. Raising the WHOLE PROCESS was
 				// measured 5x WORSE with K-hot: it elevates all N workers, so 29 spinning threads
 				// preempt the completion thread that feeds them. Raising only the hot workers (and,
@@ -1430,7 +1483,7 @@ void Thread::Worker() {
 				// this deliberately refuses to touch. See HotThreadPolicy.
 				if (hot && !hotPriorityRaised &&
 				    TaskScheduler::GetHotThreadPolicy() != TaskScheduler::HotThreadPolicy::Normal) {
-					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+					ApplyHotPriority(true);
 					hotPriorityRaised = true;
 					atCriticalPriority = true;
 				}
@@ -1453,7 +1506,7 @@ void Thread::Worker() {
 				// thrashing the syscall in the idle loop; the flags make it fire only on a real
 				// change, and K moves at 200us up / 200ms down, not per pass.
 				else if (!hot && hotPriorityRaised) {
-					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+					ApplyHotPriority(false);
 					hotPriorityRaised = false;
 					atCriticalPriority = false;
 				}
@@ -1463,35 +1516,9 @@ void Thread::Worker() {
 				// only because this worker is still HOT -- the branch above has already stood down
 				// anyone who is not.
 				else if (hotPriorityRaised && !atCriticalPriority) {
-					::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+					ApplyHotPriority(true);
 					atCriticalPriority = true;
 				}
-#else
-				// ---- POSIX: NOT IMPLEMENTED, and not a one-line port --------------------------
-				//
-				// Deliberately empty rather than approximated. What it would take:
-				//
-				//   Elevated  Linux/BSD SCHED_RR on the hot threads only; macOS
-				//             QOS_CLASS_USER_INTERACTIVE. Needs RLIMIT_RTPRIO or CAP_SYS_NICE, so it
-				//             can fail at runtime in a way the Windows call never does -- the port
-				//             has to decide what a REFUSED elevation means and say so.
-				//   Realtime  SCHED_FIFO (CAP_SYS_NICE); macOS THREAD_TIME_CONSTRAINT_POLICY.
-				//
-				// THE TRAP, recorded so the port does not walk into it: SCHED_FIFO is NOT the
-				// analogue of Windows TIME_CRITICAL. TIME_CRITICAL is priority 15 inside a NORMAL
-				// process -- above the pool, below the OS. SCHED_FIFO is above almost everything and
-				// will not yield, which is far closer to the process-wide elevation this file
-				// records as measuring 5x WORSE: N runnable threads at a priority that preempts the
-				// completion thread feeding them. A naive "FIFO == TIME_CRITICAL" port regresses.
-				//
-				// nice() is not a substitute either: under SCHED_OTHER it biases the weighting, it
-				// does not guarantee preemption, and preemption is the entire mechanism here.
-				//
-				// SetHotWorkerPin is the PORTABLE half of this story and already works everywhere --
-				// though note it measured WORSE than doing nothing on a saturated pool, because
-				// pinning confines the hot worker without excluding anyone else from its core.
-				(void)hot;
-#endif
 #ifdef JLIBSCHED_HOT_OCCUPANCY_STATS
 				// THE WITNESS. Reaching here means this worker's whole search came up empty, so for
 				// a hot worker this is by definition an idle pass. Sampled 1-in-64 rather than every
