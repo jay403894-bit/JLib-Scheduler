@@ -836,6 +836,61 @@ void TaskScheduler::GetHotWorkerRange(size_t& minK, size_t& maxK) noexcept {
 	maxK = g_hotMax.load(std::memory_order_relaxed);
 }
 
+// QueueLoad by default: the historical behaviour, unchanged, and the right one for throughput work.
+// Opting into WaitTime is a claim that this lane has a DEADLINE, which the library cannot infer.
+static std::atomic<uint8_t>   g_kPolicy{ (uint8_t)TaskScheduler::KPolicy::QueueLoad };
+static std::atomic<long long> g_laneWaitTargetNs{ 250000 };   // 250 us; see the header
+
+void TaskScheduler::SetHotWorkerPolicy(KPolicy p) noexcept {
+	g_kPolicy.store((uint8_t)p, std::memory_order_relaxed);
+}
+TaskScheduler::KPolicy TaskScheduler::GetHotWorkerPolicy() noexcept {
+	return (KPolicy)g_kPolicy.load(std::memory_order_relaxed);
+}
+void TaskScheduler::SetLaneWaitTargetNs(long long ns) noexcept {
+	// A non-positive target would promote on every arrival and never demote -- the K ratchet, in one
+	// setter. Clamped rather than asserted because it is reachable from a config file.
+	if (ns < 1000) ns = 1000;
+	g_laneWaitTargetNs.store(ns, std::memory_order_relaxed);
+}
+long long TaskScheduler::GetLaneWaitTargetNs() noexcept {
+	return g_laneWaitTargetNs.load(std::memory_order_relaxed);
+}
+
+// See the header: a latch, not a sample. Counted rather than a bool purely so the window path can
+// tell "one late arrival" from "late continuously" if that ever matters; the promote only asks
+// whether it is non-zero.
+static std::atomic<unsigned> g_laneWaitExceeded{ 0 };
+
+void TaskScheduler::NoteLaneWaitExceeded() noexcept {
+	g_laneWaitExceeded.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Diagnostics only -- the DECISION is the latch above. Kept because a wait target you cannot
+// observe is a number nobody can tune, and this is the only place the actual delay is visible.
+long long TaskScheduler::DrainLaneWaitMaxNs(size_t k) noexcept {
+	if (!instance) return 0;
+	long long worst = 0;
+	for (size_t i = 0; i < k && i < instance->workers.size(); ++i) {
+		const long long w =
+		    instance->workers[i]->laneWaitMaxNs.exchange(0, std::memory_order_relaxed);
+		if (w > worst) worst = w;
+	}
+	return worst;
+}
+
+void TaskScheduler::StampLaneArrival(size_t chosen) noexcept {
+	if ((KPolicy)g_kPolicy.load(std::memory_order_relaxed) != KPolicy::WaitTime) return;
+	if (chosen >= workers.size()) return;
+	std::atomic<long long>& slot = workers[chosen]->laneArrivalNs;
+	// Loaded first so the clock read is skipped when a stamp is already pending -- what we want is
+	// the OLDEST un-picked arrival, and a later one must not overwrite it. The CAS then makes that
+	// check honest against a concurrent pickup clearing the slot between the load and the store.
+	if (slot.load(std::memory_order_relaxed) != 0) return;
+	long long expected = 0;
+	slot.compare_exchange_strong(expected, MonotonicNs(), std::memory_order_relaxed);
+}
+
 // A LANE MISS: a completion that had to QUEUE behind another one on the same worker.
 //
 // WHY THIS AND NOT THE SATURATION EDGE. The edge trigger needs every hot worker past
@@ -951,8 +1006,32 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	// Occupancy is the only thing that answers "sustainably needed", so only the OCCUPANCY promote
 	// below clears this. Event-driven promotes take the core immediately, as they should, and then
 	// have to survive the same time-based scrutiny as everything else to keep it.
-	if (k < hi && (missed || adv == mask)
+	// POLICY SPLITS HERE. QueueLoad keeps its two volume signals; WaitTime replaces them outright
+	// rather than OR-ing with them -- a lane opted into a deadline should not also be promoted by a
+	// backlog that never formed, and more importantly the reverse: OR-ing would mean WaitTime could
+	// never demote below whatever QueueLoad wanted, which is the K ratchet.
+	//
+	// Evaluated on the FAST path, not in the 10 ms window below, because 10 ms is an eternity to a
+	// lane whose target is a quarter of a millisecond: by the time a window closed, hundreds of
+	// arrivals would have missed it.
+	const KPolicy policy = (KPolicy)g_kPolicy.load(std::memory_order_relaxed);
+	bool wantUp;
+	if (policy == KPolicy::WaitTime) {
+		// LOADED, NOT EXCHANGED. Clearing here would mean every tick that reads the latch while
+		// kHotUpIntervalNs has not elapsed throws away the very evidence the next tick needs -- and
+		// the controller ticks orders of magnitude more often than it is allowed to act. The clear
+		// belongs on the promote that USES it, below.
+		wantUp = g_laneWaitExceeded.load(std::memory_order_relaxed) != 0;
+		// A lane still missing its target must not be shed underneath itself.
+		if (wantUp) g_lowWindows.store(0, std::memory_order_relaxed);
+	} else {
+		wantUp = (missed || adv == mask);
+	}
+
+	if (k < hi && wantUp
 	    && now - g_lastHotChangeNs.load(std::memory_order_relaxed) >= kHotUpIntervalNs) {
+		// Cleared by the promote that consumed it, and only there -- see the load above.
+		if (policy == KPolicy::WaitTime) g_laneWaitExceeded.store(0, std::memory_order_relaxed);
 		SetHotWorkersEffective(k + 1);
 		g_lastHotChangeNs.store(now, std::memory_order_relaxed);
 		return;
@@ -1040,7 +1119,25 @@ void TaskScheduler::MaybeAdjustHotWorkers() noexcept {
 	//   loaded  : steering spreads, so every hot worker runs something. Keep, at any occupancy.
 	//
 	// It also refuses to punish a lane for being fast, which occupancy structurally does.
-	const bool low = (topTasks == 0);
+	// THE DEMOTE PREDICATE IS POLICY-SPLIT TOO, and it has to be. Pairing WaitTime's promote with
+	// QueueLoad's demote would churn: topTasks == 0 is true in most windows at a low arrival rate
+	// (0.6 packets per 10 ms window, rotated across the hot set, means the marginal core usually
+	// runs none), so the controller would promote on a late arrival and shed the core again three
+	// windows later, forever. A policy selects a PAIR of predicates, not just a promote.
+	//
+	// The clear edge is a QUARTER of the target, not the target itself. Demoting the moment waits
+	// dip below the promote threshold sits the controller exactly on its own switching point; the
+	// gap is the hysteresis, the same shape as the lane hint's Schmitt trigger in TaskScheduler.h.
+	bool low;
+	if (policy == KPolicy::WaitTime) {
+		// THE WINDOW IS WHERE STALE EVIDENCE IS FORGOTTEN. Exchanging here -- once per 10 ms rather
+		// than once per tick -- is what stops a single late arrival from justifying the core
+		// forever, while still giving the promote path a whole window to notice it.
+		low = (g_laneWaitExceeded.exchange(0, std::memory_order_relaxed) == 0);
+		(void)DrainLaneWaitMaxNs(k);      // diagnostics; also keeps the per-worker max bounded
+	} else {
+		low = (topTasks == 0);
+	}
 	(void)topBusyNs;
 	unsigned lows = 0;
 	if (low) lows = g_lowWindows.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2722,7 +2819,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		const size_t hotN = GetHotWorkers();
 		const bool useHi = task->hiPri && hotN;
 		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
-		if (useHi) hiPriInboxes[chosen]->push(task);
+		if (useHi) { StampLaneArrival(chosen); hiPriInboxes[chosen]->push(task); }
 		else
 			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 		workers[chosen]->MarkQueuedWork();
@@ -2742,7 +2839,7 @@ bool TaskScheduler::Requeue(Task* task) {
 	const size_t hotN = GetHotWorkers();
 	const bool useHi = task->hiPri && hotN;
 	const uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
-	if (useHi) hiPriInboxes[chosen]->push(task);
+	if (useHi) { StampLaneArrival(chosen); hiPriInboxes[chosen]->push(task); }
 	else
 		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
 	workers[chosen]->MarkQueuedWork();

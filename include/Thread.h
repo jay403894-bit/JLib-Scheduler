@@ -387,6 +387,32 @@ namespace JLib {
         // takes a share of the arrival rate" from "this core is surplus", which is the actual
         // question, and it does not punish a lane for being fast.
         std::atomic<unsigned> laneTasksRun{ 0 };
+
+        // ---- KPolicy::WaitTime evidence ------------------------------------------------------
+        //
+        // HEAD-OF-LINE ARRIVAL STAMP, written by the PUSHER. It has to be the pusher: a worker
+        // cannot observe a wait it incurred while it was busy, and under load that is the only
+        // wait that matters -- the hot worker runs ordinary tasks between completions, so a lane
+        // arrival queues behind ORDINARY work, not behind another lane task. That is also why
+        // NoteLaneMiss(count > 1) stays silent at low arrival rates: two packets 16.7 ms apart
+        // never coincide with each other, so the lane queue is never deep, and the task waits
+        // anyway.
+        //
+        // Not a field in Task, deliberately. Task's last 8 bytes are the tail padding that
+        // LambdaTask<F> reuses; claiming them moves every single-capture lambda from the 64-byte
+        // slab class to the 128-byte one -- a 2x memory regression on the commonest task in the
+        // system, to carry a diagnostic timestamp. See the tail-padding note in Task.h.
+        //
+        // CAS 0 -> now, so only the FIRST arrival into an idle slot stamps: what survives is the
+        // oldest un-picked arrival, which is the head-of-line wait and the one worth promoting on.
+        // Cleared by an exchange at pickup, which is a site that already exists and already reads
+        // the clock -- no new clear site, and this file has a history of those drifting apart.
+        std::atomic<long long> laneArrivalNs{ 0 };
+
+        // Largest head-of-line wait seen since the controller last drained this. A MAX, not a mean:
+        // the controller is asking "did anything wait too long", and an average over a window
+        // containing one late arrival and fifty prompt ones answers a different question.
+        std::atomic<long long> laneWaitMaxNs{ 0 };
     private:
 
         // Worker sleep state, so a push can skip the wake entirely when this worker is already

@@ -268,6 +268,23 @@ void InputThread(std::uint32_t packets, int rateHz) {
     ::closesocket(s);
 }
 
+// ---- where does K actually sit? -------------------------------------------------------------------
+//
+// The controller's behaviour is not inferable from the latency numbers -- "between static K=1 and
+// static K=2" is consistent with sitting at 1 most of the time, at 2 most of the time, or flapping.
+// Sampling the effective K settles it, and it is the only way to tell which of the promote signals
+// is or is not firing without instrumenting the scheduler itself.
+
+std::atomic<unsigned> g_kHist[16];
+
+void KSamplerThread() {
+    while (!g_stop.load(std::memory_order_relaxed)) {
+        const size_t k = JLib::TaskScheduler::GetHotWorkers();
+        g_kHist[k < 16 ? k : 15].fetch_add(1, std::memory_order_relaxed);
+        ::Sleep(1);
+    }
+}
+
 // ---- background load -----------------------------------------------------------------------------
 //
 // Keeps the worker pool genuinely busy, which is the only way to ask whether the receive path and
@@ -362,6 +379,8 @@ int main(int argc, char** argv) {
         if (load) loadThread = std::thread(LoadThread, load);
     }
 
+    std::thread ksampler;
+    if (!plain) ksampler = std::thread(KSamplerThread);
     std::thread input(InputThread, packets, rate);
 
     // Run the pump for the requested wall time. A timer posts WM_QUIT when the window has had long
@@ -380,6 +399,7 @@ done:
     g_stop.store(true, std::memory_order_relaxed);
     if (input.joinable()) input.join();
     if (loadThread.joinable()) loadThread.join();
+    if (ksampler.joinable()) ksampler.join();
 
     if (plain) {
         ::closesocket(s);                       // unblocks the recvfrom
@@ -434,6 +454,17 @@ done:
                 "paint -> paint", j.mean, j.p50, j.p90, j.p95, j.p99, j.max);
     std::printf("  frame jitter (sd): %.3f ms over %zu frames; target interval %.3f ms\n",
                 sd, gaps.size(), 1000.0 / (double)(rate ? rate : 60));
+
+    unsigned ktot = 0;
+    for (int i = 0; i < 16; ++i) ktot += g_kHist[i].load();
+    if (ktot) {
+        std::printf("\n  effective K over the run (1 ms samples):\n");
+        for (int i = 0; i < 16; ++i) {
+            const unsigned c = g_kHist[i].load();
+            if (c) std::printf("    K=%d  %5.1f%%  (%u samples)\n",
+                               i, 100.0 * (double)c / (double)ktot, c);
+        }
+    }
 
     const double frame = 1000.0 / 60.0;
     std::printf("\n  VERDICT: input->paint p99 = %.3f ms vs a %.2f ms frame -- %s\n",

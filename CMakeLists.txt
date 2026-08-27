@@ -778,3 +778,9 @@ if(WIN32 AND JLIBSCHED_COROUTINES)
     target_compile_features(SchedulerUdpLatencyBench PRIVATE cxx_std_20)
     set_target_properties(SchedulerUdpLatencyBench PROPERTIES OUTPUT_NAME udp_latency_bench)
 endif()
+
+# The KPolicy pair. A PAIRED test: WaitTime must promote where QueueLoad provably does not, on the
+# workload measured to defeat volume-based signals. C++17 -- no coroutines involved.
+add_executable(SchedulerKPolicyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/kpolicy_test.cpp")
+target_link_libraries(SchedulerKPolicyTest PRIVATE Scheduler)
+target_compile_features(SchedulerKPolicyTest PRIVATE cxx_std_17)

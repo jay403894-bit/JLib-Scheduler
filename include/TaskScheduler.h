@@ -390,6 +390,50 @@ namespace JLib {
 		static void SetHotWorkerRange(size_t minK, size_t maxK) noexcept;
 		static void GetHotWorkerRange(size_t& minK, size_t& maxK) noexcept;
 
+		// WHICH EVIDENCE THE CONTROLLER READS. Orthogonal to the range, which says how far K may
+		// move; this says what makes it move. Not a re-run of the cancelled Mode::KMode -- that one
+		// was redundant with the range (min == max already means static), and this is not
+		// expressible by the range at all.
+		//
+		// The two policies exist because K answers two different questions that happen to share a
+		// mechanism:
+		//
+		//   QueueLoad (default, and the historical behaviour) -- "is the lane keeping up with the
+		//     arrival RATE?" Promotes on backlog depth or sustained occupancy; demotes when the
+		//     marginal core takes no share of the arrivals. Correct for throughput work, where more
+		//     hot workers means more completed per second.
+		//
+		//   WaitTime -- "did an arrival have to WAIT?" Promotes on head-of-line queueing delay,
+		//     demotes when that delay stays small. Correct for a deadline lane, where the marginal
+		//     worker earns its keep by being AVAILABLE for the next arrival rather than by
+		//     completing a share of them.
+		//
+		// WHY QueueLoad CANNOT COVER THE SECOND CASE. Every one of its signals measures VOLUME, and
+		// availability is invisible to volume: a worker held free to catch the next completion looks
+		// exactly like a worker with nothing to do. Measured on a 60 Hz UDP lane -- one small packet
+		// per tick -- dynamic K under QueueLoad sat at K=1 for 100% of a 60 s run, because a 10 ms
+		// window holds 0.6 packets: the backlog edge needs four queued at once, occupancy needs 7 ms
+		// of lane work in the window, and the miss counter needs two packets coincident. All three
+		// are structurally dead at low arrival rates, while the demote path fires easily. The lane
+		// was latency-bound the whole time and nothing could see it.
+		//
+		// This is the same blind spot the demote path was already fixed for -- see the AVAILABLE,
+		// not busy note on laneTasksRun in Thread.h. That fix was applied to one direction only.
+		enum class KPolicy : uint8_t { QueueLoad, WaitTime };
+
+		static void    SetHotWorkerPolicy(KPolicy p) noexcept;
+		static KPolicy GetHotWorkerPolicy() noexcept;
+
+		// Head-of-line wait above which WaitTime promotes, and below which it starts counting
+		// windows toward a demote. Ignored entirely under QueueLoad.
+		//
+		// A DURATION, not a ratio, because the thing being defended is a deadline: what matters is
+		// how late an arrival was in microseconds, not how late relative to how busy anything was.
+		// The default is deliberately well under a 60 Hz frame -- a lane whose arrivals wait a
+		// quarter-millisecond is already the dominant term in most frame budgets.
+		static void      SetLaneWaitTargetNs(long long ns) noexcept;
+		static long long GetLaneWaitTargetNs() noexcept;
+
 		// Evaluated by ONE worker, sampled rather than every pass -- a clock read per pass per
 		// worker would cost more than the mechanism saves. Public only so Thread.cpp can call it.
 		// TRUE only when the range can actually move. Under static K -- min == max, which is the
@@ -404,6 +448,13 @@ namespace JLib {
 		// to queue behind another. Detected at depth ONE, where the saturation edge needs
 		// kLaneStealDepth, and computed for free from a count the drain already has.
 		static void NoteLaneMiss(size_t waiting) noexcept;
+
+		// KPolicy::WaitTime's evidence. A LATCH, not a sample, and that distinction is the whole
+		// mechanism: the controller ticks far more often than kHotUpIntervalNs lets it act, so a
+		// read-and-reset would let a tick that CANNOT promote destroy the evidence a later one
+		// needed. Set here, cleared only by a promote that used it or by a window that found none.
+		// Called from the lane pickup in Thread.cpp, which already has the arrival stamp and clock.
+		static void NoteLaneWaitExceeded() noexcept;
 		// WHO MAY DRAIN A BACKLOGGED LANE.
 		//
 		//   0  nobody -- the lane is strictly private to its hot worker
@@ -1660,6 +1711,16 @@ namespace JLib {
 		AbiCanary abiCanary{};
 
 	private:
+		// KPolicy::WaitTime plumbing. Members rather than file-static helpers in the .cpp only
+		// because `workers` is private; there is nothing public about either.
+		//
+		// StampLaneArrival must run BEFORE the push, not after. Stamp afterwards and a task consumed
+		// immediately leaves its arrival time in the slot with nothing pending, so the NEXT lane task
+		// on that worker measures its wait from the previous arrival -- an enormous overstatement
+		// that would promote on an idle lane.
+		void             StampLaneArrival(size_t chosen) noexcept;
+		static long long DrainLaneWaitMaxNs(size_t k) noexcept;
+
 		std::unordered_map<std::string, std::unique_ptr<Event>> eventRegistry;
 		std::mutex registryMtx;
 		EventPool eventPool{ 1024 };   // pooled DirectEvents for WaitOnEventDirectArmed
