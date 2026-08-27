@@ -19,10 +19,64 @@ namespace JLib {
         // ONE BATCH PER THREAD, and that is sound where a per-thread PROTECT cell would not be.
         // Retiring is a point operation: it appends and maybe scans, and neither can suspend. It is
         // PROTECTION that spans a suspend, which is why cells are per-reader and this is not.
+        //
+        // BUT A THREAD-LOCAL BAG DIES WITH ITS THREAD, and that is a leak with a deleter attached.
+        // Retire takes a DELETER over the CALLER'S memory, so a bag abandoned at thread exit does
+        // not merely delay reclamation -- those objects are never freed and their destructors never
+        // run. Workers exit at Join and app threads come and go, so this is reachable, not
+        // theoretical: retire a few nodes on a thread, let the thread end, and they are gone.
+        //
+        // THE HANDOFF IS A DESTRUCTOR, not a call somewhere in the thread's exit path. Same reason
+        // HazardGuard owns its record: "released on every path a thread can end" is a property the
+        // language will enforce and a list of call sites will not. Every leftover moves to a global
+        // orphan store that any later Scan sweeps.
         struct RetireBatch {
             std::vector<std::pair<void*, void (*)(void*)>> items;
+            ~RetireBatch();
         };
         thread_local RetireBatch t_retire;
+
+        // SET BY ~RetireBatch, and it must outlive the batch. A bool with constant initialization
+        // has no destructor, so it is still readable while OTHER thread_locals are being destroyed
+        // -- and one of those may itself Retire, which would otherwise touch a dead vector. After
+        // the flag is up, Retire goes straight to the orphan store.
+        thread_local bool t_retireDead = false;
+
+        // LEAKED ON PURPOSE, exactly like g_records. A thread_local destructor may run during
+        // process teardown, and a function-local static with a destructor could already be gone by
+        // then -- handing objects to a destroyed vector is a worse bug than the one being fixed.
+        // Nothing here is large: it holds only what abandoned threads left behind, which is zero in
+        // a healthy process.
+        struct OrphanStore {
+            std::mutex mtx;
+            std::vector<std::pair<void*, void (*)(void*)>> items;
+        };
+        OrphanStore* const g_orphans = new OrphanStore();
+
+        // THE GATE, and the reason Scan does not pay a mutex. Scan runs on the retire threshold and
+        // again before every park, so it is warm; the orphan sweep is for a case that never happens
+        // in a healthy run. One relaxed load of a line that stays 0 keeps the cost at zero until
+        // something is actually stranded.
+        std::atomic<std::size_t> g_orphanCount{ 0 };
+
+        // Cumulative, so a test can ask "did anything EVER get stranded" after the sweep has
+        // already emptied the store. g_orphanCount goes back to zero; this does not.
+        std::atomic<std::size_t> g_orphanTotal{ 0 };
+
+        void AdoptOrphans(std::vector<std::pair<void*, void (*)(void*)>>& from) {
+            if (from.empty()) return;
+            std::lock_guard<std::mutex> lk(g_orphans->mtx);
+            for (auto& it : from) g_orphans->items.push_back(it);
+            g_orphanTotal.fetch_add(from.size(), std::memory_order_relaxed);
+            g_orphanCount.store(g_orphans->items.size(), std::memory_order_release);
+            from.clear();
+        }
+
+        RetireBatch::~RetireBatch() {
+            t_retireDead = true;
+            AdoptOrphans(items);
+        }
+
 
         std::uint64_t ThisThreadId() {
             // +1 so a valid id is never 0, which is the "unclaimed" marker for external readers.
@@ -265,6 +319,15 @@ namespace JLib {
 
     void HazardDomain::Retire(void* p, void (*deleter)(void*)) {
         if (!p || !deleter) return;
+        // THE BAG MAY ALREADY BE GONE. A thread_local destructor running earlier in this thread's exit
+        // can Retire -- freeing a structure whose nodes were still protected is exactly the kind of
+        // thing a destructor does -- and t_retire.items would then be a destroyed vector. Straight to
+        // the orphan store instead, where the next Scan on any thread will reclaim it.
+        if (t_retireDead) {
+            std::vector<std::pair<void*, void (*)(void*)>> one{ { p, deleter } };
+            AdoptOrphans(one);
+            return;
+        }
         EnsureTable();
         t_retire.items.emplace_back(p, deleter);
 
@@ -277,7 +340,11 @@ namespace JLib {
 
     void HazardDomain::Scan() {
         EnsureTable();
-        if (t_retire.items.empty()) return;
+        // BOTH must be empty to skip. Checking only the local bag made the orphan sweep unreachable
+        // from the very thread that needs to run it: a thread with nothing of its own to reclaim
+        // returned before ever looking at what an exited thread left. Caught by the test, which
+        // failed on "a Scan on ANOTHER thread reclaimed all of them".
+        if (t_retire.items.empty() && g_orphanCount.load(std::memory_order_acquire) == 0) return;
 
         std::atomic<void*>* base = cells.load(std::memory_order_acquire);
         if (!base) return;
@@ -310,7 +377,6 @@ namespace JLib {
                 if (void* v = g_records[i].cells[k].load(std::memory_order_acquire))
                     named.push_back(v);
         }
-
         std::sort(named.begin(), named.end());
 
         std::vector<std::pair<void*, void (*)(void*)>> keep;
@@ -320,9 +386,41 @@ namespace JLib {
             else it.second(it.first);
         }
         t_retire.items.swap(keep);
+
+        // SWEEP WHAT ABANDONED THREADS LEFT, using the scan set already computed above -- the same
+        // safety test, so an orphan is freed under exactly the conditions its own thread would have
+        // required. Nothing is freed early: an object still named by a live reader stays in the
+        // store and waits for the next scan.
+        //
+        // GATED, because Scan is warm -- retire threshold and every park -- while this case is
+        // empty in every healthy run. One relaxed load, and the mutex is only ever taken when
+        // something is genuinely stranded.
+        if (g_orphanCount.load(std::memory_order_acquire) != 0) {
+            std::lock_guard<std::mutex> lk(g_orphans->mtx);
+            std::vector<std::pair<void*, void (*)(void*)>> stillNamed;
+            stillNamed.reserve(g_orphans->items.size());
+            for (auto& it : g_orphans->items) {
+                if (std::binary_search(named.begin(), named.end(), it.first)) stillNamed.push_back(it);
+                else it.second(it.first);
+            }
+            g_orphans->items.swap(stillNamed);
+            g_orphanCount.store(g_orphans->items.size(), std::memory_order_release);
+        }
     }
 
     std::size_t HazardDomain::PendingRetired() const { return t_retire.items.size(); }
+
+    // Waiting in the orphan store right now -- zero in a healthy run, and back to zero once a Scan
+    // sweeps it. Use OrphanedTotal to ask whether stranding ever HAPPENED.
+    std::size_t HazardDomain::OrphanedRetired() const {
+        return g_orphanCount.load(std::memory_order_acquire);
+    }
+
+    // Cumulative and never decremented, so it survives the sweep that empties the store. A test
+    // that only checked OrphanedRetired would pass whether or not the handoff ever ran.
+    std::size_t HazardDomain::OrphanedTotal() const {
+        return g_orphanTotal.load(std::memory_order_relaxed);
+    }
 
     // ---- HazardGuard ---------------------------------------------------------------------------
 

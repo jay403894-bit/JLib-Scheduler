@@ -811,3 +811,9 @@ target_compile_features(SchedulerTeardownDrainTest PRIVATE cxx_std_17)
 add_executable(SchedulerDequeOverflowTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_overflow_test.cpp")
 target_link_libraries(SchedulerDequeOverflowTest PRIVATE Scheduler)
 target_compile_features(SchedulerDequeOverflowTest PRIVATE cxx_std_17)
+
+# A thread that exits with a non-empty retire bag must not take its contents with it. Retire holds a
+# deleter over the CALLER's memory, so an abandoned bag is a leak whose destructors never run.
+add_executable(SchedulerHazardOrphanTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_orphan_test.cpp")
+target_link_libraries(SchedulerHazardOrphanTest PRIVATE Scheduler)
+target_compile_features(SchedulerHazardOrphanTest PRIVATE cxx_std_17)

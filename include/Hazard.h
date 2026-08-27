@@ -206,6 +206,18 @@ namespace JLib {
         std::size_t ReaderCount() { EnsureTable(); return readerCount; }
         std::size_t PendingRetired() const;
 
+        // ORPHANED RETIRES -- what a thread left behind when it exited with a non-empty bag.
+        //
+        // Retire takes a deleter over the CALLER'S memory, so a bag abandoned at thread exit is not
+        // delayed reclamation, it is a leak with the destructor never running. ~RetireBatch hands
+        // leftovers to a global store and any later Scan sweeps it under the same safety test.
+        //
+        // Both are ZERO in a healthy process. OrphanedRetired is what is waiting now; OrphanedTotal
+        // is cumulative, because the first number goes back to zero and cannot answer whether the
+        // handoff ever ran -- which is exactly what a test has to assert.
+        std::size_t OrphanedRetired() const;
+        std::size_t OrphanedTotal() const;
+
         // KNOWN LIMITATION -- A LEAK, NOT A SMASH. A coroutine parked while holding a guard, that is
         // never re-pushed (teardown that stops resuming before every started frame has unwound),
         // leaves its record LIVE forever. Nothing is freed under anybody -- the record keeps naming
