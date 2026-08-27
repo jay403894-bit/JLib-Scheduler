@@ -2,7 +2,6 @@
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #include "../include/Thread.h"
-#include "../include/Hazard.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
@@ -1998,7 +1997,6 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// flushes its retire bag, which lands in the domain, WHILE this is still running. Left to build
 	// on first touch it would bake in a table of zero fibers, and every poolIndex afterwards would
 	// be out of range. Workers are up and Ready() by this point, so the sizes are final.
-	HazardDomain::Instance().Init();
 
 	poolMutex.unlock();
 }

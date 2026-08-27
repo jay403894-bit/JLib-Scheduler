@@ -779,20 +779,6 @@ if(WIN32 AND JLIBSCHED_COROUTINES)
     set_target_properties(SchedulerUdpLatencyBench PROPERTIES OUTPUT_NAME udp_latency_bench)
 endif()
 
-# Hazard pointers. The test is worth reading before the implementation: its only meaningful case has
-# a PARK in the middle, and it RUNS its negative control (worker-owned cells must free under the
-# sleeping reader) rather than asserting the control in a comment.
-add_executable(SchedulerHazardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_test.cpp")
-target_link_libraries(SchedulerHazardTest PRIVATE Scheduler)
-target_compile_features(SchedulerHazardTest PRIVATE cxx_std_17)
-
-# The coroutine half of hazard pointers. C++20 -- it co_awaits a mutex from inside a protected
-# section, which is precisely the case worker-owned cells cannot survive.
-if(JLIBSCHED_COROUTINES)
-    add_executable(SchedulerCoroHazardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/coro_hazard_test.cpp")
-    target_link_libraries(SchedulerCoroHazardTest PRIVATE Scheduler)
-    target_compile_features(SchedulerCoroHazardTest PRIVATE cxx_std_20)
-endif()
 
 # Eager mutex cancellation. Every case holds the lock for its whole duration and never unlocks before
 # asserting, so a waiter that comes back came back because it was EJECTED.
@@ -813,11 +799,6 @@ add_executable(SchedulerDequeGrowTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_g
 target_link_libraries(SchedulerDequeGrowTest PRIVATE Scheduler)
 target_compile_features(SchedulerDequeGrowTest PRIVATE cxx_std_17)
 
-# A thread that exits with a non-empty retire bag must not take its contents with it. Retire holds a
-# deleter over the CALLER's memory, so an abandoned bag is a leak whose destructors never run.
-add_executable(SchedulerHazardOrphanTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_orphan_test.cpp")
-target_link_libraries(SchedulerHazardOrphanTest PRIVATE Scheduler)
-target_compile_features(SchedulerHazardOrphanTest PRIVATE cxx_std_17)
 
 # Ingress backpressure: a flooding external producer is slowed, a WORKER never is (that would
 # deadlock -- a task pushing chunks is a consumer of the inbox it would wait on).
@@ -832,8 +813,3 @@ add_executable(SchedulerDequeCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dequ
 target_link_libraries(SchedulerDequeCeilingTest PRIVATE Scheduler)
 target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)
 
-# The hazard domain's fatal paths must actually fire. Same pattern and same reason as
-# SchedulerDequeCeilingTest: an abort path nothing executes is the vacuous shape again.
-add_executable(SchedulerHazardCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_ceiling_test.cpp")
-target_link_libraries(SchedulerHazardCeilingTest PRIVATE Scheduler)
-target_compile_features(SchedulerHazardCeilingTest PRIVATE cxx_std_17)

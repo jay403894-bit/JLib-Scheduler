@@ -49,7 +49,6 @@
 
 #include "TaskScheduler.h"
 #include "Future.h"      // Future<T>/Promise<T>: the C++17 half; the awaiter for it is at the bottom
-#include "Hazard.h"      // the frame owns a hazard RecordId; the core cannot see a promise type
 
 #include <coroutine>
 #include <cstdint>
