@@ -54,26 +54,104 @@ namespace JLib {
     };
 
     class alignas(platform::kCacheLine) TaskDeque {
+    private:
+        // ONE IMMUTABLE OBJECT PER GENERATION -- slots and mask together, written once before it is
+        // published and never mutated after, so reading r->mask after loading r is automatically
+        // consistent with r->slots. Declared FIRST because grow() and MakeRing() name it. See the
+        // note further down for why two independent atomics would be a bug rather than a style choice.
+        struct Ring {
+            size_t                  mask;
+            size_t                  capacity;
+            std::atomic<uintptr_t>* slots;
+        };
+
     public:
-        explicit TaskDeque(size_t capacity = 32768)
-            : capacity_(capacity),
-            mask_(capacity - 1),
-            buffer_(new uintptr_t[capacity])
-        {
+        explicit TaskDeque(size_t capacity = 32768) {
             if ((capacity & (capacity - 1)) != 0)
                 throw std::runtime_error("Capacity must be a power of 2");
-
-            for (size_t i = 0; i < capacity; i++)
-                buffer_[i] = 0;
-
+            ring_.store(MakeRing(capacity), std::memory_order_relaxed);
             top_.store(0, std::memory_order_relaxed);
             bottom_.store(0, std::memory_order_relaxed);
         }
 
         ~TaskDeque() {
-            delete[] buffer_;
+            for (Ring* r : retired_) { delete[] r->slots; delete r; }
+            Ring* r = ring_.load(std::memory_order_relaxed);
+            delete[] r->slots;
+            delete r;
         }
 
+
+        // ---- growth -------------------------------------------------------------------------
+        //
+        // MODEL-CHECKED BEFORE IT WAS WRITTEN. tests/verify/deque_grow_model.c, GenMC v0.17.0:
+        // 210 complete executions, no errors, with three negative controls that all fail as they
+        // must. Read that file before changing anything below -- each line here corresponds to one
+        // of its claims.
+        static constexpr size_t kMaxCapacity = 1u << 22;   // 4M slots; see grow()
+
+        // HOW MANY TIMES ANY DEQUE HAS GROWN. Process-wide and incremented only inside grow(), so it
+        // is free on every path that matters. It exists because a test asserting "no task was lost"
+        // cannot tell growth working from a deque that never filled -- the same vacuity that made
+        // the first version of tests/deque_overflow_test.cpp pass with its mechanism removed.
+        // A C++17 INLINE VARIABLE, not a function-local static. The function-local version compiled
+        // and linked, and the test read a DIFFERENT object from the one the library incremented --
+        // it reported 0 grows on a run that had grown. An inline data member is one object across
+        // every translation unit by the standard, which is the property actually needed here.
+        static inline std::atomic<size_t> g_growCount{ 0 };
+        static size_t GrowCount() { return g_growCount.load(std::memory_order_relaxed); }
+
+        static Ring* MakeRing(size_t capacity) {
+            Ring* r = new Ring{ capacity - 1, capacity, new std::atomic<uintptr_t>[capacity] };
+            for (size_t i = 0; i < capacity; ++i)
+                r->slots[i].store(0, std::memory_order_relaxed);
+            return r;
+        }
+
+        // OWNER ONLY, called from push_bottom having already observed the deque full with the same
+        // b and t the push will use. Returns false if it cannot grow, and the caller then falls
+        // back exactly as it did before.
+        //
+        // top_ AND bottom_ ARE NOT TOUCHED. That is what leaves the existing Chase-Lev proof
+        // intact: the CAS on top_ stays the sole arbiter of who owns a slot, and this only changes
+        // WHERE that slot lives. Copying by LOGICAL index is what makes the two rings agree -- a
+        // thief reading old->slots[t & oldMask] and one reading new->slots[t & newMask] read the
+        // SAME VALUE -- so a grow racing a steal cannot change WHICH task is claimed.
+        bool grow(Ring* old, size_t t, size_t b) {
+            const size_t newCap = old->capacity * 2;
+
+            // A CEILING, DELIBERATELY, and the reason the overflow lane still exists. Doubling
+            // without a bound turns an infinitely self-spawning task from a diagnosable failure
+            // into an OOM with no message. 4M slots is 32MB of pointers on one lane, which no real
+            // workload reaches; past it the caller overflows and the assert there names the cause.
+            if (newCap > kMaxCapacity) return false;
+
+            Ring* r = nullptr;
+            try {
+                r = MakeRing(newCap);
+            }
+            catch (const std::bad_alloc&) {
+                // NOTHING HAS BEEN PUBLISHED, so the deque is still entirely on `old` and the
+                // caller's fallback is correct. Refusing to grow is not an error state.
+                return false;
+            }
+
+            // COPY BY LOGICAL INDEX. i is the absolute index, so the same i lands at a different
+            // physical slot under the new mask while holding the same value.
+            for (size_t i = t; i != b; ++i)
+                r->slots[i & r->mask].store(old->slots[i & old->mask].load(std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+
+            // RELEASE. A thief that acquires this pointer must see the copy above; -DNO_PUBLISH_RELEASE
+            // in the model is exactly this store weakened, and it is a safety violation.
+            ring_.store(r, std::memory_order_release);
+
+            // RETIRE, NOT DELETE. A thief may still be reading through `old`. Kept until this deque
+            // dies -- see the note on retired_ for why that beats reclaiming it properly here.
+            retired_.push_back(old);
+            g_growCount.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
         // ---- tag encoding -------------------------------------------------------------------
         // bits 0-1: CorePref (Default/P/E/Wide are 0..3)   bits 2-3: TaskType
         //
@@ -113,10 +191,17 @@ namespace JLib {
             }
             size_t b = bottom_.load(std::memory_order_relaxed);
             size_t t = top_.load(std::memory_order_acquire);
-            if (b - t >= capacity_) {
-                return false;  // Full
+
+            // RELAXED IS RIGHT FOR THE OWNER: it is the only writer of ring_, so it cannot read a
+            // stale one. Thieves load it acquire, pairing with grow's releasing store.
+            Ring* r = ring_.load(std::memory_order_relaxed);
+            if (b - t >= r->capacity) {
+                // GROW INSTEAD OF REFUSING. Only when it declines -- past kMaxCapacity, or the
+                // allocation failed -- does the caller still see false and take its fallback.
+                if (!grow(r, t, b)) return false;   // Full and cannot grow
+                r = ring_.load(std::memory_order_relaxed);
             }
-            buffer_[b & mask_] = tag(item);
+            r->slots[b & r->mask].store(tag(item), std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_release);
             bottom_.store(b + 1, std::memory_order_release);
             return true;
@@ -128,12 +213,16 @@ namespace JLib {
             size_t b = bottom_.load(std::memory_order_relaxed);
             size_t t = top_.load(std::memory_order_acquire);
 
-            if ((b + count) - t > capacity_) {
-                return false;
+            Ring* r = ring_.load(std::memory_order_relaxed);
+            while ((b + count) - t > r->capacity) {
+                // A LOOP, NOT AN IF: one doubling may not cover a whole batch, where a single push
+                // only ever needs one. grow() returning false terminates it, so this cannot spin.
+                if (!grow(r, t, b)) return false;
+                r = ring_.load(std::memory_order_relaxed);
             }
 
             for (size_t i = 0; i < count; ++i) {
-                buffer_[(b + i) & mask_] = tag(items[i]);
+                r->slots[(b + i) & r->mask].store(tag(items[i]), std::memory_order_relaxed);
             }
 
             std::atomic_thread_fence(std::memory_order_release);
@@ -167,7 +256,8 @@ namespace JLib {
             t = top_.load(std::memory_order_acquire);
 
             if (t <= b) {
-                Task* item = untag(buffer_[b & mask_]);
+                Ring* r = ring_.load(std::memory_order_relaxed);
+                Task* item = untag(r->slots[b & r->mask].load(std::memory_order_relaxed));
                 if (t == b) {
                     // Last item: race the stealer for it.
                     // seq_cst, matching Le/Pop/Cohen/Zappa Nardelli's verified Chase-Lev (PPoPP
@@ -219,7 +309,10 @@ namespace JLib {
             size_t b = bottom_.load(std::memory_order_acquire);
 
             if (t < b) {
-                Task* item = untag(buffer_[t & mask_]);
+                // ACQUIRE, AND RELOADED EVERY ATTEMPT: ring_ is no longer loop-invariant once the
+                // deque can grow, and this pairs with grow's releasing store.
+                Ring* r = ring_.load(std::memory_order_acquire);
+                Task* item = untag(r->slots[t & r->mask].load(std::memory_order_relaxed));
                 if (top_.compare_exchange_strong(
                     t, t + 1,
                     std::memory_order_seq_cst,   // see pop_bottom: paper ordering, not GenMC's weaker acq_rel
@@ -272,7 +365,9 @@ namespace JLib {
             size_t b = bottom_.load(std::memory_order_acquire);
 
             if (t < b) {
-                const uintptr_t slot = buffer_[t & mask_];
+                // Same reload rule as steal() -- see there.
+                Ring* r = ring_.load(std::memory_order_acquire);
+                const uintptr_t slot = r->slots[t & r->mask].load(std::memory_order_relaxed);
                 // Vetted from the TAG, never by dereferencing `slot` -- that is the entire point.
                 // Everything the predicate needs travels in bits the deque itself owns.
                 if (!pred(bits(slot)))
@@ -295,8 +390,10 @@ namespace JLib {
             return (b > t) ? (b - t) : 0;
         }
 
+        // THE CURRENT capacity, which now changes: the deque doubles rather than refusing a push.
+        // Any caller caching this is wrong -- there are none, and there should stay none.
         size_t capacity() const {
-            return capacity_;
+            return ring_.load(std::memory_order_acquire)->capacity;
         }
         bool empty() const {
             size_t t = top_.load(std::memory_order_acquire);
@@ -304,13 +401,46 @@ namespace JLib {
             return t >= b;
         }
     private:
+        // ONE IMMUTABLE OBJECT PER GENERATION, holding the slots and the mask together. This shape
+        // is not tidiness -- it is what tests/verify/deque_grow_model.c's -DSPLIT_PTR_MASK control
+        // proves is required. Store the pointer and the mask as two independent atomics and a thief
+        // can load one from each generation and index off the end of the older array; GenMC reports
+        // it immediately. A Ring is written once, before it is published, and never mutated after,
+        // so reading r->mask after loading r is automatically consistent with r->slots.
+        //
         // TAGGED POINTERS, not plain Task*. See StealBits above for what the low bits carry and
         // why. Task is `alignas(16)`, so bits 0-3 of every Task* in here are guaranteed zero and
         // free to use; kTagMask is asserted against alignof(Task) below so shrinking that alignment
         // cannot silently start corrupting pointers.
-        uintptr_t* buffer_;
-        const size_t capacity_;
-        const size_t mask_;
+        //
+        // SLOTS ARE ATOMIC AND ACCESSED RELAXED, matching the verified Chase-Lev of Le, Pop, Cohen
+        // and Zappa Nardelli, and it is NOT ceremony. The owner pushing at b writes the same
+        // PHYSICAL slot a thief reads at a stale t whenever their logical indices are congruent mod
+        // capacity. The thief discards the value when its CAS fails, so it is benign in OUTCOME --
+        // but with a plain uintptr_t it is a data race on a non-atomic object, which is UB, and
+        // GenMC reports it as one the moment a model lets the owner push concurrently with a thief.
+        // deque_model.c never did (its owner thread only pops), which is why this stood so long.
+        // Relaxed atomics generate identical code to plain loads and stores on x86-64 and AArch64.
+
+        std::atomic<Ring*> ring_;
+
+        // RETIRED RINGS ARE KEPT, NOT FREED, until this deque is destroyed. That is a deliberate
+        // choice over epoch or hazard reclamation, and it is cheaper in the place that matters:
+        //
+        //   FREEING AT GROW IS UNSAFE. A thief that loaded the old Ring before the publish is still
+        //   reading through it. deque_grow_model.c's -DNO_RETIRE control is exactly this, and it is
+        //   a safety violation.
+        //
+        //   RECLAIMING IT PROPERLY WOULD PUT A GUARD ON THE STEAL PATH. An EpochGuard per steal
+        //   attempt is real cost on the hottest loop in the library, paid on every attempt to make
+        //   a once-in-a-process event safe.
+        //
+        //   KEEPING THEM IS BOUNDED AND TINY. Capacity doubles, so every retired ring together is
+        //   smaller than the live one -- the waste is under 2x, and only for a deque that actually
+        //   grew. The original Chase-Lev paper does the same.
+        //
+        // OWNER-ONLY, and never read by anyone else, so it needs no synchronisation of its own.
+        std::vector<Ring*> retired_;
 
         alignas(platform::kCacheLine) std::atomic<size_t> top_;
         alignas(platform::kCacheLine) std::atomic<size_t> bottom_;

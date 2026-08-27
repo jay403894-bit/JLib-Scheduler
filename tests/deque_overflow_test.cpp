@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
-// DEQUE OVERFLOW -- a full lane must not lose a task.
+// A FULL LANE MUST NOT LOSE A TASK -- it GROWS, and overflow is the backstop past that.
 //
 // A TaskDeque is a FIXED 32,768 slots and push_bottom returns false when it is full. That return
 // was honoured at exactly one of its three call sites. The other two ignored it, and neither
@@ -25,6 +25,7 @@
 // to "capacity is now large enough", which would make this test vacuous without failing it.
 
 #include "TaskScheduler.h"
+#include "TaskDeque.h"
 
 #include <atomic>
 #include <chrono>
@@ -57,6 +58,8 @@ int main() {
     // 45,000 items in an inbox that is about to be drained in a single pass.
     const int kN = 45000;
 
+    const size_t growsBefore = JLib::TaskDeque::GrowCount();
+
     std::atomic<int> ran{ 0 };
     JLib::WaitGroup  rootWg;
 
@@ -86,8 +89,19 @@ int main() {
     // and watching it still report ALL CHECKS PASSED. Assert the path was ENTERED, not merely that
     // the outcome looked right.
     const size_t overflowed = sched.OverflowTotal(false) + sched.OverflowTotal(true);
-    std::printf("      overflow lane took %zu task(s)\n", overflowed);
-    Check(overflowed > 0, "the overflow lane was actually exercised (else this proves nothing)");
+    const size_t grew       = JLib::TaskDeque::GrowCount() - growsBefore;
+    std::printf("      lane grew %zu time(s); overflow lane took %zu task(s)\n", grew, overflowed);
+
+    // THE CHECK THAT MAKES "nothing was lost" MEAN SOMETHING. That is equally true of a run where
+    // the lane never filled, and the first version of this file passed with its mechanism removed
+    // for exactly that reason. Assert the path was ENTERED.
+    //
+    // IT ASSERTS GROWTH, NOT OVERFLOW, AND THAT CHANGED WHEN grow() LANDED. Before it, a full lane
+    // pushed to the overflow lane and this asked for overflowed > 0. Now the lane DOUBLES instead,
+    // so overflow is unreachable until kMaxCapacity -- 4M slots, far past what a test should
+    // allocate -- and this same run reports 0 overflowed. Overflow is not dead code: it is what a
+    // deque that cannot grow any further does instead of dropping a task.
+    Check(grew > 0, "the lane actually GREW (else this test proves nothing)");
 
     if (kN <= 32768)
         std::printf("  WARNING: kN no longer exceeds a lane; this test is vacuous\n");
