@@ -432,3 +432,37 @@ setting a library has no business writing, and Android's cgroups override it reg
 **Darwin is flagged, not guessed.** QoS is the lever (`USER_INTERACTIVE` vs `UTILITY`) and
 `HotThreadPolicy` already sets it for hot workers, but a class-following version cannot be tested in
 CI — same treatment as the AArch64 PAC/BTI gap.
+
+---
+
+## Fatal paths — what is death-tested, and the two deliberately left open
+
+**An abort path nothing executes is the same shape as a negative control that cannot fail.** Both
+look like safety and provide none. Three were shipped in that state and are now covered
+(`deque_ceiling_test.cpp`, `hazard_ceiling_test.cpp`), every one **dual-direction** — an
+over-the-line child that must abort, paired with an up-to-the-line child that must exit cleanly.
+Without the pair, a structure that aborted on *every* operation would pass.
+
+| path | trigger | covered |
+|---|---|---|
+| `TaskDeque::FatalGrow` | push past `maxCapacity` | yes |
+| `FatalCellOverflow` (cell index) | `Protect(k)`, `k >= kCellsPerReader` | yes |
+| `FatalCellOverflow` (external slots) | more non-worker readers than `kExternalReaders` | **was an `assert`** — now fatal |
+| `FatalPushRefused` | `push_bottom` refuses a non-null item | unreachable by argument; hard-stops anyway |
+| record registry exhausted | coroutine + full `kMaxRecords` | hook verified from the non-coroutine side only |
+
+**Abort, not `exit(code)`.** The spec these came from used distinct exit codes per handler. They
+keep `std::abort()` instead: abort produces a minidump and `exit()` does not, and in production the
+core dump is the entire point. Tests distinguish *which* handler fired by matching its stderr text,
+which is equally specific and costs nothing in Release.
+
+### Two left open on purpose
+
+**The coroutine record-exhaustion abort itself.** Driving a real C++20 frame to that branch needs
+careful frame-state setup so the child does not leak or hit UB *before* reaching the hook — a test
+that crashes for the wrong reason is worse than no test. `ExhaustRecordsForTest` is wired and
+verified from the non-coroutine side, which holds the line.
+
+**`Retire(nullptr)` staying a silent no-op.** Making it fatal is a genuine API behaviour change:
+`free(nullptr)` semantics is what a caller reasonably expects, and lenient cleanup paths may depend
+on it. It deserves an audit of every call site before the trigger is pulled, not a quick edit.
