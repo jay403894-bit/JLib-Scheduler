@@ -62,10 +62,15 @@ reader holding hazards pins only the nodes it named.
 
 That is not a 1.41x difference. It is bounded against unbounded.
 
-**And the argument closes itself:** the only reason a coroutine needs a special path at all is that
-it can suspend inside the section. If it provably cannot, it does not need the counted path either —
-slots would do. So the case where this choice arises is exactly the case where the park cost
-dominates, and hazards win there regardless of the per-guard arithmetic.
+**A COROUTINE CANNOT HAVE A SLOT, and that is why counted epochs exist -- not the suspend.** Slots
+are indexed by a stable identity: a fiber has `poolIndex`, a coroutine frame has nothing, because
+frames are not a bounded pool. Borrowing the worker's slot is not having one -- it is the unsafe
+thing, since the worker's next guard overwrites the announcement. A fixed slot pool was built and
+reverted: any bound reintroduces the exact ceiling coroutines exist to escape, and a reactor parks
+thousands.
+
+So counted epochs are THE epoch mechanism for coroutines, not a fallback for a narrow case. The
+choice below is between two VALID schemes for a coroutine, and it is decided by the park.
 
 An earlier version of this note hedged that "a single protect probably favours the counted epoch".
 That compared guard costs and ignored what a park does to everyone else's reclamation — which is the

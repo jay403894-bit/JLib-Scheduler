@@ -155,9 +155,13 @@ namespace JLib {
 		// which pays a seq_cst fence per pointer. It is what a PARK costs everyone else. The epoch
 		// advance gate refuses to advance the ring while a reader is parked in it, so ONE parked
 		// coroutine stalls reclamation globally; a parked hazard reader pins only the nodes it named.
-		// Bounded against unbounded. And the only reason a coroutine needs a special path at all is
-		// that it can suspend here -- so the case where this choice arises is exactly the case where
-		// the park dominates. See design/NOTES.md.
+		// Bounded against unbounded.
+		//
+		// NOTE what counted epochs are FOR: a coroutine cannot have a SLOT. Slots need a stable
+		// identity -- a fiber has poolIndex, a frame has nothing, and a fixed slot pool was built and
+		// reverted because any bound reintroduces the ceiling coroutines exist to escape. So counted
+		// epochs are THE epoch mechanism for a coroutine, not a fallback; the branch above chooses
+		// between two VALID schemes, on the park. See design/NOTES.md.
 		static TaskType CurrentTaskType() noexcept;
 		void CleanupTaskMetadata(Task* task);
 
