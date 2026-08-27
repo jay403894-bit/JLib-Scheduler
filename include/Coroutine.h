@@ -49,6 +49,7 @@
 
 #include "TaskScheduler.h"
 #include "Future.h"      // Future<T>/Promise<T>: the C++17 half; the awaiter for it is at the bottom
+#include "Hazard.h"      // the frame owns a hazard RecordId; the core cannot see a promise type
 
 #include <coroutine>
 #include <cstdint>
@@ -397,6 +398,7 @@ namespace JLib {
             // coroutine. Null until spawned, which is what makes an un-spawned Coro safe to destroy.
             Task* task = nullptr;
 
+
             // Optional: a TaskDAG external node this coroutine completes when it finishes. Null for
             // an ordinary Spawn. Just the node, not the DAG -- TaskNode carries its owner, which is
             // why CreateExternalNode sets it.
@@ -492,6 +494,7 @@ namespace JLib {
     private:
         Handle h_{};
     };
+
 
     // Schedules a coroutine on the pool. Returns false only if the task slab is exhausted, in which
     // case the coroutine is destroyed without running and the WaitGroup is left untouched.

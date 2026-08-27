@@ -130,6 +130,45 @@ namespace JLib {
         std::size_t ReaderCount() { EnsureTable(); return readerCount; }
         std::size_t PendingRetired() const;
 
+        // KNOWN LIMITATION -- A LEAK, NOT A SMASH. A coroutine parked while holding a guard, that is
+        // never re-pushed (teardown that stops resuming before every started frame has unwound),
+        // leaves its record LIVE forever. Nothing is freed under anybody -- the record keeps naming
+        // a node and the scan keeps honouring it -- so the failure is that reclamation of THAT node
+        // stops, and one registry slot is gone. Bounded by kMaxRecords.
+        //
+        // The reason it is only a leak is the discard policy: a STARTED task is never discarded, so
+        // a live frame is resumed and unwound rather than abandoned. If an abort-a-waiter API is ever
+        // added -- destroy WITHOUT resume -- then ~HazardGuard on handle.destroy() becomes
+        // load-bearing and this comment becomes wrong. That API must not exist today.
+        //
+        // ---- external records: the coroutine path (phase 3) --------------------------------------
+        //
+        // A coroutine frame has no dense stable index -- frames are not a bounded pool -- so it
+        // cannot use the flat table. It gets a RECORD instead: acquired on first Protect, released
+        // in ~promise_type, and NEVER DELETED. FREE -> LIVE -> RETIRED -> FREE with a bumped
+        // generation, because a hazard registry cannot be protected by the hazard domain it serves.
+        //
+        // DEVIATION, AND IT IS DELIBERATE: the record OWNS its cells rather than taking a pointer to
+        // storage inside the frame. Frame-owned cells die with the frame, and a DEFERRED grace
+        // cannot protect memory that is already freed -- honouring it would need a synchronous
+        // drain inside ~promise_type, spinning until every scanner left that block. Domain-owned
+        // cells remove the hazard outright and cost the frame 4 bytes (an id) instead of 32 (four
+        // cells). The registry outlives every frame by construction.
+        //
+        // THE GRACE PERIOD WAITS ON SCANS, NOT ON READERS, and that distinction is load-bearing.
+        // A scan runs to completion on one thread and cannot suspend, so waiting for one is bounded.
+        // Waiting for READERS to leave would be the epoch-pin failure again: a parked fiber would
+        // freeze record reuse the way it must never freeze reclamation. A parked reader here delays
+        // freeing THE NODE IT NAMED and nothing else.
+        using RecordId = std::uint32_t;
+        static constexpr RecordId kNoRecord = 0xFFFFFFFFu;
+        static constexpr std::size_t kMaxRecords = 1024;
+
+        RecordId            AcquireRecord();
+        void                ReleaseRecord(RecordId id);
+        std::atomic<void*>* RecordCells(RecordId id);
+
+
         // TEST HOOK, and it exists to make a NEGATIVE CONTROL deterministic rather than lucky.
         //
         // Forces CurrentReader() to resolve a fiber to its WORKER's cells -- i.e. reintroduces bug
@@ -202,6 +241,10 @@ namespace JLib {
 
     private:
         std::atomic<void*>* cells  = nullptr;
+        // Set when this guard is using a coroutine RECORD rather than a table slot. RELEASED BY
+        // ~HazardGuard: the guard is a local in the frame, so the language runs that on every path
+        // the frame can end, including destroy() on a suspended one.
+        HazardDomain::RecordId record = HazardDomain::kNoRecord;
         std::size_t         reader = HazardDomain::kNoReader;
     };
 

@@ -1,7 +1,9 @@
 # Hazard pointers — design note
 
-**Status: phases 1-2 and 4 SHIPPED (include/Hazard.h, src/Hazard.cpp, tests/hazard_test.cpp).**
-**Phase 3 (coroutines) DESIGNED, NOT BUILT -- see the section at the end.**
+**Status: ALL PHASES SHIPPED.** include/Hazard.h, src/Hazard.cpp, tests/hazard_test.cpp (5/5),
+tests/coro_hazard_test.cpp (6/6).
+Phase 3 diverged from its plan in two places -- see "Phase 3 as BUILT" at the end for what changed
+and why.
 
 ## The hole
 
@@ -135,7 +137,7 @@ only while the frame still owns the cells.
 1. **Fiber-owned cells + a scan set that includes parked fibers.** Both bugs, first, before
    `Protect()` is written. — **DONE**
 2. Native-task cells on the worker. — **DONE**
-3. Coro registry. — **DESIGNED, NOT BUILT** (section at the end of this file)
+3. Coro registry. — **DONE**, though not as planned (see "Phase 3 as BUILT")
 4. Retire batching (`R = k × live_cells`), deleter-based. — **DONE**
 
 Two things fell out of building 1–2 that were not in this plan and are worth knowing before 3:
@@ -183,7 +185,7 @@ dynamically acquired records, never freed, released back for reuse.
 
 ---
 
-# Phase 3 — coroutines (DESIGNED, NOT BUILT)
+# Phase 3 — coroutines (the PLAN; see "Phase 3 as BUILT" below for what shipped)
 
 Layering first: **no promise types in the C++17 core.** The core exposes a hook; the C++20 header
 owns everything coroutine-shaped.
@@ -265,3 +267,52 @@ addition to it.
 
 **Summary: the layering is sound; the work is making discard and `final_suspend` the SAME
 unregister, once, with a generation, on every path already known to be forgettable.**
+
+## Phase 3 as BUILT — where it diverged from the plan, and why
+
+**Shipped.** `include/Hazard.h`, `src/Hazard.cpp`, `tests/coro_hazard_test.cpp` (6/6).
+
+**Divergence 1 — the guard owns the record, not the promise.** The plan put a `RecordId` in the
+promise and had the resume trampoline hand the core a pointer to that field. That was UNSOUND:
+`ResumeCoroutine` is generic BY DESIGN, because `Task::data` holds whichever frame was last armed --
+for a nested `Lazy` that is the parent, not the `Coro` -- so typing the handle to reach
+`promise().hazardRecord` reads a different promise's storage. Built it, it hung, root-caused it.
+
+A `HazardGuard` is a LOCAL IN THE FRAME, so it already survives the `co_await`, and unwinding runs
+its destructor. Owning the record there gets "released on every path" from the language instead of
+from a list of call sites -- the same class of bug as the missing `PushBatch` stamp, closed by
+construction rather than by vigilance. No promise field, no trampoline change, no type pun.
+
+**Divergence 2 — cells are domain-owned.** Frame-owned cells die with the frame, and a deferred
+grace cannot protect memory that is already freed; honouring it would need a synchronous drain
+inside the destructor. Domain-owned removes the hazard and costs 4 bytes instead of 32.
+
+**The grace period waits on SCANS, not on readers.** A scan runs to completion and cannot suspend,
+so waiting for one is bounded. Waiting for readers to leave would be the epoch-pin failure again.
+
+## "Destroy the frame from another worker" is UNREACHABLE, deliberately
+
+The acceptance spec's step 3 has no code path here, and the refusal is explicit:
+
+```
+DiscardIfCancelled:  if (!task || task->started || !IsTaskCancelled(task)) return false;
+```
+
+A STARTED task is never discarded -- "discarding one of those abandons a live stack or frame rather
+than cancelling it". `Spawn()` takes the handle via `Release()`, so no caller retains one either.
+
+**The reachable analogue, and what is tested:** suspend inside a protected section, cancel, the
+scheduler re-pushes, the frame resumes, polls, unwinds, and `~HazardGuard` unregisters. A frame
+discarded before it ever starts never took a guard and holds no record.
+
+Writing a foreign-`destroy()` test would be a regression test against a policy this runtime does not
+have. **The contract has no path to violate, which is stronger than a passing test for it.**
+
+## Known limitation: shutdown leak (not a smash)
+
+A coroutine parked holding a guard that is NEVER re-pushed -- teardown that stops resuming before
+every started frame has unwound -- leaves its record LIVE forever. Nothing is freed under anyone;
+reclamation of that one node stops and one registry slot is lost. Bounded by `kMaxRecords`.
+
+If an abort-a-waiter API is ever added (destroy WITHOUT resume), `~HazardGuard` on `handle.destroy()`
+becomes load-bearing and the note above stops being true.

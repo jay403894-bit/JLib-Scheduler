@@ -785,3 +785,11 @@ endif()
 add_executable(SchedulerHazardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_test.cpp")
 target_link_libraries(SchedulerHazardTest PRIVATE Scheduler)
 target_compile_features(SchedulerHazardTest PRIVATE cxx_std_17)
+
+# The coroutine half of hazard pointers. C++20 -- it co_awaits a mutex from inside a protected
+# section, which is precisely the case worker-owned cells cannot survive.
+if(JLIBSCHED_COROUTINES)
+    add_executable(SchedulerCoroHazardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/coro_hazard_test.cpp")
+    target_link_libraries(SchedulerCoroHazardTest PRIVATE Scheduler)
+    target_compile_features(SchedulerCoroHazardTest PRIVATE cxx_std_20)
+endif()
