@@ -688,7 +688,16 @@ void Thread::Worker() {
 				// holding an older arrival, or it was stolen from another worker whose slot holds
 				// it. Skipped rather than counted as zero wait, because a false ZERO is a false
 				// "nothing waited", which is the one direction that silently suppresses promotion.
-				const long long arrived = laneArrivalNs.exchange(0, std::memory_order_relaxed);
+				// POLICY-GATED, and it has to be. Under QueueLoad nothing ever stamps the slot, so
+				// this exchange could only ever return 0 -- but it is an atomic RMW on the lane's
+				// hottest path, executed for every lane task, by users who did not opt in. Worse
+				// than the cost: it lands microseconds from where laneStartNs is read, so it
+				// perturbs the very occupancy measurement the QueueLoad controller decides on.
+				// A default policy must pay nothing for a feature it cannot use.
+				const long long arrived =
+				    (TaskScheduler::GetHotWorkerPolicy() == TaskScheduler::KPolicy::WaitTime)
+				        ? laneArrivalNs.exchange(0, std::memory_order_relaxed)
+				        : 0;
 				if (arrived != 0) {
 					const long long waited = laneStartNs - arrived;
 					// THE COMPARISON HAPPENS HERE, not in the controller, because here is where the
