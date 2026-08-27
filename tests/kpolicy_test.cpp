@@ -38,7 +38,7 @@ std::atomic<bool> g_stop{ false };
 // not reserved, so between completions it runs pool work like any other worker.
 void LoadThread(TaskScheduler& sched) {
     while (!g_stop.load(std::memory_order_relaxed)) {
-        sched.ParallelFor(0, 64, 1, [](int lo, int hi) {
+        sched.ParallelFor(0, 256, 1, [](int lo, int hi) {
             for (int i = lo; i < hi; ++i) {
                 volatile double acc = 0;
                 for (int k = 0; k < 200000; ++k) acc += (double)k * 1.000001;
@@ -143,7 +143,16 @@ int main() {
     // WaitTime ever appears to ratchet.
     TaskScheduler::SetLaneWaitTargetNs(250000);   // the shipped default
     TaskScheduler::SetHotWorkersEffective(1);
-    const size_t peakWaitTime = RunAndWatchK(sched, 1500, 60);
+
+    // LONGER THAN THE OTHER PHASES, because this arm is PROBABILISTIC and the others are not.
+    // Push() cannot say which worker takes the task -- PickNextWorker rotates -- so whether the
+    // chosen worker happens to be mid-ordinary-task when a lane task lands is chance. The PushBatch
+    // arm below names worker 0 explicitly and therefore contends every time. This arm needs enough
+    // arrivals for one of them to be genuinely late; at 60 Hz that is ~180 chances. Observed
+    // failing at 1500 ms, which is the flake this window exists to remove -- if it ever flakes
+    // again the fix is more time or heavier load, NOT a lower target (that would break the
+    // wake-floor rule above).
+    const size_t peakWaitTime = RunAndWatchK(sched, 3000, 60);
     Check(peakWaitTime > 1,
           "WaitTime DOES promote on the same workload (the paired result)");
 
