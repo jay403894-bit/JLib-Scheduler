@@ -197,7 +197,7 @@ JLib::Coro RecvLoop(JLib::IoSocket s, HWND hwnd, JLib::CancelToken tok) {
         //
         // This is the split that decides whether the scheduler can do anything about the tail at
         // all: (flushed - completed) is time the REACTOR held the completion in a batch, and
-        // (recv - flushed) is time the SCHEDULER took to get a worker onto it. KPolicy::WaitTime
+        // (recv - flushed) is time the SCHEDULER took to get a worker onto it. K
         // can only ever see the second. If the tail lives in the first, no amount of K helps.
         if (r.completedAtNs != 0 && p.seq < g_rows.size()) {
             g_rows[p.seq].tCompleted = r.completedAtNs;
@@ -432,9 +432,8 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     int  seconds = 60, rate = 60, load = 0;
-    bool plain = false, hipri = false, waittime = false, pinHot = false, elevate = false, noActivate = false;
+    bool plain = false, hipri = false, pinHot = false, elevate = false, noActivate = false;
     size_t    kmin = 1, kmax = 2;
-    long long waitTargetNs = 0;                 // 0 = leave the library default alone
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)   seconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--rate") && i + 1 < argc) rate    = std::atoi(argv[++i]);
@@ -443,15 +442,13 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--hipri"))                hipri   = true;
         else if (!std::strcmp(argv[i], "--k") && i + 1 < argc) { kmin = kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
         // Range and policy are SEPARATE flags on purpose. Bundling them would make every
-        // WaitTime-vs-QueueLoad comparison also a range comparison, and there would be no way to
+        // policy comparison also a range comparison, and there would be no way to
         // say which one moved the number.
         else if (!std::strcmp(argv[i], "--kmin") && i + 1 < argc) { kmin = (size_t)std::atoi(argv[++i]); hipri = true; }
         else if (!std::strcmp(argv[i], "--kmax") && i + 1 < argc) { kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
-        else if (!std::strcmp(argv[i], "--waittime"))           { waittime = true; hipri = true; }
         else if (!std::strcmp(argv[i], "--pin"))                  pinHot   = true;
         else if (!std::strcmp(argv[i], "--prio"))                 elevate  = true;
         else if (!std::strcmp(argv[i], "--noactivate"))            noActivate = true;
-        else if (!std::strcmp(argv[i], "--waittarget") && i + 1 < argc) waitTargetNs = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--headless"))             g_headless = true;
     }
 
@@ -525,7 +522,7 @@ int main(int argc, char** argv) {
     g_paintGaps.reserve(packets);
 
     Out("udp_latency_bench -- %s receive, %d s at %d Hz%s\n",
-                plain ? "PLAIN blocking" : (hipri ? (waittime ? "JLib lane WaitTime" : "JLib lane QueueLoad") : "JLib reactor"), seconds, rate,
+                plain ? "PLAIN blocking" : (hipri ? "JLib lane" : "JLib reactor"), seconds, rate,
                 load ? "  [pool under load]" : "");
 
     SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -590,8 +587,6 @@ int main(int argc, char** argv) {
         if (pinHot)  JLib::TaskScheduler::SetHotWorkerPin(true);
         if (elevate) JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
         if (hipri) JLib::TaskScheduler::SetHotWorkerRange(kmin, kmax);
-        if (waittime) JLib::TaskScheduler::SetHotWorkerPolicy(JLib::TaskScheduler::KPolicy::WaitTime);
-        if (waitTargetNs > 0) JLib::TaskScheduler::SetLaneWaitTargetNs(waitTargetNs);
         JLib::TaskScheduler::Init(0);
         auto& io = JLib::IoReactor::Instance();
         if (!io.RegisterSocket(s)) { Out("RegisterSocket failed\n"); return 1; }
@@ -692,7 +687,7 @@ done:
             Stats b = Summarise(batched);
             Stats d = Summarise(dispatch);
             PrintRow("reactor held (batch)", b, "us   <-- K cannot touch this");
-            PrintRow("scheduler dispatch",   d, "us   <-- what WaitTime sees");
+            PrintRow("scheduler dispatch",   d, "us   <-- the scheduler getting a worker onto it");
         }
     }
 

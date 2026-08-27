@@ -745,39 +745,6 @@ void Thread::Worker() {
 				laneStartNs = MonotonicNs();
 				ranLaneTaskLastPass = true;
 				laneTasksRun.fetch_add(1, std::memory_order_relaxed);
-
-				// KPolicy::WaitTime's evidence, taken here because the clock read above is already
-				// paid for. The exchange both consumes the stamp and re-arms the slot for the next
-				// arrival, so a burst records its head-of-line wait once rather than once per task.
-				//
-				// A zero means nobody stamped -- this task was pushed while the slot was still
-				// holding an older arrival, or it was stolen from another worker whose slot holds
-				// it. Skipped rather than counted as zero wait, because a false ZERO is a false
-				// "nothing waited", which is the one direction that silently suppresses promotion.
-				// POLICY-GATED, and it has to be. Under QueueLoad nothing ever stamps the slot, so
-				// this exchange could only ever return 0 -- but it is an atomic RMW on the lane's
-				// hottest path, executed for every lane task, by users who did not opt in. Worse
-				// than the cost: it lands microseconds from where laneStartNs is read, so it
-				// perturbs the very occupancy measurement the QueueLoad controller decides on.
-				// A default policy must pay nothing for a feature it cannot use.
-				const long long arrived =
-				    (TaskScheduler::GetHotWorkerPolicy() == TaskScheduler::KPolicy::WaitTime)
-				        ? laneArrivalNs.exchange(0, std::memory_order_relaxed)
-				        : 0;
-				if (arrived != 0) {
-					const long long waited = laneStartNs - arrived;
-					// THE COMPARISON HAPPENS HERE, not in the controller, because here is where the
-					// budget can be judged against ONE arrival. A controller reading an aggregate has
-					// already lost which arrival was late -- and an average over a window holding one
-					// late arrival and fifty prompt ones answers a different question entirely.
-					if (waited > 0) {
-						// Single writer: only this worker writes its own max, so no CAS loop.
-						if (waited > laneWaitMaxNs.load(std::memory_order_relaxed))
-							laneWaitMaxNs.store(waited, std::memory_order_relaxed);
-						if (waited > TaskScheduler::GetLaneWaitTargetNs())
-							TaskScheduler::NoteLaneWaitExceeded();
-					}
-				}
 			}
 			// CANCELLATION, OBSERVED AT PICKUP. One flag in the scope; every task carrying a token
 			// to it reads the new value the next time it is touched, and this is one of those
