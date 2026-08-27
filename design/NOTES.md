@@ -252,6 +252,75 @@ policy this runtime does not have.
 **If an abort-a-waiter API is ever added** (destroy *without* resume), `~HazardGuard` on
 `handle.destroy()` becomes load-bearing and several notes above stop being true.
 
+### What a coroutine still must not do — the contract after the record
+
+The record closes *migration*. Two things are left, and neither is about worker cells — worker cells
+were never going to save either one, with or without a worker.
+
+**1. Do not `Protect` without a record.** On `kNoRecord` the guard's cells stay null and the first
+`Protect` is fatal, naming `kMaxRecords`. The constructor returns early rather than resolving a
+reader, so there is no downgrade at all: every available downgrade stops protecting at the first
+`co_await`.
+
+**2. Do not stash a raw `T*` and drop the guard.** Protection is the **guard's lifetime**, not the
+pointer's. `~HazardGuard` clears the cells; a pointer kept past that is a plain pointer with nothing
+announcing it.
+
+**Rule 2 is easier to get wrong in a coroutine than anywhere else, and that is the reason to write
+it down.** In a fiber or native task the scope that drops the guard usually ends soon after, so the
+mistake is short-lived. A coroutine frame *outlives its suspensions*, so a stashed pointer keeps
+looking valid — the frame still holds it, it still compiles, and the read after resume is a
+use-after-free with nothing nearby to suggest it.
+
+**Rule 1 is enforced; rule 2 cannot be.** Exhaustion is a state the code can observe, so it aborts
+on it. A raw pointer copied out of a protected read is invisible from inside the library — no
+signature to check, no tripwire to arm. That asymmetry is why one is an abort and the other is a
+paragraph, and why review of any coroutine taking a guard should look for it specifically.
+
+### The refusal has to live in the constructor, not in `CurrentReader()`
+
+The guard used to *say* it refused the worker-cell downgrade on exhaustion and then fall through to
+`CurrentReader()`, which refused a second time. Two things wrong with that, one of them live:
+
+- **The refusal lived in another function.** Both sites derived "is this a coroutine" from
+  `currentRunningTask->type`, so they agreed — but the guarantee rested on two call sites continuing
+  to agree, a bet this codebase has lost three times (discard sites, the `PushBatch` stamp,
+  `LeaveRegistry`).
+- **`CurrentReader()`'s fiber branch ran first**, returning `fb->poolIndex` before it ever looked at
+  the task type.
+
+**And the detector itself could lie**, which no amount of gating fixes: `Complete()` used to free
+the Task while the worker loop still held `currentRunningTask`, so through the whole unwind window
+that pointer named a recycled slab slot. A destructor constructing a guard would read `Native` for a
+coroutine and take worker cells *through the front door*. Fixed by moving `Complete()` to
+`final_suspend` — see the entry below.
+
+**Shape, not frequency, is what made this worth fixing.** `kMaxRecords` is rarely hit and the task
+type is normally set, so the frequency was low. But the failure mode is: every test that never
+`co_await`s inside the guard passes, and the first real suspend is a use-after-free. A fallback
+whose only failing case is the case it exists for is the wrong shape regardless of how rare it is.
+
+### `Complete()` belongs in `final_suspend`, not `return_void`
+
+C++ runs `return_void()`, **then** destroys the body's locals, **then** reaches `final_suspend()`.
+Completing in `return_void()` announced "done" while the frame's own destructors had yet to run.
+Three defects from one ordering:
+
+- `WaitFor(wg)` was not a happens-before for anything the frame owned. Measured at up to a
+  millisecond on the cancellation path — not a few instructions.
+- Hazard records were held past completion, pressuring `kMaxRecords`, whose exhaustion is a fatal
+  abort by design.
+- `currentRunningTask` went stale while user code could still run (above).
+
+The old comment objected that "the promise is on borrowed time" in `final_suspend`. Half right:
+nothing may touch the promise *after* `final_suspend` returns, and nothing does — but
+`final_suspend()` is a member call on a **live** frame, since `suspend_never` destroys the frame
+after the call, not before it.
+
+`coro_hazard_test` went 3–4/40 failing to 0/40. **That number alone is weak** — at the pooled rate,
+0/40 happens ~2.8% of the time by chance. What carries it is that the mechanism predicted the result
+before the run, and an instrumented build had already shown the record *was* released, just late.
+
 ---
 
 ## Cross-cutting rules this session kept re-proving

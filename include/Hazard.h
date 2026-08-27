@@ -101,9 +101,38 @@
 // TaskScheduler::CurrentTaskType() and take the guard that fits -- that dual-guard pattern is
 // approved and documented in design/NOTES.md.
 //
-// The record is released in ~promise_type and NEVER DELETED: FREE -> LIVE -> RETIRED -> FREE with a
-// bumped generation, because a hazard registry cannot be protected by the hazard domain it serves.
+// The record is released by ~HazardGuard -- NOT by ~promise_type, which was the discarded plan --
+// and is NEVER DELETED: FREE -> LIVE -> RETIRED -> FREE with a bumped generation, because a hazard
+// registry cannot be protected by the hazard domain it serves.
 // One known limitation remains and it is a LEAK, NOT A SMASH -- see the note on ReaderCount below.
+//
+// == WHAT A COROUTINE STILL MUST NOT DO ==
+//
+// Two rules, and they are what is left after the record closes the migration problem. Neither is
+// about worker cells: worker cells were never going to save either one, with or without a worker.
+//
+//   1. DO NOT PROTECT WITHOUT A RECORD. If AcquireRecord returns kNoRecord -- every one of
+//      kMaxRecords LIVE or still inside its grace -- the guard's cells stay null and the first
+//      Protect is FATAL, naming the knob. That is deliberate and it is the whole reason the
+//      constructor returns early instead of resolving a reader: there is no downgrade, because
+//      every available downgrade stops protecting at the first co_await. Raise kMaxRecords, or find
+//      the frames that take a guard and never release it.
+//
+//   2. DO NOT STASH A RAW T* AND DROP THE GUARD. Protection is the GUARD'S LIFETIME, not the
+//      pointer's. ~HazardGuard clears the cells; a pointer you kept past that point is a plain
+//      pointer with nothing announcing it, and the next retire is free to reclaim it.
+//
+//      THIS IS EASIER TO GET WRONG IN A COROUTINE THAN ANYWHERE ELSE, which is why it is written
+//      here rather than assumed. In a fiber or a native task the scope that drops the guard usually
+//      ends soon after, so the mistake is short-lived and often harmless. A coroutine frame OUTLIVES
+//      its suspensions, so a stashed pointer keeps LOOKING valid -- the frame still holds it, the
+//      code still compiles, and the read after resume is a use-after-free with nothing nearby to
+//      suggest it. Hold the guard across every use, including across the co_await.
+//
+// RULE 1 IS ENFORCED, RULE 2 CANNOT BE. Exhaustion is a state this code can observe, so it aborts
+// on it. A raw pointer copied out of a protected read is invisible from here -- there is no
+// signature to check and no tripwire to arm. That asymmetry is why rule 2 is documented instead,
+// and why review of any coroutine that takes a guard should look for it specifically.
 //
 // == ALLOCATION ==
 //
