@@ -115,19 +115,20 @@ int main(int argc, char** argv) {
             g.Protect(JLib::HazardDomain::kCellsPerReader, g_src);   // one past: must abort
             return 0;                                                // reaching here is a failure
         }
-
-        // ---- coroutine record registry ----------------------------------------------------
+        // ---- a NATIVE task may protect; only a coroutine may not ---------------------------
         //
-        // FORCED RATHER THAN FILLED. Genuinely exhausting kMaxRecords (1024) needs 1024 live
-        // coroutines each holding a guard -- heavy, timing-dependent, and a worse way to reach a
-        // deterministic branch. The hook mirrors ForceWorkerCellsForTest, which exists for the
-        // same reason.
-        if (std::strcmp(mode, "records-over") == 0) {
-            JLib::HazardDomain::ExhaustRecordsForTest(true);
-            // A guard taken on a NON-coroutine is unaffected by the hook, so this asserts the hook
-            // is aimed correctly too: it must still work here.
+        // The refusal is keyed on TaskType::Coroutine, so this child exists to prove it is aimed at
+        // the right thing rather than at guards in general. A guard taken on an ordinary task must
+        // work exactly as before.
+        //
+        // NOT COVERED HERE: the coroutine refusal firing. That needs a C++20 child driving a real
+        // frame that takes a guard, and a child which crashes for the WRONG reason is worse than no
+        // child at all. The refusal is structural -- HazardGuard's ctor returns early on
+        // TaskType::Coroutine and Set() calls FatalCoroutineGuard -- but it is asserted by reading
+        // the code, not by running it. Said plainly rather than implied by an absent test.
+        if (std::strcmp(mode, "native-ok") == 0) {
             { JLib::HazardGuard g; g.Protect(0, g_src); }
-            std::printf("non-coroutine guard unaffected by record exhaustion\n");
+            std::printf("native guard protected normally\n");
             sched.Join();
             return 0;
         }
@@ -149,9 +150,9 @@ int main(int argc, char** argv) {
     Check(rc != 0, "protecting past kCellsPerReader ABORTS rather than overrunning");
     Check(sawCellMsg, "and it is the CELL handler that fired, named in the message");
 
-    rc = RunChild(argv[0], "records-over", err);
-    std::printf("      record registry exhausted: exit=%d\n", rc);
-    Check(rc == 0, "record exhaustion does not affect a non-coroutine reader");
+    rc = RunChild(argv[0], "native-ok", err);
+    std::printf("      native task, ordinary guard:  exit=%d\n", rc);
+    Check(rc == 0, "the refusal is aimed at coroutines only -- a native guard still works");
 
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
     return g_fail == 0 ? 0 : 1;

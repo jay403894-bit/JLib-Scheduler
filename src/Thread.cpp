@@ -1,6 +1,7 @@
 ﻿// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
+#include "../include/Hazard.h"  // retire-bag flush on the way into sleep
 #include "../include/Thread.h"
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
@@ -1673,6 +1674,12 @@ void Thread::Worker() {
 			//
 			// The retire bag is per-THREAD, deliberately -- protection follows the reader because a
 			// protected pointer survives a park, but the deferred FREE LIST must never sleep. Put
+			// the bag on the fiber and a park freezes reclamation exactly the way an epoch pin does.
+			//
+			// So: drain it on the way IN, before the park is even advertised, because a worker that
+			// retired some nodes and then went idle would otherwise sit on them until its OWN next
+			// retire -- which on an idle worker may be never.
+			HazardDomain::Instance().Scan();
 
 			int expected = WS_AWAKE;
 			workerState.compare_exchange_strong(expected, WS_GOING_TO_SLEEP,

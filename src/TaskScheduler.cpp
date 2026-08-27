@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
 #include "../include/Thread.h"
+#include "../include/Hazard.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
@@ -1985,6 +1986,11 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		else                                      cpu = i + 1;
 		workers[i]->StartWorker(cpu, fiberCacheCapacity);
 	}
+
+	// AFTER the workers exist, because the cell table is sized from the fiber pool and the worker
+	// count. Building it earlier bakes in a table of zero readers and every later poolIndex is out of
+	// range -- see HazardDomain::EnsureTable, which refuses to build before the pool for that reason.
+	HazardDomain::Instance().Init();
 	for (auto& w : workers) {
 		while (!w->Ready())
 			std::this_thread::yield();

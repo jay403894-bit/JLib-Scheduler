@@ -813,3 +813,20 @@ add_executable(SchedulerDequeCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dequ
 target_link_libraries(SchedulerDequeCeilingTest PRIVATE Scheduler)
 target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)
 
+
+# Hazard pointers -- Michael's algorithm over a reader-indexed table (fibers by poolIndex, native
+# tasks by worker, external threads by a reserved block). NO COROUTINE PATH: a HazardGuard in a
+# coroutine frame is refused at Protect, because a frame has no dense stable index and the record
+# registry that used to cover it had a grace period nobody could state or test. Use counted epochs
+# for a reader that suspends. See design/hazard-pointers.md.
+add_executable(SchedulerHazardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_test.cpp")
+target_link_libraries(SchedulerHazardTest PRIVATE Scheduler)
+target_compile_features(SchedulerHazardTest PRIVATE cxx_std_17)
+
+add_executable(SchedulerHazardOrphanTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_orphan_test.cpp")
+target_link_libraries(SchedulerHazardOrphanTest PRIVATE Scheduler)
+target_compile_features(SchedulerHazardOrphanTest PRIVATE cxx_std_17)
+
+add_executable(SchedulerHazardCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_ceiling_test.cpp")
+target_link_libraries(SchedulerHazardCeilingTest PRIVATE Scheduler)
+target_compile_features(SchedulerHazardCeilingTest PRIVATE cxx_std_17)
