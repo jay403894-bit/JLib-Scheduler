@@ -123,15 +123,26 @@ release. That cost twice —
 Ejected waiters are resumed **without** the lock — the same rule as everywhere here: a cancelled
 acquire took no permit, a cancelled wait holds no lock.
 
-### Three details in the drain that are easy to get wrong
+### Four details in the drain that are easy to get wrong
 
 **Ordering: after the service threads stop, BEFORE the workers join.** Nothing new can arrive once
 the reactor and timer are stopped, but *unwinding is work* and needs live workers to run it. Drain
 after the join and frames get re-pushed onto a pool that is gone.
 
-**Copy the list under the lock, walk it outside.** `DrainForShutdown` resumes frames that can run
-immediately, destroy their own primitives, and re-enter `~WaitPrimitive` — which takes the same
-mutex. Holding it across the walk self-deadlocks.
+**Pop the head under the lock; drain outside it.** The obvious version — copy the list under the
+lock, walk the copy — gets the deadlock right and the lifetime wrong. `DrainForShutdown` resumes
+frames that run *immediately*, and a resumed frame can destroy its own primitives, so a copy holds
+raw pointers to objects resumption is free to free: drain N unwinding a stack that owns primitive
+N+1 leaves a dangling entry that drain N+1 calls a virtual on. Unlinking each primitive *before*
+draining it fixes both — the mutex is not held across the resume, and anything a resumed frame
+destroys unlinks itself before the loop reaches it.
+
+**Every derived destructor calls `LeaveRegistry()` FIRST.** Unlinking in `~WaitPrimitive` is too
+late: by then the derived part is gone and the vtable has reverted, so a racing drain calls into a
+half-destroyed object. That is why `DrainForShutdown` is *not* pure — it is an asserting default, so
+a class that forgets the call degrades to a skipped drain and a loud test failure instead of a
+pure-virtual crash. Four call sites for one invariant; three of them will be the ones someone
+forgets.
 
 **`DrainForShutdown` is a separate virtual from `CancelWaiters`, and tokenless.** A token would
 invite using it as a general-purpose cancel, and `Event::CancelWaiters` has no token at all — a
@@ -265,3 +276,9 @@ QueueLoad asks *would another worker help?*, and the answer was no. Removed.
 **Measurement conditions are part of the measurement.** Window focus and process QoS move dispatch
 latency ~173× on this machine. Benchmarks now print their own conditions, and latency numbers are
 only trusted from a run started by hand.
+
+**A bisect at the wrong sample size is not a bisect.** Five "fixes" and a full revert went into a
+`dag_external` segfault that turned out to be pre-existing — at n=40 the *pre-hazard* build crashes
+too. Every clean run along the way (0/15, 0/20) was underpowered: at a ~7% rate those happen 31% and
+21% of the time by chance. Before a run of green is treated as evidence, work out what a run of
+green is worth.
