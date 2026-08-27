@@ -364,6 +364,19 @@ exhaustive rather than lucky. Models live in `tests/verify/`.
   capacity. Benign in outcome, since the thief discards the value when its CAS fails, but a race on
   a plain object nonetheless, which is why the verified Chase-Lev stores the array as atomics.
   `deque_model.c` misses it only because its owner thread never *pushes*.
+- **MPSC inbox** (`mpsc_model.c`) - Vyukov's intrusive queue, which every worker inbox is. Two
+  producers, one consumer: **2,478 executions, no errors**. Both halves of the publication pair are
+  load-bearing - dropping the release on the link store, or the acquire on the consumer's `next`
+  load, is a non-atomic race on the node's payload in 21 executions.
+  There is deliberately **no control for the head exchange**: relaxing it from `acq_rel` checks
+  clean over 14,840 executions, and that is the correct answer rather than a hole. An exchange is an
+  RMW, so producers linearize through the location's modification order whatever ordering it
+  carries; the payload is published by the release/acquire pair instead. Same finding as the steal
+  CAS above, and it stays `acq_rel` for the same reason.
+  The model also does **not** assert that everything pushed comes out. That is liveness and it is
+  false for a bounded run - a consumer can finish while a producer sits between its exchange and its
+  link store, which is the window the whole algorithm is built around. Asserting it would be a bug
+  report against correct code.
 - **Event waiter stack** (`event_model.c`) - two pushers, one drainer, 24 executions, no errors. No
   waiter lost, none woken twice, no race on the plain `nextWaiter` field.
 - **Worker sleep/wake predicate** (`sleepwake_model.c`) - the `workerState`/`hasQueuedWork`/
