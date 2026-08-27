@@ -150,6 +150,12 @@ namespace JLib {
 		//
 		// Both arms, gated on one branch, so the path is covered whichever context enters it.
 		//
+		// THE RULE: hazards when a coroutine can SUSPEND inside the section -- not merely when one can
+		// ENTER it. A coroutine that runs the section to completion never migrates inside it, so the
+		// borrowed worker slot holds and a plain EpochGuard is correct. That is how TaskDAG works today
+		// and why it needs no change: a coroutine reaches ForEachDependent, but that walk has no
+		// co_await in it. The Epochs.h tripwire is what keeps the assumption honest.
+		//
 		// !! THE READER BRANCH ALONE IS NOT SUFFICIENT. Mixed readers on one structure make RETIRE
 		// unsound: a fiber holding an EpochGuard names no hazard cell, so a hazard scan frees the node
 		// it is traversing -- and a parked coroutine holding a hazard does not stall epoch advancement,

@@ -23,6 +23,20 @@ type.** Not one or the other.
 > The mirror fails too: a parked coroutine holding a hazard on N does not stall epoch advancement, so
 > an epoch-based retire frees N underneath it.
 >
+> **THE RULE, sharpened: hazards when a coroutine can SUSPEND inside the section -- not merely when
+> one can ENTER it.**
+>
+> A coroutine that enters and runs the section to completion is indistinguishable from a native task
+> for epoch purposes: same worker throughout, so the borrowed worker slot is never clobbered. That is
+> not "having a slot" -- it is getting away without one, and it is sound exactly while nothing
+> suspends. The `Epochs.h` tripwire is what keeps that honest.
+>
+> **Worked example: TaskDAG stays on epochs and needs no change.** A coroutine reaches
+> `ForEachDependent` through `SignalExternalNode` -> `SignalExternal`, and that walk takes a plain
+> `EpochGuard`. It is a bare `for (DagEdge* e = node->firstEdge; e; e = e->next) fn(e->dep);` with no
+> `co_await` in it, so the coroutine cannot migrate mid-walk. Add a suspend there and the tripwire
+> fires -- which is the design working, not a latent bug.
+>
 > **So pick one of these before using the pattern:**
 >
 > 1. **Per-structure scheme.** Every reader of a structure uses the SAME one. If coroutines can touch
