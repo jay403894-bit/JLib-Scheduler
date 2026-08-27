@@ -77,6 +77,81 @@ void ApplyHotPriority(bool wantElevated) noexcept {
     (void)wantElevated;
 #endif
 }
+
+// OPT THIS THREAD OUT OF (OR INTO) OS POWER THROTTLING. Windows only; every other platform is a
+// deliberate no-op, explained below.
+//
+// THIS IS NOT PRIORITY, and it is the reason ApplyHotPriority does not cover it. Priority decides
+// who wins a timeslice contest. EcoQoS decides whether the thread runs at reduced FREQUENCY and
+// gets parked on efficiency cores -- a thread can be TIME_CRITICAL and still be throttled, because
+// the scheduler happily gives full priority within a clamped budget. So this applies to EVERY
+// worker, not only hot ones, and it applies whatever HotThreadPolicy says.
+//
+// WHY IT IS WORTH A SYSCALL PER WORKER AT STARTUP. Windows applies EcoQoS by inheritance and by
+// heuristic: a process launched from a background context starts throttled, and a process that
+// loses foreground can be demoted. Measured on this machine, those two levers together moved
+// dispatch latency by ~173x -- large enough that a whole benchmarking session was invalidated by it
+// before the cause was found. A compute pool that the application has explicitly created and is
+// actively feeding is not the workload EcoQoS is for.
+//
+// THE POLICY IS RESOLVED BY THE CALLER, not here. Topology never reaches this function -- the worker
+// entry point turns it into OptOut or Force using isPCore, because that is the only place that knows
+// which worker this is. See SetWorkerPowerThrottling for the policy itself.
+//
+// NEVER ECOQoS A WORKER THIS SCHEDULER PINS TO A P-CORE: that asks the OS to put the work on its
+// fastest core AND to run it slowly, and what you get is a clamped P-core.
+//
+// NOT A GUARANTEE, and nothing here checks otherwise. The call is a REQUEST; the OS may still
+// throttle for thermal or battery reasons, and on a version older than Windows 10 1809 it simply
+// fails with ERROR_INVALID_PARAMETER. Failure is ignored for the same reason ApplyHotPriority
+// ignores EPERM: refusing is the system's answer, not an error in the caller.
+//
+// NO POSIX EQUIVALENT EXISTS, and the absence is not an oversight. Linux expresses the same idea
+// through cgroup cpu.uclamp and per-task util_clamp, which are administrative settings a library
+// has no business writing; on Android the cgroup arbitration overrides anything a thread asks for
+// anyway. macOS folds it into QoS, which ApplyHotPriority already sets -- QOS_CLASS_USER_INTERACTIVE
+// is both the priority and the "do not park me on an E-core" request there.
+void ApplyPowerThrottling(TaskScheduler::PowerThrottling p) noexcept {
+#if JLIB_PLATFORM_WINDOWS
+#ifdef THREAD_POWER_THROTTLING_CURRENT_VERSION
+    THREAD_POWER_THROTTLING_STATE s{};
+    s.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+
+    // THE TWO MASKS ARE NOT A BOOL, which is the easy thing to get wrong here. ControlMask says
+    // which knob is being SET; StateMask says what to set it to. So:
+    //   Control = EXECUTION_SPEED, State = 0                -> throttling OFF (full speed)
+    //   Control = EXECUTION_SPEED, State = EXECUTION_SPEED  -> throttling ON  (EcoQoS)
+    //   Control = 0,               State = 0                -> hands off, OS decides
+    // Zeroing both is NOT "no throttling" -- it is "stop overriding", which is a third outcome.
+    switch (p) {
+    case TaskScheduler::PowerThrottling::OptOut:
+        s.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        s.StateMask = 0;
+        break;
+    case TaskScheduler::PowerThrottling::Force:
+        s.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        s.StateMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        break;
+    // Topology cannot arrive here -- the worker entry resolves it to OptOut or Force. Falling into
+    // SystemManaged rather than asserting is the conservative reading of "somebody added an
+    // enumerator": stop overriding, do not guess at full speed.
+    case TaskScheduler::PowerThrottling::Topology:
+    case TaskScheduler::PowerThrottling::SystemManaged:
+    default:
+        s.ControlMask = 0;
+        s.StateMask = 0;
+        break;
+    }
+    (void)::SetThreadInformation(::GetCurrentThread(), ThreadPowerThrottling, &s, sizeof(s));
+#else
+    // SDK predates the API. Building against it is fine and running on a newer OS is fine; this
+    // build just cannot ask.
+    (void)p;
+#endif
+#else
+    (void)p;
+#endif
+}
 } // namespace
 
 #if !JLIB_PLATFORM_WINDOWS
@@ -134,6 +209,28 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 		while (!ready->load(std::memory_order_acquire)) std::this_thread::yield();
 		instance = this;
 		thread_id = thread_counter.fetch_add(1);
+		// ONCE, HERE, AT THREAD ENTRY. Deliberately not on any per-task or steal path -- it is a
+		// syscall, and the deque CAS and the steal loop stay untouched by design.
+		//
+		// TOPOLOGY IS RESOLVED HERE rather than inside the helper, because this is the only place
+		// that knows WHICH worker this is. isPCore is filled by BuildTopology, which runs before any
+		// worker is released -- StartWorker stores `ready` only after it has placed this thread --
+		// so the read is ordered, not hopeful.
+		//
+		// P-CORE -> OPT OUT, E-CORE -> THROTTLE. Never the other way: this scheduler sets an ideal
+		// P-core for the workers it wants fast, and EcoQoS-ing one of those asks the OS for two
+		// opposite things and delivers a clamped P-core. On a non-hybrid CPU every worker reports P,
+		// so nothing is throttled, which is the right answer there.
+		{
+			TaskScheduler::PowerThrottling pt = TaskScheduler::GetWorkerPowerThrottling();
+			if (pt == TaskScheduler::PowerThrottling::Topology) {
+				const bool onECore = ((size_t)qIndex < scheduler->isPCore.size())
+				                     && !scheduler->isPCore[(size_t)qIndex];
+				pt = onECore ? TaskScheduler::PowerThrottling::Force
+				             : TaskScheduler::PowerThrottling::OptOut;
+			}
+			ApplyPowerThrottling(pt);
+		}
 		// ThreadLocalCache::Initialize clamps this to its MaxCapacity and floors it at 2.
 		localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity);
 		this->Worker();

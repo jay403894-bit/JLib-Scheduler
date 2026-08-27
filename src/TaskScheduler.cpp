@@ -1127,6 +1127,12 @@ void TaskScheduler::ClampHotWorkersToPool() {
 // its OWN priority. Off by default -- see the header.
 static std::atomic<TaskScheduler::HotThreadPolicy> g_hotPolicy{ TaskScheduler::HotThreadPolicy::Normal };
 void TaskScheduler::SetHotThreadPolicy(HotThreadPolicy p) { g_hotPolicy.store(p, std::memory_order_relaxed); }
+
+// Read ONCE per worker at thread entry, never on a per-task path -- relaxed is right and nothing
+// downstream orders against it.
+static std::atomic<TaskScheduler::PowerThrottling> g_powerThrottling{ TaskScheduler::PowerThrottling::OptOut };
+void TaskScheduler::SetWorkerPowerThrottling(PowerThrottling p) { g_powerThrottling.store(p, std::memory_order_relaxed); }
+TaskScheduler::PowerThrottling TaskScheduler::GetWorkerPowerThrottling() { return g_powerThrottling.load(std::memory_order_relaxed); }
 TaskScheduler::HotThreadPolicy TaskScheduler::GetHotThreadPolicy() { return g_hotPolicy.load(std::memory_order_relaxed); }
 
 // Hard-pin the hot workers only. Read in StartWorker, so it must be set BEFORE Init.

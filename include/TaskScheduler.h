@@ -710,6 +710,62 @@ namespace JLib {
 		static void            SetHotThreadPolicy(HotThreadPolicy p);
 		static HotThreadPolicy GetHotThreadPolicy();
 
+		// OS POWER THROTTLING (EcoQoS) for worker threads. Windows only; see ApplyPowerThrottling
+		// in Thread.cpp for why every other platform is a deliberate no-op.
+		//
+		// SEPARATE FROM HotThreadPolicy BECAUSE IT IS A DIFFERENT KNOB. Priority decides who wins a
+		// timeslice contest; EcoQoS decides whether the thread runs at reduced FREQUENCY and gets
+		// parked on an efficiency core. A thread can be TIME_CRITICAL and still be throttled. So
+		// this applies to EVERY worker, not just hot ones, whatever HotThreadPolicy says.
+		//
+		// THE DEFAULT FOLLOWS TOPOLOGY RATHER THAN BLANKET-DISABLING, and that is the whole design:
+		// this scheduler already knows which workers sit on performance cores and which sit on
+		// efficiency cores, and the throttling decision should agree with that placement instead of
+		// fighting it.
+		//
+		//   NEVER ECOQoS A THREAD YOU THEN SET AS IDEAL P-CORE. That combination asks the OS for two
+		//   opposite things -- put this work on your fastest core, and also run it slowly -- and
+		//   what you get is the P-core sitting at a clamped frequency. The blanket OptOut this
+		//   started as would not have done that, but it also throws away information already in
+		//   hand: an E-core worker draining background bulk work has no reason to burn turbo budget.
+		//
+		//   Topology       P-core workers opt OUT of throttling; E-core workers are throttled.
+		//                  DEFAULT. On a non-hybrid CPU every core reports as P, so this is
+		//                  "nothing is throttled" there -- which is also the right answer.
+		//   OptOut         every worker asks for full execution speed, whatever its core.
+		//   SystemManaged  stop overriding and let the OS decide -- exactly what a process that
+		//                  never called this used to get. NOT the same as OptOut: it clears the
+		//                  override rather than requesting full speed.
+		//   Force          every worker asks to BE throttled. For a pool that should run cheap -- a
+		//                  background asset importer, a nightly bake -- where finishing on E-cores
+		//                  is the point.
+		//
+		// WHY IT MATTERS AT ALL. Windows applies EcoQoS by inheritance and by heuristic: a process
+		// launched from a background context starts throttled, and one that loses foreground can be
+		// demoted. Measured on the development machine, those two levers together moved dispatch
+		// latency by ~173x -- enough to invalidate an entire benchmarking session before the cause
+		// was found. A pool the application explicitly created and is actively feeding is not the
+		// workload EcoQoS exists for.
+		//
+		// SET BEFORE Init. Applied once per worker as that worker starts, which is also why it costs
+		// nothing at runtime: one syscall at thread entry, on no per-task path, no steal path, and
+		// nothing near the deque CAS. Per-task QoS would be a syscall per task and is not offered.
+		//
+		// LINUX IS DELIBERATELY A NO-OP. The nearest equivalents are SCHED_IDLE and nice, and both
+		// mean "background" far more strongly than EcoQoS does -- most game loops should not ask for
+		// that, and cgroup cpu.uclamp is an administrative setting a library has no business
+		// writing. On Android cgroups arbitrate regardless. DARWIN IS ALSO NOT WIRED HERE: QoS is
+		// the lever (USER_INTERACTIVE vs UTILITY) and HotThreadPolicy already sets it for hot
+		// workers, but a class-following version is untestable in CI -- flagged rather than guessed
+		// at, the same way the AArch64 PAC/BTI gap is.
+		//
+		// A REQUEST, NOT A GUARANTEE. The OS may still throttle for thermal or battery reasons, and
+		// on anything older than Windows 10 1809 the call simply fails. Failure is ignored, the same
+		// way HotThreadPolicy ignores EPERM: refusing is the system's answer, not a caller error.
+		enum class PowerThrottling : uint8_t { Topology = 0, OptOut, SystemManaged, Force };
+		static void            SetWorkerPowerThrottling(PowerThrottling p);
+		static PowerThrottling GetWorkerPowerThrottling();
+
 		// Hard-pin ONLY the hot workers to their cores, leaving the rest on the global policy.
 		// MUST be set before Init -- placement happens as each worker starts. OFF BY DEFAULT.
 		//

@@ -380,3 +380,55 @@ raw and returns with a bare `ret`, and `Fiber::Init` seeds a raw address into th
 
 Reasoned, not tested — there is no PAC/BTI target in CI. Starting point for that port, not a
 verified account of it.
+
+---
+
+## Deferred — trace zones (the spec, before anyone writes one)
+
+Not built. Written down first because the obvious version of this is wrong in a way that is hard to
+undo once a profiler capture exists and looks plausible.
+
+**Zone the chunks a profiler user cares about**, and nothing else: `push`, `run task`, `park`,
+`steal`, `overflow dequeue`, `epoch tick`.
+
+**One zone around the whole worker loop is noise.** It reports "the worker was in the worker loop,"
+which is true and useless, and it hides the transitions that actually explain a frame.
+
+**One zone per SUCCESSFUL steal is enough. Do not zone the empty-victim scan.** A failed probe is
+the common case by a wide margin, so zoning it buys a trace dominated by nothing happening and puts
+instrumentation directly on the steal path — the one place in this scheduler where a few
+instructions have been measured to matter.
+
+**Nothing may land near the deque CAS.** Same rule the power-throttling work follows: a syscall or a
+timestamp on the steal CAS taxes the hot path to observe a cold one.
+
+**Behind a compile flag, so the bench binary has zero Tracy/PIX calls.** Not a runtime bool — the
+existing `JLIBSCHED_*_STATS` options are the precedent, and they exist precisely because a timing
+taken with instrumentation on must never be compared against one taken with it off.
+
+**Name the threads `jlib-p0` / `jlib-e3`** so P/E shows up in the trace. The class is already known
+(`isPCore`), and a trace that cannot distinguish a P worker from an E one cannot explain the
+scheduling decisions this library makes.
+
+## Power throttling — SHIPPED, and it follows topology
+
+`SetWorkerPowerThrottling`, Windows `SetThreadInformation` + `THREAD_POWER_THROTTLING`. Default is
+`Topology`: **P-core workers opt out of throttling, E-core workers are throttled.**
+
+**Never EcoQoS a thread you then set as an ideal P-core.** That asks the OS for two opposite things
+— put this work on your fastest core, and run it slowly — and delivers a clamped P-core. The first
+version of this was a blanket opt-out for every worker; that avoids the contradiction but throws
+away information already in hand, since an E-core worker draining background bulk has no reason to
+burn turbo budget.
+
+**Set once at worker entry, never per task.** Per-task QoS is a syscall per task. The call appears
+on no per-task path, no steal path, and nothing near the deque CAS — two call sites total, the
+definition and the thread entry.
+
+**Linux is deliberately a no-op.** `SCHED_IDLE` and nice mean "background" far more strongly than
+EcoQoS does, and most game loops should not ask for that; `cpu.uclamp` is an administrative cgroup
+setting a library has no business writing, and Android's cgroups override it regardless.
+
+**Darwin is flagged, not guessed.** QoS is the lever (`USER_INTERACTIVE` vs `UTILITY`) and
+`HotThreadPolicy` already sets it for hot workers, but a class-following version cannot be tested in
+CI — same treatment as the AArch64 PAC/BTI gap.
