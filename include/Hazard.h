@@ -288,10 +288,17 @@ namespace JLib {
             // the same class of bug as worker-owned cells -- protection quietly moves off the node
             // it was guarding -- just relocated onto the fiber.
             //
-            // Fatal in BOTH configurations, unlike the coroutine tripwire, because the failure mode
-            // here is not "wrong on some paths": returning a pointer this never published hands the
-            // caller something it believes is protected and is not. A use-after-free with a
-            // confident comment above it is strictly worse than a stop.
+            // Fatal in BOTH configurations, because the failure mode here is not "wrong on some
+            // paths": returning a pointer this never published hands the caller something it
+            // believes is protected and is not. A use-after-free with a confident comment above it
+            // is strictly worse than a stop.
+            //
+            // THE COROUTINE CHECK COMES FIRST and is not an ordering nicety. cells is null for BOTH
+            // a refused coroutine and an external thread that ran out of reserved slots; same
+            // symptom, completely different fix, so they must not share a message. Set() makes the
+            // same check for the same reason -- this is the second of the two entry points, not a
+            // duplicate of the first.
+            if (coroRefused) HazardDomain::FatalCoroutineGuard();
             if (!cells || k >= HazardDomain::kCellsPerReader)
                 HazardDomain::FatalCellOverflow(k, cells ? "cell index out of range"
                                                          : "no reader slot (external slots exhausted?)");

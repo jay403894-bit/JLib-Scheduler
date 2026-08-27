@@ -295,12 +295,9 @@ namespace JLib {
         // THE SCAN SET IS THE WHOLE TABLE, NOT "WHO IS RUNNING". Walking running workers is bug 2 --
         // it frees under a parked fiber, whose cells are still live and still name their nodes.
         // Indexing by reader makes sleepers unavoidable rather than something to remember.
-        //
-        // AND THE TABLE IS NOW ALL OF IT. There used to be a second walk over a record registry for
-        // coroutines, plus a scan counter (g_scanSeq) whose only job was gating record reuse. Both
-        // are gone with the registry -- see FatalCoroutineGuard. A reader here is a fiber, a worker
-        // or an external thread, every one of which has a dense stable index, so the flat table is
-        // the entire scan set and there is no second lifecycle to reason about.
+        // AND THE TABLE IS ALL OF IT. Every reader -- fiber, worker, external thread -- has a dense
+        // stable index, so this one walk is the entire scan set and there is no second lifecycle to
+        // reason about. See experimental/hazard/README.md for what used to be here.
         std::vector<void*> named;
         named.reserve(readerCount * kCellsPerReader / 4 + 8);
         for (std::size_t i = 0; i < readerCount * kCellsPerReader; ++i)
@@ -356,27 +353,21 @@ namespace JLib {
     HazardGuard::HazardGuard() {
         HazardDomain& d = HazardDomain::Instance();
 
-        // A COROUTINE MAY NOT TAKE A HAZARD GUARD. Refused here, structurally, before anything is
+        // A COROUTINE MAY NOT TAKE A HAZARD GUARD. Refused structurally, before anything is
         // resolved -- not downgraded, not deferred to CurrentReader(), not made to work.
         //
-        // THIS REPLACED A RECORD REGISTRY, and the removal is the point rather than a retreat. A
-        // coroutine has no dense stable index (frames are not a bounded pool), so it could not live
-        // in the flat table; it took a record from a pool with its own FREE -> LIVE -> RETIRED ->
-        // FREE lifecycle, a generation counter, and a grace period keyed on a scan sequence.
+        // WHY: cells are indexed by reader, and a coroutine frame has no dense stable index --
+        // frames are not a bounded pool the way fibers, workers and the reserved external block are.
         //
-        // THAT GRACE COULD NOT BE STATED IN ONE SENTENCE, which is the test it failed. Reuse was
-        // gated on `now > retiredAt + 1` -- a scan COUNT -- rather than on no scan that began at or
-        // before retiredAt still being in flight. Nothing tested record reuse at all: every
-        // assertion in tests/ covers protection, none covers a recycled RecordId. And this codebase
-        // has already shipped one generation-wraparound bug that a test looked straight past.
+        // AND NO FALLBACK, WHICH IS THE FEATURE. Worker or fiber cells are correct until the frame's
+        // first co_await and a use-after-free after it, so a downgrade would pass every test that
+        // does not suspend inside a protected section -- exactly the case it would exist for.
         //
-        // A grace period nobody can spec is not a safe extra, and the registry was the only part of
-        // this file that was not Michael's. Six of the six bugs found here were in that adaptation
-        // layer. So it is gone, and what remains is the paper plus reader-indexed cells.
+        // USE COUNTED EPOCHS for a reader that suspends. That is what the counted scheme was built
+        // for, it is verified, and epochs are this engine's reclamation; hazard pointers are extra.
         //
-        // WHAT A COROUTINE USES INSTEAD: counted epochs. Epochs.h already covers a reader that
-        // suspends -- that is exactly what the counted scheme was built for -- and it is verified.
-        // Hazard pointers are the EXTRA here; epochs are the engine's reclamation.
+        // The registry that used to cover coroutines, and why it was removed rather than repaired:
+        // experimental/hazard/README.md.
         if (Thread::GetCurrent() && TaskScheduler::CurrentTaskType() == TaskType::Coroutine) {
             // REFUSED AT Protect, NOT HERE. cells stays null and reader stays kNoReader, so
             // CONSTRUCTING a guard in a coroutine is inert while PROTECTING through one is fatal --
