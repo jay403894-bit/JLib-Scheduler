@@ -125,6 +125,36 @@ ContextSwitch:
  *
  *  The C++ entry point was seeded in the x19 slot. It never returns (it switches away); brk traps
  *  loudly if it ever does.
+ *
+ *  == NOT PAC/BTI READY. DEFERRED, NOT OVERLOOKED. ==
+ *
+ *  This trampoline assumes classic AArch64: an unsigned return address and unguarded indirect
+ *  branches. That is correct on every target this currently builds for, and it is the next #ifdef
+ *  the moment iOS or a hardened Linux/Android distribution matters. Three specific things, because
+ *  "add PAC support" is not one change:
+ *
+ *    BTI LANDING PADS. With -mbranch-protection=bti an indirect branch may only land on a `bti`
+ *    instruction. `blr x19` below is a guarded indirect CALL, so its target needs `bti c` -- a
+ *    compiler-built entry point gets that in its own prologue, so the call itself is fine. What is
+ *    NOT fine is this label: FiberTrampoline is entered by the `ret` in ContextSwitch, and `ret` is
+ *    unguarded by BTI (returns are PAC's job, not BTI's), so it works today -- but anything that
+ *    ever reaches this label with `br`/`blr` needs `bti c` here first.
+ *
+ *    THE PROPERTY NOTE IS THE QUIET ONE. A hand-written .S with no
+ *    GNU_PROPERTY_AARCH64_FEATURE_1_AND note makes the linker mark the WHOLE BINARY as not
+ *    BTI/PAC compatible -- so shipping this file into a hardened build does not fault, it silently
+ *    turns the protection off for every other object too. That is the failure worth remembering:
+ *    not a crash, a downgrade nobody sees.
+ *
+ *    PAC SIGNS AGAINST SP. `paciasp`/`autiasp` use the stack pointer as the modifier, so a return
+ *    address signed on one stack cannot be authenticated on another. A fiber switch changes SP by
+ *    definition. This port is safe only because it never signs: ContextSwitch saves and restores
+ *    x30 raw and returns with a bare `ret`, and Fiber::Init seeds a raw address into the x30 slot.
+ *    Adding pac-ret to THIS file means auditing that sign/authenticate never straddle a switch --
+ *    it is not a matter of pasting the two instructions in.
+ *
+ *  Reasoned, not tested: there is no PAC/BTI target in CI. Treat the above as the starting point
+ *  for that port, not as a verified account of it.
  */
 #if defined(__APPLE__)
     .globl  _FiberTrampoline

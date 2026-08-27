@@ -351,3 +351,32 @@ only trusted from a run started by hand.
 too. Every clean run along the way (0/15, 0/20) was underpowered: at a ~7% rate those happen 31% and
 21% of the time by chance. Before a run of green is treated as evidence, work out what a run of
 green is worth.
+
+---
+
+## Deferred — AArch64 PAC/BTI
+
+`src/posix/aarch64/ContextSwitch.S` assumes classic AArch64: unsigned return addresses, unguarded
+indirect branches. Correct for every target that builds today; the next `#ifdef` if iOS or a
+hardened Linux/Android distribution matters. **Not a bug in what ships — a forward-looking gap.**
+
+Three distinct things, because "add PAC support" is not one change:
+
+**BTI landing pads.** `blr x19` is a guarded indirect *call*, so its target needs `bti c` — a
+compiler-built entry point emits that in its own prologue, so the call is fine. The label
+`FiberTrampoline` is entered by `ret`, and BTI does not guard returns (that is PAC's job), so it
+works today. Anything that ever reaches that label with `br`/`blr` needs `bti c` first.
+
+**The property note is the quiet one.** A hand-written `.S` with no
+`GNU_PROPERTY_AARCH64_FEATURE_1_AND` note makes the linker mark the **whole binary** as not
+BTI/PAC-compatible. Shipping this file into a hardened build does not fault — it silently disables
+the protection for every other object too. A downgrade nobody sees is worse than a crash.
+
+**PAC signs against SP.** `paciasp`/`autiasp` use the stack pointer as the modifier, so a return
+address signed on one stack cannot be authenticated on another — and a fiber switch changes SP by
+definition. This port is safe *only because it never signs*: `ContextSwitch` saves and restores x30
+raw and returns with a bare `ret`, and `Fiber::Init` seeds a raw address into the x30 slot. Adding
+`pac-ret` here means auditing that sign and authenticate never straddle a switch. Not a paste job.
+
+Reasoned, not tested — there is no PAC/BTI target in CI. Starting point for that port, not a
+verified account of it.
