@@ -45,6 +45,7 @@
 #include "IoAsync.h"
 #include "Coroutine.h"
 #include "CancelToken.h"
+#include "Timer.h"      // MonotonicNs -- the clock the reactor stamps its own timings in
 
 #include <algorithm>
 #include <atomic>
@@ -81,6 +82,12 @@ struct Row {
     std::int64_t tSend  = 0;
     std::int64_t tRecv  = 0;
     std::int64_t tPaint = 0;     // 0 if this packet was superseded before any frame showed it
+
+    // Reactor-internal, in MonotonicNs rather than QPC, so these three only ever get compared with
+    // EACH OTHER -- never subtracted from tSend/tRecv above. Zero without JLIBSCHED_IO_LOCK_STATS.
+    std::int64_t tCompleted = 0;
+    std::int64_t tFlushed   = 0;
+    std::int64_t tResumeNs  = 0;
 };
 
 std::vector<Row>           g_rows;
@@ -159,6 +166,19 @@ JLib::Coro RecvLoop(JLib::IoSocket s, HWND hwnd, JLib::CancelToken tok) {
         if (r.bytes != sizeof(Packet)) continue;
         Packet p{};
         std::memcpy(&p, buf, sizeof p);
+
+        // WHERE INSIDE send->recv THE TIME WENT. Zero unless the library was built with
+        // JLIBSCHED_IO_LOCK_STATS, so this costs nothing in a normal build.
+        //
+        // This is the split that decides whether the scheduler can do anything about the tail at
+        // all: (flushed - completed) is time the REACTOR held the completion in a batch, and
+        // (recv - flushed) is time the SCHEDULER took to get a worker onto it. KPolicy::WaitTime
+        // can only ever see the second. If the tail lives in the first, no amount of K helps.
+        if (r.completedAtNs != 0 && p.seq < g_rows.size()) {
+            g_rows[p.seq].tCompleted = r.completedAtNs;
+            g_rows[p.seq].tFlushed   = r.flushedAtNs;
+            g_rows[p.seq].tResumeNs  = JLib::MonotonicNs();   // same clock as the two above
+        }
         Accept(p, t);
         ::PostMessage(hwnd, kWmPkt, 0, 0);
     }
@@ -311,8 +331,9 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     int  seconds = 60, rate = 60, load = 0;
-    bool plain = false, hipri = false;
-    size_t kmin = 1, kmax = 2;
+    bool plain = false, hipri = false, waittime = false;
+    size_t    kmin = 1, kmax = 2;
+    long long waitTargetNs = 0;                 // 0 = leave the library default alone
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)   seconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--rate") && i + 1 < argc) rate    = std::atoi(argv[++i]);
@@ -320,6 +341,13 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--plain"))                plain   = true;
         else if (!std::strcmp(argv[i], "--hipri"))                hipri   = true;
         else if (!std::strcmp(argv[i], "--k") && i + 1 < argc) { kmin = kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
+        // Range and policy are SEPARATE flags on purpose. Bundling them would make every
+        // WaitTime-vs-QueueLoad comparison also a range comparison, and there would be no way to
+        // say which one moved the number.
+        else if (!std::strcmp(argv[i], "--kmin") && i + 1 < argc) { kmin = (size_t)std::atoi(argv[++i]); hipri = true; }
+        else if (!std::strcmp(argv[i], "--kmax") && i + 1 < argc) { kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
+        else if (!std::strcmp(argv[i], "--waittime"))           { waittime = true; hipri = true; }
+        else if (!std::strcmp(argv[i], "--waittarget") && i + 1 < argc) waitTargetNs = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--headless"))             g_headless = true;
     }
 
@@ -333,7 +361,7 @@ int main(int argc, char** argv) {
     g_paintGaps.reserve(packets);
 
     std::printf("udp_latency_bench -- %s receive, %d s at %d Hz%s\n",
-                plain ? "PLAIN blocking" : (hipri ? "JLib reactor HIPRI lane" : "JLib reactor"), seconds, rate,
+                plain ? "PLAIN blocking" : (hipri ? (waittime ? "JLib lane WaitTime" : "JLib lane QueueLoad") : "JLib reactor"), seconds, rate,
                 load ? "  [pool under load]" : "");
 
     SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -372,6 +400,8 @@ int main(int argc, char** argv) {
         // kmax==kmin is STATIC K by construction -- no controller, no oscillation. --k lets the
         // bench separate "the lane helps" from "the controller is stable", which are different claims.
         if (hipri) JLib::TaskScheduler::SetHotWorkerRange(kmin, kmax);
+        if (waittime) JLib::TaskScheduler::SetHotWorkerPolicy(JLib::TaskScheduler::KPolicy::WaitTime);
+        if (waitTargetNs > 0) JLib::TaskScheduler::SetLaneWaitTargetNs(waitTargetNs);
         JLib::TaskScheduler::Init(0);
         auto& io = JLib::IoReactor::Instance();
         if (!io.RegisterSocket(s)) { std::printf("RegisterSocket failed\n"); return 1; }
@@ -454,6 +484,27 @@ done:
                 "paint -> paint", j.mean, j.p50, j.p90, j.p95, j.p99, j.max);
     std::printf("  frame jitter (sd): %.3f ms over %zu frames; target interval %.3f ms\n",
                 sd, gaps.size(), 1000.0 / (double)(rate ? rate : 60));
+
+    // ---- inside send->recv, when the reactor was built with the stats define ---------------------
+    {
+        std::vector<double> batched, dispatch;
+        for (std::size_t i = 1; i < g_rows.size(); ++i) {
+            const Row& r = g_rows[i];
+            if (r.tCompleted == 0 || r.tFlushed == 0 || r.tResumeNs == 0) continue;
+            batched.push_back((double)(r.tFlushed - r.tCompleted) / 1000.0);   // ns -> us
+            dispatch.push_back((double)(r.tResumeNs - r.tFlushed) / 1000.0);
+        }
+        if (!batched.empty()) {
+            std::printf("\n  the dispatch seam, split (needs -DJLIBSCHED_IO_LOCK_STATS):\n");
+            std::printf("  %-22s %8s %8s %8s %8s %8s %9s\n",
+                        "stage", "mean", "p50", "p90", "p95", "p99", "max");
+            std::printf("  ---------------------------------------------------------------------------\n");
+            Stats b = Summarise(batched);
+            Stats d = Summarise(dispatch);
+            PrintRow("reactor held (batch)", b, "us   <-- K cannot touch this");
+            PrintRow("scheduler dispatch",   d, "us   <-- what WaitTime sees");
+        }
+    }
 
     unsigned ktot = 0;
     for (int i = 0; i < 16; ++i) ktot += g_kHist[i].load();

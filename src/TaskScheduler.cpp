@@ -2242,6 +2242,17 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes hiPri, so a batch routed there
 		// would never run. Same rule as PushLocal and Requeue, asked of the same predicate.
 		const bool useHi = hiPri && HiPriLaneActive();
+		// LANE ENQUEUE SITE 3 OF 3 -- the other two are PushLocal and Requeue, and every one of them
+		// must stamp or KPolicy::WaitTime silently measures nothing.
+		//
+		// This is the site that mattered and the one that was missed. The reactor does NOT resume
+		// completions through Push: pushSteered batches them and calls PushBatch with an explicit
+		// affinity, so with only the first two sites stamped, WaitTime saw no lane arrivals at all
+		// on the exact workload it was built for. Measured: scheduler dispatch p90 433 us, p99
+		// 751 us -- far past any sane target -- with K sitting at 1 for 100% of the run, because
+		// the evidence was never recorded. The comment above about batches once going to loPri
+		// unconditionally is the same bug in an earlier form; this helper is where lane facts belong.
+		if (useHi) StampLaneArrival((size_t)chosen);
 		(useHi ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
 		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
 		// is private and nothing wakes it without a notify targeting it specifically.

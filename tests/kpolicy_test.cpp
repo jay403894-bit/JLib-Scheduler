@@ -47,8 +47,34 @@ void LoadThread(TaskScheduler& sched) {
     }
 }
 
+// EVERY LANE ENQUEUE PATH MUST STAMP, and this test originally proved that for only one of them.
+//
+// It pushed through Push() -> PushLocal and passed while PushBatch was unstamped -- which is the
+// path the I/O reactor actually uses: pushSteered batches completions and calls PushBatch with an
+// explicit affinity. So WaitTime measured nothing at all on the workload it exists for, and the
+// green test said otherwise. Parameterised by path so a missed site fails here instead of in a
+// benchmark four hours later.
+enum class LanePath { Push, PushBatch };
+
+void SubmitLaneTask(TaskScheduler& sched, LanePath path) {
+    auto* t = sched.CreateTask([]() {
+        volatile double acc = 0;
+        for (int k = 0; k < 200; ++k) acc += (double)k;
+    }, /*hipri*/ 1);
+    if (!t) return;
+
+    if (path == LanePath::Push) {
+        sched.Push(t);
+    } else {
+        // Affinity 1 = worker 0, 1-based, exactly as pushSteered aims a completion at a hot worker.
+        // hiPri is a PARAMETER here, not read from the task -- see the note in PushBatch.
+        Task* one[1] = { t };
+        sched.PushBatch(one, 1, /*cpuaffinity*/ 1, /*minPerSegment*/ 64, /*hiPri*/ true);
+    }
+}
+
 // Returns the highest K observed while pushing lane tasks at `rateHz` for `ms`.
-size_t RunAndWatchK(TaskScheduler& sched, int ms, int rateHz) {
+size_t RunAndWatchK(TaskScheduler& sched, int ms, int rateHz, LanePath path = LanePath::Push) {
     size_t peak = TaskScheduler::GetHotWorkers();
 
     const auto  start    = std::chrono::steady_clock::now();
@@ -57,13 +83,8 @@ size_t RunAndWatchK(TaskScheduler& sched, int ms, int rateHz) {
     auto        next     = start + period;
 
     while (std::chrono::steady_clock::now() < deadline) {
-        // hiPri = 1: this is a lane task. Tiny body -- microseconds -- which is exactly the shape
-        // that makes occupancy useless as a signal.
-        auto* t = sched.CreateTask([]() {
-            volatile double acc = 0;
-            for (int k = 0; k < 200; ++k) acc += (double)k;
-        }, /*hipri*/ 1);
-        if (t) sched.Push(t);
+        // Tiny body -- microseconds -- which is exactly the shape that makes occupancy useless.
+        SubmitLaneTask(sched, path);
 
         std::this_thread::sleep_until(next);
         next += period;
@@ -126,7 +147,21 @@ int main() {
     Check(peakWaitTime > 1,
           "WaitTime DOES promote on the same workload (the paired result)");
 
-    std::printf("\n  peak K: QueueLoad=%zu  WaitTime=%zu\n", peakQueueLoad, peakWaitTime);
+    // ---- the same thing through the path the REACTOR uses ---------------------------------------
+    //
+    // THE ASSERTION THAT WOULD HAVE CAUGHT THE REAL BUG. Everything above submits with Push();
+    // PushBatch is a separate enqueue site, and it is the one the reactor's pushSteered actually
+    // calls. With it unstamped the suite was green while WaitTime measured nothing whatsoever on
+    // live I/O -- scheduler dispatch p90 433 us, K pinned at 1 for the whole run.
+    // The load thread from above is still running, which is the point -- this must be the SAME
+    // saturated pool, differing only in which enqueue call carries the task.
+    TaskScheduler::SetHotWorkersEffective(1);
+    const size_t peakBatch = RunAndWatchK(sched, 1500, 60, LanePath::PushBatch);
+    Check(peakBatch > 1,
+          "WaitTime promotes through PushBatch too (the reactor's actual path)");
+
+    std::printf("\n  peak K: QueueLoad=%zu  WaitTime(Push)=%zu  WaitTime(PushBatch)=%zu\n",
+                peakQueueLoad, peakWaitTime, peakBatch);
 
     // ---- and it must come back down ---------------------------------------------------------------
     //
