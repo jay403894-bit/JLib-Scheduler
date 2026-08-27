@@ -1,5 +1,42 @@
 ﻿// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
+//
+// == CREDIT / PRIOR ART ==
+//
+// The SHAPE of this scheduler is not original. It is the fiber-based job system Christian Gyrling
+// described in "Parallelizing the Naughty Dog Engine Using Fibers" (GDC 2015) -- a small pool of
+// worker threads, fibers as the unit that blocks so a wait costs a context switch instead of a
+// core, and counters as the sync primitive. That design was published as a TALK, with no paper and
+// no reference implementation, so everything here is a reconstruction from the description rather
+// than a port. Where it diverges, it diverges because measurement said to, and CHANGELOG.md says
+// which measurement.
+//
+// The pieces underneath it are equally other people's, and are named where they are used rather
+// than only here:
+//
+//   Chase-Lev work-stealing deque    David Chase and Yossi Lev (SPAA 2005). Memory ordering from
+//                                    Le, Pop, Cohen and Zappa Nardelli (PPoPP 2013) -- see
+//                                    TaskDeque.h, and README.md for what our own model checking
+//                                    settled about the steal CAS.
+//   Intrusive MPSC queue             Dmitry Vyukov. See TaskMPSCQueue.h.
+//   Epoch-based reclamation          Keir Fraser (2004). The COUNTED variant used for coroutines
+//                                    is SRCU-shaped -- see Epochs.h for why a coroutine cannot
+//                                    have a slot and what that costs.
+//   Hazard pointers                  Maged M. Michael (IEEE TPDS, 2004). See Hazard.h, which also
+//                                    documents the two bugs a textbook port has in a fiber runtime.
+//   Work stealing as a discipline    Blumofe and Leiserson (Cilk). ParallelFor is Cilk-style, with
+//                                    no cost model -- steals decide how work is divided.
+//   Treiber stack                    R. K. Treiber (1986). Used for Event's waiter list until
+//                                    2.15.0, when a flat fiber-indexed table replaced it.
+//   ConcurrentQueue, LightweightSemaphore
+//                                    Cameron Desrochers (moodycamel), vendored under their own
+//                                    licenses -- see include/LICENSE.md.
+//
+// WHAT IS ACTUALLY OURS is the integration and the failure modes: three execution modes sharing one
+// pool, the K-hot lane and its controller, counted epochs so a coroutine reader is safe rather than
+// forbidden, hazard cells indexed by the thing that MIGRATES instead of by thread, the cancellation
+// model, and the tripwires. Those are the parts with no prior art to copy, which is also why they
+// are the parts that have been wrong most often.
 
 #pragma once
 #define NOMINMAX

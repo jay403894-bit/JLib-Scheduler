@@ -857,6 +857,36 @@ paragraph ever reaches two, the policy is the thing that is wrong, not the relea
 
 [CHANGELOG.md](CHANGELOG.md) has the release history and the negative results.
 
+## Credit
+
+**The shape of this scheduler is not original.** It is the fiber-based job system Christian Gyrling
+described in *Parallelizing the Naughty Dog Engine Using Fibers* (GDC 2015): a small pool of worker
+threads, fibers as the unit that blocks — so a wait costs a context switch instead of a core — and
+counters as the sync primitive. That design was published as a **talk**, with no paper and no
+reference implementation, so everything here is a reconstruction from the description rather than a
+port. Where it diverges it diverges because a measurement said to, and [CHANGELOG.md](CHANGELOG.md)
+says which measurement.
+
+Everyone knows nobody in this space invented the deque either, so the rest is named too:
+
+| Piece | Original | Where it lives |
+|---|---|---|
+| Fiber-based job system | Christian Gyrling (GDC 2015) | the whole design |
+| Chase-Lev work-stealing deque | David Chase, Yossi Lev (SPAA 2005); orderings from Lê, Pop, Cohen, Zappa Nardelli (PPoPP 2013) | `TaskDeque.h` |
+| Intrusive MPSC queue | Dmitry Vyukov | `TaskMPSCQueue.h` |
+| Epoch-based reclamation | Keir Fraser (2004); the counted variant is SRCU-shaped | `Epochs.h` |
+| Hazard pointers | Maged M. Michael (IEEE TPDS, 2004) | `Hazard.h` |
+| Work stealing as a discipline | Blumofe, Leiserson (Cilk) | `ParallelFor`, no cost model |
+| Treiber stack | R. K. Treiber (1986) | `Event`'s waiter list until 2.15.0 |
+| `ConcurrentQueue`, `LightweightSemaphore` | Cameron Desrochers (moodycamel) | vendored, [include/LICENSE.md](include/LICENSE.md) |
+
+**What is actually ours** is the integration and the failure modes: three execution modes sharing
+one pool, the K-hot lane and its controller, counted epochs so a coroutine reader is *safe* rather
+than *forbidden*, hazard cells indexed by the thing that migrates instead of by thread, the
+cancellation model, and the tripwires. Those are the parts with no prior art to copy — which is
+also why they are the parts that have been wrong most often, and why the negative results are in
+the changelog instead of quietly deleted.
+
 ## License
 
 BSD 3-Clause. Use it, fork it, ship it.

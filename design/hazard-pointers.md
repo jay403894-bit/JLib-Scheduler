@@ -125,12 +125,22 @@ Precedent again: `GlobalFiberPool.cpp` already clears `localEpoch` to `SIZE_MAX`
 Hazard cells need the same discipline plus the generation, since a cell holds a *pointer* rather
 than a monotonic number and cannot be sanity-checked by value.
 
-## Coroutines
+## Coroutines — SUPPORTED (this section was the plan; see "Phase 3 as BUILT")
 
-Same rule, worse list. Either the cells live on the **promise** and are unregistered in
-`final_suspend`/destroy, or `Protect()` across a `co_await` is disallowed without that unregister.
-The epoch invariant is untouched: **still no parking inside an epoch.** HP across an await is legal
-only while the frame still owns the cells.
+**A coroutine may hold a `HazardGuard` across a `co_await`.** That is the point of the record: it is
+owned by the **guard**, not by the worker and not by the frame, so it survives the suspend and
+travels with the logical reader to whichever worker resumes it.
+
+The original plan below — cells on the **promise**, unregistered in `final_suspend` — was written
+before `ResumeCoroutine` was understood to be generic, and did not survive contact with it. What
+shipped instead is a registry of records the guard acquires on first `Protect`. The distinction
+matters: frame-owned cells die with the frame, and a *deferred* grace period cannot protect memory
+that is already freed.
+
+**The epoch invariant is untouched: still no parking inside an `EpochGuard`.** That asymmetry is the
+whole reason both schemes exist — a coroutine has no epoch slot of its own (it borrows the
+worker's), so suspending inside an epoch guard is a contract violation with a tripwire on it, while
+suspending inside a hazard guard is ordinary use.
 
 ## Implementation order
 

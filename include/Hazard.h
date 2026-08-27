@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
+// == CREDIT ==
+//
+// ORIGINAL DESIGN: Maged M. Michael, "Hazard Pointers: Safe Memory Reclamation for Lock-Free
+// Objects" (IEEE TPDS 15(6), 2004). The core is his: publish a pointer, fence, reload and verify,
+// and let a retiring thread scan the published set before it frees. Everything below that line is
+// unchanged from the paper and should stay that way.
+//
+// ADDED HERE, and each one is a deviation you should read before trusting your intuition about HP:
+//
+//   FIBER-AS-THREAD. Michael's reader is a THREAD and his cells are slots[tid][i]. Here the reader
+//   is whatever migrates, so cells are indexed by Fiber::poolIndex for fibers, by worker for native
+//   tasks, and by a reserved block for non-worker threads. This is not a cosmetic renaming: it is
+//   the fix for both of the bugs described above, and a textbook slots[tid][i] port has them.
+//
+//   COROUTINES, via an external record the GUARD owns. A coroutine frame has no dense stable index,
+//   so it cannot live in the flat table; it takes a record from a registry instead. See "COROUTINES
+//   ARE SUPPORTED" below -- coroutines are FIRST-CLASS here, in contrast to Epochs.h, where holding
+//   a guard across a suspend is a contract violation.
+//
+//   FAILURE MODES AND TRIPWIRES. Michael's paper does not have to describe what a migrating reader
+//   or a registry exhaustion does, because neither exists in it. The warnings in this file and in
+//   design/hazard-pointers.md are ours, they were each written after finding the thing they warn
+//   about, and the assert text is part of the interface -- do not soften it.
+//
 // HAZARD POINTERS -- safe reclamation for structures behind FIBER-AWARE LOCKS.
 //
 // == WHY THIS EXISTS AND EPOCHS DO NOT COVER IT ==
@@ -44,11 +68,42 @@
 //              workers, so the slot lives here (not on the thread)").
 //   Native     the worker. A native task does not change stack mid-section, so it cannot migrate
 //              inside a protected span and worker-owned cells are correct for it.
+//   Coroutine  a RECORD from a registry, acquired by the guard on first Protect. A frame has no
+//              dense stable index -- frames are not a bounded pool -- so it cannot be a row in the
+//              flat table. The record is what makes coroutines work; see below.
 //   External   a non-worker thread (main, an app thread) claims one of a small reserved block.
 //
 // The table is FLAT and indexed by that reader id, which is what makes the scan include parked
 // fibers BY CONSTRUCTION: a parked fiber's index still addresses its cells, and the scan walks the
 // table rather than walking "who is running". Same perfect-hash property Event's waiter index uses.
+// The record registry is scanned alongside it, for the same reason and with the same property.
+//
+// == COROUTINES ARE SUPPORTED -- AND THIS IS WHERE THEY BEAT EPOCHS ==
+//
+// A coroutine may hold a HazardGuard across a co_await. That is the whole point of the record: it
+// is owned by the GUARD, not by the worker and not by the frame, so it survives the suspend and
+// travels with the logical reader to whichever worker resumes it.
+//
+// CONTRAST WITH Epochs.h, and this is the reason both schemes exist. A coroutine has no epoch slot
+// of its own -- it borrows the WORKER's -- so suspending inside an EpochGuard is a contract
+// violation with a debug tripwire on it, and counted epochs exist to make the release-build
+// consequence a bounded leak instead of a smash. Hazard pointers have no such restriction.
+//
+// SO THE RULE FOR PICKING ONE IS PERFORMANCE, NOT SAFETY -- both are safe now:
+//
+//   Fiber / native reader, never suspends      epoch guard    ~0.40 ns    the optimal path
+//   Coroutine reader                           counted epoch  ~0.55 ns    safe, SRCU-shaped
+//   Coroutine reader, or a suspending one      hazard         pricier per protected pointer,
+//                                                             but it does not pin everything
+//                                                             retired since it announced
+//
+// If a lock-free path can be entered by BOTH a coroutine and a fiber, branch on
+// TaskScheduler::CurrentTaskType() and take the guard that fits -- that dual-guard pattern is
+// approved and documented in design/NOTES.md.
+//
+// The record is released in ~promise_type and NEVER DELETED: FREE -> LIVE -> RETIRED -> FREE with a
+// bumped generation, because a hazard registry cannot be protected by the hazard domain it serves.
+// One known limitation remains and it is a LEAK, NOT A SMASH -- see the note on ReaderCount below.
 //
 // == ALLOCATION ==
 //
