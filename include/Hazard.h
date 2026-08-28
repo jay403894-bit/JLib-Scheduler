@@ -57,8 +57,16 @@
 //                                       Nobody frees a node you can reach while you hold the lock,
 //                                       so frequently there is nothing here for EBR or HP to do.
 //
-//   LOCK-FREE STRUCTURE WITH SHARED     hazard pointers or another reclamation scheme may be
-//   POINTERS                            required. This is the case the file is for.
+//   LOCK-FREE STRUCTURE, RAW POINTERS   a reclamation scheme IS required -- readers dereference
+//                                       nodes a writer may be retiring, and nothing else says when
+//                                       the free is safe. EBR, hazard pointers and REFCOUNTING are
+//                                       all answers here; this file is one of them.
+//
+//                                       std::shared_ptr IS ALREADY SUCH A SCHEME, not a reason to
+//                                       reach for this one. If the nodes are refcounted, lifetime
+//                                       is handled -- what is left is a cost question (an atomic
+//                                       per copy versus an announce per traversal), not a safety
+//                                       one.
 //
 //   EPOCH-COMPATIBLE WORKLOAD           epochs may simply be cheaper -- one announce per traversal
 //                                       (~0.40 ns) against a store plus a fence per protected

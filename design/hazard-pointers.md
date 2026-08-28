@@ -22,8 +22,13 @@ The honest version is three cases:
 | workload | what it needs |
 |---|---|
 | **locked structure** | lock / ownership can often establish lifetime on its own |
-| **lock-free structure with shared pointers** | hazard pointers or another reclamation scheme may be required |
+| **lock-free structure, raw pointers** | a reclamation scheme *is* required -- EBR, hazard pointers or refcounting |
 | **epoch-compatible workload** | epochs may simply be cheaper |
+
+`std::shared_ptr` **is already such a scheme, not a reason to reach for this one.** If the nodes are
+refcounted, lifetime is handled; what is left is a cost question — an atomic per copy against an
+announce per traversal — not a safety one. Refcounting is also half of the coroutine pattern this
+file enforces: hazard-protect the lookup, take a refcount, drop the guard, then await.
 
 **And where epochs and hazard pointers overlap, the axis is pinning, not suspension.** An epoch
 reader pins *everything* retired since it announced; a hazard reader pins *only the nodes it named*.

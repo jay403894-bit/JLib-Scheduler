@@ -109,9 +109,12 @@ not break, not that the feature is unwanted.
 someone putting a node-recycling structure behind a fiber-aware lock, "the exact place `Epochs.h`
 forbids". That does not hold up: if you hold the lock, mutual exclusion already establishes
 lifetime. The three real cases are — a **locked structure**, where lock/ownership can often
-establish lifetime on its own; a **lock-free structure with shared pointers**, which may require
-hazard pointers or another scheme; and an **epoch-compatible workload**, where epochs may simply be
-cheaper. Only the middle one is this.
+establish lifetime on its own; a **lock-free structure with raw pointers**, which does require a
+reclamation scheme, though EBR, hazard pointers and refcounting are all answers; and an
+**epoch-compatible workload**, where epochs may simply be cheaper. Only the middle one is this.
+
+`std::shared_ptr` is already such a scheme, **not** a reason to reach for this one — if the nodes
+are refcounted, lifetime is handled and what remains is a cost question, not a safety one.
 
 **WHAT THE REFUSAL COSTS, precisely.** A coroutine in that middle case is not blocked: **counted
 epochs** exist for exactly that reader and are verified — a coroutine survives its own suspension
