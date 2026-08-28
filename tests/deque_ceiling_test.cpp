@@ -110,14 +110,21 @@ int main(int argc, char** argv) {
     // ABORT LOOKS DIFFERENT ON EVERY PLATFORM, so the test asks only "did it exit abnormally":
     // Windows reports 3 for abort(), POSIX shells report 134 (128 + SIGABRT). Anything non-zero and
     // not one of the test's own explicit codes means it died the way it should.
-    std::snprintf(cmd, sizeof(cmd), "\"%s\" over > nul 2>&1", argv[0]);
+// NUL on Windows, /dev/null everywhere else -- redirecting to "nul" on POSIX silently creates a
+    // FILE called nul in the working directory, which is not a failure but is litter in CI.
+#if defined(_WIN32)
+    const char* kDevNull = "nul";
+#else
+    const char* kDevNull = "/dev/null";
+#endif
+    std::snprintf(cmd, sizeof(cmd), "\"%s\" over > %s 2>&1", argv[0], kDevNull);
     int overRc = std::system(cmd);
     std::printf("      past the ceiling: child exit=%d\n", overRc);
     Check(overRc != 0, "pushing past the ceiling ABORTED rather than dropping or corrupting");
 
     // THE HALF THAT KEEPS THIS HONEST. A deque that aborted on every push would satisfy the check
     // above and be worthless; this says the ceiling is where it is claimed to be.
-    std::snprintf(cmd, sizeof(cmd), "\"%s\" under > nul 2>&1", argv[0]);
+    std::snprintf(cmd, sizeof(cmd), "\"%s\" under > %s 2>&1", argv[0], kDevNull);
     int underRc = std::system(cmd);
     std::printf("      up to the ceiling: child exit=%d\n", underRc);
     Check(underRc == 0, "filling exactly TO the ceiling did not abort (else the test is vacuous)");
