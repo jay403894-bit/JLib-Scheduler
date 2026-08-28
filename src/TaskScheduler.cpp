@@ -2784,7 +2784,22 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// by PushImmediate this returned false and the caller had to cope. With pinning gone
 		// (4.0.1) there is no way for a worker to be unavailable, so the refusal path and the
 		// retry loops that danced around it are unreachable and removed. See SetReservedCores.
-		loPriInboxes[idx]->push(task);
+
+		// AFFINITY DOES NOT DEMOTE. This branch pushed to loPriInboxes unconditionally, so
+		// Push(affinity, hiPriTask) silently landed lane work on the ordinary deque -- the exact
+		// priority inversion PushBatch's submitRun refuses by name ("no caller could see" it), and a
+		// direct contradiction of the contract on Task::hiPri, which lists PushLocal among the paths
+		// that route on it. Nothing reported it: the task still ran, just never on the lane, so the
+		// lane simply never filled and its hint bit never set.
+		//
+		// Found by a reachability test that pinned hiPri work to one worker with affinity and then
+		// could not explain why stealHintLane stayed 0x0.
+		//
+		// SAME PREDICATE AS EVERY OTHER PUSH PATH, deliberately: at K=0 nobody probes hiPri, so a
+		// task routed to the lane would never run at all -- collapsing to loPri is what makes hiPri
+		// free rather than dangerous when the lane is off.
+		const bool useHi = task->hiPri && HiPriLaneActive();
+		(useHi ? hiPriInboxes : loPriInboxes)[idx]->push(task);
 		NoteInboxPush(1);
 		// Targeted at worker idx specifically, not NotifyAll() -- only that one worker's
 		// inbox actually changed. MarkQueuedWork() (release-ordered, matching
