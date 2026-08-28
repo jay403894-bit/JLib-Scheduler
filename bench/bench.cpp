@@ -1248,7 +1248,13 @@ int main(int argc, char** argv) {
                    "  nosweep   skip the ParallelFor crossover sweep AND the splitter-vs-cursor\n"
                    "            sweep (the two slowest sections), so a pool-size sweep is a few\n"
                    "            seconds per point instead of minutes.\n"
-                   "  hot=N     reserve N workers for the LATENCY LANE (SetHotWorkers). Default 0.\n"
+                   "  hot=N     reserve N workers for the LATENCY LANE (SetHotWorkers). DEFAULT 2,\n"
+                   "            and PINNED: SetHotWorkers fixes the range to [N,N] so the dynamic-K\n"
+                   "            controller cannot move it mid-run. That matters because the\n"
+                   "            controller reacts to lane occupancy that 1p/mp/burst create as a\n"
+                   "            side effect -- left to itself, K would differ between runs of the\n"
+                   "            same command and the banner (sampled once at startup) would not\n"
+                   "            even show it. hot=0 is also pinned: a lane-less pool, deliberately.\n"
                    "            K=0 collapses the lane: a hiPri push then routes to loPri by design,\n"
                    "            because nobody probes hiPri at K=0 and a task sent there would never\n"
                    "            run -- so latency/hot and io-pipe SKIP themselves and say why rather\n"
@@ -1279,7 +1285,9 @@ int main(int argc, char** argv) {
     auto   idle = JLib::TaskScheduler::IdlePolicy::Sleep;
     const char* idleName = "sleep";
     bool   runBoth = false;
-    size_t hotWorkers = 0;               // hot=N: dedicated low-latency-lane workers, 0 = off
+    // hot=N: workers dedicated to the latency lane. DEFAULT 2, AND PINNED -- see the SetHotWorkers
+    // call below for why a benchmark must not leave this to the controller.
+    size_t hotWorkers = 2;
     for (int a = 2; a < argc; ++a) {
         if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
         if (JLIB_STRICMP(argv[a], "noev") == 0)    { runEvents = false; continue; }
@@ -1360,7 +1368,23 @@ int main(int argc, char** argv) {
 
     // BEFORE Init: StartPool clamps K against the real pool size and publishes the hot CPU set as
     // the workers come up, so the count has to be known by then.
-    if (hotWorkers) JLib::TaskScheduler::SetHotWorkers(hotWorkers);
+    //
+    // ALWAYS CALLED, INCLUDING AT ZERO, AND THAT IS THE POINT. SetHotWorkers(k) pins the range to
+    // [k,k], which the dynamic-K controller cannot move. Skipping the call -- which is what
+    // `if (hotWorkers)` used to do at the default -- leaves K to the controller, and the controller
+    // reacts to lane occupancy that 1p, mp and burst create as a side effect. K would then differ
+    // between runs of the same command, and every row would be describing a configuration the
+    // reader cannot see, because the banner samples GetHotWorkers() once at startup and a promotion
+    // after that never appears in the paste.
+    //
+    // That is exactly the throughput/bt lesson -- a bench that quietly reports two configurations
+    // under one heading -- and it is worse here, because K changes what the OTHER rows mean, not
+    // just its own. A benchmark measures one configuration and says which one.
+    //
+    // DEFAULT 2 rather than 0: at K=0 the lane is collapsed, latency/hot and io-pipe skip
+    // themselves, and the suite silently stops covering the thing those sections exist for. Pass
+    // hot=0 deliberately to measure a lane-less pool -- that is still PINNED at zero, not dynamic.
+    JLib::TaskScheduler::SetHotWorkers(hotWorkers);
 
     // PRESIZE THE SLAB, because a growth allocation is MEASUREMENT NOISE HERE and nowhere else.
     //
@@ -1393,7 +1417,9 @@ int main(int argc, char** argv) {
     // was never on the path, so K only shrank the compute pool and the row looks worse for free.
     // The plain `latency` row below is ALWAYS a generic push; latency/hot is the hiPri one.
     const size_t bannerK = JLib::TaskScheduler::GetHotWorkers();
-    printf("config: workers=%zu  hot=%zu  affinity=%s  idle=%s  events=%s\n",
+    // "PINNED" is not decoration: it says the dynamic-K controller cannot move this mid-run, so the
+    // number in the banner is the number every row below was measured under.
+    printf("config: workers=%zu  hot=%zu (PINNED)  affinity=%s  idle=%s  events=%s\n",
            sched.GetWorkerCount(), bannerK, policyName, idleName, runEvents ? "on" : "off");
     printf("        latency row = generic Push (never the lane);  latency/hot = hiPri push%s\n",
            bannerK ? "" : "  [K=0: hiPri collapses to loPri, so hot rows are skipped]");
