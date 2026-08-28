@@ -1373,56 +1373,189 @@ void Thread::Worker() {
 					return true;
 				};
 
-				// CLASS-FIRST victim ordering: probe the victims this worker can actually steal
-				// class-pinned work from BEFORE the ones it might have to decline -- scan order
-				// matches steal legality. Phases: same-class LLC mates -> idle SMT sibling (same
-				// physical core = same class by construction) -> foreign-class mates -> global
-				// random, same-class set first. Same total coverage as the old order (the two mate
-				// lists ARE clusterMates, split); on non-hybrid CPUs matesOtherClass is empty and
-				// this degrades to exactly the classic scan.
-				auto probeList = [&](const std::vector<int>& list) {
-					if (list.empty() || task_to_run) return;
-					size_t probeLimit = (consecutiveMisses < kBackoffMissThreshold)
-						? list.size() : (size_t)1;
-					size_t s = FastRand() % list.size();
-					for (size_t i = 0; i < probeLimit; ++i) {
-						if (tryStealFrom(list[(s + i) % list.size()])) break;
-					}
+				// ================= VICTIM SELECTION: ADVERTISED WORKERS ONLY ===================
+				//
+				// ONE POLICY. The two mechanisms answer different questions and neither substitutes
+				// for the other:
+				//
+				//   THE FLAG   "is there anything to take?" -- a presence test. One shared word,
+				//              written only on a state change, so under steady load it sits
+				//              shared-clean in every thief's cache.
+				//   TOPOLOGY   "if I take something, from whom is it cheapest?" -- an ORDERING over
+				//              victims. Never a presence test.
+				//
+				// So: never probe a victim whose bit is clear; use topology only to ORDER the ones
+				// whose bit is set.
+				//
+				// THIS DOES NOT CHANGE WHICH VICTIMS ARE PROBED. tryStealFrom was already
+				// flag-first, so a clear-bit victim was never probed -- the old scan merely walked
+				// to it and bounced off MaybeStealable. What is deleted is the WALK, not a steal:
+				// the mate vectors, the sibling's remote `busy` load, the unconditional
+				// non-worker-lane probe and the two random class picks all existed to REACH victims
+				// the flag then rejected.
+				//
+				// HINTS ARE ALLOWED TO BE LATE, BY DESIGN, which is why "poke the deque anyway in
+				// case the hint went stale" is the waste and not the safety net. A stale CLEAR
+				// delays one steal until the owner's next pass. A stale SET costs one failed probe,
+				// after which the thief clears the bit. Paying a failed probe on every idle core on
+				// every pass to insure against the first is that trade run backwards -- and under
+				// NoSleep this block IS the idle loop.
+				//
+				// WHAT IS ACTUALLY EXPENSIVE, stated so this does not get re-litigated: steal_if on
+				// another worker's deque, because the owner's pop_bottom lives on that line. Walking
+				// a vector and bouncing off a bitmap test is small -- not free, but small. The
+				// disaster was never the walk; it was treating the walk as a reason to touch deques.
+				//
+				// ROLE PICKS THE WORD. Three advertisements exist: backlog and parallel describe
+				// ordinary deques, stealHintLane describes a hot worker's lane. tryStealFrom keeps
+				// hot and ordinary in disjoint worlds, so a candidate list built from the wrong word
+				// yields nothing but rejected calls -- that mistake silently disabled hot->hot lane
+				// stealing once already, and SchedulerDynamicKTest is what caught it.
+				//
+				// PUBLISHERS VERIFIED BY HAND, because this policy starves if one is missing:
+				//   - ordinary deque -- UpdateBacklogHint at depth >= kStealHintDepth, DRAIN-set by
+				//     the owner (its only call site). Goes stale-clear while a long task runs, since
+				//     a buried worker is not looping. Identical to today: the old scan would not
+				//     have probed a clear bit either. If that window ever needs closing, the fix is
+				//     a publisher-side set like the lane already has -- NOT a wider scan.
+				//   - lazy splits -- SetParallelHint at publish, before the split becomes visible.
+				//   - the NON-WORKER lane -- covered, and this is the one that would have starved
+				//     ParallelFor. LaneForCurrentThread() is reached only by the lazy-split publish
+				//     and its own drain, and the publish sets the parallel bit with that lane's
+				//     index, so bits == 0 really does mean the lane is empty too.
+				//
+				// POOLS ABOVE 64 DEQUES ARE THE EXCEPTION. MaybeStealable returns true there -- the
+				// bitmap cannot name those victims at all -- so every worker stays a candidate and
+				// tryStealFrom's own gate is the only filter, which miss-probes. That is the thing
+				// this policy exists to stop, and the fix is a SECOND HINT WORD, not a wider scan.
+				// Do not "solve" >64 by scanning mates harder.
+				// THE ORDINARY MASK MUST INCLUDE THE LANE AT laneHintMode 4, and leaving it out is a
+				// silently disabled feature rather than a slow path. There are TWO lane branches in
+				// tryStealFrom: hot->hot (the isHotWorker block) and, at mode 4 ONLY, ordinary->hot
+				// -- an ordinary worker draining a backlogged lane, which is the DEFAULT (laneHintMode
+				// is 4). That branch only decides what to do with a victim already chosen, so an
+				// ordinary mask of backlog|parallel never names a hot worker advertising on
+				// stealHintLane and the path becomes unreachable. Selection is upstream of the gate.
+				//
+				// The OR is conditional on the mode for the same reason the mask exists at all: at
+				// modes 0/1/2/3 an ordinary thief handed a hot victim just walks into
+				// `GetLaneHintMode() != 4 -> return false`, which is a call bought and thrown away.
+				// EVERY READ HERE GOES THROUGH `scheduler`, NEVER THROUGH A STATIC. The static
+				// LaneBacklogMask() reaches the same word via Instance(), which THROWS before the
+				// pool is up -- from a noexcept function, so it is std::terminate, not an exception.
+				// Workers start inside StartPool, before `instance` is assigned, so an unconditional
+				// static read here killed every pool-starting test at 0xC0000409: silent, no message,
+				// invisible to ASan. It survived earlier revisions only because the call sat behind
+				// `isHotWorker` and K defaults to 0, so nothing ever executed it.
+				// SNAPSHOT ONCE, ONLY THE WORDS THIS POOL USES. nWords is ceil(queues/64), so a
+				// 32-worker pool reads exactly one word per map and pays what it always did; the
+				// cost scales with the machine rather than with the 256-queue ceiling.
+				const size_t nq0     = scheduler->loPri.size();
+				const bool bitsUsable = nq0 <= TaskScheduler::kMaxHintQueues;
+				const size_t nWords   = bitsUsable ? ((nq0 + 63) / 64) : 0;
+
+				// laneHintMode 4 -- the DEFAULT -- lets an ORDINARY worker drain a backlogged lane,
+				// and tryStealFrom only decides what to do with a victim already chosen. Without the
+				// lane bits folded in here that victim is never selected and the feature is silently
+				// dead. Conditional on the mode, because at 0/1/2/3 an ordinary thief handed a hot
+				// victim just walks into `!= 4 -> return false` -- a call bought and thrown away.
+				const bool ordinaryTakesLane = (TaskScheduler::GetLaneHintMode() == 4);
+
+				unsigned long long bitsW[TaskScheduler::kHintWords] = {};
+				unsigned long long bitsAny = 0;
+				for (size_t w = 0; w < nWords; ++w) {
+					bitsW[w] = isHotWorker
+						? scheduler->LaneHintWord(w)
+						: (scheduler->StealHintWord(w)
+						   | (ordinaryTakesLane ? scheduler->LaneHintWord(w) : 0ull));
+					bitsAny |= bitsW[w];
+				}
+
+				// THE KILL SWITCH HAS TO BE READ HERE, not just in MaybeStealable, and missing it
+				// broke the one control this project relies on.
+				//
+				// stealHintOn is the A/A diagnostic: flip it and the hint stops filtering, so the
+				// hint's value can be measured against itself INSIDE ONE PROCESS -- which exists
+				// because comparing separately-built arms produced a false result here twice.
+				// MaybeStealable honours it, but MaybeStealable runs inside tryStealFrom, DOWNSTREAM
+				// of selection. Filtering the victim out here meant it never reached the switch, so
+				// SetStealHint(false) silently did nothing and the hint-OFF arm of nosleep_tax was
+				// measuring hint-ON. Selection is upstream of permission -- the same trap that killed
+				// laneHintMode 4, in a different place.
+				const bool hintsOn = TaskScheduler::stealHintOn.load(std::memory_order_relaxed);
+
+				auto advertised = [&](int t) -> bool {
+					if (!hintsOn)   return true;       // A/A control: behave as if nothing filtered
+					if (!bitsUsable) return true;      // no bit exists for anyone; see the note
+					const size_t ut = (size_t)t;
+					if (ut >= TaskScheduler::kMaxHintQueues) return true;   // none for THIS one
+					return ((bitsW[ut >> 6] >> (ut & 63)) & 1ull) != 0;
 				};
 
-				probeList(scheduler->matesSameClass[qIndex]);
+				// POOL-WIDE EMPTY CHECK. Nothing advertised means there is nothing to steal -- not
+				// "nothing nearby". Walking mates, the sibling or the random picks here would touch
+				// shared state to re-derive an answer already sitting in a register.
+				// `!hintsOn` belongs in this test for the same reason it belongs in advertised(): with
+				// the control off, an empty bitmap must NOT end the sweep, or the arm that is
+				// supposed to behave like the old scan would instead do nothing at all -- the most
+				// misleading possible result, since it would look like the hint was free.
+				if (!hintsOn || !bitsUsable || bitsAny != 0) {
+					// PHASE 2 SWEEPS EVERY QUEUE, not just the first 64. It used to stop at 64
+					// because that was where bits ran out; with four words the bitmap covers the
+					// whole pool, and anything past 256 has no bit and is waved through by
+					// `advertised` -- so clamping here would have silently excluded those victims
+					// from selection entirely, which is worse than probing them.
+					const int lim = (int)scheduler->loPri.size();
 
-				if (!task_to_run) {
-					int sibling = scheduler->siblingQIndex[qIndex];
-					if (sibling >= 0 && !scheduler->workers[sibling]->busy.load(std::memory_order_relaxed)) {
-						tryStealFrom(sibling);
-					}
-				}
+					// The backoff budget still counts PROBES, never skips: a candidate rejected by
+					// its bit touches nothing, so charging it would blind a backed-off worker to the
+					// one advertised victim sitting behind two quiet ones.
+					const size_t probeLimit = (consecutiveMisses < kBackoffMissThreshold)
+						? (size_t)lim : (size_t)1;
+					size_t probed = 0;
 
-				probeList(scheduler->matesOtherClass[qIndex]);
-
-				// THE NON-WORKER LANE (see TaskScheduler::nonWorkerLane). Probed HERE -- after both
-				// topology phases, before the global random fallback -- and the position is a
-				// judgement, not an accident. It has no cache locality to any worker, so it does
-				// not belong among the LLC mates; but it is the one victim guaranteed to be a
-				// SINGLE known index rather than a random draw out of a set, so putting it after
-				// the random fallback would make a lazy split's fan-out depend on a dice roll.
-				// Unlike the mate lists this is one deque pair, so the probe is unconditional and
-				// costs two loads when it is empty, which is the overwhelmingly common case.
-				if (!task_to_run) {
-					tryStealFrom((int)scheduler->nonWorkerLane);
-				}
-
-				if (!task_to_run) {
-					// Global fallback: one random probe from the same-class set, then one from the
-					// other class -- covers workers outside this LLC cluster (multi-CCD parts).
-					auto tryRandomFrom = [&](const std::vector<int>& set) {
-						if (set.empty() || task_to_run) return;
-						int t = set[FastRand() % set.size()];
-						if (t != qIndex) tryStealFrom(t);
+					// EVERY VICTIM IS PROBED AT MOST ONCE PER PASS. Phase 2 sweeps the whole index
+					// range, so without this it re-probes the mate phase 1 just lost a race on --
+					// a second remote CAS against the owner that already beat us, which is the
+					// single most expensive thing this block can do. Only indices under 64 need
+					// recording; above that `advertised` waves everything through anyway and the
+					// mate list cannot contain them on a pool that large without bitsUsable being
+					// false, in which case one duplicate probe is the old behaviour.
+					unsigned long long tried = 0;
+					auto probeOnce = [&](int t) {
+						if (t == qIndex || !advertised(t)) return;
+						if (t < 64) {
+							if (tried & (1ull << t)) return;
+							tried |= 1ull << t;
+						}
+						++probed;
+						tryStealFrom(t);
 					};
-					tryRandomFrom(iAmP ? scheduler->pWorkers : scheduler->eWorkers);
-					tryRandomFrom(iAmP ? scheduler->eWorkers : scheduler->pWorkers);
+
+					// PHASE 1 -- advertised same-class LLC mates. This is the only place topology
+					// can still earn its keep: several advertised victims at once on a multi-CCD
+					// part, where one of them is genuinely cheaper. It never justifies probing a
+					// clear bit.
+					//
+					// ROTATING START HERE TOO. Walking the mate list from slot 0 puts every idle
+					// thief on this cluster onto the same first advertised mate, which is the herd
+					// the hint was supposed to break up -- and it is worse than phase 2 herding,
+					// because these are the threads most likely to be searching simultaneously. The
+					// scan this replaced randomised its offset; dropping that was a regression.
+					const std::vector<int>& mates = scheduler->matesSameClass[qIndex];
+					if (!mates.empty()) {
+						const size_t ms = FastRand() % mates.size();
+						for (size_t i = 0; i < mates.size() && !task_to_run && probed < probeLimit; ++i)
+							probeOnce(mates[(ms + i) % mates.size()]);
+					}
+
+					// PHASE 2 -- every other advertised victim, including the non-worker lane and
+					// any worker outside this LLC cluster. Rotating start, for the same reason.
+					if (!task_to_run && lim > 0) {
+						const int start = (int)(FastRand() % (unsigned)lim);
+						for (int i = 0; i < lim && !task_to_run && probed < probeLimit; ++i)
+							probeOnce((start + i) % lim);
+					}
 				}
 
 				if (task_to_run) {

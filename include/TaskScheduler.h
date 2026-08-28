@@ -1937,6 +1937,30 @@ namespace JLib {
 		// the pool outgrew one word -- necessarily, because covering only 0..63 would have starved
 		// everything above it. With 256 bits available the guard is now per-queue, so a pool larger
 		// than one word keeps its hints; only a pool larger than 256 falls back, and then uniformly.
+
+		// ---- PER-WORD ACCESSORS FOR THE STEAL BLOCK ------------------------------------------
+		//
+		// The sweep snapshots ceil(queues/64) words ONCE and then tests bits in a register, rather
+		// than re-deriving a candidate's bit through MaybeStealable per victim. On a one-word pool
+		// that is two acquire loads for the whole sweep instead of two per mate.
+		//
+		// MEMBERS, NOT THE STATICS, and this is not a style preference. LaneBacklogMask() reaches
+		// the same word through Instance(), which THROWS when the pool is not up -- from a noexcept
+		// function, so it is std::terminate, not an exception. Workers start INSIDE StartPool,
+		// before `instance` is assigned, so one unconditional static read in the worker loop took
+		// every pool-starting test down at 0xC0000409: silent, no message, nothing for ASan to find.
+		// A worker already holds `scheduler`; inside that loop, use these and never the statics.
+		unsigned long long StealHintWord(size_t wi) const noexcept {
+			return stealHintBacklog[wi].load(std::memory_order_acquire)
+			     | stealHintParallel[wi].load(std::memory_order_acquire);
+		}
+		// The lane map is deliberately ONE word (hot workers are always the lowest indices, and K is
+		// clamped to 64 for exactly that reason), so every higher word is empty by construction
+		// rather than by accident -- returning 0 keeps the caller's loop uniform across both maps.
+		unsigned long long LaneHintWord(size_t wi) const noexcept {
+			return (wi == 0) ? stealHintLane.load(std::memory_order_acquire) : 0ull;
+		}
+
 		bool MaybeStealable(size_t q) const noexcept {
 			if (q >= kMaxHintQueues || loPri.size() > kMaxHintQueues) return true;
 			if (!stealHintOn.load(std::memory_order_relaxed)) return true;

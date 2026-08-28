@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -84,9 +85,29 @@ int main(int argc, char** argv) {
     const double floorMs = Median(floorS);
 
     JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
+    // THE POOL MUST NOT SATURATE THE MACHINE, and defaulting it to every core is what made this
+    // bench blind. Measured 2026-08-28 on a 32-thread part with the old default (31 workers):
+    //
+    //     hint OFF  tax +79.75%          hint ON  tax +79.60%
+    //
+    // Those two are this file's KNOWN-POSITIVE -- the comparison the whole bench exists to show --
+    // and they came back flat. That is not a result about the hint, it is an instrument reporting
+    // nothing, and the magnitude says why: a +80% tax is not cache interference, it is the main
+    // thread having no core to run on. With 31 spinning workers the floor-vs-pool gap is CPU
+    // contention -- the "spinning" component the header calls unavoidable -- and it swamps the
+    // "searching" component this bench exists to isolate. Game01's ~3.5% came from a pool that left
+    // the app room; at half the machine this lands in the same range.
+    //
+    // Override with argv[3] to reproduce the saturated case deliberately.
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int poolDefault = (hw > 3u) ? (int)(hw / 2u) : 1;
+    const int poolN = (argc > 3) ? std::atoi(argv[3]) : poolDefault;
+
     // Init is STATIC and must precede any Instance() call -- going through Instance() to reach it
     // fastfails before the pool exists, with no output if stdout is still buffered.
-    JLib::TaskScheduler::Init();
+    JLib::TaskScheduler::Init(poolN);
+    std::printf("  pool: %d workers (machine has %u); the headroom is deliberate -- see the note above\n\n",
+                poolN, hw);
 
     // Nothing is ever submitted. Every worker is idle for the whole run, which is the configuration
     // under test -- an app whose pool is provisioned for bursts and quiet between them.
@@ -96,20 +117,23 @@ int main(int argc, char** argv) {
     // cause without ever attributing it.
     std::vector<double> offS, onS;
     long long offProbes = 0, onProbes = 0, offHits = 0, onHits = 0;
-    for (int r = 0; r < reps; ++r) {
+    // ARM ORDER ROTATES PER REP. It did not until 2026-08-28, and that was a real defect in this
+    // file: with a fixed off-then-on sequence, ANY monotonic drift inside a run -- a thermal ramp, a
+    // background process starting, the buffer settling -- lands on the arms in order and reads as a
+    // clean result. A smoke run showed exactly that shape. Alternating removes it.
+    auto runArm = [&](bool hintOn) {
         long long p0 = 0, h0 = 0, p1 = 0, h1 = 0;
-
-        JLib::TaskScheduler::SetStealHint(false);
+        JLib::TaskScheduler::SetStealHint(hintOn);
         JLib::StealStatsRead(p0, h0);
-        offS.push_back(RunWorkload(inner));
+        const double ms = RunWorkload(inner);
         JLib::StealStatsRead(p1, h1);
-        offProbes += p1 - p0; offHits += h1 - h0;
-
-        JLib::TaskScheduler::SetStealHint(true);
-        JLib::StealStatsRead(p0, h0);
-        onS.push_back(RunWorkload(inner));
-        JLib::StealStatsRead(p1, h1);
-        onProbes += p1 - p0; onHits += h1 - h0;
+        if (hintOn) { onS.push_back(ms);  onProbes  += p1 - p0; onHits  += h1 - h0; }
+        else        { offS.push_back(ms); offProbes += p1 - p0; offHits += h1 - h0; }
+    };
+    for (int r = 0; r < reps; ++r) {
+        const bool firstOn = (r & 1) != 0;
+        runArm(firstOn);
+        runArm(!firstOn);
     }
 
     const double offMs = Median(offS), onMs = Median(onS);
