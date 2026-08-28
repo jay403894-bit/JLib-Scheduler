@@ -971,21 +971,28 @@ static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
 // the resume may land while the fiber is still warm; at 1 ms it has certainly settled. The gap
 // between those two numbers is the part that belongs to the machine rather than to the primitive.
 //
-// A AND B DO NOT SEPARATE, AND THIS SECTION DOES NOT PRETEND THEY DO. Four consecutive runs on an
-// idle machine: 0.33x, 0.79x, 1.09x, 1.17x -- Direct ahead twice, Event ahead twice, across a
-// factor of three and a half. The comparison is therefore not reported as a verdict; both numbers
-// are printed and the ratio is labelled meaningless on its own.
+// A AND B ARE NOT RANKED AGAINST EACH OTHER, AND THIS SECTION PRINTS NO RATIO BETWEEN THEM.
 //
-// AND THE SPREAD IS NOT JUST A BUSY MACHINE. In the 0.33x run the Event arm's MEDIAN OF 25 was
-// 32.4 us where the other three runs put it at 6.6-10.0. One arm occasionally collects a batch slow
-// enough that twenty-five samples do not average it out, which is worth understanding before
-// anyone tunes anything on the strength of this row.
+// TWO INDEPENDENT REASONS, either of which is sufficient.
 //
-// There IS a structural difference, and it is small rather than decisive. Event's slot index is the
-// waiting fiber's own poolIndex, so registering is two stores and allocates nothing; Direct takes a
-// DirectEvent from a pool and hands it back. Closing that gap would mean preallocating one
-// DirectEvent per fiber -- Event's design, plus a per-fiber object idle almost always -- which is
-// memory spent to chase a difference this bench cannot resolve.
+// The sampling cannot support a ranking. Four consecutive runs on an idle machine gave 0.33x,
+// 0.79x, 1.09x and 1.17x -- Direct ahead twice, Event ahead twice, across a factor of three and a
+// half. And it is not simply a busy machine: in the 0.33x run the Event arm's MEDIAN OF 25 was
+// 32.4 us where the other three put it at 6.6-10.0, so one arm sometimes collects a batch that
+// twenty-five samples do not average away. Each arm's own number is a measurement; a quotient of
+// two numbers that unstable is not, and printing it -- even hedged -- is what invites somebody to
+// quote it.
+//
+// And they answer different questions, so a ranking would be the wrong output even with perfect
+// sampling. Event is for REPEATED waits on a known event, where the slot index is the waiting
+// fiber's own poolIndex and registering is two stores that allocate nothing. Direct is for a
+// PER-OPERATION wait with a fresh identity -- a fence value, an I/O completion -- where the cost
+// that matters is not the resume at all but the registry name you did not have to mint, because
+// GetEvent holds a global mutex across its lookup and never evicts.
+//
+// Closing the small structural gap would mean preallocating one DirectEvent per fiber, which is
+// Event's design plus a per-fiber object idle almost always -- memory spent chasing a difference
+// this bench cannot resolve, to make one primitive better at a job the other already has.
 //
 // THE CONCLUSION THIS ROW MUST NOT PRODUCE is "Direct is slower, use Event." Direct exists so a
 // PER-OPERATION wait -- a fence, an I/O completion, anything with a fresh identity each time --
@@ -1122,15 +1129,22 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
     // understood, this row reports two numbers and no comparison.
     //
     // WHAT DOES REPRODUCE, run to run, is latency/hot at ~0.10x of latency/cold. Trust that row.
-    if (a1 > 0.0 && b1 > 0.0)
-        printf("  ratio this run %.2fx -- MEANINGLESS ALONE. Observed 0.33x to 1.17x across four\n"
-               "  consecutive runs, both directions. Neither primitive is faster here; they are\n"
-               "  chosen for different things. Event's slot is the waiting fiber's own poolIndex\n"
-               "  (two stores, nothing allocated); Direct takes a pooled object and returns it, and\n"
-               "  in exchange never mints a registry name -- which is what a per-operation wait (a\n"
-               "  fence, an I/O completion) needs, because GetEvent holds a global mutex across a\n"
-               "  lookup and never evicts. That is the reason to pick one, not this number.\n",
-               a1 / b1);
+    // NO RATIO IS PRINTED. Not a labelled one, not a hedged one -- printing the number at all
+    // invites the ranking, and 25 samples cannot support one: four consecutive runs on an idle
+    // machine gave 0.33x, 0.79x, 1.09x and 1.17x, both directions, and in the first of those the
+    // Event arm's MEDIAN was 32.4 us against 6.6-10.0 in the rest. Each arm's own number is a
+    // measurement; the quotient of two numbers this unstable is not.
+    //
+    // They also answer different questions, so a ranking would be the wrong output even if the
+    // sampling were good enough to produce one.
+    printf("  These are NOT ranked against each other. Same job, different constraints:\n"
+           "    Event  -- repeated waits on a KNOWN event. Slot index is the waiting fiber's own\n"
+           "              poolIndex, so registering is two stores and allocates nothing. Hoist the\n"
+           "              Event& once at startup; GetEvent by name takes a global mutex.\n"
+           "    Direct -- one PER-OPERATION wait with a fresh identity (a fence value, an I/O\n"
+           "              completion). Costs a pooled object, and in exchange never mints a\n"
+           "              registry name -- GetEvent's map never evicts, so a name per operation is\n"
+           "              an unbounded map and a lock convoy that looks like a deadlock an hour in.\n");
 
     if (includeSleepingArm) {
         // C: let the pool genuinely park before signalling. 50 ms is what BenchIdleBurst uses for
