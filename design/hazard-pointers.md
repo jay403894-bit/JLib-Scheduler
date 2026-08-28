@@ -5,23 +5,40 @@ tests/coro_hazard_test.cpp (6/6).
 Phase 3 diverged from its plan in two places -- see "Phase 3 as BUILT" at the end for what changed
 and why.
 
-## The hole
+## When this is the right tool
 
-`SchedulerMutex`, `SchedulerSemaphore` and the condition variable all **suspend the fiber** on
-contention. That is the point of them — a suspended fiber releases its worker, where a `std::mutex`
-would park the OS thread and cost a core.
+**The original framing here was wrong, and it is corrected rather than quietly softened.** This note
+used to open with "the hole": `SchedulerMutex` and friends suspend the fiber, `Epochs.h` forbids
+suspending inside an `EpochGuard`, therefore a structure behind a fiber-aware lock has *no* safe
+reclamation scheme. That argument does not hold up.
 
-`Epochs.h` carries a hard invariant with a debug tripwire: **a fiber may not suspend inside an
-`EpochGuard`.**
+If you hold the lock, mutual exclusion already establishes lifetime — nothing can free a node you
+can reach. And if the traversal is lock-free, you should not be suspending inside it anyway; the
+standard pattern is protect the lookup, take a refcount, drop the guard, *then* await. So the case
+this was sold on is much thinner than claimed.
 
-Together those leave a gap with nothing in it:
+The honest version is three cases:
 
-> A data structure guarded by a fiber-aware lock has **no safe memory-reclamation scheme today.**
-> Its critical section can suspend, so it cannot use EBR. The alternatives are `std::mutex` — which
-> stalls a worker, the exact thing this library exists to avoid — or no reclamation at all.
+| workload | what it needs |
+|---|---|
+| **locked structure** | lock / ownership can often establish lifetime on its own |
+| **lock-free structure with shared pointers** | hazard pointers or another reclamation scheme may be required |
+| **epoch-compatible workload** | epochs may simply be cheaper |
 
-Nothing in-tree puts a concurrent node-recycling structure behind `SchedulerMutex` yet, which is the
-only reason this has not bitten. The first client that does hits it immediately.
+**And where epochs and hazard pointers overlap, the axis is pinning, not suspension.** An epoch
+reader pins *everything* retired since it announced; a hazard reader pins *only the nodes it named*.
+A reader does not have to suspend to be slow — a descheduled worker, a preempted thread, a long
+traversal or a parked fiber all do it. That is why hazard pointers exist in the literature and it is
+the honest reason they exist here.
+
+Epochs remain this engine's reclamation and stay on the steal path: nothing there stalls for long,
+and the cheaper announce (~0.40 ns, against a store plus a fence per protected pointer) wins. Reach
+for hazard pointers when a reader can be slow **and** the retire rate is high enough that pinning
+everything since the announcement would matter.
+
+Nothing in-tree needs either from this file — no concurrent node-recycling structure sits behind a
+`SchedulerMutex`. That is a statement about the library, not about whether the facility is useful:
+the users are applications, and this exists for the one that writes such a structure.
 
 ## The partition
 

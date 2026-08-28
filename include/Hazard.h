@@ -44,26 +44,35 @@
 // Naughty Dog Engine Using Fibers" (GDC 2015) -- started independently here and informed by it
 // afterwards. See the credit block in TaskScheduler.h for the full history.
 //
-// HAZARD POINTERS -- safe reclamation for structures behind FIBER-AWARE LOCKS.
+// HAZARD POINTERS -- reclamation that bounds what a SLOW reader pins.
 //
-// == WHY THIS EXISTS AND EPOCHS DO NOT COVER IT ==
+// == WHEN THIS IS THE RIGHT TOOL -- A WEAKER CASE THAN THIS FILE ONCE CLAIMED ==
 //
-// SchedulerMutex, SchedulerSemaphore and the condition variable all SUSPEND the fiber on
-// contention -- that is the point of them, since a suspended fiber releases its worker where a
-// std::mutex would park the OS thread and cost a core.
+// THE ORIGINAL MOTIVATION WAS OVERSTATED, and it is corrected here rather than quietly softened.
+// This file used to say that a structure behind a fiber-aware lock has NO reclamation scheme
+// available, because SchedulerMutex and friends suspend the fiber and Epochs.h forbids suspending
+// inside an EpochGuard. That does not hold up, and the honest version is three cases:
 //
-// Epochs.h forbids exactly that: a fiber may not suspend inside an EpochGuard, enforced by a debug
-// tripwire. So a structure guarded by a fiber-aware lock has NO reclamation scheme available -- its
-// critical section can suspend, so EBR is illegal, leaving std::mutex (stalls a worker) or nothing.
+//   LOCKED STRUCTURE                    lock / ownership can often establish lifetime on its own.
+//                                       Nobody frees a node you can reach while you hold the lock,
+//                                       so frequently there is nothing here for EBR or HP to do.
 //
-// The dividing line is CAN THE READER SUSPEND, not lock-free versus locked:
+//   LOCK-FREE STRUCTURE WITH SHARED     hazard pointers or another reclamation scheme may be
+//   POINTERS                            required. This is the case the file is for.
 //
-//   Epochs            lock-free structures. Reader never suspends. One announce per traversal.
-//                     A stalled reader pins EVERYTHING retired since it announced.
-//   Hazard pointers   structures behind fiber-aware locks. Reader suspends by design. A store plus
-//                     fence per protected pointer. A stalled reader pins ONLY the nodes it named.
+//   EPOCH-COMPATIBLE WORKLOAD           epochs may simply be cheaper -- one announce per traversal
+//                                       (~0.40 ns) against a store plus a fence per protected
+//                                       pointer here.
 //
-// Epochs are unchanged and stay on the steal path; that is what this cost column buys.
+// AND THE AXIS IS PINNING, NOT SUSPENSION. Where the two overlap, what separates them is what a
+// SLOW reader costs: an epoch reader pins EVERYTHING retired since it announced, a hazard reader
+// pins ONLY the nodes it named. A reader does not have to suspend to be slow -- a descheduled
+// worker, a preempted thread, a long traversal or a parked fiber all do it. That is why HP exists
+// in the literature and it is the honest reason it exists here.
+//
+// Epochs remain this engine's reclamation and stay on the steal path; nothing there stalls for long
+// and the cheaper announce wins. Reach for hazard pointers when a reader can be slow AND the retire
+// rate is high enough that pinning everything since the announcement would matter.
 //
 // == THE TWO BUGS A TEXTBOOK PORT HAS HERE ==
 //
