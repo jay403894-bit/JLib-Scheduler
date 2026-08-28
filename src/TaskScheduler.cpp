@@ -733,6 +733,16 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 		const size_t n = instance->workers.size();
 		if (n && eff >= n) eff = n - 1;
 	}
+	// AND CLAMPED TO WHAT THE LANE BITMAP CAN NAME. stealHintLane is one 64-bit word, unlike the
+	// backlog/parallel maps which are four -- and that is deliberate rather than an oversight, because
+	// a hot worker is always one of the LOWEST indices (`victimIsHot` is literally `hotN > target`),
+	// so one word covers K <= 64 and K is measured useful in the 1-4 range.
+	//
+	// But "implausible" is not "impossible", and unclamped it fails SILENTLY: on a 128-thread part
+	// somebody could ask for K=100, and hot workers 64..99 would never set a lane bit, so no sibling
+	// could ever find them buried -- hot->hot stealing simply absent for a third of the lane, with
+	// nothing reporting it. Clamping is the honest failure: K stops where the bitmap does.
+	if (eff > 64) eff = 64;
 	const size_t prev = g_hotWorkers.exchange(eff, std::memory_order_relaxed);
 	// THE GENERATION IS BUMPED ONLY ON A REAL CHANGE, and this line is the reason the whole scheme
 	// is cheap: every worker reads it every pass, so it must stay in shared state. K moves rarely

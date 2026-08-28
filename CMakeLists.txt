@@ -813,6 +813,13 @@ add_executable(SchedulerDequeCeilingTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dequ
 target_link_libraries(SchedulerDequeCeilingTest PRIVATE Scheduler)
 target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)
 
+# The steal hint past bit 63. Oversubscribes deliberately (100 workers) because that is the only way
+# to reach a two-word hint bitmap without a 128-thread machine -- every other test on a normal box
+# runs the one-word path and would pass with the second word wired up backwards.
+add_executable(SchedulerStealHintWordsTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_hint_words_test.cpp")
+target_link_libraries(SchedulerStealHintWordsTest PRIVATE Scheduler)
+target_compile_features(SchedulerStealHintWordsTest PRIVATE cxx_std_17)
+
 
 # Hazard pointers -- Michael's algorithm over a reader-indexed table (fibers by poolIndex, native
 # tasks by worker, external threads by a reserved block). NO COROUTINE PATH: a HazardGuard in a

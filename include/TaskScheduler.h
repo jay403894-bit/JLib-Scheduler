@@ -1879,38 +1879,71 @@ namespace JLib {
 		// says so; a bare non-empty queue does not.
 		static constexpr size_t kStealHintDepth = 8;
 
-		std::atomic<unsigned long long> stealHintBacklog{ 0 };
-		std::atomic<unsigned long long> stealHintParallel{ 0 };
+		// ---- THE HINT BITMAPS ARE MULTI-WORD, and that is a correctness property, not a size ----
+		//
+		// One bit per queue index. A SINGLE 64-bit word used to be the whole story, and the failure
+		// it produced was not "large pools lose an optimisation" -- it was a CLIFF, in the direction
+		// that hurts most:
+		//
+		//   loPri.size() is num_workers + 1 (the non-worker lane), so the edge sat at 64 WORKERS,
+		//   not 64 CPUs. Init(0) takes hardware_concurrency - 1, so a 64-thread machine landed on
+		//   exactly 64 and kept its hints, while a 128-thread Threadripper got 127 workers and
+		//   MaybeStealable disabled the hints WHOLESALE -- every idle worker back to probing every
+		//   victim, at the 0.2-0.9% hit rate the hints were built to fix. Probe traffic goes as N^2,
+		//   so the machine where the hint matters most was the one that switched it off.
+		//
+		// The wholesale disable was itself correct given one word: covering only 0..63 would starve
+		// every queue above it, since those could never advertise and so would never be stolen from.
+		// The fix is more words, never a narrower guarantee.
+		//
+		// FOUR WORDS = 256 QUEUES, matching topology::CpuMask::kMaxCpus so the two ceilings cannot
+		// drift apart. Cost is bounded by the POOL, not by the constant: readers walk
+		// ceil(loPri.size()/64) words, so a 32-worker pool touches exactly one and pays what it
+		// always did. Above 256 the guards below fall back to "always a candidate", which is the old
+		// probe-everything behaviour -- correct, just unoptimised, and on hardware nobody has yet.
+		static constexpr size_t kHintWords     = 4;
+		static constexpr size_t kMaxHintQueues = kHintWords * 64;   // 256
+
+		std::atomic<unsigned long long> stealHintBacklog[kHintWords]{};
+		std::atomic<unsigned long long> stealHintParallel[kHintWords]{};
 
 		// Owner-maintained, on push and pop. Writes only on a threshold crossing.
 		void UpdateBacklogHint(size_t q, size_t depth) noexcept {
-			if (q >= 64) return;
-			const unsigned long long bit = 1ull << q;
+			if (q >= kMaxHintQueues) return;
+			auto& word = stealHintBacklog[q >> 6];
+			const unsigned long long bit = 1ull << (q & 63);
 			const bool want = depth >= kStealHintDepth;
-			if (want == ((stealHintBacklog.load(std::memory_order_relaxed) & bit) != 0)) return;
-			if (want) stealHintBacklog.fetch_or(bit, std::memory_order_release);
-			else      stealHintBacklog.fetch_and(~bit, std::memory_order_relaxed);
+			if (want == ((word.load(std::memory_order_relaxed) & bit) != 0)) return;
+			if (want) word.fetch_or(bit, std::memory_order_release);
+			else      word.fetch_and(~bit, std::memory_order_relaxed);
 		}
 		// Set by the splitter when it publishes; cleared by the owner when its lane drains. Held
 		// conservatively -- while ANY work remains the lane stays advertised, which costs a probe
 		// and can never hide a split.
 		void SetParallelHint(size_t q) noexcept {
-			if (q < 64) stealHintParallel.fetch_or(1ull << q, std::memory_order_release);
+			if (q < kMaxHintQueues)
+				stealHintParallel[q >> 6].fetch_or(1ull << (q & 63), std::memory_order_release);
 		}
 		void ClearParallelHintIfEmpty(size_t q, size_t depth) noexcept {
-			if (q >= 64 || depth != 0) return;
-			stealHintParallel.fetch_and(~(1ull << q), std::memory_order_relaxed);
+			if (q >= kMaxHintQueues || depth != 0) return;
+			stealHintParallel[q >> 6].fetch_and(~(1ull << (q & 63)), std::memory_order_relaxed);
 		}
 
 		// Runtime kill switch, so the hint`s value can be measured against an A/A control inside one
 		// process. Three separately-built binaries measured in three sessions is how a 2x machine
 		// drift once got read as a result.
+		// THE POOL-WIDE DISABLE IS GONE, and it is the whole point of the multi-word change. It read
+		// `loPri.size() > 64 -> return true`, which turned the hint off for EVERY queue the moment
+		// the pool outgrew one word -- necessarily, because covering only 0..63 would have starved
+		// everything above it. With 256 bits available the guard is now per-queue, so a pool larger
+		// than one word keeps its hints; only a pool larger than 256 falls back, and then uniformly.
 		bool MaybeStealable(size_t q) const noexcept {
-			if (q >= 64 || loPri.size() > 64) return true;
+			if (q >= kMaxHintQueues || loPri.size() > kMaxHintQueues) return true;
 			if (!stealHintOn.load(std::memory_order_relaxed)) return true;
-			const unsigned long long bit = 1ull << q;
-			return ((stealHintBacklog.load(std::memory_order_acquire)
-			       | stealHintParallel.load(std::memory_order_acquire)) & bit) != 0;
+			const size_t wi = q >> 6;
+			const unsigned long long bit = 1ull << (q & 63);
+			return ((stealHintBacklog[wi].load(std::memory_order_acquire)
+			       | stealHintParallel[wi].load(std::memory_order_acquire)) & bit) != 0;
 		}
 
 		// ---- THE LANE'S OWN BACKLOG SIGNAL, and why it is not the one above -------------------
