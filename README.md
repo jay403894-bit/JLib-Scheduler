@@ -886,9 +886,16 @@ hot worker and pays a core for it. K=0 costs nothing: the lane collapses and the
 deque and one steal probe per victim instead of two.
 
 **`SetHotThreadPolicy(Elevated)`** additionally raises the hot workers and the reactor's completion
-threads to `THREAD_PRIORITY_TIME_CRITICAL` (Windows; a no-op elsewhere). It raises **only** those
+threads, and it is implemented on every platform -- `THREAD_PRIORITY_TIME_CRITICAL` on Windows,
+`QOS_CLASS_USER_INTERACTIVE` on macOS (which is also what steers P vs E there, since Apple Silicon
+exposes no affinity API), and per-thread nice on Linux. It raises **only** those
 threads, never the process -- raising the whole process measured *5x worse*, because the spinning
-workers then preempt the completion thread feeding them. Untested beside a live audio or present
+workers then preempt the completion thread feeding them. That is also why the Linux backend goes
+through `SYS_setpriority` on a TID rather than glibc's `setpriority`, which follows POSIX and would
+elevate the whole process: the same regression, reachable by accident through the portable spelling.
+Off Windows the request can be **refused** -- lowering nice needs `CAP_SYS_NICE`, and Android's
+cgroups arbitrate regardless -- and a refusal is swallowed, because the unprivileged answer is still
+an answer. Untested beside a live audio or present
 thread; if you see stutter rather than an I/O win, drop it and keep `SetHotWorkers` alone, which is
 where most of the measured benefit is.
 

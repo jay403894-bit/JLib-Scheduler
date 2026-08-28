@@ -1564,24 +1564,35 @@ void Thread::Worker() {
 				// spot that costs a pusher nothing, which is the actual hypothesis being tested.
 				const bool hot = TaskScheduler::GetHotWorkers() > (size_t)qIndex;
 
-				// ---- WINDOWS ONLY. There is no POSIX implementation of HotThreadPolicy. ----------
+				// ---- PORTABLE PROTOCOL. HotThreadPolicy is implemented on every platform. --------
 				//
-				// PORTABLE PROTOCOL. Every platform difference lives in ApplyHotPriority; the state
-				// machine below is one copy on every OS, because three copies of it would drift.
+				// (An older banner here said "WINDOWS ONLY. There is no POSIX implementation" and
+				// was contradicted by the very next sentence. It predates ApplyHotPriority gaining
+				// its Darwin and Linux backends. Deleted rather than softened, because a stale
+				// portability claim is the kind that gets believed and then designed around.)
+				//
+				// Every platform difference lives in ApplyHotPriority -- Windows raises to
+				// TIME_CRITICAL, macOS asks for QOS_CLASS_USER_INTERACTIVE, Linux sets per-thread
+				// nice through the raw syscall so it cannot leak to the process. The state machine
+				// below is ONE copy on every OS, because three copies of it would drift.
 				//
 				// TARGETED priority, and the targeting is the point. Raising the WHOLE PROCESS was
 				// measured 5x WORSE with K-hot: it elevates all N workers, so 29 spinning threads
 				// preempt the completion thread that feeds them. Raising only the hot workers (and,
 				// separately, the reactor's completion threads) elevates exactly the critical path
-				// and leaves everyone else at Normal.
+				// and leaves everyone else at Normal. That failure mode is what makes the Linux
+				// backend use SYS_setpriority on a TID rather than glibc's process-wide setpriority
+				// -- the same regression, reachable by accident through the portable spelling.
 				//
-				// TIME_CRITICAL inside a NORMAL_PRIORITY_CLASS process is priority 15 -- the top of
-				// the non-realtime range. True realtime (16-31) needs REALTIME_PRIORITY_CLASS and a
-				// privilege, and would let a spin loop starve the OS, so it is deliberately not
-				// asked for here.
-				// Elevated and Realtime map to the SAME Windows call: TIME_CRITICAL is already the
-				// top of the non-realtime range, and the only step above it is a process-wide class
-				// this deliberately refuses to touch. See HotThreadPolicy.
+				// Elevated and Realtime map to the SAME call on every backend. On Windows
+				// TIME_CRITICAL is already the top of the non-realtime range and the only step above
+				// it is a process-wide privileged class; on Linux the step above is SCHED_FIFO,
+				// which does not yield and is closer to the process-wide elevation recorded above as
+				// a regression. Refusing to escalate is the honest answer -- see HotThreadPolicy.
+				//
+				// AND ELEVATION MAY SIMPLY BE REFUSED off Windows: lowering nice needs CAP_SYS_NICE,
+				// and Android's cgroups arbitrate regardless. The flags below still record "raised",
+				// because they exist to suppress redundant syscalls, not to describe the kernel.
 				if (hot && !hotPriorityRaised &&
 				    TaskScheduler::GetHotThreadPolicy() != TaskScheduler::HotThreadPolicy::Normal) {
 					ApplyHotPriority(true);
