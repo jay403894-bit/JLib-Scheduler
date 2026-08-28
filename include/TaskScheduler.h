@@ -3,13 +3,21 @@
 //
 // == CREDIT / PRIOR ART ==
 //
-// The SHAPE of this scheduler is not original. It is the fiber-based job system Christian Gyrling
-// described in "Parallelizing the Naughty Dog Engine Using Fibers" (GDC 2015) -- a small pool of
-// worker threads, fibers as the unit that blocks so a wait costs a context switch instead of a
-// core, and counters as the sync primitive. That design was published as a TALK, with no paper and
-// no reference implementation, so everything here is a reconstruction from the description rather
-// than a port. Where it diverges, it diverges because measurement said to, and CHANGELOG.md says
-// which measurement.
+// THE SHAPE OF THIS SCHEDULER IS NOT ORIGINAL, and the honest history is neither "copied" nor
+// "invented". It was started independently, before the talks were known to exist. They were found
+// partway in, and from that point the design was informed by them -- so what began as convergence
+// became, deliberately, the same design.
+//
+// The reference is Christian Gyrling, "Parallelizing the Naughty Dog Engine Using Fibers" (GDC
+// 2015): a small pool of worker threads, fibers as the unit that blocks so a wait costs a context
+// switch instead of a core, and counters as the sync primitive. It was published as a TALK, with no
+// paper and no reference implementation, so nothing here is a port -- but nothing here is unaware of
+// it either, and claiming pure independence would be as inaccurate as claiming to have followed a
+// spec.
+//
+// CONCRETELY, WHAT WAS TAKEN: the fiber stack split -- 64 KB standard, 512 KB heavy -- is
+// FiberTaskingLib's numbers, the open implementation of that design. Where the two differ
+// elsewhere, the difference came from a measurement, and CHANGELOG.md says which one.
 //
 // The pieces underneath it are equally other people's, and are named where they are used rather
 // than only here:
@@ -26,6 +34,8 @@
 //                                    documents the two bugs a textbook port has in a fiber runtime.
 //   Work stealing as a discipline    Blumofe and Leiserson (Cilk). ParallelFor is Cilk-style, with
 //                                    no cost model -- steals decide how work is divided.
+//   Fiber stack sizes               FiberTaskingLib (RichieSams) -- 64 KB / 512 KB, see
+//                                    GlobalFiberPool.h.
 //   Treiber stack                    R. K. Treiber (1986). Used for Event's waiter list until
 //                                    2.15.0, when a flat fiber-indexed table replaced it.
 //   ConcurrentQueue, LightweightSemaphore

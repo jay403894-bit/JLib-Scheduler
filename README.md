@@ -1,6 +1,11 @@
 # JLib::Scheduler
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
+> **Development note.** This runtime was developed iteratively, using AI-assisted tooling for rapid
+> prototyping and code generation under strict human specification and verification. All
+> architectural decisions, correctness validation, and performance tuning were conducted manually.
+> The commit history reflects this collaborative, tool-accelerated workflow.
+
 A hybrid runtime whose **core is C++17**, with **C++20 coroutines as an optional header**. It gives
 you:
 
@@ -885,14 +890,29 @@ paragraph ever reaches two, the policy is the thing that is wrong, not the relea
 [CHANGELOG.md](CHANGELOG.md) has the release history and the negative results.
 
 ## Credit
+**The shape of this scheduler is not original, and the honest history is neither "copied" nor
+"invented."** It was started independently, before I knew the talks existed. Partway in I found
+them, and from that point the design was informed by them — so what began as convergence became,
+deliberately, the same design.
 
-**The shape of this scheduler is not original.** It is the fiber-based job system Christian Gyrling
-described in *Parallelizing the Naughty Dog Engine Using Fibers* (GDC 2015): a small pool of worker
-threads, fibers as the unit that blocks — so a wait costs a context switch instead of a core — and
-counters as the sync primitive. That design was published as a **talk**, with no paper and no
-reference implementation, so everything here is a reconstruction from the description rather than a
-port. Where it diverges it diverges because a measurement said to, and [CHANGELOG.md](CHANGELOG.md)
-says which measurement.
+The reference is Christian Gyrling's *Parallelizing the Naughty Dog Engine Using Fibers* (GDC 2015):
+a small pool of worker threads, fibers as the unit that blocks — so a wait costs a context switch
+instead of a core — and counters as the sync primitive. It was published as a **talk**, with no
+paper and no reference implementation, so nothing here is a port; but nothing here is unaware of it
+either, and claiming pure independence would be as inaccurate as claiming to have followed a spec.
+
+**Concretely, what was taken:** the fiber stack split — 64 KB standard, 512 KB heavy — is
+[FiberTaskingLib](https://github.com/RichieSams/FiberTaskingLib)'s numbers, the open implementation
+of that design. Where the two differ elsewhere, the difference came from a measurement, and
+[CHANGELOG.md](CHANGELOG.md) says which one.
+
+**What is new here is not the design — it is that an implementation of this scope is open.** Fiber
+job systems, work-stealing deques, hazard pointers and async I/O all exist publicly in pieces. A
+single runtime that assembles them — three execution modes on one pool, K-hot latency lanes,
+completion-based I/O inside the scheduler, primitives whose waiters steal work instead of blocking a
+core, reclamation that covers readers which *migrate*, main-thread nodes in the DAG, near-zero
+runtime allocation — is the part that has generally lived inside studios and trading firms rather
+than in public. That is the claim, and it is about availability, not invention.
 
 Everyone knows nobody in this space invented the deque either, so the rest is named too:
 
