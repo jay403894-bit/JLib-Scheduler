@@ -21,7 +21,11 @@
 // happened: the src/posix/ copy kept an IoAcceptor::Ready() long after the acceptor stopped using a
 // semaphore, and macOS had no copy at all, so Linux broke on a signature and macOS on missing
 // symbols. ONE stub, guarded, compiled from the common glob on every platform.
-#if !defined(_WIN32)
+// LINUX HAS A REAL BACKEND NOW (src/posix/IoReactor.cpp), so this stub covers what is left: macOS,
+// and any POSIX target without one. Excluding Linux here rather than deleting the file is what lets
+// the port land incrementally -- the platforms that have no backend keep failing cleanly instead of
+// failing to link.
+#if !defined(_WIN32) && !defined(__linux__)
 
 #include "../include/IoReactor.h"
 

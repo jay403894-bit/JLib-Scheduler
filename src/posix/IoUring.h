@@ -102,6 +102,21 @@ io_uring_sqe* GetSqe(Ring& r) noexcept;
 // GetQueuedCompletionStatusEx provides on the Windows side.
 int Submit(Ring& r, unsigned waitFor) noexcept;
 
+// BLOCK FOR COMPLETIONS WITHOUT SUBMITTING ANYTHING. Submit() publishes one reserved SQE, which a
+// completion thread with nothing to send must not do. This is the analogue of a blocking
+// GetQueuedCompletionStatus: enter the kernel, sleep until `minComplete` CQEs exist, return.
+// Returns 0 on success or -errno; -EINTR is normal and means "woken, look again".
+int WaitCq(Ring& r, unsigned minComplete) noexcept;
+
+// THE SUBMISSION QUEUE HAS EXACTLY ONE LEGAL PRODUCER, which is the difference from IOCP that costs
+// the POSIX reactor a lock IOCP never needed. WSARecv is thread-safe against itself; the io_uring SQ
+// tail is a plain shared word, so two workers reserving at once would hand the kernel a torn or
+// duplicated entry. The reactor therefore serialises submission -- see the note at the submit mutex
+// in IoReactor.cpp -- and these two are the pieces it serialises.
+//
+// Kept as separate calls rather than one locked helper so the reactor can hold its lock across
+// "reserve, fill, publish" without this file knowing what a reactor is.
+
 // Drain up to `max` completions into `out`. Returns how many were written. Advances the CQ head, so
 // the entries are consumed; copy anything needed out of them before the next call.
 unsigned Reap(Ring& r, io_uring_cqe* out, unsigned max) noexcept;

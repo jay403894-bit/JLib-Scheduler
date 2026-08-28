@@ -168,6 +168,14 @@ int Submit(Ring& r, unsigned waitFor) noexcept {
     return (n < 0) ? -errno : n;
 }
 
+int WaitCq(Ring& r, unsigned minComplete) noexcept {
+    // toSubmit == 0: nothing is published here. A completion thread that called Submit() instead
+    // would publish whatever SQE happened to be sitting at the tail -- one a submitter had reserved
+    // and not yet filled -- which is a torn entry handed to the kernel.
+    const int n = sys_io_uring_enter(r.fd, 0, minComplete, IORING_ENTER_GETEVENTS, nullptr);
+    return (n < 0) ? -errno : 0;
+}
+
 unsigned Reap(Ring& r, io_uring_cqe* out, unsigned max) noexcept {
     const unsigned head = Atomic(r.cqHead).load(std::memory_order_relaxed);
     // ACQUIRE, the mirror of Submit's release: the tail is published by the kernel AFTER it writes
