@@ -286,7 +286,13 @@ jobs:
           run_negative -DNO_RELEASE tests/verify/event_model.c
 
           run_positive tests/verify/sleepwake_model.c
-          run_negative -DIMMEDIATE_ONLY -DWEAK_IMMEDIATE tests/verify/sleepwake_model.c
+          # The immediate-flag control went with PushImmediate in 4.0.1. sleepwake_model.c already
+          # carries its replacements -- ACQ_REL_ONLY for the ordering, and LANE_ONLY + WEAK_LANEWAKE
+          # isolating the SECOND predicate input, which is the same shape as the old control because
+          # laneWake took over that role. CI was still invoking the deleted flags, which passed, and
+          # the vacuity guard correctly refused them.
+          run_negative -DACQ_REL_ONLY tests/verify/sleepwake_model.c
+          run_negative -DLANE_ONLY -DWEAK_LANEWAKE tests/verify/sleepwake_model.c
 
           run_positive tests/verify/fiberwait_model.c
           run_negative -DOLD_ORDERING tests/verify/fiberwait_model.c
