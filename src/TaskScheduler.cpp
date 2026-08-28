@@ -532,7 +532,11 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		const auto s = workers[i]->GetDebugState();
 		static const char* kNames[] = { "AWAKE", "GOING_TO_SLEEP", "SLEEPING" };
 		const char* st = (s.workerState >= 0 && s.workerState <= 2) ? kNames[s.workerState] : "?";
-		printf(" %2d  %-14s   %d      %d    %d   %d     %d/%d           %zu/%zu%s\n",
+		// TEN specifiers for TEN arguments. It had eleven: an extra %d ahead of the inbox pair
+		// desynchronised everything after it -- the deque sizes (size_t) were read through %d, the
+		// marker string through %zu, and the trailing %s consumed an argument that was never passed.
+		// That is UB in the one dump you only ever run when something has already gone wrong.
+		printf(" %2d  %-14s   %d      %d    %d       %d/%d           %zu/%zu%s\n",
 			s.qIndex, st, (int)s.hasQueuedWork, (int)s.busy, (int)s.running,
 			(int)!hiPriInboxes[i]->empty(), (int)!loPriInboxes[i]->empty(),
 			hiPri[i]->size(), loPri[i]->size(),
