@@ -159,10 +159,33 @@ struct IoReactor::Impl {
         total.fetch_sub(1, std::memory_order_relaxed);
     }
 
+    // Takes the shard lock itself. The completion path already holds it and uses UnlinkLocked; the
+    // submit path does not, and hand-rolling the lock at three call sites is how one of them ends up
+    // without it.
+    void UnlinkUnlocked(IoRequest* r) noexcept {
+        std::lock_guard<std::mutex> lk(ShardFor(r).m);
+        UnlinkLocked(r);
+    }
+
     std::mutex               life;
     std::atomic<bool>        stopping{ true };   // starts stopped; Start() clears it
     bool                     running = false;
     std::vector<std::thread> workers;
+
+    // LAZY, so a process that never does I/O never pays for a completion thread. Called on the
+    // submit path rather than at Init for the same reason the Windows side does it: EnableIoReactor
+    // constructs the reactor, and constructing it must not spawn a thread that may never have work.
+    void EnsureThreads() {
+        if (running) return;                       // fast path, no lock: only ever false->true
+        std::lock_guard<std::mutex> lk(life);
+        if (running || !ringUp) return;
+        stopping.store(false, std::memory_order_release);
+        workers.emplace_back([this] { CompletionLoopEntry(this); });
+        running = true;
+    }
+
+    // Defined below the loop; declared here because Impl is what owns the threads.
+    static void CompletionLoopEntry(Impl* impl);
 };
 
 namespace {
@@ -181,7 +204,7 @@ namespace {
 //      the resume is pushed (the push can let the request's frame die)
 //   4. collect the Task*, never touch the request again
 //
-static void CompletionLoop(IoReactor::Impl* impl) {
+void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
     constexpr unsigned kCqBatch = 64;
     constexpr std::size_t kBatch = 64;
 
@@ -245,8 +268,24 @@ static void CompletionLoop(IoReactor::Impl* impl) {
             IoResult res{};
             if (c.res >= 0) {
                 res.status = IoStatus::Completed;
-                res.bytes  = static_cast<std::uint32_t>(c.res);
                 res.error  = 0;
+
+                // AN ACCEPT'S res IS A FILE DESCRIPTOR, NOT A BYTE COUNT, and this is the one place
+                // that difference has to be understood. io_uring's ACCEPT creates the socket itself
+                // and returns its fd; AcceptEx fills a socket the CALLER made, so on Windows the
+                // accepted socket is already in `aux` and res is a byte count like everything else.
+                //
+                // Storing it in `aux` here makes the two platforms agree at the point the waiter
+                // reads them: aux is "the accepted socket" on both, and bytes stays 0 because no
+                // bytes were transferred. Leaving the fd in `bytes` instead would hand the caller a
+                // descriptor through a field named for a length, and IoAcceptor would close the
+                // socket it never received.
+                if (r->kind == IoRequest::Kind::Accept) {
+                    r->aux    = static_cast<std::uintptr_t>(c.res);
+                    res.bytes = 0;
+                } else {
+                    res.bytes = static_cast<std::uint32_t>(c.res);
+                }
             } else if (c.res == -ECANCELED) {
                 // A cancellation is not a failure: RequestCancel asked for exactly this, and the
                 // waiter must be able to tell it apart from a real error to unwind correctly.
@@ -306,19 +345,52 @@ IoReactor& IoReactor::Instance() { static IoReactor r; return r; }
 // FALSE UNTIL THE OPERATIONS EXIST. The ring being up is necessary and not sufficient -- reporting
 // available while every Submit* returns false would make callers take the async path and then
 // discover it does nothing, which is worse than the honest no.
-bool IoReactor::IsAvailable() noexcept { return false; }
+// TRUE ONCE THE RING IS UP, because the operations are real now. It stayed false while every
+// Submit* was a stub -- reporting available then would have made callers take the async path and
+// find it inert, which is worse than the honest no.
+//
+// Reads the singleton's ring rather than a static flag: the answer is a property of THIS process's
+// reactor, and a kernel that refused io_uring (seccomp, container policy) must report false even
+// though the build supports it.
+bool IoReactor::IsAvailable() noexcept {
+    // STILL FALSE, AND THIS IS THE HONEST ANSWER RATHER THAN A LEFTOVER.
+    //
+    // The operations work -- accept, connect, send, recv, a peer close as a zero-byte completion,
+    // vectored send, and the too-many-segments refusal all pass against real io_uring on
+    // SchedulerIoSocketTest. What does NOT work is IoStream's CHAINING: the concurrency section
+    // hangs with every thread asleep and the main thread in futex_do_wait, which is a LOST
+    // COMPLETION -- an operation was submitted and no CQE ever arrived, so the completion thread
+    // sleeps in io_uring_enter and the waiter never wakes.
+    //
+    // Reporting available while that is true would be worse than reporting nothing: a caller would
+    // take the async path and HANG rather than get an error, and a hang is the one failure this
+    // reactor's whole design is meant to make impossible. Flip this to `return Instance()->ringUp`
+    // once the chained path completes -- the socket test's IsAvailable skip is what re-enables the
+    // coverage automatically.
+    //
+    // The suspect list, narrowed by what already passes: SubmitPrepared is the only path the
+    // working sections do not exercise, so either its SQE is malformed in a way the kernel accepts
+    // without completing, or the chained transfer is legitimately pending (a WRITEV that filled the
+    // socket buffer with nobody draining it would look exactly like this). Instrument the
+    // completion loop before assuming either.
+    return false;
+}
 
 void IoReactor::Start() noexcept {
-    std::lock_guard<std::mutex> lk(impl->life);
     if (!impl->ringUp) return;
-    impl->stopping.store(false, std::memory_order_release);
-    if (impl->running) return;
 
-    // ONE COMPLETION THREAD FOR NOW. The Windows side runs several; how many this wants is a
-    // measurement nobody has taken on a ring, and a second thread contending on one CQ is not
-    // obviously a win. Starting at one keeps the first version honest.
-    impl->workers.emplace_back([this] { CompletionLoop(impl); });
-    impl->running = true;
+    // NO LOCK HELD HERE, AND THAT IS THE FIX RATHER THAN AN OVERSIGHT. This used to take impl->life
+    // and then call EnsureThreads(), which takes impl->life itself -- and std::mutex is not
+    // recursive, so it was a self-deadlock on the calling thread. It hung Init() before the process
+    // printed a single line, which is a hard shape to read: no output, no CPU, no failing assertion.
+    //
+    // EnsureThreads owns the whole decision (the `running` check, the flag, the spawn) under that
+    // one lock, so there is exactly one place that decides whether a completion thread exists.
+    // Start() and a first Submit racing each other would otherwise be two spawners sharing one flag.
+    //
+    // ONE COMPLETION THREAD FOR NOW. The Windows side runs several; how many a ring wants is a
+    // measurement nobody has taken, and a second thread contending on one CQ is not obviously a win.
+    impl->EnsureThreads();
 }
 
 void IoReactor::Stop() noexcept {
@@ -359,53 +431,364 @@ std::size_t IoReactor::InFlight() const noexcept {
 // never arrive". They therefore report failure through the out-parameter as well where they have
 // one, and the awaiter layer treats that as an immediate failure rather than a park.
 
-bool IoReactor::Register(void*)            { return false; }
-bool IoReactor::InitSockets()              { return false; }
-bool IoReactor::RegisterSocket(IoSocket)   { return false; }
+// ALL THREE TRIVIALLY TRUE, AND NOT AS STUBS. They are IOCP concepts with no io_uring equivalent:
+// a handle must be ASSOCIATED with a completion port before it can be used with one, and Winsock
+// must be started before any socket call exists. io_uring needs neither -- an SQE names a raw fd.
+//
+// IORING_REGISTER_FILES does exist and would let the kernel skip an fd lookup per operation, but it
+// is an optimisation with real bookkeeping (a fixed table, re-registration on change), not a
+// requirement, and nothing here has measured a need for it.
+//
+// TRUE rather than false matters: the tests assert on these, and false would report a setup failure
+// for something that simply does not apply on this platform.
+bool IoReactor::Register(void*)            { return true; }
+bool IoReactor::InitSockets()              { return true; }
+bool IoReactor::RegisterSocket(IoSocket)   { return true; }
 
-// THE SUBMIT FAMILY, RETURNING TRUE WITH A FAILURE -- and the polarity is the whole point.
+// ================================ SUBMISSION ===================================================
 //
-// TRUE means "the answer is already final, do NOT suspend". FALSE means "queued; stay suspended
-// until a completion arrives". So the wrong stub here is `return false`: the caller would park
-// forever waiting on a completion no backend will ever produce, and the symptom would be a HANG
-// rather than an error. Returning true with Failed/ENOSYS gives the awaiter something to unwind on.
+// THE RETURN POLARITY IS THE THING TO GET RIGHT, and it is inverted from what reads naturally.
+// TRUE means "the answer is already final, do NOT suspend" -- *out is filled. FALSE means "queued;
+// the request and *out belong to the reactor until the completion". So the dangerous mistake is
+// returning false on an error: the caller would park forever on a completion nobody will produce,
+// and the symptom is a HANG rather than a failure.
 //
-// ENOSYS rather than a made-up code, because IoResult::error is documented as a platform error
-// number and a caller may well log it: "function not implemented" is exactly what is true here.
-static bool NotImplemented(IoResult* out) noexcept {
-    if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
-    return true;
+// One helper, one lambda per operation, mirroring the Windows Submit() so the two backends have the
+// same shape and the same ordering: cancel check, fill the request, link, submit, unlink on
+// immediate failure.
+template <typename Fill>
+static bool SubmitOp(IoReactor::Impl* impl, IoRequest* req, IoResult* out,
+                     Task* resume, CancelToken token, Fill&& fill) {
+    const std::uint32_t tok = token.Raw();
+
+    // ALREADY CANCELLED: answer now and do NOT submit. The one case where an I/O cancel is
+    // immediate, because the kernel never took the buffer -- so there is nothing to wait for and
+    // nothing that could still write into the caller's frame.
+    if (CancelToken(tok).Cancelled()) {
+        if (out) *out = IoResult{ IoStatus::Cancelled, 0, 0 };
+        return true;
+    }
+
+    if (!impl->ringUp) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+        return true;
+    }
+    if (impl->stopping.load(std::memory_order_acquire)) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ESHUTDOWN };
+        return true;
+    }
+
+    req->out    = out;
+    req->resume = resume;
+    req->token  = tok;
+
+    // LINKED BEFORE SUBMITTED, never after. The completion can arrive on another thread the
+    // instant the SQE is published -- before this function returns -- and the drain looks the
+    // request up in the shard to unlink it. Linking afterwards is a race whose loser is a
+    // completion for a request that is not in the list yet.
+    impl->Link(req);
+
+    {
+        std::lock_guard<std::mutex> lk(impl->submitMx);
+        io_uring_sqe* sqe = uring::GetSqe(impl->ring);
+        if (!sqe) {
+            // SQ FULL. Not a queue we may spin on: only the kernel drains it, and this thread is a
+            // worker that would be spinning instead of running the work that drains it. Report and
+            // let the caller decide -- EAGAIN is exactly what a full submission queue means.
+            impl->UnlinkUnlocked(req);
+            if (out) *out = IoResult{ IoStatus::Failed, 0, EAGAIN };
+            return true;
+        }
+        std::memset(sqe, 0, sizeof(*sqe));
+        fill(sqe);
+        sqe->user_data = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(req));
+
+        const int rc = uring::Submit(impl->ring, 0);
+        if (rc < 0) {
+            impl->UnlinkUnlocked(req);
+            if (out) *out = IoResult{ IoStatus::Failed, 0, -rc };
+            return true;
+        }
+    }
+
+    impl->EnsureThreads();
+    return false;      // queued: stay suspended
 }
 
-bool IoReactor::SubmitRead(void*, void*, std::uint32_t, std::uint64_t,
-                           IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitWrite(void*, const void*, std::uint32_t, std::uint64_t,
-                            IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitRecv(IoSocket, void*, std::uint32_t, std::uint32_t,
-                           IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitSend(IoSocket, const void*, std::uint32_t, std::uint32_t,
-                           IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitRecvV(IoSocket, const IoBuffer*, std::uint32_t, std::uint32_t,
-                            IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitSendV(IoSocket, const IoBuffer*, std::uint32_t, std::uint32_t,
-                            IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitRecvFrom(IoSocket, void*, std::uint32_t, std::uint32_t, IoAddress*,
-                               IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitSendTo(IoSocket, const void*, std::uint32_t, std::uint32_t,
-                             const void*, std::uint32_t,
-                             IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitAccept(IoSocket, IoSocket, IoAcceptBuffer*,
-                             IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitConnect(IoSocket, const void*, std::uint32_t,
-                              IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitDisconnect(IoSocket, bool,
-                                 IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
-bool IoReactor::SubmitPrepared(IoRequest* req) { return NotImplemented(req ? req->out : nullptr); }
+bool IoReactor::SubmitRecv(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
+                           IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Recv;
+    req->handle = reinterpret_cast<void*>(s);
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode    = IORING_OP_RECV;
+        sqe->fd        = static_cast<int>(s);
+        sqe->addr      = reinterpret_cast<std::uint64_t>(buf);
+        sqe->len       = len;
+        sqe->msg_flags = flags;
+    });
+}
 
-std::size_t IoReactor::RequestCancel(CancelToken) noexcept {
-    // Nothing can be in flight while no Submit* works, so there is nothing to cancel. This becomes
-    // an IORING_OP_ASYNC_CANCEL walk over the shards once operations exist.
-    return 0;
+bool IoReactor::SubmitSend(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
+                           IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Send;
+    req->handle = reinterpret_cast<void*>(s);
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode    = IORING_OP_SEND;
+        sqe->fd        = static_cast<int>(s);
+        sqe->addr      = reinterpret_cast<std::uint64_t>(buf);
+        sqe->len       = len;
+        sqe->msg_flags = flags;
+    });
+}
+
+// READV/WRITEV rather than RECV/SEND: the vectored socket ops in io_uring are RECVMSG/SENDMSG, which
+// need a msghdr the caller never supplied. READV works on a socket fd and takes the iovec array
+// directly, which is what this already has.
+bool IoReactor::SubmitRecvV(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+                            std::uint32_t flags, IoRequest* req, IoResult* out,
+                            Task* resume, CancelToken token) {
+    if (!ioplat::FillBufs(req, bufs, count)) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ioplat::kErrMsgSize };
+        return true;
+    }
+    req->kind = IoRequest::Kind::Recv;
+    req->bufCount = count;
+    req->handle = reinterpret_cast<void*>(s);
+    (void)flags;   // READV has no flags argument; a caller passing MSG_* gets them ignored, not honoured
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode = IORING_OP_READV;
+        sqe->fd     = static_cast<int>(s);
+        sqe->addr   = reinterpret_cast<std::uint64_t>(Iov(req));
+        sqe->len    = count;
+        sqe->off    = static_cast<std::uint64_t>(-1);   // -1 = "current position", required for a socket
+    });
+}
+
+bool IoReactor::SubmitSendV(IoSocket s, const IoBuffer* bufs, std::uint32_t count,
+                            std::uint32_t flags, IoRequest* req, IoResult* out,
+                            Task* resume, CancelToken token) {
+    if (!ioplat::FillBufs(req, bufs, count)) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, ioplat::kErrMsgSize };
+        return true;
+    }
+    req->kind = IoRequest::Kind::Send;
+    req->bufCount = count;
+    req->handle = reinterpret_cast<void*>(s);
+    (void)flags;
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode = IORING_OP_WRITEV;
+        sqe->fd     = static_cast<int>(s);
+        sqe->addr   = reinterpret_cast<std::uint64_t>(Iov(req));
+        sqe->len    = count;
+        sqe->off    = static_cast<std::uint64_t>(-1);
+    });
+}
+
+bool IoReactor::SubmitRead(void* handle, void* buf, std::uint32_t len, std::uint64_t offset,
+                           IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Generic;
+    req->handle = handle;
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode = IORING_OP_READ;
+        sqe->fd     = static_cast<int>(reinterpret_cast<std::uintptr_t>(handle));
+        sqe->addr   = reinterpret_cast<std::uint64_t>(buf);
+        sqe->len    = len;
+        sqe->off    = offset;
+    });
+}
+
+bool IoReactor::SubmitWrite(void* handle, const void* buf, std::uint32_t len, std::uint64_t offset,
+                            IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Generic;
+    req->handle = handle;
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode = IORING_OP_WRITE;
+        sqe->fd     = static_cast<int>(reinterpret_cast<std::uintptr_t>(handle));
+        sqe->addr   = reinterpret_cast<std::uint64_t>(buf);
+        sqe->len    = len;
+        sqe->off    = offset;
+    });
+}
+
+// RECVMSG/SENDMSG, because these are the only ops that carry a peer address. The msghdr lives in
+// the request's own `native` (see the layout note at the top) -- the kernel reads it for the whole
+// duration of the operation, so a stack local in this function would be a use-after-free the moment
+// the call went pending, and it would usually appear to work.
+bool IoReactor::SubmitRecvFrom(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
+                               IoAddress* from, IoRequest* req, IoResult* out,
+                               Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Recv;
+    req->handle = reinterpret_cast<void*>(s);
+
+    struct iovec* v = Iov(req);
+    v[0].iov_base = buf;
+    v[0].iov_len  = len;
+
+    auto* mh = reinterpret_cast<struct msghdr*>(req->native);
+    std::memset(mh, 0, sizeof(*mh));
+    mh->msg_name    = from ? from->bytes : nullptr;
+    mh->msg_namelen = from ? static_cast<socklen_t>(IoAddress::kBytes) : 0;
+    mh->msg_iov     = v;
+    mh->msg_iovlen  = 1;
+
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode    = IORING_OP_RECVMSG;
+        sqe->fd        = static_cast<int>(s);
+        sqe->addr      = reinterpret_cast<std::uint64_t>(mh);
+        sqe->len       = 1;
+        sqe->msg_flags = flags;
+    });
+}
+
+bool IoReactor::SubmitSendTo(IoSocket s, const void* buf, std::uint32_t len, std::uint32_t flags,
+                             const void* to, std::uint32_t toLen,
+                             IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Send;
+    req->handle = reinterpret_cast<void*>(s);
+
+    struct iovec* v = Iov(req);
+    v[0].iov_base = const_cast<void*>(buf);
+    v[0].iov_len  = len;
+
+    auto* mh = reinterpret_cast<struct msghdr*>(req->native);
+    std::memset(mh, 0, sizeof(*mh));
+    mh->msg_name    = const_cast<void*>(to);
+    mh->msg_namelen = toLen;
+    mh->msg_iov     = v;
+    mh->msg_iovlen  = 1;
+
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode    = IORING_OP_SENDMSG;
+        sqe->fd        = static_cast<int>(s);
+        sqe->addr      = reinterpret_cast<std::uint64_t>(mh);
+        sqe->len       = 1;
+        sqe->msg_flags = flags;
+    });
+}
+
+// ACCEPT DIFFERS FROM WINDOWS IN WHO CREATES THE SOCKET, and the difference reaches the caller.
+// AcceptEx needs a socket to exist first and fills it in; io_uring's ACCEPT creates one and returns
+// its fd as the completion's `res`. So the `accepted` argument is UNUSED here -- IoAcceptor
+// pre-creates a socket per slot for Windows's benefit, and on this backend that socket is simply
+// closed and replaced by the one the kernel makes.
+//
+// THE ACCEPTED FD ARRIVES IN res, NOT in aux, which the completion loop has to know: for an accept,
+// a non-negative res is a FILE DESCRIPTOR rather than a byte count.
+bool IoReactor::SubmitAccept(IoSocket listener, IoSocket accepted, IoAcceptBuffer* addrs,
+                             IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    // The pre-created socket is dead weight on this backend. Closing it here rather than leaking it
+    // keeps the acceptor's slot bookkeeping honest without teaching it about backends.
+    if (accepted) ioplat::CloseSocket(accepted);
+
+    req->kind = IoRequest::Kind::Accept;
+    req->handle = reinterpret_cast<void*>(listener);
+    req->aux = 0;
+
+    auto* alen = reinterpret_cast<socklen_t*>(req->native + sizeof(struct msghdr));
+    *alen = addrs ? static_cast<socklen_t>(IoAcceptBuffer::kBytes) : 0;
+
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode       = IORING_OP_ACCEPT;
+        sqe->fd           = static_cast<int>(listener);
+        sqe->addr         = addrs ? reinterpret_cast<std::uint64_t>(addrs->bytes) : 0;
+        sqe->off          = reinterpret_cast<std::uint64_t>(alen);   // addrlen goes in off/addr2
+        sqe->accept_flags = 0;
+    });
+}
+
+bool IoReactor::SubmitConnect(IoSocket s, const void* sockaddr, std::uint32_t sockaddrLen,
+                              IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    req->kind = IoRequest::Kind::Connect;
+    req->handle = reinterpret_cast<void*>(s);
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode = IORING_OP_CONNECT;
+        sqe->fd     = static_cast<int>(s);
+        sqe->addr   = reinterpret_cast<std::uint64_t>(sockaddr);
+        sqe->off    = sockaddrLen;      // CONNECT puts the address LENGTH in off, not len
+    });
+}
+
+// SHUTDOWN, and `reuse` CANNOT BE HONOURED. DisconnectEx(TF_REUSE_SOCKET) hands a socket back to
+// the pool ready to connect again, which has no Linux equivalent -- there is no way to un-connect a
+// socket. Reported rather than silently ignored: a caller that asked for reuse and got a plain
+// shutdown would reuse a socket that cannot be reconnected, and fail later somewhere else.
+bool IoReactor::SubmitDisconnect(IoSocket s, bool reuse,
+                                 IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
+    if (reuse) {
+        if (out) *out = IoResult{ IoStatus::Failed, 0, EOPNOTSUPP };
+        return true;
+    }
+    req->kind = IoRequest::Kind::Generic;
+    req->handle = reinterpret_cast<void*>(s);
+    return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
+        sqe->opcode = IORING_OP_SHUTDOWN;
+        sqe->fd     = static_cast<int>(s);
+        sqe->len    = SHUT_RDWR;        // SHUTDOWN takes `how` in len
+    });
+}
+
+// Re-submits a request whose fields are already filled -- IoStream's chaining path, which builds a
+// request when a transfer is queued and submits it when its turn comes.
+bool IoReactor::SubmitPrepared(IoRequest* req) {
+    if (!req) return true;
+    const bool isSend = (req->kind == IoRequest::Kind::Send);
+    const IoSocket s = reinterpret_cast<IoSocket>(req->handle);
+    return SubmitOp(impl, req, req->out, req->resume, CancelToken(req->token),
+                    [&](io_uring_sqe* sqe) {
+        sqe->opcode = isSend ? IORING_OP_WRITEV : IORING_OP_READV;
+        sqe->fd     = static_cast<int>(s);
+        sqe->addr   = reinterpret_cast<std::uint64_t>(Iov(req));
+        sqe->len    = req->bufCount;
+        sqe->off    = static_cast<std::uint64_t>(-1);
+    });
+}
+
+// CANCELLATION IS A REQUEST, NOT AN ORDER, which is the same two-phase contract the Windows side
+// has and the reason this is named RequestCancel. The kernel owns the buffer until it says
+// otherwise, so nothing here may free or unlink anything: it asks, and the COMPLETION does the
+// unlinking with -ECANCELED like any other outcome. A cancel that unlinked eagerly would race the
+// completion for a request whose frame is about to unwind.
+//
+// A DEFAULT-CONSTRUCTED TOKEN MEANS EVERYTHING, which is what Stop() relies on to drain.
+std::size_t IoReactor::RequestCancel(CancelToken token) noexcept {
+    if (!impl->ringUp) return 0;
+    const std::uint32_t tok = token.Raw();
+    const bool all = (tok == CancelToken{}.Raw());
+    std::size_t asked = 0;
+
+    for (std::size_t i = 0; i < kShards; ++i) {
+        // THE TARGETS ARE COLLECTED UNDER THE SHARD LOCK AND SUBMITTED OUTSIDE IT. Submitting while
+        // holding it would take submitMx underneath a shard lock, while the completion path takes
+        // the shard lock on its own -- two locks in two orders, which is the deadlock this ordering
+        // avoids. Copying the pointers is safe because a request cannot be freed while it is still
+        // linked, and it is unlinked only by its own completion.
+        IoRequest* targets[64];
+        std::size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(impl->shards[i].m);
+            for (IoRequest* r = impl->shards[i].head; r && n < 64; r = r->next)
+                if (all || r->token == tok) targets[n++] = r;
+        }
+
+        for (std::size_t k = 0; k < n; ++k) {
+            std::lock_guard<std::mutex> lk(impl->submitMx);
+            io_uring_sqe* sqe = uring::GetSqe(impl->ring);
+            if (!sqe) break;              // SQ full: what could not be asked stays in flight
+            std::memset(sqe, 0, sizeof(*sqe));
+            sqe->opcode = IORING_OP_ASYNC_CANCEL;
+            sqe->fd     = -1;
+            // THE TARGET IS NAMED BY ITS user_data, which is how io_uring identifies an in-flight
+            // operation -- there is no handle to pass. That is exactly why user_data is the
+            // IoRequest pointer and nothing else.
+            sqe->addr = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(targets[k]));
+            // The cancel's OWN completion is discarded: it reports whether the cancel was accepted,
+            // not the outcome of the cancelled operation, and the caller is waiting for the latter.
+            sqe->user_data = kWakeSentinel;
+            if (uring::Submit(impl->ring, 0) < 0) break;
+            ++asked;
+        }
+    }
+    return asked;
 }
 
 } // namespace JLib
