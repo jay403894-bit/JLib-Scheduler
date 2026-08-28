@@ -224,6 +224,32 @@ namespace JLib {
     // point that already pays a re-push and a wake, so leaving it out of Release buys nothing and
     // would make a violation a use-after-free in exactly the build nobody is watching. Epochs had to
     // buy their way out of that with a whole counted scheme; here it is free, so it stays.
+    // A SECOND WORKER-ROW GUARD WHILE ONE IS ALREADY LIVE. Same class as suspend-with-guard, and
+    // caught with the same counter, because it is the same mistake: a worker row has ONE set of
+    // cells, and two guard objects on it are two allocators for the same slots. The inner
+    // destructor nulls the row and the outer guard silently stops protecting anything.
+    void HazardDomain::FatalNestedWorkerGuard() {
+        std::fprintf(stderr,
+            "[JLib::Scheduler] FATAL: a second HazardGuard on a worker row while one is live.\n"
+            "  Every non-fiber guard on a worker shares one set of cells, so a second guard object\n"
+            "  is not more capacity -- it is a collision, and the inner destructor erases the\n"
+            "  outer's announcement while the outer is still using it.\n"
+            "\n"
+            "  USE ONE GUARD WITH SEVERAL CELLS. That is already the mechanism for a nested or\n"
+            "  hand-over-hand lookup, and it is the scheme as published:\n"
+            "\n"
+            "      HazardGuard g;\n"
+            "      Node* a = g.Protect(0, head);       // hold one\n"
+            "      Node* b = g.Protect(1, a->next);    // and another, same guard\n"
+            "\n"
+            "  kCellsPerReader is the budget (-DJLIBSCHED_HAZARD_CELLS=n to raise it).\n"
+            "  A FIBER may nest across fibers -- each has its own row -- so this is about native\n"
+            "  tasks and coroutines only. Two independent holders on one OS thread would need\n"
+            "  per-guard cell allocation, which this deliberately does not have.\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+
     void HazardDomain::FatalSuspendWithGuard(std::size_t depth) {
         std::fprintf(stderr,
             "[JLib::Scheduler] FATAL: a coroutine suspended while holding %zu hazard guard(s).\n"
@@ -383,6 +409,29 @@ namespace JLib {
         // point of indexing cells by the thing that migrates, so a fiber row must not contribute --
         // otherwise the next coroutine to suspend on that worker trips an alarm it did not cause.
         countsForSuspend = (reader != HazardDomain::kNoReader) && !d.IsFiberReader(reader);
+
+        // ONE WORKER-ROW GUARD AT A TIME, and the counter that enforces it is the same one the
+        // suspension check uses -- because it is the same class of bug. Every non-fiber guard on a
+        // worker resolves to the SAME cells, Cells(fiberCount + qIndex), so a second live guard
+        // there is a second allocator for one set of slots: the inner destructor nulls the row and
+        // the outer guard's announcement disappears while it is still in use.
+        //
+        // kCellsPerReader IS THE NESTED-LOOKUP MECHANISM, and it already exists. Hand-over-hand is
+        // one guard with several k -- Protect(0, ...), Protect(1, ...) -- which is Michael's scheme
+        // as written. A second HazardGuard object is not more capacity; it is a collision.
+        //
+        // FIBER ROWS STAY NESTABLE ACROSS FIBERS, since each has its own poolIndex and therefore its
+        // own row. This rule is only about !IsFiberReader.
+        // SUPPRESSED UNDER ForceWorkerCellsForTest, and that is not an escape hatch. That hook exists
+        // to resolve FIBERS to worker cells on purpose, reintroducing bug 1 so a test can watch a node
+        // be freed under a sleeping reader. Under it, two fibers on one worker really do share a row --
+        // which is exactly the collision this check reports, so the check is RIGHT and would abort the
+        // very run that exists to observe the consequence. The hook is test-only and never set in a
+        // real program, so nothing in production loses the check.
+        if (countsForSuspend && HazardDomain::SuspendUnsafeDepth() != 0
+            && !g_forceWorkerCells.load(std::memory_order_relaxed))
+            HazardDomain::FatalNestedWorkerGuard();
+
         if (countsForSuspend) ++HazardDomain::SuspendUnsafeDepth();
     }
 

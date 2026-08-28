@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
   #include <crtdbg.h>
@@ -187,6 +188,63 @@ int main(int argc, char** argv) {
             return (heldOff && sawAlive && freedAfter) ? 0 : 1;
         }
 
+        // NESTED GUARDS ON ONE WORKER ROW must ABORT. Not "does Scan free" -- a different bug, and
+        // the one this file did not cover until it was found.
+        //
+        // Every non-fiber guard on a worker resolves to the SAME cells: Cells(fiberCount + qIndex).
+        // Two live guards there share one row, and ~HazardGuard nulls the WHOLE row rather than the
+        // cells it personally set -- so the inner guard's destructor erases the outer guard's
+        // announcement while the outer is still using it. A Scan may then free a node the outer
+        // guard still names.
+        //
+        // FIBERS DO NOT COLLIDE ACROSS TASKS, since each fiber has its own poolIndex. Worker rows do,
+        // and they are what native tasks and coroutines get.
+        //
+        // REACHED HERE BY PLAIN NESTING because that is the smallest reproduction. The path that
+        // makes it more than a style rule is the spin-help one: a native task holding a guard calls
+        // WaitFor, TryRunStolenNativeTask runs ANOTHER task on the same worker, and that task's
+        // guard lands on the same row without anything looking nested at all.
+        if (std::strcmp(mode, "nested-worker-row") == 0) {
+            WaitGroup wg;
+            auto* t = sched.CreateTask([] {
+                HazardGuard outer;
+                Node* n = outer.Protect(0, g_head);
+
+                {
+                    // THE VIOLATION. Before the fix this destructed and nulled the whole row,
+                    // silently erasing `outer`. Now constructing it aborts.
+                    HazardGuard inner;                 // SAME worker row as `outer`
+                    inner.Protect(1, g_head);
+                }
+
+                g_reached.store(true, std::memory_order_release);
+                while (!g_mainDone.load(std::memory_order_acquire)) std::this_thread::yield();
+
+                // Still holding `outer`. If its announcement survived, this node is intact.
+                g_sawAlive.store(n && n->magic == 0xA11E, std::memory_order_release);
+            });
+            t->waitGroup = &wg;
+            wg.n.fetch_add(1, std::memory_order_relaxed);
+            sched.Push(t);
+
+            while (!g_reached.load(std::memory_order_acquire)) std::this_thread::yield();
+
+            Node* victim = g_head.exchange(nullptr, std::memory_order_acq_rel);
+            HazardDomain::Instance().Retire(victim, [](void* p) {
+                g_freed.fetch_add(1, std::memory_order_relaxed);
+                delete static_cast<Node*>(p);
+            });
+            HazardDomain::Instance().Scan();
+
+            const bool heldOff = (g_freed.load(std::memory_order_acquire) == 0);
+            g_mainDone.store(true, std::memory_order_release);
+            sched.WaitFor(wg);
+
+            std::printf("heldOff=%d (outer guard still live when main scanned)\n", (int)heldOff);
+            sched.Join();
+            return heldOff ? 0 : 1;
+        }
+
         if (std::strcmp(mode, "suspend-with-guard") == 0) {
             g_gate.Lock();                       // force the await to actually suspend
             WaitGroup wg;
@@ -253,6 +311,14 @@ int main(int argc, char** argv) {
     rc = RunChild(argv[0], "coro-protects", err);
     std::printf("      coroutine guard protects:    exit=%d  %s", rc, err.c_str());
     Check(rc == 0, "a node named by a coroutine survived a retire+scan, and freed once dropped");
+
+    rc = RunChild(argv[0], "nested-worker-row", err);
+    std::printf("      second guard on one worker row: exit=%d\n", rc);
+    const bool nestedNamed = err.find("second HazardGuard on a worker row") != std::string::npos;
+    const bool nestedFix   = err.find("USE ONE GUARD WITH SEVERAL CELLS") != std::string::npos;
+    Check(rc != 0,     "a second worker-row guard ABORTS instead of erasing the first");
+    Check(nestedNamed, "and it is the NESTED handler that fired, not another one");
+    Check(nestedFix,   "and the message says to use one guard with several cells");
 
     rc = RunChild(argv[0], "coro-control", err);
     std::printf("      NEGATIVE CONTROL, no guard:  exit=%d  %s", rc, err.c_str());

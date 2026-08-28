@@ -15,15 +15,34 @@
 //   tasks, and by a reserved block for non-worker threads. This is not a cosmetic renaming: it is
 //   the fix for both of the bugs described above, and a textbook slots[tid][i] port has them.
 //
-//   COROUTINES, via an external record the GUARD owns. A coroutine frame has no dense stable index,
-//   so it cannot live in the flat table; it takes a record from a registry instead. See "COROUTINES
-//   ARE SUPPORTED" below -- coroutines are FIRST-CLASS here, in contrast to Epochs.h, where holding
-//   a guard across a suspend is a contract violation.
+//   COROUTINES, via a SCOPE-BOUNDARY RULE rather than a second reader type. A coroutine may hold a
+//   guard; it may not carry one across a suspension point. The supported shape is the standard
+//   production pattern -- hazard-protect the LOOKUP, hand off to a refcount, DROP the guard, then
+//   co_await -- and the rule is enforced at detail::ArmResume, the one choke point every awaiter
+//   passes through, so a non-suspending guarded span costs nothing and raises nothing.
+//
+//   THAT PATTERN IS NOT ORIGINAL HERE and is credited rather than presented as a discovery: it is
+//   how concurrent runtimes conventionally combine hazard pointers with asynchronous code, and it
+//   reached this file through an AI-assisted design pass rather than being derived from the code.
+//   What IS this codebase's is the verification that ArmResume is the right place to enforce it
+//   (eight call sites, all in-library) and the tests that show it works in both directions.
+//
+//   AN EARLIER ATTEMPT GAVE COROUTINES THEIR OWN READER -- an external record from a pool, with a
+//   generation and a grace period keyed on a scan count. It was removed, not repaired: the grace
+//   could not be stated in one testable sentence and nothing exercised record reuse. Every bug ever
+//   found in this file lived in that adaptation. experimental/hazard/README.md has the postmortem
+//   and the two designs that would do it properly if it is ever wanted.
 //
 //   FAILURE MODES AND TRIPWIRES. Michael's paper does not have to describe what a migrating reader
-//   or a registry exhaustion does, because neither exists in it. The warnings in this file and in
+//   does, because migrating readers do not exist in it. The warnings in this file and in
 //   design/hazard-pointers.md are ours, they were each written after finding the thing they warn
 //   about, and the assert text is part of the interface -- do not soften it.
+//
+// WHY MIGRATION IS THE PROBLEM AT ALL is upstream of this file: in this runtime the unit that
+// blocks is a FIBER rather than a thread, so Michael's readers cannot move and these can. That
+// shape matches the fiber-based job system Christian Gyrling described in "Parallelizing the
+// Naughty Dog Engine Using Fibers" (GDC 2015) -- started independently here and informed by it
+// afterwards. See the credit block in TaskScheduler.h for the full history.
 //
 // HAZARD POINTERS -- safe reclamation for structures behind FIBER-AWARE LOCKS.
 //
@@ -267,6 +286,9 @@ namespace JLib {
 
         // A COROUTINE SUSPENDED WHILE HOLDING A WORKER-CELL GUARD. See the definition.
         [[noreturn]] static void FatalSuspendWithGuard(std::size_t depth);
+
+        // A SECOND worker-row guard while one is already live. See the definition.
+        [[noreturn]] static void FatalNestedWorkerGuard();
 
         // Worker-cell guards live on THIS thread right now. Read by ArmResume at every coroutine
         // suspension point; incremented and decremented by HazardGuard.
