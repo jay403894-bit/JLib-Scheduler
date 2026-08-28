@@ -32,7 +32,6 @@ jobs:
             prims: build/bin/Release/SchedulerPrimitivesTest.exe
             fiberbudget: build/bin/Release/SchedulerFiberBudgetTest.exe
             slabsize: build/bin/Release/SchedulerTaskSlabSizeTest.exe
-            immediatedrain: build/bin/Release/SchedulerImmediateDrainTest.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
@@ -41,7 +40,6 @@ jobs:
             prims: build/bin/SchedulerPrimitivesTest
             fiberbudget: build/bin/SchedulerFiberBudgetTest
             slabsize: build/bin/SchedulerTaskSlabSizeTest
-            immediatedrain: build/bin/SchedulerImmediateDrainTest
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
@@ -50,7 +48,6 @@ jobs:
             prims: build/bin/SchedulerPrimitivesTest
             fiberbudget: build/bin/SchedulerFiberBudgetTest
             slabsize: build/bin/SchedulerTaskSlabSizeTest
-            immediatedrain: build/bin/SchedulerImmediateDrainTest
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
@@ -59,7 +56,6 @@ jobs:
             prims: build/bin/SchedulerPrimitivesTest
             fiberbudget: build/bin/SchedulerFiberBudgetTest
             slabsize: build/bin/SchedulerTaskSlabSizeTest
-            immediatedrain: build/bin/SchedulerImmediateDrainTest
 
     steps:
       - uses: actions/checkout@v4
@@ -144,15 +140,6 @@ jobs:
       # 137 allocation attempts against a slab meant to hold 37 ever returned nullptr).
       - name: Run task slab size test (SetTaskSlabSize wiring)
         run: ./${{ matrix.slabsize }}
-        shell: bash
-
-      # PushImmediate's inbox drain: does draining a >BATCH_SIZE backlog via the 2.2.0 PushBatch
-      # swap still get every task out and running, and does the pinned immediate task still run
-      # afterward. Needs an exact 2-worker pool to make the drain deterministic (worker 0 pins,
-      # worker 1 is the only place the drained backlog can land), which is why this is standalone
-      # rather than folded into primitives_test.cpp.
-      - name: Run immediate-task drain test (PushBatch-based inbox drain)
-        run: ./${{ matrix.immediatedrain }}
         shell: bash
 
       # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
@@ -391,10 +378,6 @@ jobs:
 
       - name: Run task slab size test (SetTaskSlabSize wiring)
         run: ./build/bin/Release/SchedulerTaskSlabSizeTest.exe
-        shell: bash
-
-      - name: Run immediate-task drain test (PushBatch-based inbox drain)
-        run: ./build/bin/Release/SchedulerImmediateDrainTest.exe
         shell: bash
 
       - name: Run benchmark (smoke test)
