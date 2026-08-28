@@ -1,9 +1,24 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
-// A MODEL of COUNTED EPOCHS -- the reclamation scheme that would let a COROUTINE hold epoch
-// protection across a suspension. Not implemented anywhere yet; this file exists to find out
-// whether it can be, before any of it is written.
+// A MODEL of COUNTED EPOCHS -- the reclamation scheme that gives a COROUTINE epoch protection at
+// all, since it has no slot of its own to announce in.
+//
+// SHIPPED 2026-08-25. This file was written before the implementation existed, to decide whether
+// the scheme could work; it now models code that is live in Epochs.h (CountedEpochGuard, and the
+// advance gate in AdvanceEpoch). Treat a failure here as a failure of the shipping reclaimer.
+//
+// WHAT IT DOES *NOT* SANCTION, stated because the original wording of this header implied it and
+// that reading cost a session. A counted guard survives a suspension and a migration, and that is
+// deliberate -- but it is DAMAGE LIMITATION for a contract violation, not permission to commit one.
+// Suspending inside ANY EpochGuard remains forbidden, and the tripwire in Coroutine.h asserts on it.
+// The reason is what EBR is: reclamation waits for the oldest active reader, so a parked reader
+// does not hold its own node, it holds EVERY retirement from that moment until it wakes -- and a
+// coroutine suspends on external state, so that stall is unbounded. A counter cannot fix it, since
+// the counter is the thing doing the holding. What this scheme buys is that the Release consequence
+// of the violation is a bounded stall instead of the slot scheme's silent corruption. Hazard
+// pointers are the mechanism for protecting something ACROSS a suspension, because they protect
+// named pointers rather than everything younger than an epoch.
 //
 //   genmc -- counted_epoch_model.c                        # as designed; passes
 //   genmc -- -DNO_ADVANCE_GATE counted_epoch_model.c      # control; FAILS, as it must
@@ -100,11 +115,19 @@
 // only because it was labelled as such.
 // ================================================================================================
 //
-// WHAT IS NOT MODELLED, so nobody reads more into a pass than is there: the sharded per-worker
-// counters a real implementation would need for contention, and the full SafeEpoch scan. The
-// reclaim condition below is the narrowest one that can expose both races with one reader, which is
-// the point -- a richer model would let a broken protocol pass by accident, which is the vacuous
-// -test trap this project has hit before.
+// WHAT IS NOT MODELLED, so nobody reads more into a pass than is there: the full SafeEpoch scan,
+// and the real ring width (NSLOTS is 2 here, 8 in Epochs.h). The reclaim condition below is the
+// narrowest one that can expose both races with one reader, which is the point -- a richer model
+// would let a broken protocol pass by accident, which is the vacuous-test trap this project has
+// hit before.
+//
+// SHARDING *IS* MODELLED, correcting an earlier version of this paragraph that said it was not.
+// NSHARDS is 2, RingTotal() sums across shards exactly as the shipping code does, and leave_epoch()
+// deliberately runs on a DIFFERENT shard than enter_epoch() -- which is the migration case and the
+// whole reason the scheme exists. Individual shards going negative is the mechanism, not a bug: the
+// sum is the only thing any reader of these counters looks at. What is not modelled is the real
+// shard COUNT (32, picked for contention) and the thread_id-based shard selection, neither of which
+// can change the argument, since correctness never depends on a reader picking the same shard twice.
 
 #include <stdatomic.h>
 #include <stdint.h>

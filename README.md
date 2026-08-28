@@ -384,7 +384,27 @@ exhaustive rather than lucky. Models live in `tests/verify/`.
   executions. **An assertion too weak to fail makes the thing it was meant to test look
   unnecessary.**
 - **Event waiter stack** (`event_model.c`) - two pushers, one drainer, 24 executions, no errors. No
-  waiter lost, none woken twice, no race on the plain `nextWaiter` field.
+  waiter lost, none woken twice, no race on the plain `nextWaiter` field. **This structure is
+  retired** - `Event` has used a slot table since 2026-08-24 and `Task::nextWaiter` is gone. The
+  model is kept and still run because the argument it verifies is *why* the replacement exists: the
+  stack was correct and still could not support `SignalOne`, because its links were the tasks
+  themselves, so a waiter could never leave early without the next drain walking a recycled slab
+  slot. Do not read a green run of it as coverage of what ships.
+- **Event waiter table** (`event_table_model.c`) - the wake path that *does* ship: a fiber-indexed
+  slot array with an occupancy bitmap. Two pushers plus a concurrent `SignalAll` and `SignalOne`,
+  36 executions clean. Verifies that the slot-then-bit publish is seen in that order, and that a
+  waiter is claimed exactly once. Its three controls are the interesting part: every one of them
+  fails at the *publication* assert rather than the double-claim it was aimed at, because the slot
+  exchange turns out to be a stronger arbiter than the bitmap claim - so "it would wake someone
+  twice" is the wrong thing to go looking for in a bug report about this code.
+- **Counted epochs** (`counted_epoch_model.c`) - the counter-based reclamation a coroutine uses,
+  having no epoch slot of its own; sharded, and modelled with the leave landing on a different shard
+  than the enter, which is the migration case. 18 executions clean, 831 with a second reader.
+  `-DNO_ADVANCE_GATE` **fails**, which is the proof the advance gate is load-bearing: without it a
+  reader parked a full ring back is indistinguishable from a fresh one. Its other control,
+  `-DNO_REVALIDATE`, **passes** - re-validation really is redundant here, because a reader announces
+  before it loads. That is a simplification and a hazard at once, and the model says so: it makes
+  announce-then-traverse a load-bearing requirement rather than a convention.
 - **Worker sleep/wake predicate** (`sleepwake_model.c`) - the `workerState`/`hasQueuedWork`/
   `immediate` protocol that lets a push skip the mutex+notify when the target is already awake.
   32 executions clean as shipped. Its own history is the cautionary tale for this whole section: an
