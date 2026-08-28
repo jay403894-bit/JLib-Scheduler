@@ -38,7 +38,11 @@
 
 #include "../../include/IoReactor.h"
 #include "../../include/TaskScheduler.h"
+#include "../IoPlatform.h"
 #include "IoUring.h"
+
+#include <sys/socket.h>
+#include <sys/uio.h>
 
 #include <atomic>
 #include <cerrno>
@@ -48,6 +52,44 @@
 #include <vector>
 
 namespace JLib {
+
+// ---- THE LAYOUT OF IoRequest::native ON POSIX, and the seam's half that depends on it ----------
+//
+//   [0]                 struct msghdr   (56 bytes)
+//   [sizeof(msghdr)]    struct iovec[kMaxVectors]  (128 bytes)
+//                       ------------------------------------
+//                       184 of the 192 available
+//
+// MEASURED, NOT ASSUMED: msghdr is 56 and iovec is 16 on x86-64 Linux, checked before this layout
+// was chosen. The static_assert below is what keeps that true on a platform where it is not -- an
+// overflow here would write past `native` into whatever follows it in the request, silently.
+//
+// msghdr FIRST because RECVMSG/SENDMSG need it at a stable address and the iovec array is what it
+// points AT; putting the variable-length part first would make the fixed part's offset depend on
+// the segment count.
+static_assert(sizeof(struct msghdr) + IoRequest::kMaxVectors * sizeof(struct iovec)
+                  <= IoRequest::kNativeBytes,
+              "IoRequest::kNativeBytes cannot hold msghdr plus kMaxVectors iovecs");
+
+static struct iovec* Iov(IoRequest* r) {
+    return reinterpret_cast<struct iovec*>(r->native + sizeof(struct msghdr));
+}
+
+namespace ioplat {
+    // The mirror of the Windows definition, over this backend's layout. Converts rather than casts:
+    // iovec is { void* iov_base; size_t iov_len; } and IoBuffer is { void* data; uint32_t len; } --
+    // same order here, unlike WSABUF, but the length widths differ and a struct that is ABI-identical
+    // to both does not exist.
+    bool FillBufs(IoRequest* r, const IoBuffer* bufs, std::uint32_t count) noexcept {
+        if (count == 0 || count > IoRequest::kMaxVectors) return false;
+        struct iovec* v = Iov(r);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            v[i].iov_base = bufs[i].data;
+            v[i].iov_len  = static_cast<std::size_t>(bufs[i].len);
+        }
+        return true;
+    }
+}
 
 namespace {
     // Matches the Windows side's shard count and reasoning: the measured contention was
@@ -320,6 +362,45 @@ std::size_t IoReactor::InFlight() const noexcept {
 bool IoReactor::Register(void*)            { return false; }
 bool IoReactor::InitSockets()              { return false; }
 bool IoReactor::RegisterSocket(IoSocket)   { return false; }
+
+// THE SUBMIT FAMILY, RETURNING TRUE WITH A FAILURE -- and the polarity is the whole point.
+//
+// TRUE means "the answer is already final, do NOT suspend". FALSE means "queued; stay suspended
+// until a completion arrives". So the wrong stub here is `return false`: the caller would park
+// forever waiting on a completion no backend will ever produce, and the symptom would be a HANG
+// rather than an error. Returning true with Failed/ENOSYS gives the awaiter something to unwind on.
+//
+// ENOSYS rather than a made-up code, because IoResult::error is documented as a platform error
+// number and a caller may well log it: "function not implemented" is exactly what is true here.
+static bool NotImplemented(IoResult* out) noexcept {
+    if (out) *out = IoResult{ IoStatus::Failed, 0, ENOSYS };
+    return true;
+}
+
+bool IoReactor::SubmitRead(void*, void*, std::uint32_t, std::uint64_t,
+                           IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitWrite(void*, const void*, std::uint32_t, std::uint64_t,
+                            IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitRecv(IoSocket, void*, std::uint32_t, std::uint32_t,
+                           IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitSend(IoSocket, const void*, std::uint32_t, std::uint32_t,
+                           IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitRecvV(IoSocket, const IoBuffer*, std::uint32_t, std::uint32_t,
+                            IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitSendV(IoSocket, const IoBuffer*, std::uint32_t, std::uint32_t,
+                            IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitRecvFrom(IoSocket, void*, std::uint32_t, std::uint32_t, IoAddress*,
+                               IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitSendTo(IoSocket, const void*, std::uint32_t, std::uint32_t,
+                             const void*, std::uint32_t,
+                             IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitAccept(IoSocket, IoSocket, IoAcceptBuffer*,
+                             IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitConnect(IoSocket, const void*, std::uint32_t,
+                              IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitDisconnect(IoSocket, bool,
+                                 IoRequest*, IoResult* out, Task*, CancelToken) { return NotImplemented(out); }
+bool IoReactor::SubmitPrepared(IoRequest* req) { return NotImplemented(req ? req->out : nullptr); }
 
 std::size_t IoReactor::RequestCancel(CancelToken) noexcept {
     // Nothing can be in flight while no Submit* works, so there is nothing to cancel. This becomes

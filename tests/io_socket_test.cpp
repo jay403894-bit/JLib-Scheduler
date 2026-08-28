@@ -21,8 +21,7 @@
 #include "Timer.h"
 #include "platform.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "socket_compat.h"   // Winsock spelling on both platforms -- see the header
 
 #include <atomic>
 #include <chrono>
@@ -78,6 +77,26 @@ int main() {
     auto& io = JLib::IoReactor::Instance();
 
     std::printf("IoReactor sockets -- workers=%zu\n\n", sched.GetWorkerCount());
+
+    // SKIP CLEANLY WHERE THE REACTOR HAS NO BACKEND YET, rather than failing every assertion below.
+    //
+    // This test is built on Linux from the moment the socket-compat shim exists, which is EARLIER
+    // than the Linux reactor's operations land -- deliberately, so the shim and this file's
+    // portability are compiled and kept honest by CI while the backend is still being written. A
+    // test that must fail until an unrelated change arrives teaches everyone to ignore it, and an
+    // ignored red test is worse than no test.
+    //
+    // IsAvailable() is the reactor's own answer, not a platform check: it is false while the
+    // operations are stubs and becomes true when they work, so this skip disappears on its own
+    // without anybody remembering to remove it.
+    if (!JLib::IoReactor::IsAvailable()) {
+        std::printf("  SKIPPED -- IoReactor reports no backend on this platform.\n");
+        std::printf("  The Linux reactor's lifecycle exists; its operations do not yet. This file\n");
+        std::printf("  is compiled here so the socket shim and its portability stay verified.\n");
+        sched.Join();
+        return 0;
+    }
+
     Check(wsaRc == 0, "WSAStartup succeeded (the app's job, not the library's)");
 
     // The extension functions have no import library; without this, accept and connect cannot be
@@ -94,7 +113,7 @@ int main() {
           ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0 &&
           ::listen(listener, SOMAXCONN) == 0, "listener bound and listening on loopback");
 
-    int addrLen = sizeof addr;
+    socklen_t addrLen = sizeof addr;
     ::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addrLen);
     Check(io.RegisterSocket(listener), "listener registered with the reactor");
 
@@ -140,12 +159,12 @@ int main() {
         // listener's properties and getpeername fails on it -- the socket looks fine until you use
         // it, which is exactly what makes omitting the fixup such a bad bug.
         sockaddr_in peer{};
-        int peerLen = sizeof peer;
+        socklen_t peerLen = sizeof peer;
         Check(::getpeername(accepted, reinterpret_cast<sockaddr*>(&peer), &peerLen) == 0,
               "getpeername works on the accepted socket (SO_UPDATE_ACCEPT_CONTEXT was applied)");
 
         sockaddr_in cpeer{};
-        int cpeerLen = sizeof cpeer;
+        socklen_t cpeerLen = sizeof cpeer;
         Check(::getpeername(client, reinterpret_cast<sockaddr*>(&cpeer), &cpeerLen) == 0,
               "and on the connected socket (SO_UPDATE_CONNECT_CONTEXT was applied)");
     }
@@ -460,7 +479,7 @@ int main() {
               ::bind(b, reinterpret_cast<sockaddr*>(&bAddr), sizeof bAddr) == 0,
               "both datagram sockets bound");
 
-        int alen = sizeof aAddr, blen = sizeof bAddr;
+        socklen_t alen = sizeof aAddr, blen = sizeof bAddr;
         ::getsockname(a, reinterpret_cast<sockaddr*>(&aAddr), &alen);
         ::getsockname(b, reinterpret_cast<sockaddr*>(&bAddr), &blen);
         Check(io.RegisterSocket(a) && io.RegisterSocket(b), "both registered with the reactor");
@@ -521,7 +540,7 @@ int main() {
         a2.sin_port = 0;
         ::bind(lis2, reinterpret_cast<sockaddr*>(&a2), sizeof a2);
         ::listen(lis2, SOMAXCONN);
-        int l2 = sizeof a2;
+        socklen_t l2 = sizeof a2;
         ::getsockname(lis2, reinterpret_cast<sockaddr*>(&a2), &l2);
         Check(io.RegisterSocket(lis2), "a second listener registered");
 
@@ -637,7 +656,7 @@ int main() {
         a5b.sin_port = 0;
         ::bind(lis5, reinterpret_cast<sockaddr*>(&a5b), sizeof a5b);
         ::listen(lis5, SOMAXCONN);
-        int l5 = sizeof a5b;
+        socklen_t l5 = sizeof a5b;
         ::getsockname(lis5, reinterpret_cast<sockaddr*>(&a5b), &l5);
         io.RegisterSocket(lis5);
 
@@ -800,7 +819,7 @@ int main() {
         a3.sin_port = 0;
         ::bind(lis3, reinterpret_cast<sockaddr*>(&a3), sizeof a3);
         ::listen(lis3, SOMAXCONN);
-        int a3len = sizeof a3;
+        socklen_t a3len = sizeof a3;
         ::getsockname(lis3, reinterpret_cast<sockaddr*>(&a3), &a3len);
 
         static sockaddr_in tgt, tgt2;

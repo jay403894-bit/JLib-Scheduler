@@ -724,9 +724,21 @@ if(WIN32)
 endif()
 
 # Sockets need the co_await surface, so this one is C++20-only like the async test.
-if(WIN32 AND JLIBSCHED_COROUTINES)
+# NO LONGER WIN32-ONLY. tests/socket_compat.h gives this file Winsock spelling on both platforms, so
+# it is ONE test rather than two that drift. It is built on Linux BEFORE the Linux reactor's
+# operations exist, and skips itself there via IoReactor::IsAvailable() -- which is the reactor's own
+# answer, so the skip disappears by itself when the backend lands. Building it early is the point:
+# it keeps the shim and this file's portability compiled and honest while the backend is written.
+#
+# The other two I/O tests stay Windows-only and for a harder reason than spelling: io_c17_test drives
+# CreateFile + SubmitRead (file I/O, which epoll cannot serve at all), and io_async_test uses NAMED
+# PIPES, which have no POSIX equivalent to shim.
+if(JLIBSCHED_COROUTINES)
     add_executable(SchedulerIoSocketTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_socket_test.cpp")
-    target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler ws2_32)
+    target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler)
+    if(WIN32)
+        target_link_libraries(SchedulerIoSocketTest PRIVATE ws2_32)
+    endif()
     target_compile_features(SchedulerIoSocketTest PRIVATE cxx_std_20)
 endif()
 
