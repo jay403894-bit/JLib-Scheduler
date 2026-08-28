@@ -46,6 +46,8 @@
 #define NOMINMAX
 #include <TaskScheduler.h>
 #include <TaskDAG.h>
+#include <Event.h>        // event/resume section
+#include <DirectEvent.h>  // event/resume section
 #include <Thread.h>    // StealStatsRead/Reset -- no-ops unless built with JLIBSCHED_STEAL_STATS
 #include <platform.h>  // SpinHintName -- stamped into the banner, see CpuRelax
 #include <chrono>
@@ -892,6 +894,311 @@ static void BenchRequeueVsPushBatch(JLib::TaskScheduler& sched) {
     SweepRequeueVsPushBatch(sched, sizes);
 }
 
+// ================================================================================================
+// WHAT hot=N ACTUALLY BUYS, and what an Event resume costs.
+//
+// THE GAP THESE CLOSE. Everything above measures the POOL: submission cliffs, fork-join, the DAG.
+// None of it measures the product story -- I/O completion lands on the hot lane, a parked fiber is
+// resumed, and a cold OS wake is what you pay when neither applies. Worse, `hot=N` has until now
+// mostly just SHRUNK the compute pool, because every section reached it through a generic Push,
+// which never routes to the lane. A paste with hot=2 therefore looked like a regression in
+// throughput and showed nothing in return. These sections are the "in return".
+//
+// THE HOT API IS A hiPri PUSH. There is no PushHot(): PickNextWorker rotates the HOT set for hiPri
+// and the ordinary set for everything else, so priority IS the routing. That also means the two
+// arms below are only different when K > 0 -- at K = 0 the lane is collapsed and PushLocal's
+// `useHi = hiPri && HiPriLaneActive()` sends a hiPri task to loPri anyway, deliberately, because
+// nobody probes hiPri at K=0 and a task routed there would never run. So at K=0 this prints ONE row
+// and says why, rather than printing two identical numbers side by side and inviting someone to
+// read the difference between them as signal.
+// ================================================================================================
+
+static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
+    constexpr int kIters = 20'000;
+    const size_t K = JLib::TaskScheduler::GetHotWorkers();
+
+    auto runArm = [&](bool hiPri) -> double {
+        const auto t0 = Clock::now();
+        for (int i = 0; i < kIters; ++i) {
+            JLib::WaitGroup wg;
+            wg.n.store(1, std::memory_order_relaxed);
+            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr, hiPri ? 1 : 0);
+            if (!t) return -1.0;
+            t->waitGroup = &wg;
+            sched.Push(t);
+            sched.WaitFor(wg);
+        }
+        return MsBetween(t0, Clock::now()) * 1000.0 / kIters;
+    };
+
+    if (K == 0) {
+        const double us = runArm(false);
+        printf("latency/hot  : SKIPPED -- K=0, so the lane is collapsed and a hiPri push routes to\n");
+        printf("               loPri by design. Re-run with hot=1 (or more) for this row to mean\n");
+        printf("               anything; a number here at K=0 would just be latency/cold twice.\n");
+        printf("latency/cold : %.2f us per push->run->wait (ordinary push, K=0)\n", us);
+        return;
+    }
+
+    // COLD FIRST, then hot. Order matters and not for fairness: the hot workers spin, so running
+    // hot first leaves them warm and the cold arm measures a pool that has just been busy. Cold
+    // first gives the cold arm the genuinely idle pool it is supposed to describe.
+    const double coldUs = runArm(false);
+    const double hotUs  = runArm(true);
+
+    printf("latency/cold : %.2f us per push->run->wait  (ordinary push -> any worker, may be parked)\n", coldUs);
+    printf("latency/hot  : %.2f us per push->run->wait  (hiPri push -> one of K=%zu hot workers)\n", hotUs, K);
+    if (coldUs > 0.0)
+        printf("               hot is %.2fx of cold%s\n", hotUs / coldUs,
+               (hotUs < coldUs) ? " (lower is better -- the lane is doing its job)"
+                                : " -- NOT faster; that is a finding, not a bad run");
+}
+
+// ================================================================================================
+// EVENT / DIRECTEVENT RESUME. The first section in this file that exercises either primitive --
+// fork-join is the only other fiber section, and it never parks on an event.
+//
+// THREE ARMS, and the third is NOT a variant of the first:
+//
+//   A  DirectEvent   1 waiter          hold-off 0 and 1 ms
+//   B  Event         1 and 8 waiters   hold-off 0 and 1 ms
+//   C  DirectEvent, waiter on a worker that has been allowed to PARK
+//
+// C IS THE OS ROW. It is the cost of an OS wake, not the cost of the primitive, and averaging it
+// into A would hide exactly the thing A exists to isolate. It is printed separately and labelled.
+//
+// THE HOLD-OFF IS THE POINT of running each arm twice. At 0 the waiter has only just parked and
+// the resume may land while the fiber is still warm; at 1 ms it has certainly settled. The gap
+// between those two numbers is the part that belongs to the machine rather than to the primitive.
+//
+// A AND B DO NOT SEPARATE, AND THIS SECTION DOES NOT PRETEND THEY DO. Four consecutive runs on an
+// idle machine: 0.33x, 0.79x, 1.09x, 1.17x -- Direct ahead twice, Event ahead twice, across a
+// factor of three and a half. The comparison is therefore not reported as a verdict; both numbers
+// are printed and the ratio is labelled meaningless on its own.
+//
+// AND THE SPREAD IS NOT JUST A BUSY MACHINE. In the 0.33x run the Event arm's MEDIAN OF 25 was
+// 32.4 us where the other three runs put it at 6.6-10.0. One arm occasionally collects a batch slow
+// enough that twenty-five samples do not average it out, which is worth understanding before
+// anyone tunes anything on the strength of this row.
+//
+// There IS a structural difference, and it is small rather than decisive. Event's slot index is the
+// waiting fiber's own poolIndex, so registering is two stores and allocates nothing; Direct takes a
+// DirectEvent from a pool and hands it back. Closing that gap would mean preallocating one
+// DirectEvent per fiber -- Event's design, plus a per-fiber object idle almost always -- which is
+// memory spent to chase a difference this bench cannot resolve.
+//
+// THE CONCLUSION THIS ROW MUST NOT PRODUCE is "Direct is slower, use Event." Direct exists so a
+// PER-OPERATION wait -- a fence, an I/O completion, anything with a fresh identity each time --
+// never mints a registry name. GetEvent holds a global mutex across its lookup and never evicts, so
+// a name per operation is an unbounded map and a lock convoy that shows up an hour into a run
+// looking exactly like a deadlock. That is what the pool round trip buys, and no latency number
+// here can show it.
+static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm) {
+    // Signal -> resume, measured inside the resumed task so no cross-thread clock comparison is
+    // needed beyond one steady_clock, which is monotonic across threads on every target here.
+    static std::atomic<long long> s_signalNs{ 0 };
+    static std::atomic<long long> s_resumeNs{ 0 };
+    static std::atomic<JLib::DirectEvent*> s_direct{ nullptr };
+    static std::atomic<int> s_armed{ 0 };
+    static std::atomic<int> s_done{ 0 };
+
+    auto nowNs = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   Clock::now().time_since_epoch()).count();
+    };
+
+    // ---- arm A / C: DirectEvent -------------------------------------------------------------
+    auto directRound = [&](int holdOffMs) -> double {
+        s_direct.store(nullptr, std::memory_order_relaxed);
+        s_armed.store(0, std::memory_order_relaxed);
+        s_done.store(0, std::memory_order_relaxed);
+
+        JLib::WaitGroup wg;
+        wg.n.store(1, std::memory_order_relaxed);
+        JLib::Task* t = sched.CreateTask(+[](void*) {
+            auto& s = JLib::TaskScheduler::Instance();
+            s.WaitOnEventDirectArmed([](JLib::DirectEvent* e) {
+                s_direct.store(e, std::memory_order_release);
+                s_armed.store(1, std::memory_order_release);
+            });
+            s_resumeNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 Clock::now().time_since_epoch()).count(),
+                             std::memory_order_release);
+            s_done.store(1, std::memory_order_release);
+        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        if (!t) return -1.0;
+        t->waitGroup = &wg;
+        sched.Push(t);
+
+        while (!s_armed.load(std::memory_order_acquire)) std::this_thread::yield();
+        if (holdOffMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(holdOffMs));
+
+        JLib::DirectEvent* e = s_direct.load(std::memory_order_acquire);
+        s_signalNs.store(nowNs(), std::memory_order_release);
+        e->Signal();
+        sched.WaitFor(wg);
+
+        const long long a = s_signalNs.load(std::memory_order_acquire);
+        const long long b = s_resumeNs.load(std::memory_order_acquire);
+        return (b > a) ? (double)(b - a) / 1000.0 : -1.0;
+    };
+
+    // ---- arm B: named Event, N waiters -------------------------------------------------------
+    auto eventRound = [&](int waiters, int holdOffMs) -> double {
+        // HOISTED, not looked up per wait. GetEvent takes a global mutex and a string hash; doing
+        // that inside the measured region would time the registry rather than the resume, which is
+        // the mistake its own header warns about.
+        JLib::Event& ev = sched.GetEvent("bench/event-resume");
+        s_armed.store(0, std::memory_order_relaxed);
+        s_resumeNs.store(0, std::memory_order_relaxed);
+
+        JLib::WaitGroup wg;
+        wg.n.store(waiters, std::memory_order_relaxed);
+        for (int i = 0; i < waiters; ++i) {
+            JLib::Task* t = sched.CreateTask(+[](void* p) {
+                auto& s = JLib::TaskScheduler::Instance();
+                JLib::Event* e = (JLib::Event*)p;
+                s.WaitOnEventArmed(*e, [] { s_armed.fetch_add(1, std::memory_order_release); });
+                // FIRST WAITER TO WAKE WINS THE TIMESTAMP. With N waiters the interesting number is
+                // signal -> first resume; the tail of a SignalAll is a different question and is not
+                // what this row claims to measure.
+                long long expect = 0;
+                s_resumeNs.compare_exchange_strong(
+                    expect,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch()).count(),
+                    std::memory_order_acq_rel);
+            }, &ev, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            if (!t) { wg.n.fetch_sub(1, std::memory_order_release); continue; }
+            t->waitGroup = &wg;
+            sched.Push(t);
+        }
+
+        while (s_armed.load(std::memory_order_acquire) < waiters) std::this_thread::yield();
+        if (holdOffMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(holdOffMs));
+
+        s_signalNs.store(nowNs(), std::memory_order_release);
+        ev.SignalAll();
+        sched.WaitFor(wg);
+
+        const long long a = s_signalNs.load(std::memory_order_acquire);
+        const long long b = s_resumeNs.load(std::memory_order_acquire);
+        return (b > a) ? (double)(b - a) / 1000.0 : -1.0;
+    };
+
+    auto medianOf = [&](const std::function<double()>& f, int reps) -> double {
+        std::vector<double> v;
+        v.reserve(reps);
+        for (int i = 0; i < reps; ++i) { const double d = f(); if (d > 0.0) v.push_back(d); }
+        if (v.empty()) return -1.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    constexpr int kReps = 25;
+    printf("event/resume : signal -> resumed, median of %d\n", kReps);
+
+    const double a0 = medianOf([&] { return directRound(0); }, kReps);
+    const double a1 = medianOf([&] { return directRound(1); }, kReps);
+    printf("  A DirectEvent  1 waiter    hold-off 0ms: %7.2f us   1ms: %7.2f us\n", a0, a1);
+
+    const double b0 = medianOf([&] { return eventRound(1, 0); }, kReps);
+    const double b1 = medianOf([&] { return eventRound(1, 1); }, kReps);
+    printf("  B Event        1 waiter    hold-off 0ms: %7.2f us   1ms: %7.2f us\n", b0, b1);
+    const double b8 = medianOf([&] { return eventRound(8, 1); }, kReps);
+    printf("  B Event        8 waiters   hold-off 1ms: %7.2f us  (signal -> FIRST resume)\n", b8);
+
+    // NO VERDICT, DELIBERATELY, and this replaced code that declared one.
+    //
+    // Four consecutive runs on one idle machine put A/B at 0.33x, 0.79x, 1.09x and 1.17x -- Direct
+    // twice ahead, Event twice ahead, spanning a factor of three and a half. An earlier version of
+    // this section printed "Direct is faster" or "Event is faster, and that is EXPECTED" depending
+    // on where a single run landed, which would have written whichever direction that run happened
+    // to take into somebody's notes as a property of the primitives.
+    //
+    // The dispersion is not the machine being busy. In the 0.33x run the Event arm's MEDIAN OF 25
+    // was 32.4 us against 6.6-10.0 us in the other three, so one arm occasionally collects a
+    // pathologically slow batch that twenty-five samples do not average away. Until that is
+    // understood, this row reports two numbers and no comparison.
+    //
+    // WHAT DOES REPRODUCE, run to run, is latency/hot at ~0.10x of latency/cold. Trust that row.
+    if (a1 > 0.0 && b1 > 0.0)
+        printf("  ratio this run %.2fx -- MEANINGLESS ALONE. Observed 0.33x to 1.17x across four\n"
+               "  consecutive runs, both directions. Neither primitive is faster here; they are\n"
+               "  chosen for different things. Event's slot is the waiting fiber's own poolIndex\n"
+               "  (two stores, nothing allocated); Direct takes a pooled object and returns it, and\n"
+               "  in exchange never mints a registry name -- which is what a per-operation wait (a\n"
+               "  fence, an I/O completion) needs, because GetEvent holds a global mutex across a\n"
+               "  lookup and never evicts. That is the reason to pick one, not this number.\n",
+               a1 / b1);
+
+    if (includeSleepingArm) {
+        // C: let the pool genuinely park before signalling. 50 ms is what BenchIdleBurst uses for
+        // the same purpose, and it is the reason this arm is last -- it leaves the pool cold.
+        auto sleeper = [&]() -> double {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return directRound(0);
+        };
+        const double c = medianOf(sleeper, 10);
+        printf("  C DirectEvent  waiter on a PARKED pool          : %7.2f us\n", c);
+        printf("     ^ THE OS ROW. This is the wake, not the primitive. Do not average it into A.\n");
+    }
+}
+
+// ================================================================================================
+// IO-PIPE: the number that belongs next to "I/O completions target the hot lane".
+//
+// There is no reactor in this executable, so one is faked in the only way that keeps the
+// measurement honest: a SIDE std::thread -- explicitly not a pool worker -- plays the completion
+// thread and pushes hiPri work, exactly as IoReactor's completion threads do. Routing this through
+// a generic Push would measure the ordinary pool and label it I/O, which is the mislabelling this
+// whole section exists to stop.
+//
+// MEASURED: completion -> job START, not job end. The body is trivial on purpose; what is being
+// timed is how long a completion waits for a worker to pick it up.
+static void BenchIoPipe(JLib::TaskScheduler& sched) {
+    const size_t K = JLib::TaskScheduler::GetHotWorkers();
+    if (K == 0) {
+        printf("io-pipe      : SKIPPED -- K=0. A hiPri push collapses to loPri with no lane to land\n");
+        printf("               on, so this would measure the ordinary pool and call it I/O.\n");
+        return;
+    }
+
+    constexpr int kOps = 4'000;
+    static std::atomic<long long> s_startNs{ 0 };
+    std::vector<double> lat;
+    lat.reserve(kOps);
+
+    std::thread reactor([&] {
+        for (int i = 0; i < kOps; ++i) {
+            JLib::WaitGroup wg;
+            wg.n.store(1, std::memory_order_relaxed);
+            JLib::Task* t = sched.CreateTask(+[](void*) {
+                s_startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    Clock::now().time_since_epoch()).count(),
+                                std::memory_order_release);
+            }, nullptr, /*hiPri*/ 1);
+            if (!t) { continue; }
+            t->waitGroup = &wg;
+            s_startNs.store(0, std::memory_order_relaxed);
+            const long long post = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       Clock::now().time_since_epoch()).count();
+            sched.Push(t);
+            sched.WaitFor(wg);
+            const long long start = s_startNs.load(std::memory_order_acquire);
+            if (start > post) lat.push_back((double)(start - post) / 1000.0);
+        }
+    });
+    reactor.join();
+
+    if (lat.empty()) { printf("io-pipe      : no samples\n"); return; }
+    std::sort(lat.begin(), lat.end());
+    printf("io-pipe      : completion -> job start, %zu samples, K=%zu\n", lat.size(), K);
+    printf("               p50 %.2f us   p90 %.2f us   p99 %.2f us   max %.2f us\n",
+           lat[lat.size() / 2], lat[(size_t)(lat.size() * 0.90)],
+           lat[(size_t)(lat.size() * 0.99)], lat.back());
+}
+
 int main(int argc, char** argv) {
     // Worker binding policy, chosen on the command line. It must be set BEFORE Init() (binding
     // happens at thread creation), and the scheduler is a process-wide singleton -- so one process
@@ -919,7 +1226,7 @@ int main(int argc, char** argv) {
             // the default and silently run the whole suite, so asking for help started a multi-
             // minute benchmark under a policy you did not choose.
             printf("usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
-                   "                     [sleep|nosleep|both]\n"
+                   "                     [sleep|nosleep|both] [hot=N] [ev|noev]\n"
                    "  sleep     (default) idle workers park on a condition variable.\n"
                    "  nosleep   never park. Holds every worker core; lowest dispatch latency.\n"
                    "            Measured 4.1x on latency, 2.9x on the frame DAG, 3.1x on fork-join.\n"
@@ -941,6 +1248,19 @@ int main(int argc, char** argv) {
                    "  nosweep   skip the ParallelFor crossover sweep AND the splitter-vs-cursor\n"
                    "            sweep (the two slowest sections), so a pool-size sweep is a few\n"
                    "            seconds per point instead of minutes.\n"
+                   "  hot=N     reserve N workers for the LATENCY LANE (SetHotWorkers). Default 0.\n"
+                   "            K=0 collapses the lane: a hiPri push then routes to loPri by design,\n"
+                   "            because nobody probes hiPri at K=0 and a task sent there would never\n"
+                   "            run -- so latency/hot and io-pipe SKIP themselves and say why rather\n"
+                   "            than printing a number that is really latency/cold twice.\n"
+                   "            N is taken from the compute pool, so raising it makes the throughput\n"
+                   "            rows slightly worse; latency/hot and io-pipe are what you get back,\n"
+                   "            and they are the only rows that can show it. Start with hot=1.\n"
+                   "  noev      skip latency/hot, event/resume and io-pipe. Those are the only\n"
+                   "            sections that exercise the LANE and the Event primitives, and the\n"
+                   "            only reason hot=N changes anything but the compute pool size --\n"
+                   "            every other section reaches the pool through a generic Push, which\n"
+                   "            never routes to the lane. On by default; `ev` re-enables.\n"
                    "\n"
                    "The scheduler is a process-wide singleton and both policy and pool size are\n"
                    "fixed at Init(), so one run measures ONE configuration -- run the exe once per\n"
@@ -952,6 +1272,9 @@ int main(int argc, char** argv) {
 
     size_t poolSize = 0;                 // 0 = auto (hw-1)
     bool   runSweep = true;
+    // The Event/lane sections. ON by default because they are the point of hot=N and they cost a
+    // couple of seconds; `noev` exists so a CI job that only wants the pool numbers can skip them.
+    bool   runEvents = true;
     // Idle policy is a trailing token so existing invocations keep working unchanged.
     auto   idle = JLib::TaskScheduler::IdlePolicy::Sleep;
     const char* idleName = "sleep";
@@ -959,6 +1282,8 @@ int main(int argc, char** argv) {
     size_t hotWorkers = 0;               // hot=N: dedicated low-latency-lane workers, 0 = off
     for (int a = 2; a < argc; ++a) {
         if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
+        if (JLIB_STRICMP(argv[a], "noev") == 0)    { runEvents = false; continue; }
+        if (JLIB_STRICMP(argv[a], "ev") == 0)      { runEvents = true;  continue; }
         if (JLIB_STRICMP(argv[a], "sleep") == 0) { continue; }
         if (JLIB_STRICMP(argv[a], "nosleep") == 0)      { idle = JLib::TaskScheduler::IdlePolicy::NoSleep;       idleName = "nosleep";   continue; }
         if (JLIB_STRICMP(argv[a], "both") == 0) { runBoth = true; continue; }
@@ -1037,13 +1362,41 @@ int main(int argc, char** argv) {
     // the workers come up, so the count has to be known by then.
     if (hotWorkers) JLib::TaskScheduler::SetHotWorkers(hotWorkers);
 
+    // PRESIZE THE SLAB, because a growth allocation is MEASUREMENT NOISE HERE and nowhere else.
+    //
+    // The library default is slots64 = 24K, and throughput/1p pushes 200,000 capture-free no-op
+    // tasks from one producer -- which outruns the drain, exceeds that class, and grows mid-run.
+    // The result is an allocation inside a timed section plus a warning line landing in the middle
+    // of the output. Growth is the right DEFAULT behaviour (a game should stutter once, not die),
+    // but a benchmark exists to describe the scheduler, and an allocator hitch inside the number is
+    // the scheduler being blamed for the allocator.
+    //
+    // NOT A SUGGESTION FOR APPLICATIONS. The shipped defaults target the 80% who never call this
+    // and are sized against PEAK LIVE, not against total submitted -- the number that matters is
+    // how many tasks exist at once, which for a real frame loop is small. These are bench numbers:
+    // deliberately far above anything an app should reserve, because this process is allowed to
+    // spend 30 MB to keep a measurement clean and an app is not.
+    JLib::TaskScheduler::SlabSizes slab;
+    slab.slots64  = 256 * 1024;   // 16 MB -- throughput/1p's burst, TaskNodes, PushArray chunks
+    slab.slots80  =  64 * 1024;   // 5 MB  -- capturing lambdas across the sweeps
+    slab.slots128 =   8 * 1024;   // 1 MB  -- larger coroutine frames
+    slab.slots256 =  32 * 1024;   // 8 MB  -- DAG edge chunks; the frame DAG runs 20,000 graphs
+    JLib::TaskScheduler::SetSlabSizes(slab);
+
     JLib::TaskScheduler::Init(poolSize);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
     // Say what was actually configured -- a run pasted without this is unattributable, and K
     // changes what the numbers mean.
-    printf("config: workers=%zu  hot=%zu  affinity=%s  idle=%s\n",
-           sched.GetWorkerCount(), JLib::TaskScheduler::GetHotWorkers(), policyName, idleName);
+    // SAY WHICH API THE LATENCY ROWS USED, not just what K is. A paste showing hot=2 next to a
+    // latency number taken through a generic Push is how a false regression hunt starts: the lane
+    // was never on the path, so K only shrank the compute pool and the row looks worse for free.
+    // The plain `latency` row below is ALWAYS a generic push; latency/hot is the hiPri one.
+    const size_t bannerK = JLib::TaskScheduler::GetHotWorkers();
+    printf("config: workers=%zu  hot=%zu  affinity=%s  idle=%s  events=%s\n",
+           sched.GetWorkerCount(), bannerK, policyName, idleName, runEvents ? "on" : "off");
+    printf("        latency row = generic Push (never the lane);  latency/hot = hiPri push%s\n",
+           bannerK ? "" : "  [K=0: hiPri collapses to loPri, so hot rows are skipped]");
 
     // Warmup: get every worker spun up and fibers touched before measuring anything.
     {
@@ -1066,6 +1419,14 @@ int main(int argc, char** argv) {
     Section("ParallelFor");    BenchParallelFor(sched);
     Section("fork-join");      BenchRecursiveForkJoin(sched);
     Section("frame DAG");      BenchFrameDag(sched);
+
+    // THE SECTIONS THAT MAKE hot= MEAN SOMETHING, and they sit HERE for a reason: after everything
+    // that wants a warm pool, before burst. Burst deliberately parks the pool for 50 ms per run, so
+    // anything measuring a hot lane after it would be timing an OS wake and calling it lane latency
+    // -- the same contamination that once read the frame DAG at 30.88 us against its true 22-24.
+    if (runEvents) { Section("latency/hot");  BenchLatencyHotCold(sched); }
+    if (runEvents) { Section("event/resume"); BenchEventResume(sched, /*sleeping arm*/ true); }
+    if (runEvents) { Section("io-pipe");      BenchIoPipe(sched); }
     // LAST, and deliberately. This one sleeps 50 ms before each of its five runs so the pool is
     // genuinely parked, which is the whole point of it. Run earlier, it leaves every worker cold and
     // the next section pays the wake-up: with it sitting before the frame DAG, that section read
