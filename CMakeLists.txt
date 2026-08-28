@@ -816,6 +816,12 @@ target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)
 # The steal hint past bit 63. Oversubscribes deliberately (100 workers) because that is the only way
 # to reach a two-word hint bitmap without a 128-thread machine -- every other test on a normal box
 # runs the one-word path and would pass with the second word wired up backwards.
+# Reachability, not throughput: can the selection step NAME the victim holding the work? Both bugs
+# it exists for were invisible to the rest of the suite -- work still ran, just never anywhere else.
+add_executable(SchedulerStealReachabilityTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_reachability_test.cpp")
+target_link_libraries(SchedulerStealReachabilityTest PRIVATE Scheduler)
+target_compile_features(SchedulerStealReachabilityTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerStealHintWordsTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_hint_words_test.cpp")
 target_link_libraries(SchedulerStealHintWordsTest PRIVATE Scheduler)
 target_compile_features(SchedulerStealHintWordsTest PRIVATE cxx_std_17)
