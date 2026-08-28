@@ -830,6 +830,19 @@ target_compile_features(SchedulerDequeCeilingTest PRIVATE cxx_std_17)
 # runs the one-word path and would pass with the second word wired up backwards.
 # Reachability, not throughput: can the selection step NAME the victim holding the work? Both bugs
 # it exists for were invisible to the rest of the suite -- work still ran, just never anywhere else.
+# Does 256-bit vector state survive a fiber suspend? ContextSwitch.asm saves only the LOW 128 bits
+# of XMM6-15, which the Win64 ABI says is complete -- but the failure mode if that reasoning is wrong
+# is SILENT wrong arithmetic, not a crash, so it gets a test rather than a paragraph.
+# AVX2 is required to build it; the runtime check is the CPU's, not CMake's.
+add_executable(SchedulerAvxSuspendTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/avx_suspend_test.cpp")
+target_link_libraries(SchedulerAvxSuspendTest PRIVATE Scheduler)
+target_compile_features(SchedulerAvxSuspendTest PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(SchedulerAvxSuspendTest PRIVATE /arch:AVX2)
+else()
+    target_compile_options(SchedulerAvxSuspendTest PRIVATE -mavx2)
+endif()
+
 add_executable(SchedulerStealReachabilityTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_reachability_test.cpp")
 target_link_libraries(SchedulerStealReachabilityTest PRIVATE Scheduler)
 target_compile_features(SchedulerStealReachabilityTest PRIVATE cxx_std_17)
