@@ -2,7 +2,8 @@
 [![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
 > **Development note.** This runtime was developed iteratively, using AI-assisted tooling for rapid
-> prototyping and code generation under strict human specification and verification. All
+> prototyping and code generation under strict human specification and verification. Lots of work was done by hand even.
+> the workflow changed as I found output and testing became of superior quality and speed than I could produce by hand. All
 > architectural decisions, correctness validation, and performance tuning were conducted manually.
 > The commit history reflects this collaborative, tool-accelerated workflow.
 
