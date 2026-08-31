@@ -464,7 +464,23 @@ IoReactor::~IoReactor() {
     g_impl = nullptr;
 }
 
-IoReactor& IoReactor::Instance() { static IoReactor r; return r; }
+// LEAKED ON PURPOSE -- see TimerQueue::Instance for the bug this class of thing causes. Same shape
+// exactly: a function-local static is constructed on first use (inside Init), TaskScheduler::
+// atExitDestroyer is a namespace-scope static constructed before main, destruction is reverse of
+// construction, and so this would be destroyed FIRST and then Join() -> IoReactor::Instance().Stop()
+// would run against a deleted `impl`. Here that is a null dereference rather than a hang, because
+// ~IoReactor sets g_impl = nullptr on its way out.
+//
+// IT WAS DORMANT UNTIL TODAY AND IS NOT ANY MORE. Join() guards that call with
+// `IoReactorEnabled() && IoReactor::IsAvailable()`, and IsAvailable returned a hardcoded false for
+// the whole life of this backend -- so Join never touched the reactor and the ordering never
+// mattered. Flipping the gate live armed it.
+//
+// NOTHING IS ABANDONED BY LEAKING. ~IoReactor's real work is Stop(), and Join() calls Stop()
+// explicitly before this would ever have run; the ring and the completion port are process-lifetime
+// resources the OS reclaims at exit. What is given up is the tidiness of a destructor, and what is
+// bought is that there is no destruction ORDER to get wrong.
+IoReactor& IoReactor::Instance() { static IoReactor* r = new IoReactor(); return *r; }
 
 // FALSE UNTIL THE OPERATIONS EXIST. The ring being up is necessary and not sufficient -- reporting
 // available while every Submit* returns false would make callers take the async path and then

@@ -90,8 +90,19 @@ namespace JLib {
     }
 
     HazardDomain& HazardDomain::Instance() {
-        static HazardDomain d;
-        return d;
+        // LEAKED, completing the set with TimerQueue and IoReactor -- see the note on
+        // TimerQueue::Instance for the bug. Constructed on first use, which is inside Init;
+        // TaskScheduler::atExitDestroyer is namespace-scope and constructed before main; so this
+        // would be destroyed FIRST and TaskScheduler::Join() drains hazards on its way down, after.
+        //
+        // THE MILDEST OF THE THREE and leaked anyway, deliberately. HazardDomain declares no
+        // destructor, so what would run is the implicit member teardown -- freeing memory in a
+        // process that is exiting. The point is not that this one was dangerous; it is that a
+        // destruction ORDER between process-wide objects is a thing to reason about, and the cheapest
+        // way to be right about it is to not have one. Two of these were live bugs and this one was
+        // one edit away from becoming the third.
+        static HazardDomain* d = new HazardDomain();
+        return *d;
     }
 
     void HazardDomain::EnsureTable() {

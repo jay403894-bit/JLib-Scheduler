@@ -610,8 +610,24 @@ namespace JLib {
     IoReactor& IoReactor::Instance() {
         // Function-local static, like the cancel table and the timer: no static-init-order dependency
         // on the scheduler, and no thread until something actually submits.
-        static IoReactor r;
-        return r;
+        //
+        // ---- AND LEAKED, FOR THE REASON TimerQueue::Instance DOCUMENTS -----------------------
+        //
+        // "No static-init-order dependency" was true about CONSTRUCTION and said nothing about
+        // DESTRUCTION, which is where the bug lives. Constructed on first use (inside Init);
+        // TaskScheduler::atExitDestroyer is namespace-scope and constructed before main; destruction
+        // is reverse of construction; so this would be destroyed FIRST and then ~AtExitDestroyer ->
+        // Join() -> IoReactor::Instance().Stop() would touch a deleted `impl`. That is exactly the
+        // sequence that hung the Linux build at process exit through the timer queue.
+        //
+        // Windows has been surviving it the way it survived the timer one -- the freed block stays
+        // mapped and the members happen to behave -- which is not a defence, it is a description of
+        // how the same bug hides on this platform.
+        //
+        // Join() calls Stop() explicitly, so no thread is abandoned; the completion port is a
+        // process-lifetime handle the OS reclaims at exit.
+        static IoReactor* r = new IoReactor();
+        return *r;
     }
 
     bool IoReactor::IsAvailable() noexcept { return true; }

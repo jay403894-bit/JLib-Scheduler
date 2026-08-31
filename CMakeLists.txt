@@ -451,9 +451,20 @@ target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED
 # Decomposes the serial submit-and-wait round trip that compare_marl.cpp reports at ~4.5 us against
 # marl's ~0.82 us: how much is the WORKER being woken, and how much is the SUBMITTER being woken.
 # All arms in one process -- idle policy and K are both runtime settings.
-add_executable(SchedulerWaitForBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/waitfor_participation.cpp")
-target_link_libraries(SchedulerWaitForBench PRIVATE Scheduler)
-target_compile_features(SchedulerWaitForBench PRIVATE cxx_std_17)
+# WINDOWS-ONLY, because the source includes <windows.h> unconditionally -- it reads thread times
+# through GetThreadTimes to split "the worker was woken" from "the submitter was woken", and there is
+# no portable equivalent it currently falls back to.
+#
+# GUARDED HERE RATHER THAN #ifdef'd IN THE SOURCE, because the failure was not that this bench does
+# not run on Linux -- it is that it does not COMPILE, and an unconditional target meant
+# `cmake --build .` aborted the whole tree at this file. Three tests after it in the build order were
+# simply never produced, which reads as "those tests do not exist on Linux" rather than as one bench
+# being unportable.
+if(WIN32)
+    add_executable(SchedulerWaitForBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/waitfor_participation.cpp")
+    target_link_libraries(SchedulerWaitForBench PRIVATE Scheduler)
+    target_compile_features(SchedulerWaitForBench PRIVATE cxx_std_17)
+endif()
 
 if(WIN32 AND NOT JLIBSCHED_ARCH STREQUAL "aarch64")
     set(JLIBSCHED_CSBENCH_ASM "${CMAKE_CURRENT_SOURCE_DIR}/bench/win32/context_switch_variants.asm")
@@ -914,10 +925,16 @@ target_compile_features(SchedulerAwakeFloorShedTest PRIVATE cxx_std_17)
 
 # Standalone wake-latency variance harness: condvar vs WaitOnAddress, isolated 2-thread ping-pong.
 # See memory: futex was rejected twice on this measurement; do not re-propose it without a fresh run.
-add_executable(SchedulerFutexVariance "${CMAKE_CURRENT_SOURCE_DIR}/bench/futex_variance.cpp")
-target_link_libraries(SchedulerFutexVariance PRIVATE Scheduler)
-target_link_libraries(SchedulerFutexVariance PRIVATE winmm)   # timeBeginPeriod/timeEndPeriod
-target_compile_features(SchedulerFutexVariance PRIVATE cxx_std_17)
+# WINDOWS-ONLY: it compares WaitOnAddress against a condvar and links winmm for
+# timeBeginPeriod/timeEndPeriod, none of which exist elsewhere. Guarded for the same reason as
+# SchedulerWaitForBench above -- an unconditional target here aborted the whole Linux build, so
+# everything after it in the build order silently never got produced.
+if(WIN32)
+    add_executable(SchedulerFutexVariance "${CMAKE_CURRENT_SOURCE_DIR}/bench/futex_variance.cpp")
+    target_link_libraries(SchedulerFutexVariance PRIVATE Scheduler)
+    target_link_libraries(SchedulerFutexVariance PRIVATE winmm)   # timeBeginPeriod/timeEndPeriod
+    target_compile_features(SchedulerFutexVariance PRIVATE cxx_std_17)
+endif()
 
 # Completion latency against a saturated pool, swept over bulk-body length. Reconstructs the
 # harness behind PickNextWorker's "hiPri was briefly steered at the unreserved floor, and it lost",
