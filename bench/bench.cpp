@@ -347,10 +347,20 @@ static void ReportStealStats(const char* label) {
         JLib::StealStatsSources(JLib::TaskScheduler::Instance().GetWorkerCount());
     const double denom = sr.total > 0 ? (double)sr.total
                                       : (double)(kThroughputTasks * kThroughputRuns);
-    printf("  steal/%s   : %lld probes, %lld hits (%.1f%% hit rate, %.3g probes per task)\n",
+    // SAY WHICH WINDOW THESE COVER. The row above prints "200000 no-op tasks" -- that is
+    // kThroughputTasks, the size of ONE run, and the headline reports the BEST of five. These
+    // counters accumulate across ALL FIVE, so they describe 1,000,000 tasks. Printed together and
+    // unlabelled, 604,844 hits under a "200000 tasks" header reads as more steals than tasks
+    // existed, which is what it looked like and is why nobody could sanity-check it.
+    //
+    // A probe IS a steal attempt and claims at most one task, so hits <= probes and hits <= tasks.
+    // With the window stated, both are checkable at a glance.
+    printf("  steal/%s   : %lld probes, %lld hits (%.1f%% hit rate, %.3g probes per task)\n"
+           "               over %d runs = %lld tasks (the row header is ONE run, best-of-%d)\n",
         label, probes, hits,
         probes ? 100.0 * (double)hits / (double)probes : 0.0,
-        denom > 0.0 ? (double)probes / denom : 0.0);
+        denom > 0.0 ? (double)probes / denom : 0.0,
+        kThroughputRuns, (long long)denom, kThroughputRuns);
 
     // ---- WHERE THE WORK CAME FROM, and the balance that falls out of it --------------------
     //
