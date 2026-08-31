@@ -773,6 +773,58 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     const size_t floorAtLatencyStart = JLib::TaskScheduler::GetAwakeFloor();
     for (auto& c : g_landedOn) c.store(0, std::memory_order_relaxed);
 
+    // ---- THE STALL HAS TO BE SAMPLED WHILE IT IS HAPPENING ----------------------------------
+    //
+    // THIS DUMP USED TO RUN AFTER WaitFor RETURNED, and it therefore could not work. By then the
+    // task has completed, the serial loop has nothing else in flight, and the pool is idle BY
+    // CONSTRUCTION -- so the only state it could ever print was "two floor workers awake, everyone
+    // else parked, nothing queued, nothing busy". Every pathological dump ever produced by this
+    // bench showed that, and it was read as evidence rather than as an artefact of when it was
+    // taken. It also carried a header saying "Pool state AT THE MOMENT it happened", which was
+    // false, and four reading hints describing states that cannot exist at that point.
+    //
+    // A blocked thread cannot dump the pool it is blocked on, so the sample has to come from
+    // somewhere else. This thread publishes the start of each round trip and a watcher reads it.
+    //
+    // IT SPINS, DELIBERATELY. The event is ~50 us and rare (1 in 20,000), so a sleeping poller
+    // would miss it every time -- there is no sleep granularity on Windows that resolves 50 us.
+    // The cost is one busy core for the ~15 ms this row takes, which is worth knowing about but is
+    // not measured by anything here: the row times a serial round trip, and a spinning watcher does
+    // not queue work, steal, or wake anybody.
+    //
+    // FIRES ONCE. After it dumps it stops looking, so a pathological run cannot turn into a
+    // thousand dumps and a perturbed row.
+    std::atomic<long long> rtInFlightNs{ 0 };   // 0 = between iterations
+    std::atomic<bool>      watcherStop{ false };
+    std::atomic<bool>      watcherDumped{ false };
+    std::thread watcher([&] {
+        for (;;) {
+            if (watcherStop.load(std::memory_order_acquire)) return;
+            const long long started = rtInFlightNs.load(std::memory_order_acquire);
+            if (started != 0 && !watcherDumped.load(std::memory_order_relaxed)) {
+                const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          Clock::now().time_since_epoch()).count();
+                if ((double)(now - started) / 1000.0 > kPathologicalUs) {
+                    watcherDumped.store(true, std::memory_order_relaxed);
+                    printf("\n  *** STALL IN PROGRESS: this round trip has been outstanding for\n"
+                           "      %.1f us and has NOT completed. The pool state below is being read\n"
+                           "      WHILE it is stuck, which is the state the old dump could never\n"
+                           "      show -- it sampled after WaitFor returned, when the pool is idle\n"
+                           "      by construction. Read it as:\n"
+                           "        a worker AWAKE with an empty queue -> searching, finding nothing\n"
+                           "        a worker with a NON-EMPTY queue    -> queued and not being run\n"
+                           "        'rs' non-empty                     -> a pinned resume nobody may take\n"
+                           "        every worker busy                  -> saturation, not a stall\n"
+                           "        ALL asleep with nothing queued     -> the wake was LOST\n",
+                           (double)(now - started) / 1000.0);
+                    JLib::TaskScheduler::Instance().DumpPoolState("bench: STALL IN PROGRESS");
+                    printf("  (the row below still reports its own numbers)\n\n");
+                }
+            }
+            JLib::platform::CpuRelax();
+        }
+    });
+
     auto t0 = Clock::now();
     for (int i = 0; i < kIters; ++i) {
         JLib::WaitGroup wg;
@@ -790,8 +842,14 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             ? std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()
             : 0;
         const auto rtStart = Clock::now();
+        // PUBLISHED BEFORE THE PUSH and cleared after the wait, so the watcher above sees a
+        // non-zero start exactly for the window this thread is blocked in.
+        rtInFlightNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               rtStart.time_since_epoch()).count(),
+                           std::memory_order_release);
         sched.Push(t);
         sched.WaitFor(wg);
+        rtInFlightNs.store(0, std::memory_order_release);
         const double rt = std::chrono::duration<double, std::micro>(Clock::now() - rtStart).count();
         rtUs.push_back(rt);
 
@@ -799,13 +857,19 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             dumped = true;
             printf("\n  *** PATHOLOGICAL ROUND TRIP: iteration %d took %.1f us "
                    "(healthy is ~2 us) ***\n", i, rt);
-            printf("  Pool state AT THE MOMENT it happened follows. Read it as:\n"
-                   "    a worker AWAKE with an empty queue      -> it is searching and finding nothing\n"
-                   "    a worker with a NON-EMPTY queue         -> work is queued and not being run\n"
-                   "    'rs' non-empty                          -> a pinned resume nobody else may take\n"
-                   "    every worker busy                       -> genuine saturation, not a stall\n");
-            sched.DumpPoolState("bench: pathological round-trip latency");
-            printf("  (continuing -- the row below still reports its own numbers)\n\n");
+            // NO POOL DUMP HERE, AND ITS ABSENCE IS THE FIX. One used to print at this point under
+            // the heading "Pool state AT THE MOMENT it happened", which was not true: the task has
+            // completed, WaitFor has returned, and a serial loop has nothing else outstanding -- so
+            // the pool is idle BY CONSTRUCTION and the dump could only ever show two floor workers
+            // awake and everything else parked. That output was read as evidence more than once,
+            // including to build and then retract a theory about the park path.
+            //
+            // The watcher started before this loop dumps DURING the stall instead, which is the
+            // only time the state means anything. If it did not fire, the stall was shorter than
+            // its threshold, and that is worth knowing too.
+            printf("  (see the STALL IN PROGRESS dump above if the watcher caught one -- this\n"
+                   "   line is only the measurement. The pool is idle by now, so a dump taken\n"
+                   "   here would show nothing but an idle pool and has been removed.)\n\n");
         }
 
         if (JLib::kLatencyStatsEnabled) {
@@ -822,6 +886,11 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         }
     }
     double totalMs = MsBetween(t0, Clock::now());
+
+    // Stopped before the row is printed, so the spinning core is released and nothing below this
+    // point is measured with an extra thread running.
+    watcherStop.store(true, std::memory_order_release);
+    watcher.join();
 
     std::sort(rtUs.begin(), rtUs.end());
     auto pct = [&](double p) { return rtUs[(size_t)((double)(rtUs.size() - 1) * p)]; };
