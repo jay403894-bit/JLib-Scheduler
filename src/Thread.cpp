@@ -3349,7 +3349,17 @@ void Thread::Worker() {
 				// about to go looking again and must not be left advertising an intent to park.
 				// Published here rather than at the top of the block, which is what broke the park.
 				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
-				JLIBSCHED_LATENCY_MARK(Wake);
+				// NO LATENCY MARK HERE, AND REMOVING IT IS A FIX. `Wake` is specified in Thread.h as
+				// "cv.wait returns / the recheck-abort escape" -- both of them moments a worker STOPS
+				// BEING ASLEEP. This is neither: it is the spin path, taken by a worker that never
+				// parked and is going round again.
+				//
+				// The mark is a single process-wide global, so a marker that fires on every idle pass
+				// does not add noise -- it OVERWRITES. With any live floor, the spinning floor
+				// workers rewrote g_lastWakeNs continuously, and the push->Wake segment then measured
+				// the time since some unrelated worker's last spin rather than the time this task's
+				// worker took to wake. It read as a plausible small number, which is the worst way for
+				// an instrument to be wrong.
 
 				// ---- HOW OFTEN A SPINNING WORKER GIVES THE CORE BACK ------------------------
 				//
