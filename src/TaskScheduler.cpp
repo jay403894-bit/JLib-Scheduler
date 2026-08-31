@@ -4660,23 +4660,80 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// TaskType::Coroutine, because resuming a coroutine is a function call on the current stack and
 	// needs no fiber. Only Fiber-backed tasks are off limits. The name is kept rather than churned
 	// because it is public API; read it as "a task that does not require a fiber".
-	// A HOT WORKER LANDS HERE TOO, and that is a hole worth naming. OnBareThread() is true for a
-	// worker running a NATIVE task (no fiber), so a hot worker whose lane task calls WaitFor,
-	// SchedulerMutex or a condition variable helps through this function -- and GetTask() steals
-	// BULK work, which is exactly what "hot workers never steal" exists to prevent.
+	// ---- A LANE WORKER DOES NOT STEAL. IT DRAINS ITS OWN INBOX AND OTHERWISE WAITS. -----------
 	//
-	// It is NOT fixed by refusing. The fallback below drains this worker's own inboxes, and that
-	// drain is load-bearing: a Native task blocking on a worker makes its own inbox unreachable by
-	// the whole pool, which is a documented deterministic deadlock. Refusing to help would trade a
-	// policy violation for a hang.
+	// A HOT WORKER REACHES THIS FUNCTION, because OnBareThread() is true for a worker running a
+	// Native OR Coroutine task -- neither takes a fiber -- so a lane task that blocks in WaitFor,
+	// SchedulerMutex or a condition variable helps through here. GetTask() steals BULK work, which
+	// is exactly what "hot workers never steal" exists to prevent.
 	//
-	// So: drain the LANE FIRST. A hot worker checks its own inbox before touching anyone else's
-	// deque, which means lane work always wins over stolen bulk, and bulk is taken only when the
-	// lane is genuinely empty. The residual violation -- a hot worker running one bulk task while a
-	// lane task of its own is blocked -- is reachable only by breaking the lane contract (lane work
-	// must be short and non-blocking), and a bounded violation beats a deadlock.
+	// THIS USED TO ALLOW THE STEAL, on the argument that refusing would "trade a policy violation
+	// for a hang". THAT ARGUMENT WAS WRONG, and specifically it overstated the risk. Refusing to
+	// steal does not hang: whatever a blocked lane task is waiting on is still runnable by the
+	// other N-K workers, and they run it, and the lane resumes. What refusing costs is the K lane
+	// threads, for as long as the rest of the pool takes to clear the dependency. A real hang needs
+	// the REST OF THE POOL blocked too, and at that point the lane's steal policy is not what is
+	// killing you. The old code paid a permanent policy violation to insure against a scenario a
+	// narrower reading does not reach.
+	//
+	// THE OWN-INBOX DRAIN IS STILL LOAD-BEARING and is deliberately NOT gated: a task in this
+	// worker's inbox has exactly one legal consumer, so nobody else can rescue it, and skipping
+	// that drain IS a genuine deterministic deadlock. "Never steals" and "always drains its own
+	// inbox" are compatible, and the split between them is the whole point.
+	//
+	// SO A BLOCKING LANE TASK NOW STALLS THE LANE, LOUDLY, and that is the intended failure. It is
+	// a CONTRACT violation, not a workload condition -- lane work must be short and non-blocking --
+	// and for a contract violation a visible stall beats silent degradation. The old behaviour
+	// produced a program that worked, with a reserved core quietly running bulk and a lane whose
+	// p99 was wrong for reasons nothing reported. That surfaces months later as "the I/O latency
+	// got worse and we don't know when". A stalled lane is found in minutes. See the debug assert
+	// in the blocking primitives, which names the offending call site instead of making you infer
+	// it from a stack dump.
+	//
+	// The lane exists only because an app asked for it -- EnableIoReactor implies it -- so the
+	// workload is I/O completions: bounded, characterised work with known durations. A contract is
+	// enforceable when you can describe the workload it applies to.
+	//
+	// READING BANDS HERE IS SAFE, unlike on the notify side ([[band-skip-lost-wake]]). A stale read
+	// is benign in both directions: stale "reserved" refuses a steal for one pass and spins again,
+	// stale "not reserved" takes one bulk task, which is what the old code did unconditionally.
+	// Nothing parks on this decision, so no wake can be lost by it.
 	Task* task = laneTask;
-	if (!task) task = GetTask();
+	if (!task) {
+		const bool laneWorker = laneOwner && laneOwner->qIndex >= 0
+		                     && (size_t)laneOwner->qIndex < GetBands().k;
+		if (!laneWorker) {
+			task = GetTask();
+		}
+#ifndef NDEBUG
+		else {
+			// ---- THE CONTRACT VIOLATION, NAMED ONCE ------------------------------------------
+			//
+			// Reaching here means all of: this is a reserved worker, it is inside a blocking
+			// primitive (that is the only way into this function), and its own lane inbox is
+			// empty. So a lane task is blocked on something no lane drain can supply -- exactly
+			// what "lane work is short and non-blocking" forbids. There is no legitimate path
+			// that produces this combination, so it cannot false-positive.
+			//
+			// A MESSAGE, NOT AN abort(). The stall IS the intended failure and the program should
+			// still reach it; aborting would replace the behaviour under test with a different
+			// one. This only removes the need to infer the cause from a dump of parked threads.
+			//
+			// ONE-SHOT, because a blocked lane task calls its primitive in a spin loop and would
+			// otherwise emit thousands of identical lines and bury the first.
+			static std::atomic<bool> warned{ false };
+			bool expected = false;
+			if (warned.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+				fprintf(stderr,
+				        "[JLib::Scheduler] LANE CONTRACT VIOLATED: reserved worker q%d is BLOCKED "
+				        "inside a task.\n  Lane work must be short and non-blocking; a lane task "
+				        "must not call WaitFor, SchedulerMutex\n  or a condition variable. The "
+				        "lane will stall until the rest of the pool clears what it waits on.\n"
+				        "  Break on this line to find the blocking call.\n",
+				        laneOwner->qIndex);
+		}
+#endif
+	}
 	if (!task) {
 		// Nothing stealable anywhere -- but "anywhere" only covers DEQUES, and if this caller is a
 		// WORKER it is here because it is blocked inside a task (a Native task spinning in

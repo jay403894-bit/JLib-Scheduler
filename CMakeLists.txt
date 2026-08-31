@@ -887,6 +887,11 @@ target_link_libraries(SchedulerReservedBandLiveKTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedBandLiveKTest PRIVATE cxx_std_17)
 
 
+add_executable(SchedulerLaneNoStealTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/lane_no_steal_test.cpp")
+target_link_libraries(SchedulerLaneNoStealTest PRIVATE Scheduler)
+target_compile_features(SchedulerLaneNoStealTest PRIVATE cxx_std_17)
+
+
 add_executable(SchedulerStealHintWordsTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_hint_words_test.cpp")
 target_link_libraries(SchedulerStealHintWordsTest PRIVATE Scheduler)
 target_compile_features(SchedulerStealHintWordsTest PRIVATE cxx_std_17)
