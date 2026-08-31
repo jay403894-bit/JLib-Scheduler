@@ -3059,6 +3059,59 @@ static constexpr size_t kMinGrain = 16;
 // is serial time on the critical path and that path is shortest exactly when the body is dear.
 static constexpr long long kProbeFloorNs = 500;
 
+// ---- REMEMBERED BODY COST, PER CALL SITE ------------------------------------------------------
+//
+// WHY THIS EXISTS. The width probe is one leaf late by construction: it cannot know what a body
+// costs until it has run some of it, so the FIRST range of any burst pays the old behaviour and
+// only later ones benefit. Remembering what the last call measured moves that knowledge to BEFORE
+// the next range instead of after, which is the whole of the cold-start problem.
+//
+// KEYED BY THE CALLABLE'S TYPE, AND A GLOBAL AVERAGE WOULD BE WORSE THAN NOTHING. A single EWMA
+// across all call sites mixes a 0.5 ns/element body with a 600 ns/element one and produces a number
+// describing neither -- and the bench alternates exactly those two, so it would have been measured
+// as "working" while being meaningless. std::function::target_type() is the identity actually
+// available here: every lambda has a distinct type, so a call site keys to itself across calls
+// without an API change or a caller-supplied token.
+//
+// COLLISIONS ARE SAFE, which is why open addressing with a short probe is enough. A wrong estimate
+// costs a wrong initial width, and width is already a LOWER BOUND that recruitment corrects upward
+// from measured leaves. Nothing here can produce an incorrect result, only a worse ramp.
+//
+// STORED AS ns PER MILLION ITEMS because per-item is routinely sub-nanosecond and integer division
+// would floor a trivial body to zero -- the exact case that must not be confused with "unknown".
+namespace {
+	struct BodyCost {
+		std::atomic<size_t>    key{ 0 };          // type_info hash, 0 = empty
+		std::atomic<long long> nsPerMega{ 0 };    // ns per 1,000,000 items
+		std::atomic<unsigned>  uses{ 0 };         // for the periodic re-probe
+	};
+	constexpr size_t kBodyCostSlots = 64;
+	BodyCost g_bodyCost[kBodyCostSlots];
+
+	// A REPROBE EVERY 64 USES, because a remembered cost is a claim about a body that may change --
+	// same lambda, different data, different cache behaviour. Cheap insurance: 1 call in 64 pays
+	// the probe and refreshes, the rest start hot.
+	constexpr unsigned kReprobeInterval = 64;
+
+	BodyCost* FindBodySlot(size_t key) noexcept {
+		if (key == 0) key = 1;                     // 0 is the empty sentinel
+		const size_t start = key % kBodyCostSlots;
+		for (size_t i = 0; i < 8; ++i) {           // short probe; give up rather than scan 64
+			BodyCost& e = g_bodyCost[(start + i) % kBodyCostSlots];
+			const size_t k = e.key.load(std::memory_order_acquire);
+			if (k == key) return &e;
+			if (k == 0) {
+				size_t expected = 0;
+				if (e.key.compare_exchange_strong(expected, key, std::memory_order_acq_rel,
+				                                  std::memory_order_acquire))
+					return &e;
+				if (expected == key) return &e;    // lost the race to the same key: fine
+			}
+		}
+		return nullptr;                            // table full for this key: behave as uncached
+	}
+}
+
 // How many thieves a range wakes on its OPENING publish. Not 1 (too slow to fill a parked pool) and
 // not a cascade (which lands 29 workers on a range that wanted 4). After the first wave, a wake
 // happens only when a previous split is still unclaimed -- demand recruits the rest.
@@ -3084,6 +3137,33 @@ size_t TaskScheduler::GetLazySplitCap() noexcept { return g_lazySplitCap.load(st
 static std::atomic<bool> g_measuredWidth{ false };
 void TaskScheduler::SetMeasuredWidth(bool on) noexcept { g_measuredWidth.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::GetMeasuredWidth() noexcept { return g_measuredWidth.load(std::memory_order_relaxed); }
+
+// ---- OFF BY DEFAULT, AND THE REASON IS A MEASURED FAILURE, NOT CAUTION -----------------------
+//
+// The idea is right and the KEY IS WRONG. Keying on func.target_type() assumes one callable type
+// per call site, and that assumption breaks on a completely ordinary pattern: a dispatcher that
+// forwards every body through a single wrapper lambda. The scheduler's own grain sweep does exactly
+// that -- one lambda at bench.cpp serves trivial through heavy, selecting the body from a captured
+// variable -- so all four hash to the SAME slot and the EWMA averages a 0.5 ns/element body with a
+// 600 ns/element one.
+//
+// MEASURED, mwidth with minfan=0, memory on vs off:
+//
+//                trivial256  light256  light1000
+//   nomemory        0.33x      0.71x      0.38x
+//   remembered      0.01x      0.07x      0.09x
+//
+// 33x worse on trivial, because the remembered "average" body looks expensive enough to fan out
+// work that costs nanoseconds. This is the exact hazard written into the comment on the table above
+// -- and it was shipped anyway on the assumption that call sites have distinct lambda types.
+//
+// SO IT NEEDS A KEY THE LIBRARY CANNOT DERIVE. A caller-supplied token would work and is an API
+// change; a return-address key would work and is not portable. Left in, off, because the mechanism
+// is correct once keyed correctly and the next attempt should start from this result rather than
+// rediscover it.
+static std::atomic<bool> g_rememberedCost{ false };
+void TaskScheduler::SetRememberedCost(bool on) noexcept { g_rememberedCost.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetRememberedCost() noexcept { return g_rememberedCost.load(std::memory_order_relaxed); }
 
 static std::atomic<bool> g_rangeRecruit{ true };
 void TaskScheduler::SetRangeRecruit(bool on) noexcept { g_rangeRecruit.store(on, std::memory_order_relaxed); }
@@ -3455,6 +3535,28 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	size_t fanWidth = workers.size();
 	if (GetMeasuredWidth()) {
 		const int len = end - begin;
+
+		// ---- IF THIS BODY HAS BEEN MEASURED BEFORE, DECIDE NOW AND SKIP THE PROBE -------------
+		//
+		// The probe is serial time on the critical path. A call site that has already been measured
+		// does not need to pay it again -- the previous call's leaves ARE the measurement, and they
+		// were taken from work that had to happen either way. This is what turns "correct from the
+		// second range" into "correct from the second range onward, for free".
+		BodyCost* slot = GetRememberedCost() ? FindBodySlot(func.target_type().hash_code()) : nullptr;
+		if (slot) {
+			const long long nsPerMega = slot->nsPerMega.load(std::memory_order_relaxed);
+			const unsigned  uses      = slot->uses.fetch_add(1, std::memory_order_relaxed);
+			// Known, and not due for a refresh.
+			if (nsPerMega > 0 && (uses % kReprobeInterval) != 0) {
+				const long long W = (nsPerMega * (long long)len) / 1'000'000LL;
+				const long long c = (long long)GetWakeCostNs();
+				size_t k = (size_t)std::sqrt((double)W / (double)(c > 0 ? c : 1));
+				if (k > workers.size()) k = workers.size();
+				if (k < 2) { func(begin, end); return; }   // remembered as too cheap to fan out
+				fanWidth = k;
+				goto haveWidth;                            // no probe, no serial prologue at all
+			}
+		}
 		// A BOUNDED FRACTION, NOT A FIXED COUNT, and getting this wrong cost heavy work 35%.
 		// The probe runs SERIALLY on the caller before anything fans out, so it is Amdahl's serial
 		// fraction and it must scale with the range. A flat kMinGrain=64 is 25% of a 256-item range
@@ -3504,6 +3606,18 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		begin += probed;
 		if (begin >= end) return;                // the whole range was the probe
 		const long long W = (probeNs * (long long)len) / (probeLen > 0 ? probeLen : 1);
+
+		// REMEMBER IT, so the next range of this body starts hot rather than re-paying the probe.
+		// EWMA weighted 3:1 toward history -- one unrepresentative reading (a cold cache, a
+		// preempted measurement) should nudge the estimate, not replace it. The first sample seeds
+		// outright, because averaging a correct first reading against 0 would halve it for nothing.
+		if (slot) {
+			const long long sample = (probeNs * 1'000'000LL) / (probeLen > 0 ? probeLen : 1);
+			const long long prev = slot->nsPerMega.load(std::memory_order_relaxed);
+			slot->nsPerMega.store(prev > 0 ? (prev * 3 + sample) / 4 : sample,
+			                      std::memory_order_relaxed);
+		}
+
 		const long long c = (long long)GetWakeCostNs();
 		size_t k = (size_t)std::sqrt((double)W / (double)(c > 0 ? c : 1));
 		if (k > workers.size()) k = workers.size();
@@ -3521,6 +3635,11 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 			return;
 		}
 	}
+	// Reached directly by the remembered-cost path above, which has a width and no probe to run.
+	// A forward jump over both branches, which is legal precisely because everything it skips is
+	// scoped inside them -- fanWidth is declared before the branch and is the only value carried.
+haveWidth:
+	;
 
 	// GRAIN IS FLOORED SO THE TREE CANNOT PRODUCE MORE LEAVES THAN THE POOL CAN USE.
 	//

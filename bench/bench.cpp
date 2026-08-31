@@ -1529,6 +1529,7 @@ template <int kFlops>
 static void SweepSplitterVsCursor(JLib::TaskScheduler& sched, const char* label, const std::vector<int>& sizes) {
     printf("  %-10s |", label);
     std::vector<double> ratios;
+    std::vector<bool>   suspects;   // per cell: did its own same-vs-same control move >5%?
     ratios.reserve(sizes.size());
 
     for (int n : sizes) {
@@ -1568,6 +1569,8 @@ static void SweepSplitterVsCursor(JLib::TaskScheduler& sched, const char* label,
             return ms;
         };
 
+        // Parallel to `ratios`: whether each cell's own same-vs-same control held. The verdict
+        // below consults it; printing a '?' the reader must apply by hand is not a control.
         std::vector<double> splitMs, cursorMs, ctlMs;
         splitMs.reserve(kReps); cursorMs.reserve(kReps); ctlMs.reserve(kReps);
         for (int r = 0; r < kReps; ++r) {
@@ -1586,20 +1589,36 @@ static void SweepSplitterVsCursor(JLib::TaskScheduler& sched, const char* label,
         ratios.push_back(cursorWins);
 
         const bool suspect = std::fabs(noiseFloor - 1.0) > 0.05;   // control moved >5% on its own
+        suspects.push_back(suspect);
         printf(" %5.2fx%s", cursorWins, suspect ? "?" : " ");
     }
 
     // Same persistence rule SweepOne uses: the first N where the cursor clears the margin AND is
     // still ahead at the next size, so a lone spike is not reported as a real crossover.
+    // SKIP THE CELLS THIS FUNCTION JUST FLAGGED. `suspect` was computed, printed as '?', and then
+    // discarded -- so the verdict was derived from data the same code told the reader not to
+    // believe. On a run where 19 of 24 cells were flagged it still announced "cursor ahead from
+    // N=1000" and "from N=100000", both resting on flagged cells, while the only two UNFLAGGED
+    // cells in the table disagreed with each other about the direction.
+    //
+    // A control that is displayed but not obeyed is worse than no control: it looks like rigour
+    // and changes nothing. If every candidate is suspect there is no verdict to report, and saying
+    // so is the honest output.
     int crossover = -1;
+    bool anyTrustworthy = false;
     for (size_t i = 0; i < ratios.size(); ++i) {
+        if (suspects[i]) continue;                 // the control moved on its own here
+        anyTrustworthy = true;
         if (ratios[i] < kWinMargin) continue;
-        if (i + 1 < ratios.size() && ratios[i + 1] < kWinMargin) continue;
+        // The persistence rule still applies, but a suspect NEIGHBOUR cannot refute a good cell --
+        // treat it as absent rather than as evidence against.
+        if (i + 1 < ratios.size() && !suspects[i + 1] && ratios[i + 1] < kWinMargin) continue;
         crossover = sizes[i];
         break;
     }
-    if (crossover > 0) printf("   | cursor ahead from N=%d\n", crossover);
-    else               printf("   | splitter ahead (or tied) across this whole range\n");
+    if (crossover > 0)          printf("   | cursor ahead from N=%d\n", crossover);
+    else if (!anyTrustworthy)   printf("   | NO VERDICT -- every cell's own control moved >5%%\n");
+    else                        printf("   | splitter ahead (or tied) across this whole range\n");
 }
 
 static void BenchSplitterVsCursorCrossover(JLib::TaskScheduler& sched) {
@@ -2532,6 +2551,16 @@ int main(int argc, char** argv) {
         //   one number handles both ends, so a run that only improves one end has not shown it.
         if (JLIB_STRICMP(argv[a], "mwidth") == 0) {
             JLib::TaskScheduler::SetMeasuredWidth(true);
+            continue;
+        }
+        // memory -- remember measured body cost per call site so the NEXT range skips the probe.
+        //   OFF by default because it MEASURED WORSE here, and the reason is this harness: one
+        //   lambda serves all four grain rows, so target_type() keys them all to the same slot and
+        //   the average of a trivial and a heavy body describes neither. trivial N=256 went
+        //   0.33x -> 0.01x. The flag exists to reproduce that, and to be useful in a program whose
+        //   call sites have genuinely distinct callable types. Only meaningful with `mwidth`.
+        if (JLIB_STRICMP(argv[a], "memory") == 0) {
+            JLib::TaskScheduler::SetRememberedCost(true);
             continue;
         }
         if (JLIB_STRICMP(argv[a], "norecruit") == 0) {

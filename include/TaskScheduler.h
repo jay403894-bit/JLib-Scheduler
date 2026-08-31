@@ -865,6 +865,26 @@ namespace JLib {
 		static void   SetMeasuredWidth(bool on) noexcept;
 		static bool   GetMeasuredWidth() noexcept;
 
+		// Remember what each call site's body cost, so the NEXT range of it starts at the right
+		// width with no probe at all -- the probe is serial time on the critical path, and paying
+		// it again for a body already measured is the cold-start cost repeated forever.
+		//
+		// Keyed by the callable's type (every lambda has a distinct one), NOT globally: a single
+		// average across call sites mixes a 0.5 ns/element body with a 600 ns/element one and
+		// describes neither. Collisions are harmless -- a wrong estimate costs a wrong initial
+		// width, and width is a lower bound that recruitment corrects upward.
+		//
+		// Re-probes 1 call in 64 so a body whose cost drifts is not remembered wrong forever.
+		//
+		// OFF BY DEFAULT, ON A MEASURED FAILURE. target_type() assumes one callable type per call
+		// site, and a dispatcher that forwards every body through ONE wrapper lambda -- an ordinary
+		// pattern, and what the scheduler's own grain sweep does -- collapses every body to a single
+		// key. Measured: trivial at N=256 went 0.33x -> 0.01x with memory on, because the averaged
+		// "body" looked expensive enough to fan out work costing nanoseconds. Needs a caller-supplied
+		// key to be correct; enable only if your call sites have genuinely distinct callable types.
+		static void   SetRememberedCost(bool on) noexcept;
+		static bool   GetRememberedCost() noexcept;
+
 		// The price of one kernel wake, in nanoseconds -- the `c` above. MEASURED, not guessed:
 		// event/resume with a 1 ms hold-off costs 8.0 us against 5.0 us with none, and that ~3 us
 		// delta is the OS wake and nothing else. It is a property of the MACHINE, so it is a knob
