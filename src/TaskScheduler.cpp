@@ -1602,6 +1602,18 @@ unsigned long long TaskScheduler::GetLaneStrandIdleWideCount() noexcept {
 // use, and a push that reads a stale value routes one task by the other policy -- both destinations
 // are legal, both are drained, nothing is lost. Making it seq_cst would put a fence on the push path
 // to protect a flag nobody flips at runtime.
+// Which breadth the LAZY SPLITTER asks for. Default false = CorePref::Default, the shipped
+// behaviour; see the argument at the CreateTask in RunLazyRange. Exists because that argument is a
+// prediction nobody has A/B'd on a quiet machine, and a cross-run comparison cannot settle it -- the
+// crossover's serial baselines have been seen to move 2x between runs.
+static std::atomic<bool> g_parallelSplitWide{ false };
+void TaskScheduler::SetParallelSplitWide(bool on) noexcept {
+	g_parallelSplitWide.store(on, std::memory_order_relaxed);
+}
+bool TaskScheduler::ParallelSplitWide() noexcept {
+	return g_parallelSplitWide.load(std::memory_order_relaxed);
+}
+
 static std::atomic<bool> g_hiPriFloorLane{ false };
 void TaskScheduler::SetHiPriFloorLane(bool on) noexcept {
 	g_hiPriFloorLane.store(on, std::memory_order_relaxed);
@@ -3041,7 +3053,8 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// The type is spelled out for the reason below; the pref is spelled out so nobody re-applies
 		// the cursor's reasoning here without re-running that table.
 		Task* t = CreateTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); },
-		                     false, TaskType::Native, CorePref::Default);
+		                     false, TaskType::Native,
+		                     ParallelSplitWide() ? CorePref::Wide : CorePref::Default);
 		if (!t) break;                      // slab exhausted: run the remainder inline, no error
 		t->waitGroup = st->wg;
 

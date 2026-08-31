@@ -1145,6 +1145,25 @@ namespace JLib {
 		// floor worker is awake, which buys the absence of a kernel wake, and it is NOT free, which
 		// is a different question -- a completion behind its current body waits for that body. The
 		// spill cannot help either: it searches [0, K), and this variant is for K = 0.
+		// ---- WHICH BREADTH DOES THE LAZY SPLITTER ASK FOR? ------------------------------------
+		//
+		// Default false = CorePref::Default, the shipped behaviour. True = Wide, so each split half
+		// is placed across the full pool instead of steered at the awake floor.
+		//
+		// A SWITCH RATHER THAN A DECISION, because the decision is not made. The case for Default is
+		// that a lazy split is SPECULATIVE -- halved on the guess a thief takes it, and an untaken
+		// split is taken straight back and run inline for ~11 ns -- so paying a kernel wake per
+		// split, recursively, is the wrong currency. That is reasoning. The one attempt to measure
+		// it read the splitter-vs-cursor table inverting, which turned out to be a property of the
+		// measuring machine: the same code reads 1.46-1.76 (cursor ahead) under a throttled process
+		// and 1.02-1.07 (tied) on a quiet one.
+		//
+		// AND IT CANNOT BE SETTLED ACROSS RUNS. The crossover's serial baselines have been observed
+		// to move 2x between runs, which makes any before/after comparison of those cells worthless.
+		// The bench's `splitpref` row exists to alternate the two settings within one measurement.
+		static void SetParallelSplitWide(bool on) noexcept;
+		static bool ParallelSplitWide() noexcept;
+
 		static void SetHiPriFloorLane(bool on) noexcept;
 		static bool HiPriFloorLane() noexcept;
 

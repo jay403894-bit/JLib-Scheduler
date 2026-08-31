@@ -1286,6 +1286,69 @@ static void BenchSplitterVsCursorCrossover(JLib::TaskScheduler& sched) {
     printf("  (sink %.1f -- printed only so the bodies can't be optimized away)\n", g_sink.load());
 }
 
+// ------------------------------------------------------ splitpref: does the SPLITTER want Wide?
+//
+// THE ONE QUESTION THIS ROW EXISTS FOR. RunLazyRange places each split half, and whether that push
+// should be steered at the awake floor (Default) or spread across the pool (Wide) is unsettled. The
+// case for Default is that the split is SPECULATIVE -- an untaken one is taken straight back and run
+// inline for ~11 ns -- so a kernel wake per split, recursively, is the wrong currency. That is a
+// prediction.
+//
+// IT CANNOT BE ANSWERED ACROSS RUNS, and that is why this is a row rather than a flag you set twice.
+// The crossover's serial baselines have been seen to move 2x between runs of the same binary, and
+// the splitter-vs-cursor table reads 1.46-1.76 on a throttled process against 1.02-1.07 on a quiet
+// one -- same code. Anything compared across two invocations is measuring the machine.
+//
+// SO THE ARMS ALTERNATE INSIDE ONE LOOP, A/B/A/B, and the reported number is the median of each.
+// Interleaving is what makes thermal drift, a background process and clock behaviour common-mode.
+//
+// AND IT MUST BE READ AT A FIXED FLOOR. At floor=31 nothing parks, the steer set IS the whole pool,
+// and Default and Wide place almost identically -- the row would honestly report ~1.00x and mean
+// nothing. Run it at the default floor=2, where the two differ.
+static void BenchSplitPref(JLib::TaskScheduler& sched) {
+    printf("\nsplitpref    : does the LAZY SPLITTER want Wide? ratio = default_ms/wide_ms; >1.00 means Wide wins\n");
+    printf("               arms ALTERNATE inside one loop -- a cross-run comparison of this cannot\n"
+           "               work, see the note above. Read at floor=2; at a wide floor both arms\n"
+           "               place identically and this is ~1.00x by construction.\n");
+
+    struct Case { const char* name; int n; int work; };
+    const Case cases[] = {
+        { "medium N=20000",  20000,  64 },
+        { "heavy  N=20000",  20000, 512 },
+        { "heavy  N=200000", 200000, 512 },
+    };
+
+    for (const Case& c : cases) {
+        std::vector<double> dflt, wide;
+        constexpr int kReps = 7;
+        for (int r = 0; r < kReps; ++r) {
+            for (int arm = 0; arm < 2; ++arm) {
+                JLib::TaskScheduler::SetParallelSplitWide(arm != 0);
+                const auto t0 = Clock::now();
+                sched.ParallelFor(0, c.n, 1, [&](int lo, int hi) {
+                    double acc = 0;
+                    for (int i = lo; i < hi; ++i)
+                        for (int k = 0; k < c.work; ++k) acc += (double)(i ^ k) * 1.000001;
+                    // store, not fetch_add: std::atomic<double> has no fetch_add before C++20 and
+                    // this only needs to defeat the optimiser, not accumulate correctly.
+                    g_sink.store(g_sink.load(std::memory_order_relaxed) + acc,
+                                 std::memory_order_relaxed);
+                });
+                const double ms = MsBetween(t0, Clock::now());
+                (arm ? wide : dflt).push_back(ms);
+            }
+        }
+        JLib::TaskScheduler::SetParallelSplitWide(false);   // leave the process on the shipped default
+
+        std::sort(dflt.begin(), dflt.end());
+        std::sort(wide.begin(), wide.end());
+        const double d = dflt[dflt.size() / 2];
+        const double w = wide[wide.size() / 2];
+        printf("               %-16s default %7.3f ms | wide %7.3f ms  ->  %.2fx\n",
+               c.name, d, w, (w > 0.0) ? d / w : 0.0);
+    }
+}
+
 // ------------------------------------------------- inbox-drain dispatch: Requeue loop vs PushBatch
 // Worker()'s immediate/fork inbox drain (Thread.cpp, "2. Immediate task execution") empties a
 // worker's own inbox one task at a time via Requeue() before that worker pins to a persistent
@@ -2446,6 +2509,7 @@ int main(int argc, char** argv) {
     Section("burst");          BenchIdleBurst(sched, JLib::CorePref::Wide);
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
     if (runSweep) { Section("splitter vs cursor sweep");    BenchSplitterVsCursorCrossover(sched); }
+    if (runSweep) { Section("splitpref");                   BenchSplitPref(sched); }
     if (runSweep) { Section("requeue vs pushbatch");        BenchRequeueVsPushBatch(sched); }
 
     g_benchDone.store(true, std::memory_order_release);
