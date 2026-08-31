@@ -785,6 +785,14 @@ void TaskScheduler::Join() {
 
 	poolActive.store(false, std::memory_order_release);
 }
+// The worker the most recent placement-chosen push was aimed at, -1 before any. Read only by
+// DumpPoolState, to mark the row a stalled round trip is waiting on -- see the write site, which is
+// after the hiPri spill redirect so it names where the task actually went.
+//
+// Unconditional rather than behind the stats define: it is one relaxed store on a path that already
+// does several, and a stall dump is precisely when a normal Release build needs to know this.
+static std::atomic<int> g_lastPushTarget{ -1 };
+
 void TaskScheduler::DumpPoolState(const char* why) const {
 	printf("\n=== POOL STATE (%s) ===\n", why);
 	// Queued work is SUMMED FROM THE QUEUES rather than read off a counter. There used to be a
@@ -882,7 +890,9 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 			// is true of that queue by design rather than by accident of scheduling.
 			(s.workerState == 2 && (s.hasQueuedWork || !hiPriInboxes[i]->empty()
 				|| !loPriInboxes[i]->empty() || !resumedInboxes[i]->empty()))
-					? "   <-- SLEEPING WITH WORK" : "");
+					? "   <-- SLEEPING WITH WORK"
+			: (g_lastPushTarget.load(std::memory_order_relaxed) == s.qIndex)
+					? "   <-- LAST PUSH TARGET" : "");
 	}
 	if (nonWorkerLane < deques.size()) {
 		printf(" nw  %-14s   -      -    -   -     -/-           %zu/%zu%s\n",
@@ -2742,6 +2752,7 @@ void TaskScheduler::ClampHotWorkersToPool() {
 // Read by the hot workers themselves and by the reactor's completion threads, each of which raises
 // its OWN priority. Off by default -- see the header.
 static std::atomic<TaskScheduler::HotThreadPolicy> g_hotPolicy{ TaskScheduler::HotThreadPolicy::Normal };
+
 void TaskScheduler::SetHotThreadPolicy(HotThreadPolicy p) { g_hotPolicy.store(p, std::memory_order_relaxed); }
 
 // Read ONCE per worker at thread entry, never on a per-task path -- relaxed is right and nothing
@@ -5441,6 +5452,21 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		if (useHi) chosen = (uint8_t)HiPriSpillTarget((size_t)chosen);
 
 		NotePush();
+		// ---- REMEMBER WHERE THIS PUSH WENT, SO A STALL DUMP CAN POINT AT IT ------------------
+		//
+		// Mid-stall the watcher cannot tell WHICH worker the outstanding task is waiting on: the
+		// task has not run, so nothing has recorded a landing index yet. That leaves the reader
+		// correlating against thirty-one interleaved rows by hand -- and the row that mattered was
+		// the one the paste happened to cut.
+		//
+		// AFTER the spill redirect, for the same reason NotePush sits here. Recording before it
+		// would name a worker the task was moved off, which is the counters-describe-one-worker,
+		// task-sits-on-another bug the comment above warns about.
+		//
+		// Relaxed, last-writer-wins: the serial latency row has one push in flight, which is the
+		// only case this is read in. Under concurrent producers it names whichever pushed last, and
+		// the dump labels it so rather than implying more than it knows.
+		g_lastPushTarget.store((int)chosen, std::memory_order_relaxed);
 		if (chosen < workers.size() && workers[chosen]
 		    && workers[chosen]->GetWorkerState() == 2 /* WS_SLEEPING */)
 			NoteWakeMiss();

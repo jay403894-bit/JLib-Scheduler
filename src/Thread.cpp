@@ -631,6 +631,26 @@ void Thread::Suspend(Fiber* targetFiber){
 	 GetCurrent()->currentFiber->Suspend();
  }
 
+// ---- ALWAYS-NOTIFY: THE A/B FOR "IS THERE A RACE ON THE AWAKE SKIP?" -------------------------
+//
+// The skip below is the StoreLoad half of the wake protocol: the producer stores the task, then
+// loads workerState seq_cst, and skips only on WS_AWAKE. The argument that it is safe is that the
+// worker's CAS to GOING_TO_SLEEP and its seq_cst re-check both follow that load in the single
+// total order, so a worker cannot park on work pushed before it read AWAKE.
+//
+// THAT ARGUMENT IS A PROOF SKETCH, NOT A MEASUREMENT, and this flag is how it gets tested rather
+// than asserted. Forcing every notify makes the skip unreachable: if the stalls persist unchanged,
+// the skip is not implicated and the tail lives somewhere else. If they vanish, the argument above
+// is wrong somewhere and the protocol needs re-deriving -- which would be a correctness bug, not a
+// tuning one.
+//
+// It is NOT a candidate default. Every push would pay a WakeByAddressSingle syscall, including the
+// overwhelming majority aimed at workers that are genuinely awake and need nothing -- which is the
+// cost the skip exists to avoid. This is an instrument.
+static std::atomic<bool> g_alwaysNotify{ false };
+void TaskScheduler::SetAlwaysNotify(bool on) noexcept { g_alwaysNotify.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetAlwaysNotify() noexcept { return g_alwaysNotify.load(std::memory_order_relaxed); }
+
 void Thread::NotifyWorker(bool force){
 	// ---- THE FLOOR IS ALREADY SCHEDULED ------------------------------------------------------
 	//
@@ -696,7 +716,10 @@ void Thread::NotifyWorker(bool force){
 	// control survives it: `-DLANE_ONLY -DWEAK_LANEWAKE` is the same shape on laneWake and fails the
 	// same way. If ANOTHER input is ever added to the sleep predicate, it must be
 	// seq_cst on both sides and it must go into that model. A proof covers what it modelled.
-	if (!force && workerState.load(std::memory_order_seq_cst) == WS_AWAKE) return;
+	// g_alwaysNotify makes this skip unreachable -- the A/B for whether the AWAKE skip is
+	// implicated in the dispatch tail. See the flag definition above.
+	if (!force && !g_alwaysNotify.load(std::memory_order_relaxed)
+	    && workerState.load(std::memory_order_seq_cst) == WS_AWAKE) return;
 
 	// ---- ONE THING TO SIGNAL ---------------------------------------------------------------
 	//

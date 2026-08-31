@@ -900,6 +900,25 @@ namespace JLib {
 		// delta is the OS wake and nothing else. It is a property of the MACHINE, so it is a knob
 		// rather than a constant; a box with a cheaper wake should recruit sooner and parallelize
 		// smaller ranges, and both fall out of this one number.
+		// ---- INSTRUMENT: force every notify, making the WS_AWAKE skip unreachable --------------
+		//
+		// NotifyWorker skips the wake when it reads the target as WS_AWAKE. That skip is the
+		// StoreLoad half of the wake protocol and the reason a push to a running worker costs no
+		// syscall. Its safety rests on an ORDERING ARGUMENT -- the producer stores the task before
+		// loading the state, so the worker's CAS to GOING_TO_SLEEP and its seq_cst re-check both
+		// follow that load in the single total order, and it cannot park on work already pushed.
+		//
+		// This flag tests that argument instead of restating it. Force every notify: if the tail
+		// is unchanged, the skip is not implicated and the stalls live elsewhere. If it vanishes,
+		// the ordering argument is wrong somewhere and this is a correctness bug rather than a
+		// tuning question.
+		//
+		// NOT A CANDIDATE DEFAULT. Every push would pay a WakeByAddress syscall, including the
+		// overwhelming majority aimed at workers that are awake and need nothing -- exactly the
+		// cost the skip exists to remove.
+		static void   SetAlwaysNotify(bool on) noexcept;
+		static bool   GetAlwaysNotify() noexcept;
+
 		static void   SetWakeCostNs(unsigned ns) noexcept;
 		static unsigned GetWakeCostNs() noexcept;
 
