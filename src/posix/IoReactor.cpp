@@ -518,22 +518,34 @@ bool IoReactor::IsAvailable() noexcept {
     // and nothing has run under load for longer than the suite takes. Reporting available is a
     // claim that the operations work, not that the backend is seasoned.
     //
-    // ---- JLIB_IO_URING_OFF=1 TURNS IT BACK OFF ------------------------------------------------
+    // ---- BOTH OVERRIDES EXIST, AND KEEPING THE "ON" ONE IS THE POINT --------------------------
     //
-    // The escape hatch points the other way now. While this returned false the variable was
-    // JLIB_IO_URING_FORCE, because the failing path was unreachable and therefore unreproducible
-    // without editing the library. With the backend reporting available, the useful override is the
-    // opposite one: something in the field misbehaves, and the operator needs the synchronous path
-    // back without a rebuild or a downgrade.
+    //   JLIB_IO_URING_FORCE=1   report available even though the default says no
+    //   JLIB_IO_URING_OFF=1     report unavailable even though the default says yes
     //
-    // DELIBERATELY AN ENVIRONMENT VARIABLE AND NOT AN API. Nothing an application links against can
-    // flip it by accident, and a variable set in one shell does not follow a shipped binary.
+    // FORCE was briefly deleted when this flipped to available, on the reasoning that the useful
+    // override had become the opposite one. Then the default went back to false for the teardown
+    // hang -- and with FORCE gone there was NO WAY to reach the failing path without editing the
+    // library and rebuilding. A gate that makes a bug unreachable also makes it unreproducible, and
+    // removing the only way past the gate takes the bug away from whoever wants to debug it.
+    //
+    // So both stay, permanently, in both polarities. Whichever way the default points, the other
+    // direction is one environment variable away.
+    //
+    // DELIBERATELY ENVIRONMENT VARIABLES AND NOT AN API. Nothing an application links against can
+    // flip either by accident, and a variable set in one shell does not follow a shipped binary.
     {
         static const bool off = [] {
             const char* v = std::getenv("JLIB_IO_URING_OFF");
             return v && *v && *v != '0';
         }();
         if (off) return false;
+
+        static const bool forced = [] {
+            const char* v = std::getenv("JLIB_IO_URING_FORCE");
+            return v && *v && *v != '0';
+        }();
+        if (forced) return uring::Probe() == uring::InitResult::Ok;
     }
 
     // ---- PROBES THE KERNEL; DOES NOT CONSTRUCT A REACTOR --------------------------------------
@@ -567,6 +579,26 @@ bool IoReactor::IsAvailable() noexcept {
     // shutdown that is waiting for threads that were never told to stop -- or were told and are not
     // looking. It is NOT the cancel drain: Stop()'s blanket `RequestCancel(CancelToken{})` still
     // takes the `all` path (a default token is !Valid(), which is what that flag tests).
+    //
+    // THE THREE ARE ALMOST CERTAINLY THE NEVER-PARK SET, AND THAT IS THE LEAD. This test calls
+    // EnableIoReactor, which implies SetIoHotLane(1), so K = 1; with the default floor of 2 that is
+    // exactly 1 + 2 = 3 threads that do not park by construction. Every other worker is parked, and
+    // a parked worker is woken and joined without trouble -- the 26 in futex_do_wait are not the
+    // problem. So the question to start from is whether TaskScheduler's teardown can join a band
+    // whose members are spinning rather than waiting on the primitive it signals, and whether the
+    // reactor's own Stop() completes before that or is itself the thing main is blocked in.
+    //
+    // TO REPRODUCE (WSL is enough; no liburing needed, IoUring.h is raw uapi):
+    //
+    //     JLIB_IO_URING_FORCE=1 ./build/bin/SchedulerIoSocketTest ; echo "exit=$?"
+    //
+    // It prints ALL CHECKS PASSED and then never returns -- CHECK THE EXIT CODE, not the output.
+    // Reading stdout is what hid this: a test that passes and then hangs looks like a passing test.
+    // Thread states without a debugger, which is how the snapshot above was taken:
+    //
+    //     for t in /proc/$PID/task/*; do
+    //         echo "$(cat $t/comm) $(awk '{print $3}' $t/stat) $(cat $t/wchan)"
+    //     done | sort | uniq -c
     //
     // WHY THIS WAS INVISIBLE UNTIL NOW. With this returning a hardcoded false the socket test
     // skipped everything, so no operation ever ran and teardown had nothing to tear down. Every
