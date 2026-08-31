@@ -15,6 +15,160 @@ what `SetHotWorkers` means, and removed `Join()` from the public API. 4.0.1 had 
 `PushImmediate`. Those change what the API *means*, not just what it does, and three patch numbers
 in a row were making trees that behave differently report nearly the same version.
 
+### The lane is the inbox: the hiPri Chase-Lev deques are gone
+
+- **`hiPri[]` removed.** A Chase-Lev deque exists so *other* threads can steal from it, and nothing
+  may take lane work from a reserved worker -- the lane is an MPSC inbox with exactly one legal
+  consumer. It was serving a use it structurally could not have. Removed with it: the lane sweep in
+  the steal loop, the per-thief lane probe above `MaybeStealable`, the staging unload at dispatch,
+  and 32,768 ring slots per worker.
+
+- The drain now does what the comment above it already claimed: pop one, run it. It could not batch
+  any more even if you wanted it to -- once tasks are out of the MPSC they need somewhere to go, and
+  the deque was that somewhere. What staging bought was reachability during a *long* body on a
+  reserved core, and the answer to that is the contract (do not put long bodies on K) plus
+  `HiPriSpillTarget`, which stops the backlog forming at push time instead of unloading it after.
+
+- **`NoteHiPriStaged` / `GetHiPriStagedCount` removed.** With no deque there is no unload to count,
+  and a diagnostic that can only ever report zero is worse than an absent one -- a reader takes the
+  zero for a measurement.
+
+- **`loPri` renamed `deques`.** There is one deque per worker now, so the priority half of the name
+  described nothing. Priority survives where it is still real: `hiPriInboxes` vs `loPriInboxes`.
+  Code sites only; roughly 60 comment mentions still say `loPri` and about 20 of those correctly
+  mean the inbox.
+
+- **A counter bug fell out of it.** The single lane pop never decremented `inboxDepth` although the
+  hiPri push increments it -- only the staging path paid it back, for the tasks it took.
+
+### Placement: three fixes, and two of them were the same bug
+
+- **[CRITICAL] `HiPriSpillTarget` could put a completion behind a bulk body.** It walked the awake
+  floor and then the entire awake pool looking for a worker that was not `busy`. The argument was
+  "an awake worker costs no kernel wake", which is true and is not the question this function asks:
+  it is asking who can *start* the task, and an awake floor worker is one that will start it
+  whenever its 400 µs ParallelFor leaf returns. Now `[0, K)` or the owner, nothing else.
+
+- **[CRITICAL] ...and then it could spill onto a *sleeping* reserved worker.** Collapsing three
+  passes into one carried the floor pass's shape onto a band that parks -- `!busy` is true for a
+  sleeper -- so the spill was free to redirect a latency-critical completion onto a thread that must
+  first be woken. The old whole-pool pass had this guard; the floor pass never needed one.
+
+- **[CRITICAL] Off by K, twice, in two functions.** `GetAwakeFloorBase()`/`GetAwakeFloor()` and
+  `BandsFb()`/`BandsF()` return floor **widths**, and both `PickNextWorker`'s growth spill and
+  `RedistributeToOverflow` read them as **indices**. The band is `[K, K+F)`, so the grown slice is at
+  `[K+baseF, K+liveF)`. Silent at K=0 (the spellings coincide) and at K=2 (index 2 is the first
+  *floor* worker -- wrong target, still legal); at K=3 index 2 is reserved and ordinary work landed
+  on an I/O core, which the runtime reported itself. Not only a warning: `io_overlap` at K=3 with
+  5 µs bodies measured `loPri p50` at **40.50 µs**, which is **2.90 µs** with the bounce removed.
+  Two identical slips in two functions is the accessor names inviting it -- they read like indices
+  at the call site and are not.
+
+### CorePref is a breadth axis now; `P` and `E` are gone
+
+- **`CorePref::P` and `::E` removed.** They were dormant -- the tree said so itself ("no shipped
+  caller requests `CorePref::P` or `::E`") and a repo-wide grep found none -- and unproven where they
+  applied: under the default `Ideal` affinity a worker is not pinned, so aiming at a "P worker" is a
+  preference the OS then weighs against its own hybrid policy. They bind only under `Hard`, measured
+  ~45% worse on wake latency. The concept is also x86-hybrid-specific and does not port.
+
+- **`Any` is now an alias of `Default`** (it meant "no class preference", and there are no classes).
+  Existing call sites compile. No packing change: two values in the same 2-bit field, two spare.
+
+- **`CorePref::Wide` is honoured, and it already documented this exact behaviour.** Ordinary
+  placement narrows to the awake floor whenever a floor worker is awake -- always, since the floor
+  never parks. That is the cheap push and the right answer for latency-shaped work; it is the wrong
+  one for bulk. `Wide` skips the narrowing and takes the full-pool rotation, paying wakes to get
+  capacity now.
+
+  Measured on the burst row (16 × 3.3 ms bodies from an idle pool, `floor=2 hot=2 neverpark`):
+
+  | | `dflt` | `wide` |
+  |---|---|---|
+  | wall | 10.11 ms | **5.19 ms** |
+  | speedup | 5.2x of 16 | **10.1x of 16** |
+  | workers that ran one | 12 | **29** |
+  | floor PEAK | 13 | **2** |
+
+  The floor never *grew* in the wide arm. Growth exists to widen the landing zone after the fact;
+  placing wide in the first place makes it unnecessary for this workload.
+
+- **ParallelFor's cursor lanes and chunked variant ask for `Wide`; the lazy splitter does not.**
+  A lane is a worker's worth of participation in one range and a chunk exists so another worker runs
+  it -- steering either at the floor lands them all on the same couple of threads. The splitter is
+  different and the `splitpref` bench row settles it: both arms reach the **same number of workers**
+  (28-31 of 31, every case, three runs, two machines), because a lazy split is distributed by
+  *stealing*, not by placement. **Wide matters where placement is the only distribution mechanism.**
+
+- **The DAG is untouched, and there was nothing to touch:** `TaskDAG::CreateNode` takes a
+  caller-supplied `Task`, so `corePref` is already the caller's decision -- which is right, since a
+  6-node frame graph is ~4.4 µs total against a ~3 µs wake.
+
+### Linux: the io_uring chain hang is fixed, and it was not a lost completion
+
+- **[CRITICAL] Short writes, never resubmitted.** `IoStream`'s chained path hung with every thread
+  asleep, which read as io_uring dropping a CQE. It was not: every SQE got a CQE. A stream socket
+  takes what fits in its send buffer and reports that -- traced at 32741 of 98304 requested, then
+  47616, then 65483 -- and nothing advanced the descriptors, so the transfer was reported *complete*
+  having sent a third of its bytes and the peer waited forever. A starved reader and a dropped
+  completion are indistinguishable from outside.
+
+  Fixed by a partial-send retry in the completion drain (send only -- a short *recv* is what a stream
+  is), `IoRequest::xferred` to carry the running total so the final completion reports what the
+  caller asked for, and a shape-correct `SubmitPrepared`: `bufCount == 0` fails `EINVAL` instead of
+  building an SQE from descriptors nobody filled, `== 1` replays as socket-native `SEND`/`RECV`
+  (which also carries `msg_flags`, silently dropped by `WRITEV`), `> 1` as `WRITEV`/`READV`. The
+  scalar submits fill their descriptors now too.
+
+- **[CRITICAL] The library did not compile on Linux at HEAD.** `std::strncpy` with no `<cstring>` --
+  MSVC pulls it in transitively via `windows.h`, so the Windows build never saw it.
+
+- **`IoReactor::IsAvailable()` is still `false` on Linux.** The chain completes, so the test now
+  reaches sections that were never reachable, and seven checks fail there: `RecvFrom` does not write
+  `msg_namelen` back, disconnect/reuse-reconnect fails (open on Windows too), and the accept-cancel
+  section fails, plausibly cascading. None of them hangs.
+
+- `JLIB_IO_TRACE=1` prints one line per SQE and per CQE, paired by request pointer.
+  `JLIB_IO_URING_FORCE=1` overrides the availability gate so the path can be exercised at all --
+  without it the failure is unreachable and therefore unreproducible without editing the library.
+
+### Measurement
+
+- **`tests/io_overlap_test.cpp` rewritten.** It had been deleted, and the numbers quoted in
+  `PickNextWorker` outlived it -- so the one result standing between the reserved band and its
+  deletion could not be reproduced or re-run at a different grain. Sweeps bulk-body length with arms
+  for K, `neverpark` and the floor lane. Asserts only that every probe completes (a stranded
+  completion is a hang, not a bad number); the latencies are reported, because a perf number as a
+  pass/fail assertion is a test everyone learns to ignore.
+
+  **The recorded "hiPri steered at the floor lost" result does not reproduce.** A floor lane beats no
+  lane 15-19x at every grain. What reservation buys is a tail that ignores the grain:
+
+  | bulk body | reserved K=2 | floor lane | no lane |
+  |---|---|---|---|
+  | 5 µs | **4.20** | 8.80 | 164.90 |
+  | 20 µs | **7.70** | 25.60 | 423.50 |
+  | 400 µs | **1.90** | 332.00 | 5030.90 |
+
+  (hiPri p99, µs.) Dropping reservation costs 2.1x on the completion tail at 5 µs grain and 175x at
+  400 µs. The "game bodies are small, so K is dead weight" argument does not survive it: a completion
+  waits behind a worker's *backlog*, not behind one body.
+
+- **`SetHiPriFloorLane()`** -- routing-only experiment flag, default off. Arms the lane at the awake
+  floor with no reservation, which is the configuration that recorded result was about.
+
+- **Lane strand counters** (`GetLaneStrandCount`, `GetLaneStrandIdlePeerCount`,
+  `GetLaneStrandIdleWideCount`): how often a dispatch strands a backlog, split by whether a peer was
+  idle in `[0,K)` and in `[0,K+F)`. Prices a shared pull lane against the current one -- an MPMC
+  removes misallocation, not queueing, so its win is confined to backlogs that had somewhere to go.
+
+- **New bench rows.** `io-pipe/ovl` (overlapped completions -- the arm where the spill can actually
+  fire), `io-pipe/ovlv` (same with the handler duration *varying*: p50 improves while p99 goes ~4x
+  worse, a jitter signature at identical offered load), `burst/dflt` vs `burst/wide`, and `splitpref`
+  (interleaved A/B for the splitter's breadth, reporting participants and the per-rep ratio spread --
+  ±40% inside one run, which is the instrument's noise floor and is now printed rather than hidden
+  behind a median).
+
 ### Teardown is destructor-only, and now it actually happens
 
 - **`Join()` is no longer public.** It advertised a teardown that could be followed by a restart, and

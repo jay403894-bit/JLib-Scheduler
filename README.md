@@ -182,10 +182,27 @@ remove and no bulk body to avoid being buried behind. io-pipe measures a complet
 whole difference. A latency lane is worth what it saves you from, and on an idle pool it saves you
 from nothing.
 
-The residual on `latency/hot` is most likely the adaptive-K observer: while a scaling range is
-armed, every lane dispatch stamps two `MonotonicNs()` reads to feed the controller's occupancy
-input, which is ~50 ns on a ~750 ns round trip. Static K does not pay it. It can be sampled if it
-proves to matter -- only the slow promote reads that input.
+**The residual on `latency/hot` turned out to be the park primitive, not the lane.** It was
+attributed here to the adaptive-K observer, which no longer exists; with `neverpark` the row reads
+0.62 µs against cold's 0.65, and without it 1.09 against 0.53. Reserving a band and then letting it
+*sleep* means every completion wakes a parked worker, which is the worst of both purchases -- the
+bench says so directly (`K IS NOMINAL: 2 of 2 workers in [0,2) PARKED`). If you arm K, arm
+`SetReservedNeverParks(true)` with it.
+
+**What the reservation actually buys is a tail that ignores the workload.** From
+`tests/io_overlap_test.cpp`, completion latency probed against a saturated pool, hiPri p99 in µs:
+
+| bulk body | reserved K=2 | lane on the floor, no reservation | no lane |
+|---|---|---|---|
+| 5 µs | **4.20** | 8.80 | 164.90 |
+| 20 µs | **7.70** | 25.60 | 423.50 |
+| 400 µs | **1.90** | 332.00 | 5030.90 |
+
+The reserved column is flat; the other two track the bulk body length. A lane on the unreserved floor
+still beats no lane by 15-19x -- so if you want the cores back, that is a real option costing ~2x on
+the tail at fine grain. What does *not* hold is the intuition that small bulk bodies make the lane
+unnecessary: a completion waits behind a worker's whole **backlog**, not behind one body, so
+shrinking the body shrinks each unit and not the queue.
 
 ### Bands, measured rather than declared
 
@@ -1120,11 +1137,47 @@ result and has not been reproduced for hazards** -- the hazard bag is smaller an
 so it is a reason to try the switch on your own workload, not a number to expect. Measure both
 halves before assuming either pays.
 
-### Placement is a hint, and on some platforms it is nothing
+### `CorePref` is about breadth, not core class
 
-`CorePref::P` / `CorePref::E` are **Windows-only**. Elsewhere the scheduler cannot tell the core
-classes apart, so the request is silently ignored rather than rejected -- leave tasks at `Default`
-and do not build a design that assumes placement held.
+```cpp
+Default   // steered at the awake floor -- the cheap push, no kernel wake
+Wide      // spread across the full pool, paying wakes to get capacity NOW
+```
+
+Ordinary placement narrows to the awake floor whenever a floor worker is awake -- which is always,
+since the floor never parks. That is the right answer for **latency-shaped** work: a completion or a
+frame-graph node lands on a thread that is already running and costs no OS wake. It is the wrong
+answer for **throughput-shaped** work, where being steered at two workers means the rest of the pool
+only arrives through steals.
+
+`Wide` is for the second kind. Use it when the body is long enough that a ~3 µs wake is noise and
+what you want is every core running now: a physics step, a large parallel loop, any burst that wants
+the machine at once.
+
+```cpp
+auto* t = sched.CreateTask(SimulateChunk, ctx, /*hiPri*/ 0,
+                           JLib::TaskType::Native, JLib::CorePref::Wide);
+```
+
+Measured on 16 heavy tasks (3.3 ms each) submitted to an idle pool at `floor=2`:
+
+| | `Default` | `Wide` |
+|---|---|---|
+| wall | 10.11 ms | **5.19 ms** |
+| speedup | 5.2x of 16 | **10.1x of 16** |
+| workers that ran one | 12 | **29** |
+
+**The rule for when it helps:** `Wide` matters where *placement is the only distribution mechanism*.
+A burst of independent tasks is exactly that -- nothing splits them, so where they land is where
+they run. A recursively-split parallel range is not: its halves are distributed by **stealing**, and
+measurement confirms the breadth hint changes nothing there (same 28-31 workers reached either way).
+`ParallelFor` already asks for `Wide` where it applies; you do not need to.
+
+**`CorePref::P` and `::E` were removed in 5.0.0.** They asked for Performance or Efficiency cores,
+were requested by nothing that shipped, and were unproven where they applied -- under the default
+`Ideal` binding a worker is not pinned, so the request was a hint the OS then weighed against its own
+hybrid policy. They bound only under `Hard`, which is measured ~45% worse on wake latency and is not
+the default for that reason. `Any` remains as an alias of `Default`.
 
 **Android ignores placement entirely**, by the platform's decision rather than a gap here: its
 cgroups own thread placement, so the affinity calls either fail for an unprivileged app or succeed
@@ -1138,18 +1191,19 @@ which take the processor group as data -- `SetThreadAffinityMask` takes it from 
 and so cannot name a CPU in a second group. Handled up to 256 CPUs, but **untested above 64**; if you
 have such a machine, that is the most useful thing you could report.
 
-**`CorePref::P`/`::E`'s reliability is quietly coupled to `AffinityPolicy`, not just to whether the
-CPU is hybrid.** `isPCore` is a label assigned ONCE per worker at pool startup, from real topology.
-Under `Hard` that label stays true for the process's whole life -- a worker never leaves its
-assigned core. Under `Ideal`, **the shipped default**, the OS is only given a preference and may
-migrate the thread under contention or thermal pressure, so the label can go stale mid-run: a
-`P`-preferring task can land on a worker that used to be on a P-core and no longer is. In other
-words, the mode where the hint is maximally trustworthy (`Hard`) is the one already measured and
-rejected as the default for its own cost (see [Worker binding](DESIGN.md#worker-binding) -- ~45%
-worse wake latency, ~2x on the frame DAG). `Ideal` migration is the exception rather than the rule
-in practice, which is why it is still treated as "meaningful" rather than as `None`, but this is a
-real gap between "hint" and "guarantee," not just boilerplate hedging -- know it before building a
-design that assumes a `P` task always lands on a P-core.
+**The reasoning that removed `CorePref::P`/`::E` is worth keeping, because it applies to any future
+placement hint.** `isPCore` is a label assigned ONCE per worker at pool startup, from real topology.
+Under `Hard` that label stays true for the process's whole life -- a worker never leaves its assigned
+core. Under `Ideal`, **the shipped default**, the OS is only given a preference and may migrate the
+thread under contention or thermal pressure, so the label goes stale mid-run: a `P`-preferring task
+could land on a worker that used to be on a P-core and no longer was. The mode where the hint was
+maximally trustworthy (`Hard`) is the one already measured and rejected as the default for its own
+cost (see [Worker binding](DESIGN.md#worker-binding) -- ~45% worse wake latency, ~2x on the frame
+DAG). So the hint was only real in a configuration nobody runs.
+
+`isPCore` itself is **not** gone and is still doing work: it drives E-core QoS handling and the
+same-class/other-class victim ordering for steals. Those are properties of the machine that the pool
+reacts to on its own, as distinct from a per-task request an application has to make correctly.
 
 ### Hot workers: how many, and when none
 

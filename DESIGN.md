@@ -50,37 +50,40 @@ priority.
 
 ```cpp
 enum class CorePref : uint8_t {
-    Default,   // no preference (full-pool round-robin) -- the default for every task
-    P,         // prefer performance cores (latency-critical, chunky work)
-    E,         // prefer efficiency cores (background/bulk; preserves P headroom)
-    Wide,      // explicit no-preference: throughput bursts that want ALL cores
-    Any = Wide // alias: "genuinely don't care" -- same mechanism, honest name
+    Default,     // steered at the awake floor -- the cheap push, no kernel wake
+    Wide = 1,    // spread across the FULL pool, paying wakes to get capacity now
+    Any  = 0     // alias of Default
 };
 
-sched.CreateTask(fn, data, /*hiPri*/ false, FiberSize::Standard, TaskType::Native, CorePref::E);
+sched.CreateTask(fn, data, /*hiPri*/ false, TaskType::Native, CorePref::Wide);
 ```
+
+**This was a core-CLASS axis until 5.0.0** (`P` / `E`, prefer performance or efficiency cores) and is
+a **breadth** axis now. `P`/`E` were requested by nothing that shipped and were only meaningful under
+`Hard` binding, which is measured ~45% worse on wake latency and is not the default -- so the hint
+was real only in a configuration nobody runs. What placement actually consumes is how *wide* to
+spread, which is measurable: on 16 heavy tasks from an idle pool, `Wide` ran on 29 workers against
+`Default`'s 12.
 
 The rules:
 
 - Priority and placement are orthogonal. `hiPri` orders queues, `corePref` places work, and they are
-  never coupled. A coupled design (hiPri→P, loPri→E) creates a structural starvation gradient:
-  sustained high-priority load spills into the efficiency cores' lanes and squeezes bulk work from
-  both directions at once.
-- Preference is a hint at push. Placement spills to the other class rather than waiting on an
-  unavailable one.
-- Preference is a rule at steal. Thieves vet a candidate's class before claiming it, via
-  `TaskDeque::steal_if` -- the predicate runs between the buffer read and the CAS, so declining costs
-  zero atomics and never claims an unvetted task. `Default`/`Any`/`Wide` tasks stay stealable by
-  everyone.
-- A declined steal is not a miss. Steal-backoff damps CAS storms; a class decline performs no CAS,
-  so it neither shrinks the probe width nor resets it.
-- Owners run what they own. Spill transfers ownership, and explicit pinning (`PushImmediate`, DAG
-  fork nodes) overrides class preference entirely.
-- On non-hybrid CPUs every worker labels P, the class checks disable, and behaviour is identical to
-  a classic full-pool scheduler.
+  never coupled. A coupled design (hiPri→narrow, loPri→wide) creates a structural starvation
+  gradient: sustained high-priority load would squeeze bulk work from both directions at once.
+- Preference is a hint at push and nothing at all afterwards. It selects the landing set; it never
+  makes a task unstealable. Every task is stealable by every worker -- which was already true for
+  every preference anyone used, and is now true unconditionally.
+- **It only reaches work that placement actually distributes.** A burst of independent tasks is
+  placed and then runs where it landed, so `Wide` is decisive there (12 → 29 participants on the
+  burst row). A recursively-split range is distributed by *stealing*, so the hint has nothing to act
+  on -- measured, both settings reach the same 28-31 of 31 workers. Ask for `Wide` when nothing else
+  is going to spread the work for you.
+- Owners run what they own. Explicit CPU affinity (DAG fork nodes, `Push(cpu, ...)`) overrides
+  `corePref` entirely: pinning to a named core is a stronger, more explicit request than a breadth
+  preference.
 
-`CorePref` is opt-in and dormant by default. See [Platform notes](#platform-notes) for where it does
-nothing at all.
+`CorePref` is opt-in; `Default` is right for most work and is what every task gets unless it says
+otherwise. See [Platform notes](#platform-notes) for where placement means less than it looks.
 
 ---
 
