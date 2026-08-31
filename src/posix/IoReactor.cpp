@@ -9,17 +9,30 @@
 // completion loop is the part every operation hangs off, so it is worth having correct and testable
 // before there is anything to complete.
 //
-// == WHY TWO BACKENDS, AND WHY epoll IS NOT OPTIONAL ==
+// == THE epoll BACKEND DESCRIBED BELOW DOES NOT EXIST ==
+//
+// READ THIS BEFORE THE NEXT PARAGRAPH, because the next paragraph is a PLAN written in the present
+// tense and it has been mistaken for a description of the code -- including by a reader who then put
+// "epoll: compiled, unexercised" into the README. This file mentions epoll eight times and calls
+// epoll_create zero times. There is one backend here, io_uring, and where io_uring is refused there
+// is NO REACTOR: IsAvailable() returns false and callers take the synchronous path.
+//
+// That is the honest behaviour and it is not a fallback. It matters most on ANDROID, where io_uring
+// is typically unavailable by SELinux policy rather than by kernel version -- so async I/O there
+// needs epoll WRITTEN, not tested. Everything below is the design it should be written to.
+//
+// == WHY TWO BACKENDS WERE PLANNED, AND WHY epoll WAS NOT OPTIONAL ==
 //
 // io_uring is completion-based, which maps 1:1 onto the IOCP design this reactor already has, and
 // it is the only one of the two that can serve SubmitRead/SubmitWrite at all: epoll_ctl REFUSES a
 // regular file (-EPERM), because a regular file is always "ready" and readiness notification is
-// meaningless for it.
+// meaningless for it. An epoll backend would therefore be sockets-only by construction -- worth
+// knowing up front, because it means epoll cannot be a drop-in floor for the whole API surface.
 //
 // But io_uring is not a given. Android ships epoll. Older distributions run kernels without
 // io_uring, or with it compiled out. Hardened containers, seccomp filters and the io_uring_disabled
-// sysctl refuse it on kernels that have it. So epoll is the FLOOR -- it gets built regardless -- and
-// io_uring is the fast path on top, chosen when the probe says it is there.
+// sysctl refuse it on kernels that have it. So epoll WAS TO BE the floor, with io_uring the fast
+// path on top, chosen when the probe says it is there.
 //
 // WHAT io_uring ACTUALLY BUYS, stated so nobody quotes a headline: syscalls per operation. epoll
 // costs roughly two (an amortised epoll_wait plus the recv that readiness only promised would

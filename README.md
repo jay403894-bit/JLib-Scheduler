@@ -823,15 +823,26 @@ or the `io_uring_disabled` sysctl reports false on a binary that supports it.
 | --- | --- | --- |
 | Windows x64 / ARM64 | IOCP | Complete. Sockets, files, named pipes. |
 | Linux x86-64 / AArch64 | io_uring | **Live as of 5.0.0.** Sockets pass end to end. |
-| Linux without io_uring | epoll | Compiled, **unexercised** -- no test covers it. |
+| Linux without io_uring | — | **Not implemented.** `IsAvailable()` is false. |
+| Android | — | Same: io_uring is usually refused by policy, so no reactor. |
 | macOS | — | `IsAvailable()` is false; no reactor. |
 
 **What "sockets pass end to end" covers**, so it is not read as more than it is: accept, connect,
 send, recv, vectored send, a peer close as a zero-byte completion, the acceptor pool, `Stop` drain,
 cancellation through nested scopes, deadlines, and `IoStream`'s chained ordering. **Not** covered:
-file I/O (`SubmitRead`/`SubmitWrite` on a regular fd) has no test on Linux, epoll has none at all,
-and nothing has run under load for longer than the suite takes. Reporting available is a claim that
-the operations work, not that the backend is seasoned.
+file I/O (`SubmitRead`/`SubmitWrite` on a regular fd) has no test on Linux, and nothing has run under
+load for longer than the suite takes. Reporting available is a claim that the operations work, not
+that the backend is seasoned.
+
+**There is no epoll backend.** The source describes one at length as the intended floor beneath
+io_uring, and it was never written -- `src/posix/IoReactor.cpp` mentions epoll eight times and calls
+`epoll_create` zero times. So on any Linux where io_uring is refused (older kernels, seccomp, the
+`io_uring_disabled` sysctl, and most Android devices by SELinux policy) there is **no reactor at
+all** and `IsAvailable()` correctly says so. That is the honest behaviour; it is not a fallback.
+
+The gap matters most on **Android**, where io_uring is usually unavailable by policy rather than by
+kernel version -- so async I/O there needs epoll written, not tested. The job system itself is
+unaffected and runs on Android normally; this is the reactor only.
 
 **Two escape hatches, both environment variables** so nothing an application links against can trip
 them: `JLIB_IO_URING_OFF=1` forces the synchronous path back without a rebuild, and
