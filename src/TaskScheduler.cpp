@@ -195,6 +195,19 @@ TaskScheduler::AtExitDestroyer TaskScheduler::atExitDestroyer;
 // so a harness that tears down explicitly and then exits does not drain twice.
 void detail::TeardownForTesting(TaskScheduler& scheduler) { scheduler.Join(); }
 
+// See the header. Joins first -- destroying a pool whose workers are still running would be a
+// different and much less interesting crash -- then does the delete that production deliberately
+// does not, so that ~TaskScheduler and every member destructor beneath it execute at least once
+// somewhere. Clears `instance` so a later Instance() faults loudly rather than handing out a
+// dangling pool.
+void detail::DestroyForTesting() {
+	TaskScheduler* p = TaskScheduler::instance;
+	if (!p) return;
+	p->Join();
+	TaskScheduler::instance = nullptr;
+	delete p;
+}
+
 TaskScheduler::AtExitDestroyer::~AtExitDestroyer() {
 	// DELETE FIRST, CLEAR AFTER -- and not the other way round, which is the tempting order and the
 	// wrong one. The pool is genuinely LIVE for the whole of the drain: workers are still spinning,
@@ -503,6 +516,33 @@ GlobalFiberPool& JLib::TaskScheduler::GetGlobalPool()
 TaskScheduler::~TaskScheduler() {
 	if (!stopFlag)
 		Join();
+
+	// ---- RELEASE THE QUEUES WHILE THE ALLOCATOR THEY FREE INTO IS STILL ALIVE -----------------
+	//
+	// MEMBERS DESTRUCT IN REVERSE DECLARATION ORDER, and this class declares the queues before the
+	// allocator:
+	//
+	//     deques, loPriInboxes, hiPriInboxes, resumedInboxes ...  then  taskAllocator
+	//
+	// so taskAllocator would be destroyed FIRST and the queue vectors after it. `~TaskMPSCQueue`
+	// ends with `alloc_->Free(stub_)` and `~TaskDeque` releases its ring, so every one of those --
+	// three queues per worker, ~90 on a 31-worker pool -- would free into an allocator that is
+	// already gone. Access violation, 0xC0000005, which is precisely the crash that made
+	// `delete instance` unusable and left the pool leaking at exit rather than destroyed.
+	//
+	// Clearing them HERE fixes it without reordering the declarations: the destructor BODY runs
+	// before any member destructor, so the queues are gone while the allocator is still whole. The
+	// declaration-order alternative (move taskAllocator to the top so it destructs last) is equally
+	// correct and compiler-enforced, but it moves an initialiser in a 3,000-line class to fix
+	// something that reads better stated than implied.
+	//
+	// mainQ NEEDS NOTHING: it is declared after taskAllocator, so it destructs before it, and it
+	// frees into a live allocator already. Left alone rather than added for symmetry -- an
+	// unnecessary clear here would suggest the ordering is arbitrary when it is not.
+	resumedInboxes.clear();
+	hiPriInboxes.clear();
+	loPriInboxes.clear();
+	deques.clear();
 }
 bool TaskScheduler::PushMain(Task* task) {
 	if (!poolActive) return false;

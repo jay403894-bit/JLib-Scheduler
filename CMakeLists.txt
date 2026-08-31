@@ -942,3 +942,10 @@ endif()
 add_executable(SchedulerIoOverlapTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_overlap_test.cpp")
 target_link_libraries(SchedulerIoOverlapTest PRIVATE Scheduler)
 target_compile_features(SchedulerIoOverlapTest PRIVATE cxx_std_17)
+
+# Runs ~TaskScheduler and every member destructor beneath it -- the code production deliberately
+# never executes, because Init() news the instance and AtExitDestroyer leaks it. See the file header:
+# an unexecuted destructor already hid a heap-corruption bug here for the life of the project.
+add_executable(SchedulerTeardownDestroyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/teardown_destroy_test.cpp")
+target_link_libraries(SchedulerTeardownDestroyTest PRIVATE Scheduler)
+target_compile_features(SchedulerTeardownDestroyTest PRIVATE cxx_std_17)

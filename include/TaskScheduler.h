@@ -231,10 +231,31 @@ namespace JLib {
 		// finds this has been told what it is, and nothing in the supported surface implies a pool
 		// can be stopped and started again.
 		void TeardownForTesting(TaskScheduler& scheduler);
+
+		// ---- THE ONE PLACE THE DESTRUCTORS ACTUALLY RUN --------------------------------------
+		//
+		// `Init()` does `instance = new TaskScheduler(...)` and nothing ever deletes it; at exit
+		// AtExitDestroyer calls Join() and then LEAKS on purpose, because a process about to stop
+		// existing gains nothing from freeing its address space. That is the right shipping choice
+		// and it has a cost nobody was paying attention to: **~TaskScheduler and every member
+		// destructor under it have never executed, in any program, ever.**
+		//
+		// Unexecuted code is where bugs live, and this project has already paid for that once --
+		// `~TaskMPSCQueue` used `::delete stub_`, handing a slab slot to the CRT heap, and it
+		// survived for the life of the project purely because nothing destroyed one.
+		//
+		// So the destructors get exercised HERE, in a test, instead of at exit. Production keeps the
+		// safe path (drain, then leak); the destructors stay executed somewhere, so they cannot rot
+		// back into dead code; and an ordering bug in them surfaces in a test run rather than in
+		// somebody's shutdown.
+		//
+		// Returns after the delete. If it crashes, that IS the finding.
+		void DestroyForTesting();
 	}
 
 	class TaskScheduler {
 		friend void detail::TeardownForTesting(TaskScheduler&);
+		friend void detail::DestroyForTesting();
 		friend class Thread;
 		// Registers and unlinks itself in the chain below. Only these two pointers are touched.
 		friend class WaitPrimitive;

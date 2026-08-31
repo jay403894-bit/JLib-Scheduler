@@ -284,13 +284,36 @@ slots` and fails, so a slack of 4 cannot hide a regression that reads 200 → 0.
   never decremented, hazard records never returned. `TaskScheduler::AtExitDestroyer` closes it.
   `tests/atexit_teardown_test.cpp` is the proof, and it is built so that silence fails.
 
-- **At exit the pool joins and then LEAKS, deliberately.** `delete instance` was tried and it
-  crashes -- reproducibly, access violation, on `Init(0); return;` with nothing parked. Not in
-  `Join()`: the drain completes and every worker stops cleanly. It dies afterwards in
-  `TaskScheduler`'s own member destruction, which is unsurprising for a path that had never run
-  being asked to run during static destruction. `Join()` is where the value is (service threads
-  stopped, primitives drained, frames unwound, workers joined); destroying the members after it buys
-  a process about to exit nothing the OS is not about to do anyway.
+- **At exit the pool joins and then LEAKS, deliberately.** `Join()` is where the value is (service
+  threads stopped, primitives drained, frames unwound, workers joined); destroying the members after
+  it buys a process about to exit nothing the OS is not about to do anyway.
+
+  **The reason for this changed, and the old one is worth recording because it was wrong.** It used
+  to read: `delete instance` was tried and it *crashes* -- reproducibly, access violation, after a
+  clean `Join()`, somewhere in `TaskScheduler`'s own member destruction. That was true and it was
+  treated as a property of the path rather than as a bug with a cause.
+
+  **[CRITICAL] The cause was member destruction order.** Members destruct in reverse declaration
+  order, and this class declares `deques`, `loPriInboxes`, `hiPriInboxes` and `resumedInboxes`
+  *before* `taskAllocator` -- so the allocator was destroyed first and roughly ninety queues then ran
+  `~TaskMPSCQueue`, whose last act is `alloc_->Free(stub_)`, against an allocator that was already
+  gone. `~TaskScheduler` now clears those vectors in its body, which runs before any member
+  destructor, and `delete instance` completes cleanly. Same shape as the `TimerQueue` hang fixed the
+  same week: one object reaching into another after that other is gone, except inside a single class
+  instead of between two statics.
+
+  So the leak is now a **choice** rather than a workaround -- freeing address space in a process
+  that is exiting is pointless, and that is the whole reason. It is no longer true that teardown
+  cannot complete.
+
+- **`tests/teardown_destroy_test.cpp` and `detail::DestroyForTesting()`** exist so the destructors
+  are executed *somewhere*. `Init()` news the instance and nothing deletes it, so `~TaskScheduler`
+  and every member destructor beneath it had never run in any program, ever -- and this project has
+  already paid for that: `~TaskMPSCQueue` used `::delete stub_`, handing a slab slot to the CRT heap,
+  and survived for the life of the project because nothing destroyed one. Production keeps the
+  shipping behaviour; the destructors run in a test, where a fault is a failing test instead of
+  somebody's shutdown. It submits 4,000 tasks first, so the structures being torn down are not
+  pristine.
 
 - **`JLib::detail::TeardownForTesting(scheduler)`** replaces the public entry for the two callers
   that legitimately need a mid-process teardown: `tests/teardown_drain_test.cpp`, where the drain is
