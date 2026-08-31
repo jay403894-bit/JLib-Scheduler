@@ -53,27 +53,24 @@
 //   NOT THE FIBER'S WORD. Fiber Resume enqueues a task; thread Wake only unparks a core. Sharing
 //   one word is how "fiber is READY, worker is PARKED, nobody runs" happens.
 //
-//   THE TWO MECHANISMS ARE INDEPENDENTLY SUFFICIENT, which the controls established rather than
-//   assumed, and it is the most useful thing this file has to say about the design:
+//   A CLAIM THIS FILE MADE AND HAS NOW RETRACTED. Before the wait object was modelled, three of
+//   these controls PASSED, and that was read as "the swap-wake and the post-commit recheck are
+//   independently sufficient -- belt and braces". THAT WAS AN ARTEFACT OF THE MISSING WAIT OBJECT,
+//   not a property of the design. With delivery modelled, WAKE_CAS_ONLY fails on its own, and so
+//   does ACQ_REL_ONLY. Only NO_RECHECK still passes alone.
 //
-//     WAKE_CAS_ONLY alone  -- the CAS fails while the word is EMPTY so no permit is latched, BUT
-//                             the work was published first, so the recheck-after-PARKED sees it
-//                             and cancels the sleep. No bug.
-//     NO_RECHECK alone     -- the worker commits to PARKED blind, BUT swap(NOTIFIED) then observes
-//                             prev == PARKED, owes the OS wake, and performs it. No bug.
-//     BOTH removed         -- SAFETY VIOLATION. Work published, thread committed PARKED, no wake.
-//
-//   So this is belt-and-braces on purpose: either the wake catches a committed sleeper, or the
-//   sleeper catches work published before it committed. Removing one is survivable and removing
-//   both is the stall. Anyone tempted to simplify either half should reproduce the combined control
-//   first.
+//   The lesson is the one this repository keeps re-learning: a control that passes tells you about
+//   the HARNESS first and the code second. Three passing controls looked like a robust design and
+//   were actually a harness that could not see the window the design exists to close.
 //
 //   Build variants -- RUN THE CONTROLS FIRST:
 //     genmc -- sleepwake_permit_model.c                                  # as proposed
+//     genmc -- -DNO_PREWAIT_REREAD sleepwake_permit_model.c              # MUST fail
+//     genmc -- -DWAKE_CAS_ONLY sleepwake_permit_model.c                  # MUST fail
+//     genmc -- -DACQ_REL_ONLY sleepwake_permit_model.c                   # MUST fail
 //     genmc -- -DWAKE_CAS_ONLY -DNO_RECHECK sleepwake_permit_model.c     # MUST fail
-//     genmc -- -DWAKE_CAS_ONLY sleepwake_permit_model.c                  # passes: recheck covers
-//     genmc -- -DNO_RECHECK sleepwake_permit_model.c                     # passes: swap covers
-//     genmc -- -DACQ_REL_ONLY sleepwake_permit_model.c                   # ordering probe
+//     genmc -- -DWAKE_ALWAYS_SYSCALL sleepwake_permit_model.c            # MUST fail (coalescing)
+//     genmc -- -DNO_RECHECK sleepwake_permit_model.c                     # passes: swap covers it
 //
 //   A NEGATIVE CONTROL THAT PASSES MEANS THE HARNESS IS BROKEN, NOT THAT THE CODE IS GOOD. The
 //   first draft of this file asserted its interesting property in main() AFTER THE JOINS -- where
@@ -88,13 +85,56 @@
 #include <pthread.h>
 #include <assert.h>
 
+/* VALUES MATCH Thread::WorkerState EXACTLY. They did not -- this file had PARKED=1 and
+   NOTIFIED=2 while the code has the reverse -- which changes nothing about what the model
+   PROVES but is a trap for anyone reading the two side by side, which is the entire reason
+   this file exists. */
 #define ST_EMPTY     0
-#define ST_PARKED    1
-#define ST_NOTIFIED  2
+#define ST_NOTIFIED  1
+#define ST_PARKED    2
 
 static _Atomic int g_permit;   /* the park word */
 static _Atomic int g_work;     /* the task the producer published */
 static _Atomic int g_oswake;   /* futex_wake / notify_one actually performed */
+
+/* ---- THE WAIT OBJECT, WHICH THE FIRST VERSION OF THIS FILE DID NOT HAVE -----------------------
+ *
+ * The first draft ended the worker at `return` and treated g_oswake as "the worker will run". In a
+ * real process that is false, and it hid the window that actually matters:
+ *
+ *     CAS EMPTY -> PARKED            permit published
+ *     recheck queues + flags
+ *                                <-- wake: swap(NOTIFIED), prev==PARKED, notify_one()
+ *     block on the wait object       the waiter is NOT REGISTERED YET
+ *
+ * The old harness counted that notify as a successful unpark -- oswake==1, assertion satisfied --
+ * while the real thread then enters the wait AFTER the signal and never returns. The next producer
+ * swaps, sees prev != PARKED, correctly issues no OS wake, and the core is asleep with a latched
+ * permit and owner-only inbox work behind it. A permanent strand, invisible to a harness with no
+ * wait object in it.
+ *
+ * This is why the address-wait arms are safe and it is not luck: WaitOnAddress/futex wait ON THE
+ * PERMIT WORD, so swap(NOTIFIED) makes the wait return by value-compare. The condvar arm is safe
+ * for a different reason -- its predicate reads the permit under the same mutex Wake takes. NEITHER
+ * REASON WAS STATED ANYWHERE, so a future change of wait object would keep a green model.
+ *
+ * g_waiting encodes "registered on the wait object". The pre-wait re-read of the permit is the
+ * thing being tested: remove it (-DNO_PREWAIT_REREAD) and this must go red.
+ */
+static _Atomic int g_waiting;
+
+/* ISSUED IS NOT DELIVERED, and conflating them is what let the first extended version of this file
+ * pass -DNO_PREWAIT_REREAD. g_oswake counts notifications SENT. A notify_one() that fires before the
+ * waiter has registered on the wait object reaches nobody and is gone -- the counter still reads 1.
+ * That is precisely the stall being modelled, so the witness has to be delivery:
+ *
+ *     g_delivered  incremented only when the wake found g_waiting already set
+ *
+ * On an ADDRESS wait this distinction collapses -- the kernel compares the word under its own lock,
+ * so a swap that lands before registration makes the wait return immediately and delivery is
+ * guaranteed. That collapse is modelled by the pre-wait re-read. On a CONDVAR over a SEPARATE object
+ * with no predicate on the permit, it does not collapse, and this is the counter that shows it. */
+static _Atomic int g_delivered;
 
 #ifdef ACQ_REL_ONLY
   /* The StoreLoad pairs are on DIFFERENT locations -- the producer publishes work then observes the
@@ -160,19 +200,51 @@ static void *worker(void *arg) {
     }
 #endif
 
-    /* 5. block(). Modelled as TERMINATION, per sleepwake_model.c: "every parked worker eventually
-          runs" is liveness and a stateless checker cannot express it, so the bad outcome is made a
-          reachable-state question instead -- work queued, thread committed PARKED, no OS wake. */
+    /* 5. REGISTER ON THE WAIT OBJECT, THEN BLOCK. The registration is a separate step from the
+          permit commit and is on a DIFFERENT object -- that separation is the whole point, and the
+          first version of this file collapsed it into `return`. */
+    atomic_store_explicit(&g_waiting, 1, PUBLISH);
+
+#ifndef NO_PREWAIT_REREAD
+    /* THE PRE-WAIT RE-READ, and it is what makes an address-wait arm correct. WaitOnAddress and
+       FUTEX_WAIT both compare the word against the expected value under the kernel's own lock and
+       return immediately if it differs -- this models that compare. A wake that landed between the
+       recheck above and this point already swapped the permit to NOTIFIED, so the wait must abort
+       rather than block on a signal that has already been delivered.
+
+       CONTROL -DNO_PREWAIT_REREAD removes it, which is what a condvar on a SEPARATE object with no
+       predicate on the permit word would look like. That must go red. */
+    if (atomic_load_explicit(&g_permit, OBSERVE) != ST_PARKED) {
+        atomic_store_explicit(&g_waiting, 0, PUBLISH);
+        return NULL;                       /* wait aborted; consume and go round */
+    }
+#endif
+
+    /* Blocked: g_waiting == 1 and the permit is PARKED. Termination from here models a thread that
+       is inside the wait -- and whether that is a stall is now an assertable question, because the
+       final state records that it was registered. */
     return NULL;
 }
 
 /* ---- the waker -------------------------------------------------------------------------------
-   Publishes the task, then latches a permit. */
+   Publishes the task, then latches a permit. TWO of these run concurrently: see the note in main()
+   for why one is not enough. */
 static void *waker(void *arg) {
     (void)arg;
     atomic_fetch_add_explicit(&g_work, 1, PUBLISH);
 
-#ifdef WAKE_CAS_ONLY
+#ifdef WAKE_ALWAYS_SYSCALL
+    /* CONTROL, AND IT IS THE ARM THAT ACTUALLY RAN ON THE MACHINE. "Notify all the time" was the
+       first thing tried against the stalls, before the state machine existed -- latch the permit and
+       then unconditionally pay the syscall, ignoring the previous state. It is SAFE: it fails neither
+       lost-wakeup assertion. It fails the COALESCING assertion, one syscall per producer instead of
+       one per park, which is exactly why it was reverted. Without this control the coalescing
+       assertion would be an assertion no variant can break, i.e. worthless. */
+    atomic_exchange_explicit(&g_permit, ST_NOTIFIED, TRANSITION);
+    atomic_fetch_add_explicit(&g_oswake, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&g_waiting, OBSERVE) == 1)
+        atomic_fetch_add_explicit(&g_delivered, 1, memory_order_relaxed);
+#elif defined(WAKE_CAS_ONLY)
     /* CONTROL. "CAS if PARKED" -- wake only when the sleeper is already committed. Looks
        sufficient and is not: between the worker's fast-path check and its CAS to PARKED the word
        is EMPTY, so this CAS fails, no permit is latched, and the worker then commits to PARKED and
@@ -186,8 +258,15 @@ static void *waker(void *arg) {
        sleeper was in, so it cannot be dropped; only the PREVIOUS value decides whether an OS wake
        is owed. Swap rather than CAS also keeps the release edge the sleeper synchronises with. */
     const int prev = atomic_exchange_explicit(&g_permit, ST_NOTIFIED, TRANSITION);
-    if (prev == ST_PARKED)
+    if (prev == ST_PARKED) {
         atomic_fetch_add_explicit(&g_oswake, 1, memory_order_relaxed);
+        /* DELIVERY, not issuance. A notify_one() aimed at a thread that has not yet registered on
+           the wait object reaches nobody -- the signal is not queued, it is dropped. Only count it
+           as delivered if the waiter was already there. This is the line that makes the
+           NO_PREWAIT_REREAD control able to fail. */
+        if (atomic_load_explicit(&g_waiting, OBSERVE) == 1)
+            atomic_fetch_add_explicit(&g_delivered, 1, memory_order_relaxed);
+    }
     /* prev EMPTY or NOTIFIED: latched, and the OS thread is not touched. */
 #endif
     return NULL;
@@ -197,27 +276,66 @@ int main(void) {
     atomic_init(&g_permit, ST_EMPTY);
     atomic_init(&g_work, 0);
     atomic_init(&g_oswake, 0);
+    atomic_init(&g_waiting, 0);
+    atomic_init(&g_delivered, 0);
 
-    pthread_t w, p;
-    pthread_create(&w, NULL, worker, NULL);
-    pthread_create(&p, NULL, waker, NULL);
-    pthread_join(w, NULL);
-    pthread_join(p, NULL);
+    /* TWO WAKERS, ONE WORKER. One waker cannot express the property the permit word exists to buy:
+       that N producers hitting a parked worker cost ONE syscall, not N. It also cannot express the
+       failure Jay named -- "one permit coalesces; the second must not be the only OS wake" -- where
+       the first producer's work is latched but silently, and the sleeper is only rescued by a second
+       producer that may never arrive. With swap-wake the FIRST swap is the one that sees prev ==
+       PARKED and owns the syscall; the second sees NOTIFIED and correctly stays out of the kernel.
 
-    const int work   = atomic_load(&g_work);
-    const int permit = atomic_load(&g_permit);
-    const int oswake = atomic_load(&g_oswake);
+       This is also the interleaving in which the two wakers can be ordered either way with respect
+       to the worker's fast-path CAS, its commit CAS, its recheck and its registration -- which is
+       where the state space actually comes from. */
+    pthread_t w, p1, p2;
+    pthread_create(&w,  NULL, worker, NULL);
+    pthread_create(&p1, NULL, waker,  NULL);
+    pthread_create(&p2, NULL, waker,  NULL);
+    pthread_join(w,  NULL);
+    pthread_join(p1, NULL);
+    pthread_join(p2, NULL);
+
+    const int work    = atomic_load(&g_work);
+    const int permit  = atomic_load(&g_permit);
+    const int oswake  = atomic_load(&g_oswake);
+    const int waiting   = atomic_load(&g_waiting);
+    const int delivered = atomic_load(&g_delivered);
 
     /* NO LOST WAKEUP. Work was published, the thread is committed PARKED, and no OS wake was
        performed -- so nothing will ever run it. Inboxes are owner-drain-only, so this is a
        permanent strand rather than a delay: the stall, in its terminal form. */
     assert(!(work > 0 && permit == ST_PARKED && oswake == 0));
 
-    /* A SECOND ASSERTION WAS HERE AND IT WAS VACUOUS -- it ended in `&& 0`, so it could never fire.
-       Deleted rather than repaired: a latched permit with the worker back in its search loop is the
-       BENIGN case (it is consumed on the next pass, or becomes one spurious wake), and the harmful
-       version is already covered by the assertion above. An assertion that cannot fail is worse than
-       no assertion, because it reads like coverage. */
+    /* BLOCKED ON A SIGNAL THAT ALREADY FIRED -- the window the first version of this file could not
+       express. The thread registered on the wait object (waiting==1) and the permit reads NOTIFIED,
+       meaning a waker already swapped and, seeing prev==PARKED, already sent its one notification.
+       That notification arrived BEFORE the registration, so it reached nobody; the next producer
+       will swap, see prev != PARKED, and correctly send nothing. The thread is asleep with a latched
+       permit and owner-only work behind it. Permanent, not late.
+
+       This is the assertion the pre-wait re-read exists to satisfy, and -DNO_PREWAIT_REREAD is the
+       control that must make it fire. */
+    /* THE `oswake == 0` TERM IS LOAD-BEARING and I dropped it on the first attempt, which made this
+       fire on the ordinary success case: worker registers, waker swaps seeing prev == PARKED, sends
+       the wake, and the final state is legitimately {waiting, NOTIFIED, oswake==1}. The bug is the
+       state with NO wake ever performed -- a registered waiter and a latched permit that nobody
+       paid a syscall for, so nothing will arrive. GenMC caught my over-strong assertion in the
+       as-proposed variant, which is the harness doing its job against the harness. */
+    assert(!(work > 0 && waiting == 1 && permit == ST_NOTIFIED && delivered == 0));
+
+    /* COALESCING. Two producers, at most one syscall -- the permit word absorbs the second. This is
+       the whole reason the word carries three states instead of a bool: NOTIFIED is a latched permit
+       that a later waker can see and stand down on. -DWAKE_ALWAYS_SYSCALL is the control and reaches
+       oswake == 2.
+
+       WHAT THIS ASSERTION ASSUMES AND DOES NOT CHECK: coalescing two wakes into one is only sound
+       because the woken worker DRAINS, rather than taking a single task and parking again. That
+       property lives in the search loop, not in the permit word, and sleep is modelled here as
+       termination -- so this harness cannot see it. It is a real obligation on Worker(), stated
+       rather than proven. Say so before citing this file as "coalescing verified". */
+    assert(oswake <= 1);
 
     return 0;
 }
@@ -233,30 +351,47 @@ int main(void) {
    GenMC is not on PATH; invoke by full path. Built inside WSL (~/genmc), not under /mnt/c --
    reading the model across /mnt/c at run time is fine.
 
-   RUN 2026-08-31, GenMC v0.17.0, WSL:
+   RUN 2026-08-31, GenMC v0.17.0, WSL -- WAIT OBJECT MODELLED, ONE WORKER, TWO WAKERS:
 
-   | variant                      | outcome                          |
-   |------------------------------|----------------------------------|
-   | (as proposed)                | no errors, 5 complete executions |
-   | -DWAKE_CAS_ONLY -DNO_RECHECK | **SAFETY VIOLATION**             |
-   | -DWAKE_CAS_ONLY              | no errors, 4 executions          |
-   | -DNO_RECHECK                 | no errors, 3 executions          |
-   | -DACQ_REL_ONLY               | no errors, 5 executions          |
+   | variant                      | outcome              | complete execs |
+   |------------------------------|----------------------|----------------|
+   | (as proposed)                | no errors            | 40             |
+   | -DNO_PREWAIT_REREAD          | **SAFETY VIOLATION** | --             |
+   | -DWAKE_CAS_ONLY              | **SAFETY VIOLATION** | --             |
+   | -DACQ_REL_ONLY               | **SAFETY VIOLATION** | --             |
+   | -DWAKE_CAS_ONLY -DNO_RECHECK | **SAFETY VIOLATION** | --             |
+   | -DWAKE_ALWAYS_SYSCALL        | **SAFETY VIOLATION** | --  (oswake==2)|
+   | -DNO_RECHECK                 | no errors            | 24             |
 
-   THE PROPOSED MACHINE HOLDS, and the combined control proves the harness can express the bug --
-   without that line the green result above would be worthless.
+   FIVE OF SIX CONTROLS FAIL. Only NO_RECHECK still passes alone, and the reason is stated at that
+   #ifdef: the unconditional swap already latches the permit the recheck would have found. Keep the
+   recheck anyway -- it is what turns a latched permit into work done without a syscall.
 
-   -DACQ_REL_ONLY PASSING IS NOT A LICENCE TO WEAKEN THE ORDERING. It says this harness does not
-   distinguish them, which is a statement about the harness: every write to the permit word here is
-   an RMW (CAS or swap), and RMWs are totally ordered per location regardless of the memory order
-   requested, so the StoreLoad hazard acq_rel would expose has no plain store to expose it through.
-   sleepwake_model.c's ACQ_REL_ONLY DOES fail, because that protocol stores. Read this cell as
-   "not tested here", not as "acq_rel is sufficient".
+   -DACQ_REL_ONLY FAILS, AND THAT IS THE IMPORTANT CELL. It PASSED in the version of this file that
+   had no wait object, and that pass was an artefact: with sleep encoded as bare termination every
+   write to the permit was an RMW, and RMWs are totally ordered per location whatever order is
+   requested, so acq_rel was indistinguishable from seq_cst and the cell honestly read "not tested
+   here". Registering on a SEPARATE object introduces the StoreLoad pair ACROSS TWO LOCATIONS that
+   acquire/release does not give, and the hole opens. The seq_cst requirement on this word is now
+   proven by the harness rather than argued from x86-vs-AArch64.
 
-   EXECUTION COUNTS ARE SMALL (3-5) because the harness is one worker and one waker with sleep
-   modelled as termination. That is enough to reach the bug -- the combined control finds it -- but
-   it does not cover multiple concurrent wakers, a second worker, or the return-from-wait path where
-   the word must read NOTIFIED and be swapped back to EMPTY. Those are the obvious extensions if the
-   machine is built.
-   ============================================================================================== */
+   -DWAKE_ALWAYS_SYSCALL IS A DIFFERENT KIND OF RED and should be read as such. It violates neither
+   lost-wakeup assertion -- it is a CORRECT machine. It fails only `oswake <= 1`: two producers, two
+   syscalls. That is the arm that ran on the machine first ("notify all the time") and it is why the
+   permit word carries three states rather than a bool.
+
+   THE TWO-WAKER CASE IS WHY THE EXECUTION COUNT WENT 8 -> 40. One waker cannot order two swaps
+   against each other, so it cannot express coalescing at all, and it cannot express "the first
+   producer's wake was dropped and only the second rescued the sleeper".
+
+   WHAT IS STILL NOT MODELLED, so do not claim it:
+     - THE RETURN-FROM-WAIT PATH. Sleep is still termination. The rule that a wait returning with
+       PARKED still set is spurious and must re-block, and that the word must read NOTIFIED and be
+       swapped back to EMPTY, is unverified here.
+     - A SECOND WORKER, hence nothing about which of two sleepers a wake reaches, or about the
+       targeting the state word is also used for.
+     - THE DRAIN OBLIGATION coalescing rests on -- see the note at the `oswake <= 1` assertion.
+     - g_work IS STICKY. In Worker() the real flags (hasQueuedWork, laneWake) are EDGE-TRIGGERED and
+       cleared at the top of the loop. A model whose work flag can never be consumed cannot express
+       "the flag was cleared by the pass that then failed to find the task".
    ============================================================================================== */

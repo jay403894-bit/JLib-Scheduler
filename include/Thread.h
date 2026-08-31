@@ -388,7 +388,14 @@ namespace JLib {
         int qIndex = 0;
         // WS_AWAKE(0) / WS_GOING_TO_SLEEP(1) / WS_SLEEPING(2). Read by the placement path to decide
         // whether a push it just routed will have to buy an OS wake -- see NoteWakeMiss.
-        int GetWorkerState() const noexcept { return workerState.load(std::memory_order_relaxed); }
+        // seq_cst, NOT relaxed, and it was relaxed. Every caller compares this against WS_PARKED to
+        // decide whether somebody needs waking or may be targeted -- which makes it one half of a
+        // Dekker pair with MarkQueuedWork, and a Dekker pair is only sound when BOTH sides are
+        // seq_cst. Parked() was already seq_cst; this was the same question asked weakly, and the
+        // five call sites reading it could act on a stale answer. The loads are in wake-selection
+        // scans, not a hot loop -- each is followed by a syscall or a placement decision -- so the
+        // strengthening costs nothing measurable and removes a class of doubt entirely.
+        int GetWorkerState() const noexcept { return workerState.load(std::memory_order_seq_cst); }
 
         // The OS thread itself, so a caller can join it directly -- `threads[i]->GetThread().join()`
         // -- rather than going through Thread::Join().
