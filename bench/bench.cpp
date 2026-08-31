@@ -1785,7 +1785,7 @@ static constexpr size_t kIoOvlWindow = 8;   // > K on every configuration we shi
 // its way into a body. Zero on BOTH under a window this wide would mean neither reachability
 // mechanism ever fired, which is the interesting failure -- it would say the lane is being drained
 // by luck.
-static void BenchIoPipeOverlap(JLib::TaskScheduler& sched) {
+static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
     const size_t K = JLib::TaskScheduler::GetHotWorkers();
     if (!JLib::TaskScheduler::HiPriLaneActive()
         || JLib::TaskScheduler::GetAwakeFloorBase() == 0) {
@@ -1802,6 +1802,7 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched) {
     struct Slot {
         std::atomic<long long> startNs;
         long long              postNs;
+        unsigned long long     iters;    // this completion's own duration -- see the mix below
     };
 
     auto nowNs = [] {
@@ -1809,15 +1810,51 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched) {
                    Clock::now().time_since_epoch()).count();
     };
 
-    // ~2 us. Calibrated against the burst body's 3'000'000 iterations for 3.28 ms (~1.09 ns each).
+    // The duration is PER TASK now, not a constant in the body. See the mix below.
     auto body = +[](void* p) {
         Slot* s = (Slot*)p;
         s->startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                              Clock::now().time_since_epoch()).count(),
                          std::memory_order_release);
         unsigned long long x = 88172645463325252ull;
-        for (int i = 0; i < 2000; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
+        const unsigned long long n = s->iters;
+        for (unsigned long long i = 0; i < n; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
         g_ioOverlapSink.fetch_add(x, std::memory_order_relaxed);
+    };
+
+    // ---- WHY THE DURATION VARIES, AND WHY THE FIXED ARM IS STILL RUN ------------------------
+    //
+    // ROUND-ROBIN PLACEMENT IS OPTIMAL FOR EQUAL SERVICE TIMES and blind to unequal ones. With a
+    // constant 2.2 us body, alternating between two reserved workers IS perfect balance, so the
+    // fixed arm measures a lane whose placement cannot be improved -- and the strand counters were
+    // reading 20-28% against exactly that best case.
+    //
+    // Real completions are not uniform. A movement packet, a state sync and a chat message are
+    // different work arriving on the same socket, and a burst of them lands together: at K=2 three
+    // packets go to K0, K1, K0, so the third waits on the FIRST finishing however long that takes,
+    // even once K1 is free. That is the case the producer-side spill structurally cannot reach --
+    // at the instant the third is pushed both workers are busy, so the search finds nobody.
+    //
+    // THE MIX is heavy-tailed on purpose and its mean is held near the fixed arm's 2.2 us, so the
+    // two rows differ in VARIANCE and not in offered load. Anything else would confound "variance
+    // hurts placement" with "more work is slower".
+    //
+    //     70%  x 1 us      20%  x 3 us      8%  x 8 us      2%  x 30 us     -> mean ~2.5 us
+    //
+    // DETERMINISTIC, not random: the duration is a hash of the completion's index, so a rerun is
+    // the same workload and two configurations can be compared. A repeating table would risk
+    // aligning with the window (8) or the rotation (K), which would be an artifact rather than a
+    // finding; splitmix64 has no such period.
+    const double itersPerUs = 2000.0 / 2.2;
+    auto durationFor = [&](int i) -> unsigned long long {
+        if (!variable) return 2000ull;
+        unsigned long long z = (unsigned long long)i + 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= (z >> 31);
+        const unsigned bucket = (unsigned)(z % 100ull);
+        const double us = (bucket < 70) ? 1.0 : (bucket < 90) ? 3.0 : (bucket < 98) ? 8.0 : 30.0;
+        return (unsigned long long)(us * itersPerUs);
     };
 
     std::vector<double> lat;
@@ -1841,6 +1878,7 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched) {
             size_t made = 0;
             for (size_t j = 0; j < n; ++j) {
                 slots[j].startNs.store(0, std::memory_order_relaxed);
+                slots[j].iters = durationFor(base + (int)j);
                 ts[j] = sched.CreateTask(body, &slots[j], /*hiPri*/ 1);
                 if (!ts[j]) break;
                 ++made;
@@ -1868,8 +1906,12 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched) {
     if (lat.empty()) { printf("io-pipe/ovl  : no samples\n"); return; }
 
     std::sort(lat.begin(), lat.end());
-    printf("io-pipe/ovl  : completion -> job start, %zu samples, %zu in flight (hiPri, K=%zu)\n",
-           lat.size(), kIoOvlWindow, K);
+    printf("io-pipe/%-4s : completion -> job start, %zu samples, %zu in flight (hiPri, K=%zu)\n",
+           variable ? "ovlv" : "ovl", lat.size(), kIoOvlWindow, K);
+    if (variable)
+        printf("               handler duration VARIES: 70%% 1us, 20%% 3us, 8%% 8us, 2%% 30us\n"
+               "               (mean held near the fixed row's 2.2us, so the two differ in\n"
+               "                VARIANCE and not in offered load)\n");
     printf("               p50 %.2f us   p90 %.2f us   p99 %.2f us   max %.2f us\n",
            lat[lat.size() / 2], lat[(size_t)(lat.size() * 0.90)],
            lat[(size_t)(lat.size() * 0.99)], lat.back());
@@ -2380,7 +2422,9 @@ int main(int argc, char** argv) {
     // -- the same contamination that once read the frame DAG at 30.88 us against its true 22-24.
     if (runEvents) { Section("latency/hot");  BenchLatencyHotCold(sched); }
     if (runEvents) { Section("event/resume"); BenchEventResume(sched, /*sleeping arm*/ true); }
-    if (runEvents) { Section("io-pipe");      BenchIoPipe(sched); BenchIoPipeOverlap(sched); }
+    if (runEvents) { Section("io-pipe");      BenchIoPipe(sched);
+                                             BenchIoPipeOverlap(sched, /*variable*/ false);
+                                             BenchIoPipeOverlap(sched, /*variable*/ true); }
     // LAST, and deliberately. This one sleeps 50 ms before each of its five runs so the pool is
     // genuinely parked, which is the whole point of it. Run earlier, it leaves every worker cold and
     // the next section pays the wake-up: with it sitting before the frame DAG, that section read
