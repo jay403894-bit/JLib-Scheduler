@@ -3130,11 +3130,31 @@ size_t TaskScheduler::GetLazySplitCap() noexcept { return g_lazySplitCap.load(st
 // ON BY DEFAULT, because the thing it replaces is doing nothing: a range currently wakes ONE worker
 // and waits to be discovered. The flag exists so `norecruit` can A/B the whole mechanism in one
 // binary against the floor=31 ceiling, which is what bounds its payoff.
-// OFF BY DEFAULT. It changes what ParallelFor does on every call -- it runs the first kMinGrain
-// items on the caller before deciding anything, and it can fan out where minItersPerWorker used to
-// refuse. That is the point, and it is also exactly the kind of change that has failed here before,
-// so it is opt-in until Jay's numbers say otherwise rather than the other way round.
-static std::atomic<bool> g_measuredWidth{ false };
+// ---- ON BY DEFAULT AS OF 2026-08-31 ----------------------------------------------------------
+//
+// It shipped opt-in while it was unproven. It is not unproven any more: against the iteration-count
+// gate it replaces, on the same run,
+//
+//                 trivial2000  trivial10000  light2000  light200k  heavy256  heavy1000
+//   minfan gate      0.05x        0.28x        0.22x     10.72x     1.00x     1.00x
+//   measured         0.94x        0.96x        1.04x     20.28x     6.61x    14.63x
+//
+// The gate fans a trivial body out at N=2000 and loses 19x, loses 4.7x on light at the same N, and
+// refuses heavy at N<=1000 where 6-15x is available. Those are not close calls and they are far
+// outside the noise -- a 0.05x cell means the parallel arm took twenty times the serial one, which
+// no measurement artefact produces.
+//
+// WHAT IT COSTS, stated plainly: ParallelFor now runs a few items on the CALLER before deciding
+// anything, so a range that would have run serially pays a probe it did not before. Measured at
+// trivial N<=512, that is about 0.06 us. It buys not throwing away 130 us on heavy N=256.
+//
+// THE CELLS BEHIND THE SMALL NUMBERS ARE QUANTISED and should not be read finely: steady_clock is
+// 100 ns here, trivial N=256 is ~120 ns of work, and the sweep takes a MINIMUM over runs -- so
+// those ratios snap to small integer fractions (1/2, 2/3, 4/5) and repeat exactly. The case above
+// rests on the large-magnitude cells, which are hundreds of ticks apart.
+//
+// SetMeasuredWidth(false) restores the old gate exactly; `nomwidth` is the bench arm.
+static std::atomic<bool> g_measuredWidth{ true };
 void TaskScheduler::SetMeasuredWidth(bool on) noexcept { g_measuredWidth.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::GetMeasuredWidth() noexcept { return g_measuredWidth.load(std::memory_order_relaxed); }
 

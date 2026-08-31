@@ -860,8 +860,18 @@ namespace JLib {
 		//
 		// It is a LOWER BOUND by design -- a back-loaded body makes the first chunk unrepresentative
 		// and W too small. Range recruitment then widens on evidence as expensive leaves complete,
-		// so the probe picks a defensible start and recruitment corrects upward. With this off,
-		// ParallelFor behaves exactly as before.
+		// so the probe picks a defensible start and recruitment corrects upward.
+		//
+		// ON BY DEFAULT since 2026-08-31. Two consequences worth knowing before you turn it off:
+		//
+		//   ParallelFor now runs a few items ON THE CALLER before deciding anything, so a range
+		//   that ends up serial has paid a small probe (~0.06 us at N<=512) it did not before. That
+		//   buys not refusing heavy ranges the old gate declined -- 1.00x to 6-15x at N<=1000.
+		//
+		//   SetMinItersPerWorker no longer gates anything unless this is OFF. It remains the gate
+		//   for the disabled path and is otherwise inert.
+		//
+		// SetMeasuredWidth(false) restores the previous behaviour exactly.
 		static void   SetMeasuredWidth(bool on) noexcept;
 		static bool   GetMeasuredWidth() noexcept;
 

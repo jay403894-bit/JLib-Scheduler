@@ -2556,8 +2556,15 @@ int main(int argc, char** argv) {
         //   instead of an iteration count. Opt-in: it changes what every ParallelFor call does.
         //   Sweep it against the trivial and heavy rows TOGETHER with minfan=0 -- the claim is that
         //   one number handles both ends, so a run that only improves one end has not shown it.
+        // mwidth / nomwidth -- measured fan-out width. ON by default since 8-31; `mwidth` is kept
+        //   so existing command lines and notes still work, `nomwidth` is the control arm that
+        //   restores the old iteration-count gate (SetMinItersPerWorker) exactly.
         if (JLIB_STRICMP(argv[a], "mwidth") == 0) {
             JLib::TaskScheduler::SetMeasuredWidth(true);
+            continue;
+        }
+        if (JLIB_STRICMP(argv[a], "nomwidth") == 0) {
+            JLib::TaskScheduler::SetMeasuredWidth(false);
             continue;
         }
         // memory -- remember measured body cost per call site so the NEXT range skips the probe.
