@@ -5129,7 +5129,18 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	// ALL BITS CLEAR = the pool is genuinely asleep, so there is nothing to prefer: the fallback
 	// runs and the wake that follows is necessary work rather than a missed optimisation.
 	if (workers.size() <= kMaxHintQueues
-	    && (pref == CorePref::Default || pref == CorePref::Any || pref == CorePref::Wide)) {
+	// ---- Wide DELIBERATELY DOES NOT ENTER HERE ----------------------------------------------
+	//
+	// This whole block narrows placement to the awake floor, which is the cheap push -- a running
+	// worker costs no kernel wake -- and it is the wrong answer for bulk. A physics step or a
+	// ParallelFor leaf wants CAPACITY now, not a cheap push: it is milliseconds of work against a
+	// ~3 us wake, and being steered at two workers means the rest of the pool only arrives through
+	// steals. The burst row measured exactly that -- growth woke 13 workers, 9 ever ran a task.
+	//
+	// So `Wide` skips this and falls through to the full-pool rotation at the end, paying the wakes
+	// to have every worker running immediately. `Default` (and `Any`, which aliases it) keeps the
+	// steered push. That is the entire meaning of the enum now.
+	    && pref == CorePref::Default) {
 		size_t nWords = (workers.size() + 63) / 64;
 		if (nWords > kHintWords) nWords = kHintWords;
 
@@ -5594,46 +5605,32 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 		}
 	}
 
-	// Round-robin a worker subset, returning the next worker in that subset (pinning is gone as of
-	// or -1 if the set is empty
-	// -- which tells the caller to SPILL to the other class rather than block on an unavailable core.
-	// DEDICATED HOT WORKERS: ordinary work must never be ROUTED to one. A hot worker exists to have
-	// nothing else to do -- that is the entire latency guarantee. Letting a bulk task land there
-	// costs a completion the whole duration of that task, because a running task cannot be
-	// preempted and no bounded "short work" class exists to steal from instead.
+	// `pickFrom` WAS HERE: a round-robin over one class's worker subset, skipping [0,K). Its only
+	// caller was the P/E branch below, so it went with it. A lambda assigned to `auto` raises no
+	// unused warning, which is exactly how this kind of thing survives a deletion -- so it is
+	// removed rather than left for the next reader to wonder about.
 	//
-	// Hot workers are indices 0..K-1 by construction, so skipping them is an index test. Zero when
-	// K = 0, which is the untouched original behaviour. P/E routing is preserved for the rest.
-	// (hotN is read once at the top of this function, above the lane branch.)
+	// The reserved-band skip it carried is not lost: the full-pool rotation at the end of this
+	// function does the same `j < hotN` test, and for the same reason. Ordinary work must never be
+	// ROUTED to a reserved worker -- one exists to have nothing else to do, and a bulk task landing
+	// there costs a completion the whole duration of that task, because a running task cannot be
+	// preempted.
 
-	auto pickFrom = [this, hotN](std::vector<int>& set, std::atomic<size_t>& cur) -> int {
-		size_t m = set.size();
-		if (m == 0) return -1;
-		size_t start = cur.load(std::memory_order_relaxed);
-		for (size_t i = 0; i < m; ++i) {
-			int idx = set[(start + i) % m];
-			// Skip BOTH reservations: K's (dead) and hiPri's [0, R). Ordinary work must never land
-			// on a reserved worker, or the reservation is a comment rather than a guarantee.
-			if ((size_t)idx < hotN || (size_t)idx < ReservedHiPri()) continue;
-			cur.store((start + i + 1) % m, std::memory_order_relaxed);
-			return idx;
-		}
-		return -1;
-	};
+	// ---- THE P/E CLASS ROUTING WAS HERE AND IS GONE ------------------------------------------
+	//
+	// It tried the preferred class set and spilled to the other. Removed because it was dormant --
+	// `src/posix/Topology.cpp` said so in the tree, "no shipped caller requests CorePref::P or ::E",
+	// and a repo-wide grep found none -- and because where it DID apply it was unproven: under the
+	// default `Ideal` affinity a worker is not pinned, so aiming at a "P worker" is a preference the
+	// OS then weighs against its own hybrid policy. It binds only under `hard`, which measured ~45%
+	// worse on wake latency. The concept is also x86-hybrid-specific and does not port.
+	//
+	// The topology it read is NOT gone and must not be: `isPCore` still drives E-core QoS handling
+	// in Thread.cpp and the same-class/other-class victim ordering for steals. Those are properties
+	// of the MACHINE that the pool reacts to; this was a per-task request nobody made.
 
-	// Preference is a HINT, not a constraint (per the "don't wait when another core is free" rule): try the
-	// preferred class, then SPILL to the other. On top of this, work-conserving stealing (an idle worker
-	// steals a hiPri task off a busy one) covers the class-backlog-while-other-idle case at run time -- so
-	// a task never sits queued while any core is idle.
-	if (pref == CorePref::P || pref == CorePref::E) {
-		const bool preferP = (pref == CorePref::P);
-		int idx = preferP ? pickFrom(pWorkers, nextPWorker) : pickFrom(eWorkers, nextEWorker);
-		if (idx < 0) idx = preferP ? pickFrom(eWorkers, nextEWorker) : pickFrom(pWorkers, nextPWorker);
-		if (idx >= 0) return idx;
-	}
-
-	// Default/Any/Wide land here directly (no class preference); for P/E it's the last resort -- sets
-	// empty (not built) or EVERY worker pinned. The original full-pool round-robin, unchanged.
+	// Every task lands here now -- Default arrives having declined the steered pick above, Wide by
+	// skipping it deliberately. The original full-pool round-robin, unchanged.
 	// SEQ_CST, explicitly, and deliberately NOT relaxed. These were bare `nextWorker + i` /
 	// `nextWorker = ...`, which default to seq_cst; on 2026-08-16 they were made explicitly RELAXED
 	// on the reasoning that this is only a round-robin HINT (true -- nothing reads it for

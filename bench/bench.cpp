@@ -509,7 +509,7 @@ static void LaneBody(void*) {
 }
 
 
-static void BenchIdleBurst(JLib::TaskScheduler& sched) {
+static void BenchIdleBurst(JLib::TaskScheduler& sched, JLib::CorePref pref) {
     constexpr int kBurst = 16;
     constexpr int kRuns  = 5;
 
@@ -546,7 +546,7 @@ static void BenchIdleBurst(JLib::TaskScheduler& sched) {
         JLib::TaskScheduler::ResetWakeCount();
         auto t0 = Clock::now();
         for (int i = 0; i < kBurst; ++i) {
-            JLib::Task* t = sched.CreateTask(BurstBody, nullptr);
+            JLib::Task* t = sched.CreateTask(BurstBody, nullptr, 0, JLib::TaskType::Native, pref);
             if (!t) { printf("burst        : ERROR -- CreateTask returned null\n"); return; }
             t->waitGroup = &wg; sched.Push(t);
         }
@@ -629,7 +629,17 @@ static void BenchIdleBurst(JLib::TaskScheduler& sched) {
     const unsigned long long burstWakes = (unsigned long long)JLib::TaskScheduler::GetWakeCount();
     const size_t floorPeakBurst  = JLib::TaskScheduler::GetAwakeFloorPeak();
     const size_t floorAfterBurst = JLib::TaskScheduler::GetAwakeFloor();
-    printf("burst        : %d heavy tasks from an idle pool -> %.2f ms (1 task = %.2f ms, speedup %.1fx of %d)\n",
+    // TWO ARMS, dflt and wide, and the pair is the point. `dflt` is steered at the awake floor --
+    // the cheap push, no kernel wake -- and this row is where that is the wrong trade: 16 bodies of
+    // ~3.3 ms each, against a wake of ~3 us. `wide` skips the narrowing and takes the full-pool
+    // rotation, paying a wake per push to have every worker running immediately instead of waiting
+    // for owners to drain their inboxes into something stealable.
+    //
+    // READ THE PARTICIPANT LINE, NOT THE MILLISECONDS. The speedup is capped by ceil(16/participants)
+    // waves, so "workers that actually RAN a burst task" is the number that says whether placement
+    // reached the pool at all.
+    printf("burst/%-5s: %d heavy tasks from an idle pool -> %.2f ms (1 task = %.2f ms, speedup %.1fx of %d)\n",
+        (pref == JLib::CorePref::Wide) ? "wide" : "dflt",
         kBurst, burst, solo, (solo * kBurst) / burst, kBurst);
     printf("               floor after the burst: %zu immediately, %zu after a 25 ms settle (base %zu)\n"
            "               ^ the first is expected to be grown -- the last completion refreshes the\n"
@@ -2432,7 +2442,8 @@ int main(int argc, char** argv) {
     // pool has to go after everything it would otherwise contaminate.
     // The "lane pressure" row is gone with adaptive K: it existed to ask whether the
     // controller ramps under sustained hiPri load, and there is no controller.
-    Section("burst");          BenchIdleBurst(sched);
+    Section("burst");          BenchIdleBurst(sched, JLib::CorePref::Default);
+    Section("burst");          BenchIdleBurst(sched, JLib::CorePref::Wide);
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
     if (runSweep) { Section("splitter vs cursor sweep");    BenchSplitterVsCursorCrossover(sched); }
     if (runSweep) { Section("requeue vs pushbatch");        BenchRequeueVsPushBatch(sched); }

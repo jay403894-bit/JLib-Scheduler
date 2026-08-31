@@ -2112,10 +2112,20 @@ namespace JLib {
 		// Takes the PREFERENCE, not the task. Steal vetting runs before the thief has claimed
 		// anything, so it must not dereference the candidate -- the value arrives in the deque's
 		// pointer tag instead (see TaskDeque's StealBits).
-		static bool StealClassCompatible(CorePref p, bool thiefIsP, bool degenerateTopology) {
-			if (p == CorePref::Default || p == CorePref::Wide) return true;   // Any aliases Wide
-			if (degenerateTopology) return true;
-			return (p == CorePref::P) ? thiefIsP : !thiefIsP;
+		// ---- ALWAYS TRUE NOW THAT P/E ARE GONE ----------------------------------------------
+		//
+		// It used to make an explicitly-P task stealable only by a P-class thief, which was the
+		// steal-side half of class placement. With no classes to match there is nothing to veto:
+		// every task is stealable by every worker, which is the work-conserving answer and was
+		// already the behaviour for Default and Wide -- i.e. for every task anyone actually pushed.
+		//
+		// KEPT AS A FUNCTION rather than deleted at the call sites, on purpose. The steal path
+		// threads a predicate through `steal_if` and the deque's pointer tag; collapsing that
+		// plumbing is a separate change to TaskDeque::StealBits, and doing it in the same commit
+		// would mix "P/E is gone" with "the steal predicate changed shape". One of those is easy to
+		// review and the other is not.
+		static bool StealClassCompatible(CorePref, bool, bool) {
+			return true;
 		}
 		// Convenience for callers that legitimately HOLD the task (owner-side placement checks),
 		// where dereferencing is fine. Steal paths must use the CorePref overload.

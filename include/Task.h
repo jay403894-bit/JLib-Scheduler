@@ -58,15 +58,35 @@ namespace JLib {
     // and explicit CPU affinity (Push(cpu,..) / DAG isLocal / isFork / isMain) OVERRIDES
     // corePref entirely -- pinning to a specific core is a stronger, more explicit request than a
     // class preference. Do not add owner-pop vetting: a task a worker owns must run, else it strands.
+    // ---- THIS IS A BREADTH AXIS NOW, NOT A CORE-CLASS ONE ------------------------------------
+    //
+    // P and E ARE GONE, and they were dormant: src/posix/Topology.cpp said so in the tree -- "no
+    // shipped caller requests CorePref::P or ::E" -- and a grep of the whole repo found none. They
+    // were also unproven where they did apply. Under the default `Ideal` affinity a worker is not
+    // pinned, so routing a task to a "P worker" expresses a preference that the OS scheduler then
+    // adjudicates against its own hybrid policy: a hint on top of a hint. They only bind under
+    // `hard`, which measured ~45% worse on wake latency, so nothing runs there. And the concept does
+    // not port -- P/E cores are an x86 hybrid notion the other platforms do not expose this way.
+    //
+    // WHAT PLACEMENT ACTUALLY CONSUMES is how WIDE to spread, and that question is real and
+    // measured. Ordinary placement narrows to the awake floor whenever a floor worker is awake --
+    // always, since the floor never parks -- which is right for latency-shaped work and wrong for
+    // bulk. The burst row shows the cost directly: growth woke 13 workers and 9 ever ran a task,
+    // because a busy worker's inbox has one legal consumer and the wave only became reachable as
+    // each owner drained it. For a 3.3 ms physics body a kernel wake is ~3 us, 0.1%, and routing
+    // around it costs most of the pool.
+    //
+    // `Any` IS GONE TOO, as a distinct idea: it meant "I do not care which core CLASS runs this",
+    // and there are no classes any more. Kept as an alias so existing call sites compile.
     enum class CorePref : uint8_t {
-        Default = 0,   // unspecified -- behaves as Any (no class preference, full-pool round-robin)
-        P       = 1,   // prefer Performance cores (latency-sensitive, chunky critical-path work)
-        E       = 2,   // prefer Efficiency cores (background/bulk work; preserves P headroom)
-        Wide    = 3,   // explicit no-preference, burst intent: round-robin the FULL pool (e.g. heavy
-                       // physics -- wants all cores at once and isn't latency-tiered)
-        Any     = 3,   // alias of Wide -- "I genuinely don't care which core class runs this." Same
-                       // mechanism today; separate NAME so intent reads at call sites and the two can
-                       // diverge later without API churn.
+        Default = 0,   // steered: prefer the awake floor. The cheap push -- no kernel wake -- and
+                       // the right answer for latency-shaped work (completions, frame-graph nodes).
+        Wide    = 1,   // spread across the FULL pool, paying wakes to get capacity NOW. For work
+                       // that is throughput-shaped and long enough that a ~3 us wake is noise:
+                       // physics steps, ParallelFor leaves, anything that wants every core at once
+                       // rather than trickling out through steals.
+        Any     = 0,   // alias of Default. Was "no class preference"; classes are gone.
+                       // Two spare values remain in the 2-bit field.
     };
     // Task's packed flag block, declared once and expanded in two places: Task itself, and
     // detail::TaskFlagPacking, which exists so the packing can be static_asserted and so the
