@@ -1254,6 +1254,58 @@ void Thread::Worker() {
 		const TaskScheduler::Bands bandsNow = TaskScheduler::GetBands();   // ONE load, whole pass
 		const bool reservedForHiPri = (size_t)qIndex < bandsNow.k;
 
+		// ---- DRAIN MY OWN loPri INBOX. ONE DEFINITION, TWO CALL SITES. -------------------------
+		//
+		// WHY THIS IS A LAMBDA RATHER THAN COPIED CODE. GrowFloorIfLongBody's comment records this
+		// file's own lesson twice over: a rule that existed on one arm and not the other silently
+		// stopped running for the workload that needed it. Two copies of a rule are two rules. This
+		// is called before the steal loop and again after it, and both calls must stay identical.
+		//
+		// WHY IT IS NOW CALLED BEFORE STEALING, which is the actual change. The search order was:
+		//
+		//     hiPri inbox -> resumed inbox -> own deque -> THE WHOLE STEAL LOOP -> loPri inbox
+		//
+		// so the ordinary work channel was consulted LAST. The staging drain further up does not
+		// cover it either: that one is gated on inboxDepth >= kStealHintDepth, which is 8, and a
+		// single producer pushing one task at a time leaves the depth at 1. So a worker with work
+		// sitting in its own inbox would try three empty queues, then probe every other worker's
+		// deque, and only then look where its work actually was. The source counters made it
+		// visible: 99.8% of the 1p row's tasks arrive through this path.
+		//
+		// THE SECOND CALL IS NOT REDUNDANT. The steal scan takes real time, and the inbox can refill
+		// during it -- so the late call catches work that arrived while this worker was looking
+		// elsewhere. Both are guarded on !task_to_run, so whichever fires first wins and the other
+		// is a cheap test.
+		//
+		// Returns true if it set task_to_run.
+		auto drainOwnInbox = [&]() -> bool {
+			if (task_to_run || reservedForHiPri) return false;
+			size_t count = 0;
+			while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count]))
+				++count;
+			TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
+			if (scheduler->loPriInboxes[qIndex]->empty())
+				inboxDepth.store(0, std::memory_order_relaxed);
+			else if (count)
+				inboxDepth.fetch_sub((int)count, std::memory_order_relaxed);
+			if (count == 0) return false;
+
+			// Publish all but one and run that one directly -- see the note at the original site.
+			const int keep = (int)count - 1;
+			if (keep == 0 || scheduler->deques[qIndex]->push_bottom_batch(batch, (size_t)keep)) {
+				for (int s = 0; s < keep; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
+				JLIBSCHED_STEAL_STAT(qIndex, ranDirect);
+				task_to_run = batch[count - 1];
+				JLIBSCHED_LATENCY_MARK(Found);
+				return true;
+			}
+			// Push refused: these are already out of the inbox, so dropping them loses them
+			// silently. Requeue all of them, including the one meant to be kept -- nothing has run.
+			for (size_t i = 0; i < count; ++i)
+				if (batch[i]) scheduler->Requeue(batch[i]);
+			return false;
+		};
+
 		// ---- WHAT OS PRIORITY DOES THIS WORKER'S BAND DESERVE, THIS PASS? ---------------------
 		//
 		// LIVE F, NOT BASE. "Active floor" is the point: a worker the growth controller promoted is
@@ -2315,6 +2367,14 @@ void Thread::Worker() {
 				}
 			}
 		}
+		// ---- MY OWN INBOX BEFORE ANYBODY ELSE'S DEQUE ----------------------------------------
+		//
+		// This is the reorder. Stealing probes every other worker's deque; draining this one is a
+		// single MPSC pop against a queue nobody else may touch. Looking there first is both
+		// cheaper and more likely to succeed, and doing it after the steal loop meant a worker with
+		// its own work waiting went hunting for somebody else's first.
+		drainOwnInbox();
+
 		{
 			// --- 4. Work stealing ---
 			if (!task_to_run) {
@@ -2784,73 +2844,11 @@ void Thread::Worker() {
 		// The lesson is narrower than "check your braces": a condition added to an EXISTING `if` is
 		// silently inherited by everything already inside it. The gate belongs on the hiPri pop, not
 		// on the section.
-		if (!task_to_run) {
-			size_t count = 0;
-
-			if (!task_to_run) {
-				count = 0;
-				// Reserved workers do not drain the ordinary inbox either. Nothing should be placed
-				// there for them, but a Requeue or an explicit-affinity push can still land one, and
-				// draining it would put a bulk body on a reserved core.
-				while (!reservedForHiPri
-				       && count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count])) {
-					count++;
-				}
-				TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
-
-				// ---- SELF-HEALING, NOT JUST BALANCED ---------------------------------------
-				//
-				// The obvious version of this is fetch_sub(count) against a fetch_add on every
-				// push, and it is one missed push site away from being permanently wrong -- which
-				// is exactly what happened: an un-incremented enqueue path walked the counter
-				// negative over 200,000 tasks, the growth gate went dead, and the symptom was a
-				// burst row that behaved as if the controller did not exist while the same code
-				// worked perfectly on a freshly started pool. Nothing announced it, because a
-				// heuristic reading a drifting input still looks like a heuristic that decided no.
-				//
-				// So when the inbox is observed EMPTY, the depth is not decremented, it is SET.
-				// The owner is the only legal consumer, so "empty" is authoritative here in a way
-				// a delta never is, and any accumulated error is erased the next time this worker
-				// runs dry -- which on any real workload is constantly. Drift is bounded by one
-				// idle cycle instead of by the lifetime of the process.
-				if (scheduler->loPriInboxes[qIndex]->empty())
-					inboxDepth.store(0, std::memory_order_relaxed);
-				else if (count)
-					inboxDepth.fetch_sub((int)count, std::memory_order_relaxed);
-				if (count > 0) {
-					// ---- PUBLISH ALL BUT ONE, AND RUN THAT ONE DIRECTLY -----------------------
-					//
-					// This pushed all `count` and then IMMEDIATELY popped one back off. pop_bottom
-					// takes the most recently pushed, so the pair cancelled exactly: the task that
-					// came back was always batch[count-1]. Publishing count-1 and running that last
-					// one is the same outcome for one fewer push and one fewer pop.
-					//
-					// PUBLISH FIRST, RUN SECOND, and the order is the point rather than an
-					// accident. Keeping one back and running it BEFORE publishing the rest would
-					// delay making count-1 tasks stealable by a whole task body -- hundreds of
-					// microseconds for a heavy one, during which the pool cannot see work that is
-					// sitting right there. Publishing first costs nothing and keeps visibility
-					// identical to what it was.
-					//
-					// count == 1 skips the batch call entirely: there is nothing to publish, and
-					// push_bottom_batch(batch, 0) is a call to move no tasks.
-					const int keep = count - 1;
-					if (keep == 0 || scheduler->deques[qIndex]->push_bottom_batch(batch, keep)) {
-						for (int s = 0; s < keep; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
-						JLIBSCHED_STEAL_STAT(qIndex, ranDirect);
-						task_to_run = batch[count - 1];
-						JLIBSCHED_LATENCY_MARK(Found);
-						continue;
-					}
-					// PUSH REFUSED. Same as the hiPri branch above: these are already out of the
-					// inbox, so dropping them loses them silently. Requeue rather than discard --
-					// and requeue ALL of them, including the one this pass meant to keep, because
-					// nothing has run yet and the deque would not take the others.
-					for (size_t i = 0; i < count; ++i)
-						if (batch[i]) scheduler->Requeue(batch[i]);
-				}
-			}
-		}
+		// SECOND CHANCE, SAME RULE. The steal scan above takes real time and the inbox can
+		// refill during it, so this catches work that arrived while this worker was looking
+		// elsewhere. Guarded on !task_to_run inside, so it is a cheap test when the earlier
+		// call already found something. ONE definition -- see drainOwnInbox above.
+		drainOwnInbox();
 
 		if (task_to_run) {
 			continue;
