@@ -159,6 +159,6 @@ int main(int argc, char** argv) {
         std::printf("  (probe counts need -DJLIBSCHED_STEAL_STATS=ON)\n");
     }
 
-    JLib::TaskScheduler::Instance().Join();
+    JLib::detail::TeardownForTesting(JLib::TaskScheduler::Instance());
     return 0;
 }

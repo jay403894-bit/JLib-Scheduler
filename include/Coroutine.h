@@ -564,7 +564,7 @@ namespace JLib {
 
         auto& sched = TaskScheduler::Instance();
         Task* t = sched.CreateTask(&detail::ResumeCoroutine,
-                                   h.address(), hiPri, FiberSize::Standard,
+                                   h.address(), hiPri,
                                    TaskType::Coroutine, pref);
         if (!t) { h.destroy(); return false; }
 
@@ -607,7 +607,7 @@ namespace JLib {
 
         auto& sched = TaskScheduler::Instance();
         Task* t = sched.CreateTask(&detail::ResumeCoroutine,
-                                   h.address(), hiPri, FiberSize::Standard,
+                                   h.address(), hiPri,
                                    TaskType::Coroutine, pref);
         if (!t) { h.destroy(); return false; }
 

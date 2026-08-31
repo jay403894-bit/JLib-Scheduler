@@ -13,7 +13,6 @@
 // failed assertion in seconds.
 
 #define NOMINMAX
-#include "LockFreeHashMap.h"
 #include <TaskScheduler.h>
 #include <cstdio>
 #include <cstdlib>
@@ -331,7 +330,7 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
                 if (released.load(std::memory_order_acquire)) evp->SignalAll();
             });
             finished.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, nullptr, false, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null under fiber pressure"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -553,7 +552,7 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
         wg.n.store(kPerRound, std::memory_order_relaxed);
         for (int i = 0; i < kPerRound; ++i) {
             JLib::Task* t = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); },
-                                             false, JLib::FiberSize::Standard, JLib::TaskType::Native);
+                                             false, JLib::TaskType::Native);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -626,7 +625,7 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                     inside.fetch_sub(1, std::memory_order_acq_rel);
                     if (useLock) m->Unlock();
                 }
-                }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+                }, false, JLib::TaskType::Fiber);
             if (!task) return std::pair<int, int>{ -1, -1 };
             task->waitGroup = &wg;
             sched.Push(task);
@@ -690,7 +689,7 @@ static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
     wg.n.store(1, std::memory_order_relaxed);
     // `body` passed directly, as an lvalue. This did not compile until LambdaTask gained a const&
     // constructor -- see TestCreateTaskAcceptsNamedCallable below, which guards it.
-    JLib::Task* t = sched.CreateTask(body, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+    JLib::Task* t = sched.CreateTask(body, false, JLib::TaskType::Fiber);
     if (!t) { Check(false, "CreateTask returned null"); return; }
     t->waitGroup = &wg;
     sched.Push(t);
@@ -731,7 +730,7 @@ static void TestConditionVariableFiber(JLib::TaskScheduler& sched) {
         heldAfterWake.store(!m.Try_Lock(), std::memory_order_release);
         m.Unlock();
         finished.store(true, std::memory_order_release);
-        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, false, JLib::TaskType::Fiber);
     if (!waiter) { Check(false, "CreateTask returned null"); return; }
     waiter->waitGroup = &wg;
     sched.Push(waiter);
@@ -772,7 +771,7 @@ static void TestConditionVariableNotifyAll(JLib::TaskScheduler& sched) {
             while (!ready) cv.Wait(m);
             m.Unlock();
             woke.fetch_add(1, std::memory_order_release);
-            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            }, false, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -898,7 +897,7 @@ static void TestEventSignalOne(JLib::TaskScheduler& sched) {
             parked.fetch_add(1, std::memory_order_relaxed);
             s.WaitOnEvent(*evp);
             woke.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, nullptr, false, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -948,7 +947,7 @@ static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
             parked2.fetch_add(1, std::memory_order_relaxed);
             s.WaitOnEvent(*evp2);
             woke2.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, nullptr, false, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -974,77 +973,6 @@ static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
     Check(woke2.load() == kN, "every waiter woke exactly once under concurrent signallers");
 }
 
-// LockFreeHashMap -- a general-purpose lock-free map, no longer used by the scheduler itself.
-// These checks lived in the DAG cancellation suite while Event indexed its waiters with this
-// map; Event now uses a flat fiber-indexed table, so they belong here with the other
-// standalone container and primitive tests instead of in a suite about DAG cancellation.
-static void TestLockFreeHashMap(JLib::TaskScheduler& sched) {
-    (void)sched;
-    // Keys here are Task* values from a slab of 64-byte slots, so they are 64-BYTE ALIGNED AND
-    // CONSECUTIVE -- exactly the input a hash that does not mix will collapse onto one bucket.
-    // does not mix will collapse onto a single bucket. Nothing about the scheduler's behaviour
-    // would change if that happened, which is why it gets a direct check rather than being left
-    // to the sections below to notice.
-    std::printf("hash spreads slab-aligned keys\n");
-    {
-        JLib::LockFreeHashMap<int> m(*JLib::TaskScheduler::Instance().GetAllocator(), 16);
-        std::vector<int> hits(m.buckets_count(), 0);
-        const uintptr_t base = 0x7ff600004000ull;      // a plausible slab base
-        for (int i = 0; i < 512; ++i) ++hits[m.bucket_index(base + uintptr_t(i) * 64)];
-
-        size_t used = 0, worst = 0;
-        for (int h : hits) { if (h) ++used; if (size_t(h) > worst) worst = size_t(h); }
-        Check(used == m.buckets_count(), "every bucket receives slab-aligned keys");
-        // Even would be 32 per bucket. Unmixed would be all 512 in one.
-        Check(worst <= 64, "no bucket takes a disproportionate share");
-    }
-
-    // Sizing. The bound on waiters is the TOTAL fiber budget, so these are the numbers that decide
-    // whether chains stay short on a big machine -- getting this wrong is invisible at runtime.
-    std::printf("index sizing follows the total fiber budget\n");
-    {
-        using Map = JLib::LockFreeHashMap<int>;
-        Check(Map::SuggestBuckets(64 * 4)  == 32,  "4 workers x 64 fibers -> 32 buckets (chain ~8)");
-        Check(Map::SuggestBuckets(64 * 16) == 128, "16 workers x 64 fibers -> 128 buckets (chain ~8)");
-        Check(Map::SuggestBuckets(8)       == 16,  "tiny bound still gets the 16-bucket floor");
-        Check(Map::SuggestBuckets(1u << 20) == 512, "huge bound is capped at the 512 ceiling");
-    }
-
-    // Lazy bucket creation is the new concurrent code: many threads racing to publish the FIRST
-    // bucket, where every loser must free the list it built. A leak here is silent, and a
-    // double-publish would lose entries outright.
-    std::printf("concurrent first-insert into one bucket\n");
-    {
-        JLib::LockFreeHashMap<int> m(*JLib::TaskScheduler::Instance().GetAllocator(), 64);
-        const int kThreads = 8, kPer = 64;
-
-        // All keys chosen to land in ONE bucket, so every thread races on the same slot.
-        const size_t target = m.bucket_index(0x1000);
-        std::vector<uint64_t> keys;
-        for (uint64_t k = 0x1000; keys.size() < size_t(kThreads * kPer); k += 8)
-            if (m.bucket_index(k) == target) keys.push_back(k);
-
-        std::vector<std::thread> ts;
-        std::atomic<int> added{ 0 };
-        for (int t = 0; t < kThreads; ++t) {
-            ts.emplace_back([&, t] {
-                for (int i = 0; i < kPer; ++i)
-                    if (m.add(keys[size_t(t * kPer + i)], t * kPer + i))
-                        added.fetch_add(1, std::memory_order_relaxed);
-            });
-        }
-        for (auto& th : ts) th.join();
-
-        Check(added.load() == kThreads * kPer, "every racing insert landed");
-        int seen = 0;
-        m.for_each([&](int) { ++seen; });
-        Check(seen == kThreads * kPer, "and every one is reachable afterwards");
-
-        int stillThere = 0;
-        for (uint64_t k : keys) if (m.contains(k)) ++stillThere;
-        Check(stillThere == kThreads * kPer, "all keys found by lookup");
-    }
-}
 
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
@@ -1111,9 +1039,8 @@ int main(int argc, char** argv) {
     TestCreateTaskAcceptsNamedCallable(sched);
     TestEventSignalOne(sched);
     TestEventSignalOneConcurrent(sched);
-    TestLockFreeHashMap(sched);
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     g_done.store(true, std::memory_order_release);
 
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");

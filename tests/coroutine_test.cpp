@@ -476,7 +476,7 @@ int main() {
                     fx.overlap.fetch_sub(1, std::memory_order_acq_rel);
                     fx.m.Unlock();
                 }
-            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            }, false, JLib::TaskType::Fiber);
             t->waitGroup = &fiberWg;
             sched.Push(t);
         }
@@ -526,7 +526,7 @@ int main() {
                     fx.sem.Signal();
                     fx.semDone.fetch_add(1, std::memory_order_relaxed);
                 }
-            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            }, false, JLib::TaskType::Fiber);
             t->waitGroup = &fiberWg;
             sched.Push(t);
         }

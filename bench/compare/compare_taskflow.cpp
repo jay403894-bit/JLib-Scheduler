@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
     JLib::TaskScheduler::Init(pool);
     JLib::TaskScheduler& jl = JLib::TaskScheduler::Instance();
-    if (!g_doJ) jl.Join();   // real teardown: nothing of JLib runs while Taskflow is timed
+    if (!g_doJ) JLib::detail::TeardownForTesting(jl);   // real teardown: nothing of JLib runs while Taskflow is timed
 
     const uint32_t workers = (uint32_t)(pool ? pool : std::thread::hardware_concurrency() - 1);
     tf::Executor ex(workers + 1);   // see the worker-accounting note at the top
@@ -289,6 +289,6 @@ int main(int argc, char** argv) {
     printf("(sink %llu -- printed only so none of the work can be optimised away)\n",
            (unsigned long long)g_sink.load());
 
-    if (g_doJ) jl.Join();
+    if (g_doJ) JLib::detail::TeardownForTesting(jl);
     return 0;
 }

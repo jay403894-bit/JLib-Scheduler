@@ -128,7 +128,7 @@ int main() {
 
     for (int i = 0; i < kInterferes; ++i) {
         JLib::Task* t = sched.CreateTask(InterferenceBody, nullptr, false,
-                                         JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+                                         JLib::TaskType::Fiber);
         if (!t) { noise.n.fetch_sub(1, std::memory_order_release); continue; }
         t->waitGroup = &noise;
         sched.Push(t);
@@ -137,7 +137,7 @@ int main() {
     for (int i = 0; i < kSubjects; ++i) {
         JLib::Task* t = sched.CreateTask(SubjectBody,
                                          reinterpret_cast<void*>(static_cast<std::uintptr_t>(i)),
-                                         false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+                                         false, JLib::TaskType::Fiber);
         if (!t) { subjects.n.fetch_sub(1, std::memory_order_release); continue; }
         t->waitGroup = &subjects;
         sched.Push(t);
@@ -169,6 +169,6 @@ int main() {
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     return g_fail == 0 ? 0 : 1;
 }

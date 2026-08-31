@@ -12,6 +12,10 @@
 
 namespace JLib {
     struct DirectEvent;   // pointer-only below; the definition is needed in WaitGroup.cpp
+    struct Fiber;         // same: the direct waiter stack stores Fiber*, and only WaitGroup.cpp
+                          // dereferences one. Including Fiber.h here would drag Task.h and Epochs.h
+                          // into every TU that touches a WaitGroup, which is the exact bloat that
+                          // moved this out of Task.h in 1.0.
 
     // Completion counter with a parked-waiter list: the primitive behind WaitFor.
     //
@@ -42,6 +46,31 @@ namespace JLib {
             uint32_t     token = 0xFFFFFFFFu;   // CancelToken::kNone
         };
         std::vector<CancelWaiter> cancellable;
+
+        // ---- DIRECT WAITERS: no mutex, no allocation, no DirectEvent ---------------------------
+        //
+        // WHAT THE OTHER PATH COSTS, per wait: a pooled DirectEvent acquire, a std::mutex, and an
+        // unordered_set node -- a heap allocation. And per completion, WakeAll takes the mutex again
+        // and builds a std::vector to wake from. On the most-used wait in the library.
+        //
+        // This is the same information as an intrusive lock-free stack threaded through the parked
+        // fibers themselves. A push is one CAS, a drain is one exchange, and nothing allocates.
+        //
+        // ONLY SOUND BECAUSE FIBERS ARE PINNED AND NEVER FREED. The link lives on the Fiber, and the
+        // global pool reserves and leaks its fibers, so a stack node cannot be recycled underneath a
+        // walker -- which is exactly the bug that retired the older Task-threaded waiter list.
+        //
+        // ORDERING IS LOAD-BEARING AND IS COPIED FROM WaitOnEventDirectArmed, which documents it:
+        // become parkable FIRST (status = WANTS_SUSPEND), publish the waiter SECOND, arm THIRD,
+        // suspend LAST -- and suspend by ContextSwitch, never Fiber::Suspend(), because Suspend()
+        // re-stores WANTS_SUSPEND and would overwrite a SUSPEND_SIGNALED that raced in. Publishing
+        // before becoming parkable lets a signal Resume() a RUNNING fiber, which is a no-op, which
+        // is a lost wakeup and a permanent hang.
+        std::atomic<Fiber*> directWaiters{ nullptr };
+
+        // Drain the direct stack and resume everyone on it. Safe to call with an empty stack, which
+        // is the Default-mode case -- nothing ever pushes there.
+        void WakeAllDirect();
 
         void WakeAll();
 

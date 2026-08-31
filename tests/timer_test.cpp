@@ -138,7 +138,7 @@ int main() {
                 cancelled.fetch_add(1, std::memory_order_relaxed);
             else
                 acquired.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, false, JLib::TaskType::Fiber);
         t->cancelToken = op.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);

@@ -102,7 +102,7 @@ int main() {
     dom.Scan();
     Check(g_freed.load() == 1, "and it IS freed once the reader lets go");
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
     return g_fail == 0 ? 0 : 1;
 }

@@ -175,6 +175,6 @@ int main(int argc, char** argv) {
                 "  the lock is a couple of atomics and the epoch machinery is pure overhead.\n"
                 "  The question is where it crosses, and whether the pool ever runs below it.\n");
 
-    JLib::TaskScheduler::Instance().Join();
+    JLib::detail::TeardownForTesting(JLib::TaskScheduler::Instance());
     return 0;
 }

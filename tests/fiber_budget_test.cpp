@@ -27,17 +27,17 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("SetFiberBudget\n");
 
-    // Defaults, before Init() and before this process has ever called the setter -- must match
-    // what StartPool always computed inline (coreCount * 64, coreCount * 8) before this API existed.
-    Check(JLib::TaskScheduler::StandardFibersPerWorker() == 64, "default standard/worker is 64");
-    Check(JLib::TaskScheduler::HeavyFibersPerWorker() == 8, "default heavy/worker is 8");
+    // ONE STACK CLASS. This asserted a second, 512 KB "heavy" budget as well; that class was
+    // deleted because nothing in the library, the tests or the benches ever requested it while it
+    // committed ~127 MB up front on a 31-worker pool. The assertions went with it rather than being
+    // relaxed -- a test that checks a number nothing consumes is the same trap the class was.
+    Check(JLib::TaskScheduler::StandardFibersPerWorker() == 64, "default is 64 fibers/worker");
 
-    // Neither value is the default in either direction, so a test that silently exercised the
-    // untouched default could not happen to pass for the wrong reason.
-    const size_t kStandard = 17, kHeavy = 3;
-    JLib::TaskScheduler::SetFiberBudget(kStandard, kHeavy);
-    Check(JLib::TaskScheduler::StandardFibersPerWorker() == kStandard, "getter reflects the new standard value");
-    Check(JLib::TaskScheduler::HeavyFibersPerWorker() == kHeavy, "getter reflects the new heavy value");
+    // Not the default, so a test that silently exercised the untouched default could not happen to
+    // pass for the wrong reason.
+    const size_t kPerWorker = 17;
+    JLib::TaskScheduler::SetFiberBudget(kPerWorker);
+    Check(JLib::TaskScheduler::StandardFibersPerWorker() == kPerWorker, "getter reflects the new value");
 
     // The real question: did StartPool actually CONSUME these, not just store them. An explicit
     // small pool size keeps the expected total exact rather than depending on this runner's core
@@ -46,15 +46,22 @@ int main() {
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
     const size_t workers = sched.GetWorkerCount();
-    const size_t expected = workers * (kStandard + kHeavy);
-    const size_t actual = sched.GetGlobalPool().AvailableCount();
+    const size_t expected = workers * kPerWorker;
+    // TotalCount, NOT AvailableCount, and the difference is the whole point of the assertion.
+    // The question here is "did StartPool consume the budget it was given" -- a CAPACITY question.
+    // AvailableCount answers a different one: how many are unclaimed right now. Those two used to
+    // be the same number only because no worker had ever touched the pool before going to sleep;
+    // once workers stopped blocking they each take a park fiber and prime a thread-local cache
+    // batch at startup, so `available` is legitimately smaller and the old check failed with
+    // 32 against an expected 80. The instrument was wrong, not the pool.
+    const size_t actual = sched.GetGlobalPool().TotalCount();
     char what[128];
     std::snprintf(what, sizeof(what),
                   "pool capacity is workers(%zu) * (standard+heavy) = %zu, got %zu",
                   workers, expected, actual);
     Check(actual == expected, what);
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
 }

@@ -1,9 +1,36 @@
 ; SPDX-License-Identifier: BSD-3-Clause
 ; Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 
+; The AVX gate, defined in src/win32/FiberInit.cpp. Zero means "no AVX on this CPU", which is also
+; the value it holds before its initialiser runs -- see the long comment beside it for why that is
+; the safe direction to fail in.
+EXTERN JLibCtxHasAvx:BYTE
+
 .code
 ContextSwitch PROC
     ; RCX = 'from' pointer (ptr to rsp), RDX = 'to' pointer (ptr to rsp)
+
+    ; 0. Retire any live upper-YMM state BEFORE the legacy-SSE block below.
+    ; A fiber that parks straight out of an AVX kernel leaves the upper halves of YMM live, and
+    ; every movdqa below then pays an SSE/AVX transition. Measured at 85.8 ns/switch against
+    ; 9.2 ns with this instruction present -- see bench/context_switch.cpp, which measures this
+    ; exact routine as one of its arms.
+    ;
+    ; Destroying that state here is LEGAL, not a liberty: the upper halves of YMM are volatile
+    ; across a call under the Win64 ABI, and a context switch is an opaque call. Anything the
+    ; compiler had live up there is already spilled to the fiber's own stack, which travels with
+    ; the fiber. tests/avx_suspend_test.cpp is the standing check on that.
+    ;
+    ; One vzeroupper covers the whole routine -- the saves below AND the restores after the stack
+    ; swap -- because nothing in between re-dirties the upper state.
+    ;
+    ; Branched rather than unconditional because vzeroupper is itself an AVX instruction; see
+    ; FiberInit.cpp. The load is from one always-hot cache line and the branch is perfectly
+    ; predicted, so it does not show above the noise floor of the switch it guards.
+    cmp byte ptr [JLibCtxHasAvx], 0
+    je  @F
+    vzeroupper
+@@:
 
     ; 1. Save Callee-Saved GPRs
     push rbx

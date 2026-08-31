@@ -88,7 +88,7 @@ int main() {
     // would be asserting the test rather than the code.
     JLib::TaskScheduler::ReportSlabUsage("slab usage, default pool");
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
 }

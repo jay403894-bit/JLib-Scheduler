@@ -638,9 +638,7 @@ int main(int argc, char** argv) {
             std::vector<double> p50[kNW], p90[kNW], p99[kNW], eps[kNW], wps[kNW], prb[kNW];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNW; ++a) {
-                JLib::TaskScheduler::SetLaneHintMode(4);      // the wake is a no-op under any other
                 JLib::TaskScheduler::SetSteerSkip(false);
-                JLib::TaskScheduler::SetLaneWake(wakeArms[a]);
                 JLib::TaskScheduler::SetLaneClearDepth(clearArms[a]);
                 JLib::TaskScheduler::SetHotWorkers(k);
                 g_skewEveryNth = 8;
@@ -688,7 +686,6 @@ int main(int argc, char** argv) {
           }
         }
         g_skewEveryNth = 0;
-        JLib::TaskScheduler::SetLaneWake(0);
         JLib::TaskScheduler::SetLaneClearDepth(3);
         JLib::TaskScheduler::SetHotWorkers(hot);
     }
@@ -739,13 +736,11 @@ int main(int argc, char** argv) {
             std::vector<double> p50[kNA], p90[kNA], p99[kNA], endK[kNA];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNA; ++a) {
-                JLib::TaskScheduler::SetLaneHintMode(4);
                 JLib::TaskScheduler::SetSteerSkip(false);
-                JLib::TaskScheduler::SetLaneWake(0);
                 JLib::TaskScheduler::SetLaneClearDepth(3);
                 if (a < 3) JLib::TaskScheduler::SetHotWorkers(a == 0 ? 1 : (a == 1 ? 2 : 4));
-                else     { JLib::TaskScheduler::SetHotWorkers(1);
-                           JLib::TaskScheduler::SetHotWorkerRange(1, 4); }
+                // Arm 3 was the ADAPTIVE arm; K is static now, so it pins the same ceiling.
+                else       JLib::TaskScheduler::SetHotWorkers(4);
                 g_skewEveryNth = 8;
                 g_skewBurnNs   = burn;
 
@@ -836,11 +831,9 @@ int main(int argc, char** argv) {
             std::vector<double> p50[kNA], p90[kNA], p99[kNA], eps[kNA], wps[kNA], prb[kNA];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNA; ++a) {
-                JLib::TaskScheduler::SetLaneHintMode(4);
                 JLib::TaskScheduler::SetSteerSkip(false);
                 JLib::TaskScheduler::SetLaneSetDepth(setArms[a]);
                 JLib::TaskScheduler::SetLaneClearDepth(clearArms[a]);
-                JLib::TaskScheduler::SetLaneWake(wakeArms[a]);
                 JLib::TaskScheduler::SetHotWorkers(k);
                 g_skewEveryNth = 8;
                 g_skewBurnNs   = burn;
@@ -875,7 +868,6 @@ int main(int argc, char** argv) {
         g_skewEveryNth = 0;
         JLib::TaskScheduler::SetLaneSetDepth(4);
         JLib::TaskScheduler::SetLaneClearDepth(3);
-        JLib::TaskScheduler::SetLaneWake(0);
         JLib::TaskScheduler::SetHotWorkers(hot);
     }
 
@@ -961,7 +953,6 @@ int main(int argc, char** argv) {
 
                 for (int rep = 0; rep < kReps; ++rep) {
                   for (int a = 0; a < kArms; ++a) {
-                    JLib::TaskScheduler::SetLaneHintMode(a < 2 ? 0 : 4);
                     JLib::TaskScheduler::SetSteerSkip((a & 1) != 0);
                     JLib::TaskScheduler::SetHotWorkers(k);
                     g_skewEveryNth = skew;
@@ -993,7 +984,6 @@ int main(int argc, char** argv) {
         }
         g_skewEveryNth = 0;
         JLib::TaskScheduler::SetSteerSkip(false);
-        JLib::TaskScheduler::SetLaneHintMode(4);
         JLib::TaskScheduler::SetHotWorkers(hot);
     }
 
@@ -1033,9 +1023,14 @@ int main(int argc, char** argv) {
         for (long long burn : { 20000LL, 200000LL }) {
           for (int skew : { 0, 8 }) {
             for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
-              for (int arm : { 0, 1, 4 }) {   // arm 2 dropped (== arm 1); arm 3 answered its question
+              // THE ARM DIMENSION IS GONE. This swept laneHintMode { off, hot->hot, any }, and
+              // every mode other than "off" selected a STEAL of the hot worker's lane -- which no
+              // longer exists in any mode: the lane is an MPSC inbox with one legal consumer.
+              // Three arms would now run the identical configuration and print three labels for
+              // it. The row keeps its real content -- the occupancy witness (idle% beside a
+              // backlogged sibling), which is a property of STEERING, not of the deleted steal.
+              for (int arm : { 0 }) {
                 if (skew == 0 && burn != 200000LL) continue;   // the control does not vary with burn
-                JLib::TaskScheduler::SetLaneHintMode(arm);
                 JLib::TaskScheduler::SetHotWorkers(k);
                 g_skewEveryNth = skew;
                 g_skewBurnNs = burn;
@@ -1056,7 +1051,7 @@ int main(int argc, char** argv) {
                 };
                 std::printf("    %3zu  %6.0f  %5d  %4s  %7.2f  %7.2f  %7.2f  %6.2f  %9.2f\n",
                             k, burn / 1000.0, skew,
-                            (arm == 0 ? "off" : arm == 3 ? "hnt" : arm == 1 ? "hot" : arm == 4 ? "any" : "pop"),
+                            (arm == 0 ? "off" : "???"),   // only "off" exists -- see the loop
                             pk(0.50), pk(0.90), pk(0.99), pct, meanD);
               }
             }

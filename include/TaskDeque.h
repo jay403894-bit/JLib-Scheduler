@@ -69,8 +69,14 @@ namespace JLib {
         // maxCapacity is a CEILING on growth, not an allocation -- see kDefaultMaxCapacity. It is a
         // parameter so an application with a genuinely deeper workload can raise it, and so the
         // death test can construct a deque whose abort path is actually reachable.
+        // A CALLER-NAMED CEILING IS HARD; THE DEFAULT ONE IS ADVISORY. Passing a ceiling is a
+        // statement about this deque's workload, so exceeding it is a fact worth stopping on -- and
+        // the death test depends on that staying true. The DEFAULT ceiling is a sizing guess made by
+        // the library, and dying on a guess turns a placement problem into a crash: the run that
+        // found the funnel would have finished and printed a note instead of aborting mid-suite.
         explicit TaskDeque(size_t capacity = 32768, size_t maxCapacity = kDefaultMaxCapacity)
-            : maxCapacity_(maxCapacity < capacity ? capacity : maxCapacity) {
+            : maxCapacity_(maxCapacity < capacity ? capacity : maxCapacity),
+              ceilingIsHard_(maxCapacity != kDefaultMaxCapacity) {
             if ((capacity & (capacity - 1)) != 0)
                 throw std::runtime_error("Capacity must be a power of 2");
             ring_.store(MakeRing(capacity), std::memory_order_relaxed);
@@ -115,6 +121,13 @@ namespace JLib {
         // nothing can trigger is the same vacuous shape as a negative control that cannot fail.
         static constexpr size_t kDefaultMaxCapacity = 1u << 16;   // 65,536 slots = 512 KB
 
+        // THE BACKSTOP BEHIND THE ADVISORY CEILING. Growth past kDefaultMaxCapacity is allowed and
+        // reported; growth past THIS is not, because doubling makes the last step as large as
+        // everything before it and an unbounded lane would otherwise end as an OOM with no
+        // explanation. 4,194,304 slots = 32 MB for the live ring, and retired rings are under 2x
+        // that by the same geometric argument that bounds the default.
+        static constexpr size_t kHardMaxCapacity = 1u << 22;
+
         // HOW MANY TIMES ANY DEQUE HAS GROWN. Process-wide and incremented only inside grow(), so it
         // is free on every path that matters. It exists because a test asserting "no task was lost"
         // cannot tell growth working from a deque that never filled -- the same vacuity that made
@@ -125,6 +138,13 @@ namespace JLib {
         // every translation unit by the standard, which is the property actually needed here.
         static inline std::atomic<size_t> g_growCount{ 0 };
         static size_t GrowCount() { return g_growCount.load(std::memory_order_relaxed); }
+
+        // DIAGNOSTIC ONLY, and deliberately not a constructor parameter: a deque is a standalone
+        // structure and its own tests build one with no owner at all.
+        void SetOwnerTag(size_t index, const char* lane) noexcept {
+            ownerIndex_ = index;
+            ownerLane_  = lane;
+        }
 
         static Ring* MakeRing(size_t capacity) {
             Ring* r = new Ring{ capacity - 1, capacity, new std::atomic<uintptr_t>[capacity] };
@@ -157,14 +177,41 @@ namespace JLib {
         // SAME VALUE -- so a grow racing a steal cannot change WHICH task is claimed.
         void grow(Ring* old, size_t t, size_t b) {
             const size_t newCap = old->capacity * 2;
-            if (newCap > maxCapacity_) FatalGrow(old->capacity, "ceiling reached");
+            if (newCap > maxCapacity_) {
+                // The caller named this ceiling: stop, exactly as before.
+                if (ceilingIsHard_)
+                    FatalGrow(old->capacity, "ceiling reached", ownerIndex_, ownerLane_, t, b);
+
+                // THE BACKSTOP IS STILL A BACKSTOP. Growing forever turns a runaway lane into an
+                // OOM with no explanation, and doubling means the step that kills the process is
+                // the size of everything before it. kHardMaxCapacity sits far enough above the
+                // default that reaching it means something is genuinely unbounded rather than
+                // merely badly balanced.
+                if (newCap > kHardMaxCapacity)
+                    FatalGrow(old->capacity, "hard ceiling reached", ownerIndex_, ownerLane_, t, b);
+
+                // ONCE PER DEQUE, not per grow: the point is to know that a lane went past its
+                // sizing and WHICH one, not to narrate every doubling. Written by the owner only --
+                // push_bottom is owner-only in Chase-Lev -- so the plain bool needs no atomic.
+                if (!warnedPastCeiling_) {
+                    warnedPastCeiling_ = true;
+                    std::fprintf(stderr,
+                        "[JLib::Scheduler] NOTE: deque (queue %zu, %s lane) grew PAST its %zu-slot\n"
+                        "  sizing ceiling to %zu, holding %zu tasks. Growth continues to %zu slots.\n"
+                        "  One lane this deep means placement is concentrating rather than spreading\n"
+                        "  -- and the usual cause is bulk submitted through Push() in a loop, which\n"
+                        "  means \"start this now\" and steers. Bulk goes through PushBatch.\n",
+                        ownerIndex_, ownerLane_, maxCapacity_, newCap, b - t, kHardMaxCapacity);
+                    std::fflush(nullptr);
+                }
+            }
 
             Ring* r = nullptr;
             try {
                 r = MakeRing(newCap);
             }
             catch (const std::bad_alloc&) {
-                FatalGrow(old->capacity, "out of memory");
+                FatalGrow(old->capacity, "out of memory", ownerIndex_, ownerLane_, t, b);
             }
 
             // COPY BY LOGICAL INDEX. i is the absolute index, so the same i lands at a different
@@ -202,15 +249,32 @@ namespace JLib {
             std::abort();
         }
 
-        [[noreturn]] static void FatalGrow(size_t capacity, const char* why) {
+        // NAMES THE QUEUE. Without the owner tag this says a deque overflowed but not WHICH one,
+        // and "which one" is the entire diagnosis: a single queue absorbing everything is a
+        // PLACEMENT problem, whereas every queue growing together is genuine backpressure. Read
+        // blind, the same message sent an investigation into the deque for an hour when the answer
+        // was that one caller had aimed 200,000 tasks at two workers.
+        //
+        // top_/bottom_ ARE PRINTED RAW, because they separate two failures that look identical from
+        // the size alone. A deque legitimately holding N items has bottom - top == N. A deque with
+        // more than one pusher -- push_bottom is OWNER-ONLY in Chase-Lev -- has a torn bottom_, and
+        // then the difference is nonsense: wildly larger than the tasks that exist, or wrapped past
+        // 2^63. Same ceiling, completely different bug.
+        [[noreturn]] static void FatalGrow(size_t capacity, const char* why,
+                                           size_t owner, const char* lane,
+                                           size_t top, size_t bottom) {
             std::fprintf(stderr,
                 "[JLib::Scheduler] FATAL: a work-stealing deque could not grow past %zu slots -- %s.\n"
+                "  owner: queue %zu, %s lane   top=%zu bottom=%zu  (bottom-top=%zu)\n"
                 "  A lane holds this many tasks only if something is spawning without bound; the\n"
                 "  ceiling is this deque's maxCapacity (default kDefaultMaxCapacity in TaskDeque.h).\n"
                 "  This is fatal rather than dropped because a dropped task never signals its\n"
                 "  WaitGroup, and the failure would surface as a hang somewhere else entirely.\n",
-                capacity, why);
-            std::fflush(stderr);
+                capacity, why, owner, lane, top, bottom, bottom - top);
+            // ALL STREAMS, not just stderr. abort() discards buffered stdout, and stdout is where
+            // every bench row and the pool dump go -- so flushing only stderr threw away the answer
+            // to "how far did it get" on every run that hit this.
+            std::fflush(nullptr);
             std::abort();
         }
         // ---- tag encoding -------------------------------------------------------------------
@@ -507,6 +571,19 @@ namespace JLib {
         // Growth ceiling for THIS deque. Const: changing it after construction would let a deque
         // that already grew past a new lower ceiling sit there in a state grow() says is impossible.
         const size_t maxCapacity_;
+
+        // Was maxCapacity_ asked for, or is it the library's default? Decides whether exceeding it
+        // stops the process or merely reports. Const for the same reason maxCapacity_ is.
+        const bool  ceilingIsHard_;
+
+        // Owner-only, so no atomic: push_bottom (the sole grower) has exactly one legal caller.
+        bool        warnedPastCeiling_ = false;
+
+        // Owner identity for the fatal message only -- never read on any hot path. Set by the pool
+        // at construction; unset reads as SIZE_MAX so a standalone deque (the tests build one) says
+        // so rather than lying about a queue index.
+        size_t      ownerIndex_ = SIZE_MAX;
+        const char* ownerLane_  = "untagged";
 
         alignas(platform::kCacheLine) std::atomic<size_t> top_;
         alignas(platform::kCacheLine) std::atomic<size_t> bottom_;

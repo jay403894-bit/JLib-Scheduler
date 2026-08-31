@@ -128,6 +128,6 @@ int main(int argc, char** argv) {
                 "  workload here -- TaskDAG takes a guard per node walk and reclaims on Tick --\n"
                 "  so a hot-path regression is paid far more often than the scan saving is.\n");
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     return 0;
 }

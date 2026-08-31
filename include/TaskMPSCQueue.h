@@ -111,5 +111,31 @@ namespace JLib {
             Task* next = tail->next.load(std::memory_order_acquire);
             return (tail == stub_ && next == nullptr);
         }
+
+        // ---- THE EMPTINESS A PARK DECISION IS ALLOWED TO TRUST ---------------------------------
+        //
+        // empty() above CAN SAY EMPTY WHILE AN ITEM EXISTS, for one window: a producer has done its
+        // head_.exchange (the item is committed -- push() cannot fail after it) but has not yet
+        // stored prev->next. empty() never looks at head_, so it sees stub_->next == null and
+        // answers "empty"; pop() fails in the same window for the same reason. One failed pop, or
+        // one empty(), therefore proves nothing about a queue a producer may be touching.
+        //
+        // For the owner's SEARCH loop that lie is harmless -- the item is found one pass later. For
+        // the PARK decision it is not: a worker that blocks on that answer sleeps on a non-empty,
+        // unstealable inbox, and only the pusher's subsequent notify (which follows the next-store)
+        // can save it. The K-demote pass is where that mattered: the leaving worker must not trust
+        // a single empty() on the lane it is abandoning.
+        //
+        // This check also reads head_: a mid-flight push has already moved head_ off the consumed
+        // position, so the window above answers "not quiescent". head_ is the producers' contended
+        // line, which is why this is a SEPARATE method rather than a fix to empty() -- the owner's
+        // per-pass emptiness probe stays off that line, and only the park path (rare by
+        // construction) pays the shared read.
+        bool quiescent() const {
+            Task* tail = tail_;
+            if (tail != stub_) return false;                                   // consumer mid-drain
+            if (tail->next.load(std::memory_order_acquire)) return false;      // linked item waiting
+            return head_.load(std::memory_order_acquire) == tail;              // no push in flight
+        }
     };
 }

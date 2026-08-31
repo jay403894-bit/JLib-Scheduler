@@ -262,6 +262,22 @@ inline std::size_t PageSize() {
 // Hand-rolled rather than std::countr_zero because the core of this library is C++17 and <bit> is
 // C++20. The MSVC path avoids <intrin.h>: LockFreeList.h used to include it, which broke every
 // non-MSVC build, so the rule since then is that intrinsics live behind this header or not at all.
+// HOW MANY BITS ARE SET. Used to count advertised steal targets straight out of the hint words.
+//
+// THIS IS WHY THERE IS NO SEPARATE COUNTER. "How many queues are advertising work" is already
+// encoded in the bitmap the pushers maintain, so counting it is a read of words the thief has
+// loaded anyway plus one instruction -- against a shared atomic that every push would have to
+// fetch_add. Relaxed would not save that: a relaxed RMW still takes the line exclusive and still
+// bounces between producers; relaxed drops the FENCE, not the coherence traffic. And a second
+// structure holding the same fact can drift from the bits it mirrors, which a derived count cannot.
+inline unsigned PopCount64(std::uint64_t x) {
+#if defined(_MSC_VER)
+    return (unsigned)__popcnt64(x);
+#else
+    return (unsigned)__builtin_popcountll(x);
+#endif
+}
+
 inline unsigned CountTrailingZeros64(std::uint64_t x) {
 #if defined(_MSC_VER)
     unsigned long i;

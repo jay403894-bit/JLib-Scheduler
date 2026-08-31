@@ -95,7 +95,7 @@ int main() {
         JLib::WaitGroup wg;
         JLib::Task* t = sched.CreateTask([] {
             printf("  [stage 1: fiber task body ran]\n"); fflush(stdout);
-        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, false, JLib::TaskType::Fiber);
         if (!t) { printf("STAGE 1 FAIL: CreateTask returned null\n"); return 1; }
 
         t->waitGroup = &wg;
@@ -116,7 +116,7 @@ int main() {
             JLib::WaitGroup inner;
             JLib::Task* child = sched.CreateTask([] {
                 printf("    [stage 2: child ran]\n"); fflush(stdout);
-            }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            }, false, JLib::TaskType::Fiber);
             if (!child) { printf("STAGE 2 FAIL: child CreateTask null\n"); return; }
 
             child->waitGroup = &inner;
@@ -125,7 +125,7 @@ int main() {
             printf("  [stage 2: outer suspending in WaitFor]\n"); fflush(stdout);
             sched.WaitFor(inner);                 // <-- suspends THIS fiber
             printf("  [stage 2: outer resumed]\n"); fflush(stdout);
-        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, false, JLib::TaskType::Fiber);
         if (!t) { printf("STAGE 2 FAIL: CreateTask returned null\n"); return 1; }
 
         t->waitGroup = &outer;

@@ -228,7 +228,7 @@ int main() {
         Check(sched.GetAllocator()->HighWaterBytes() > 0, "resident bytes are reported");
     }
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     std::printf("\n%s\n", failures == 0 ? "ALL CHECKS PASSED" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
 }

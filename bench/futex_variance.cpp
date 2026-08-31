@@ -56,6 +56,7 @@
 
 #include <windows.h>
 #include <synchapi.h>
+#include <timeapi.h>   // timeBeginPeriod/timeEndPeriod (winmm)
 #pragma comment(lib, "Synchronization.lib")   // WaitOnAddress/WakeByAddressSingle -- not auto-linked
 #pragma comment(lib, "winmm.lib")             // timeBeginPeriod/timeEndPeriod
 #include <atomic>

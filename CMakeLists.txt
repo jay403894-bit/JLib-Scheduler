@@ -31,12 +31,16 @@ cmake_minimum_required(VERSION 3.21)
 # than waiting for release day. The number's job is to tell two trees apart, and it cannot do that
 # while a modified tree still reports the last tag. CMake's project() rejects a "-dev" suffix, so
 # there is no pre-release form to hide behind: a tree ahead of a tag simply carries the next number.
-# 4.0.1 -- BETA. Not a patch bump in spirit: the 4.0 line has gained lane wakes, a
-# fourth sleep-predicate input, and dynamic K, and dynamic K BREAKS AN INVARIANT the
-# pool used to hold. PushImmediate's contract ("this core is mine until my task
-# returns") was enforced by a point-in-time check that a moving hot set can grow past.
-# Guarded for now; the design decision is open. See the note in MaybeAdjustHotWorkers.
-set(JLIBSCHED_VERSION "4.0.1")
+# 5.0.0 -- a MAJOR bump, and the 4.0 line's patch numbers were already understating it. 4.0.1
+# removed PushImmediate, 4.0.2 deleted the hiPri Chase-Lev deques and rewrote the two band
+# controllers into a single packed word. Each of those changed what the API means, not just what it
+# does, and calling them patches made two trees that behave differently report nearly the same
+# number -- the exact failure the paragraph above says this field exists to prevent.
+#
+# What forces the major is Join() leaving the public surface. It advertised a teardown that could be
+# followed by a restart, and no such restart ever existed (Init() throws on a non-null instance,
+# StartPool is private). Removing an API that never worked is still removing an API.
+set(JLIBSCHED_VERSION "5.0.0")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -413,6 +417,11 @@ if(WIN32)
     # Both exist only to tame <windows.h>; defining them elsewhere collides with headers that
     # already #define NOMINMAX themselves.
     target_compile_definitions(Scheduler PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    # WaitOnAddress / WakeByAddressSingle -- the worker park. PUBLIC because the symbols are
+    # referenced from Thread.obj inside Scheduler.lib, so every consumer linking the static library
+    # needs it too. An import library for API-set forwarders, not a DLL dependency: the calls
+    # resolve to kernel32/ntdll at run time on Windows 8 and later.
+    target_link_libraries(Scheduler PUBLIC Synchronization)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(Scheduler PUBLIC Threads::Threads)
@@ -429,6 +438,35 @@ target_link_libraries(SchedulerBench PRIVATE Scheduler)
 target_compile_features(SchedulerBench PRIVATE cxx_std_17)
 # Stamped into the header line so a pasted result identifies the build that produced it.
 target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED_VERSION}")
+
+# What one raw fiber context switch costs, and whether the legacy-SSE `movdqa` block in
+# src/win32/ContextSwitch.asm pays an SSE/AVX transition when a fiber parks with dirty YMM state.
+#
+# Windows x86-64 ONLY, and that is not a portability gap: the whole question is about the encoding
+# of one x86 instruction. AArch64 has no SSE/AVX domains and nothing to measure.
+#
+# The variants live in the BENCH, not in src/. Three context switches shipping "just in case" is
+# exactly what this bench exists to avoid -- src/win32/ContextSwitch.asm is not touched unless the
+# timer says it should be.
+# Decomposes the serial submit-and-wait round trip that compare_marl.cpp reports at ~4.5 us against
+# marl's ~0.82 us: how much is the WORKER being woken, and how much is the SUBMITTER being woken.
+# All arms in one process -- idle policy and K are both runtime settings.
+add_executable(SchedulerWaitForBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/waitfor_participation.cpp")
+target_link_libraries(SchedulerWaitForBench PRIVATE Scheduler)
+target_compile_features(SchedulerWaitForBench PRIVATE cxx_std_17)
+
+if(WIN32 AND NOT JLIBSCHED_ARCH STREQUAL "aarch64")
+    set(JLIBSCHED_CSBENCH_ASM "${CMAKE_CURRENT_SOURCE_DIR}/bench/win32/context_switch_variants.asm")
+    # Pinned for the same reason the library's own assembly is pinned a few hundred lines up: let
+    # CMake infer the language from the extension and any third-party add_subdirectory that enables
+    # the generic ASM language breaks this target -- and names our symbols in the error, not theirs.
+    set_source_files_properties("${JLIBSCHED_CSBENCH_ASM}" PROPERTIES LANGUAGE ASM_MASM)
+    add_executable(SchedulerContextSwitchBench
+        "${CMAKE_CURRENT_SOURCE_DIR}/bench/context_switch.cpp"
+        "${JLIBSCHED_CSBENCH_ASM}")
+    target_link_libraries(SchedulerContextSwitchBench PRIVATE Scheduler)
+    target_compile_features(SchedulerContextSwitchBench PRIVATE cxx_std_17)
+endif()
 
 # Measures what an IDLE NoSleep pool costs the main thread, and how much of that the steal hint
 # removes. Both arms run inside one process against one pool -- see the file header.
@@ -531,19 +569,11 @@ add_executable(SchedulerTimerTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/timer_test.
 target_link_libraries(SchedulerTimerTest PRIVATE Scheduler)
 target_compile_features(SchedulerTimerTest PRIVATE cxx_std_17)
 
-add_executable(SchedulerDynamicKTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dynamic_k_test.cpp")
-target_link_libraries(SchedulerDynamicKTest PRIVATE Scheduler)
-target_compile_features(SchedulerDynamicKTest PRIVATE cxx_std_17)
 
 add_executable(SchedulerReservedCoresTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_cores_test.cpp")
 target_link_libraries(SchedulerReservedCoresTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedCoresTest PRIVATE cxx_std_17)
 
-if(WIN32)
-    add_executable(SchedulerHotPriorityTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hot_priority_test.cpp")
-    target_link_libraries(SchedulerHotPriorityTest PRIVATE Scheduler)
-    target_compile_features(SchedulerHotPriorityTest PRIVATE cxx_std_17)
-endif()
 
 add_executable(SchedulerDagBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/dag_scaling.cpp")
 target_link_libraries(SchedulerDagBench PRIVATE Scheduler)
@@ -800,23 +830,13 @@ target_compile_features(SchedulerMutexCancelTest PRIVATE cxx_std_17)
 
 # Teardown drains parked work instead of abandoning it. The assertion is an RAII destructor running
 # on a parked fiber's stack -- which can only happen if that stack was actually unwound.
-add_executable(SchedulerTeardownDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/teardown_drain_test.cpp")
-target_link_libraries(SchedulerTeardownDrainTest PRIVATE Scheduler)
-target_compile_features(SchedulerTeardownDrainTest PRIVATE cxx_std_17)
-
 # A full lane must not lose a task -- it GROWS. Covers the two push_bottom call sites that used to
 # ignore the bool, both of which failed as a HANG rather than a visible drop, which is why they
 # survived. Named deque_overflow_test until growth replaced the overflow lanes it was checking.
-add_executable(SchedulerDequeGrowTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/deque_grow_test.cpp")
-target_link_libraries(SchedulerDequeGrowTest PRIVATE Scheduler)
-target_compile_features(SchedulerDequeGrowTest PRIVATE cxx_std_17)
 
 
 # Ingress backpressure: a flooding external producer is slowed, a WORKER never is (that would
 # deadlock -- a task pushing chunks is a consumer of the inbox it would wait on).
-add_executable(SchedulerSubmitLimitTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/submit_limit_test.cpp")
-target_link_libraries(SchedulerSubmitLimitTest PRIVATE Scheduler)
-target_compile_features(SchedulerSubmitLimitTest PRIVATE cxx_std_17)
 
 # THE GROWTH CEILING MUST ACTUALLY ABORT. grow() replaced push_bottom's `return false` and the
 # overflow lanes are gone, so this is the only thing between an infinitely self-spawning task and
@@ -843,9 +863,18 @@ else()
     target_compile_options(SchedulerAvxSuspendTest PRIVATE -mavx2)
 endif()
 
-add_executable(SchedulerStealReachabilityTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_reachability_test.cpp")
-target_link_libraries(SchedulerStealReachabilityTest PRIVATE Scheduler)
-target_compile_features(SchedulerStealReachabilityTest PRIVATE cxx_std_17)
+# Does Join() let cancelled frames UNWIND? Deleted once during the refactor as "no longer needed",
+# then restored: with the quiescence step in Join it passes, and it is the only thing that measures
+# whether shutdown runs destructors or merely stops running. See the quiesce block in Join().
+add_executable(SchedulerTeardownDrainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/teardown_drain_test.cpp")
+target_link_libraries(SchedulerTeardownDrainTest PRIVATE Scheduler)
+target_compile_features(SchedulerTeardownDrainTest PRIVATE cxx_std_17)
+
+
+add_executable(SchedulerReservedBandLiveKTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_band_live_k_test.cpp")
+target_link_libraries(SchedulerReservedBandLiveKTest PRIVATE Scheduler)
+target_compile_features(SchedulerReservedBandLiveKTest PRIVATE cxx_std_17)
+
 
 add_executable(SchedulerStealHintWordsTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/steal_hint_words_test.cpp")
 target_link_libraries(SchedulerStealHintWordsTest PRIVATE Scheduler)
@@ -876,3 +905,23 @@ if(JLIBSCHED_COROUTINES)
     target_link_libraries(SchedulerHazardCoroSuspendTest PRIVATE Scheduler)
     target_compile_features(SchedulerHazardCoroSuspendTest PRIVATE cxx_std_20)
 endif()
+
+# The awake floor must grow under a wave AND shed back to base when idle. Shedding failed silently
+# for a whole bench run before this existed -- a one-way controller reads as a latency regression.
+add_executable(SchedulerAwakeFloorShedTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/awake_floor_shed_test.cpp")
+target_link_libraries(SchedulerAwakeFloorShedTest PRIVATE Scheduler)
+target_compile_features(SchedulerAwakeFloorShedTest PRIVATE cxx_std_17)
+
+# Standalone wake-latency variance harness: condvar vs WaitOnAddress, isolated 2-thread ping-pong.
+# See memory: futex was rejected twice on this measurement; do not re-propose it without a fresh run.
+add_executable(SchedulerFutexVariance "${CMAKE_CURRENT_SOURCE_DIR}/bench/futex_variance.cpp")
+target_link_libraries(SchedulerFutexVariance PRIVATE Scheduler)
+target_link_libraries(SchedulerFutexVariance PRIVATE winmm)   # timeBeginPeriod/timeEndPeriod
+target_compile_features(SchedulerFutexVariance PRIVATE cxx_std_17)
+
+# Completion latency against a saturated pool, swept over bulk-body length. Reconstructs the
+# harness behind PickNextWorker's "hiPri was briefly steered at the unreserved floor, and it lost",
+# whose numbers outlived the file that produced them. Takes K as argv[1] (0 = no reserved band).
+add_executable(SchedulerIoOverlapTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_overlap_test.cpp")
+target_link_libraries(SchedulerIoOverlapTest PRIVATE Scheduler)
+target_compile_features(SchedulerIoOverlapTest PRIVATE cxx_std_17)

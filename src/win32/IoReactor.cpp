@@ -372,7 +372,20 @@ namespace JLib {
                 auto pushSteered = [&](Task** arr, std::size_t n, bool hiPri) {
                     if (!n) return;
                     auto& s = TaskScheduler::Instance();
+                    // NO K: PushBatch ALREADY STEERS THIS, and that is not the no-op it once was.
+                    // Since 4.0.2 a hiPri push routes on its own -- PushBatch computes
+                    // `useHiSeg = hiPri && HiPriLaneActive()`, PickNextWorker sends a hiPri task to
+                    // a worker on the AWAKE FLOOR, and it lands in that worker's hiPri INBOX with
+                    // the presence bit set for thieves. So a completion reaches a thread that is
+                    // already running, ahead of that thread's own deque, without this lambda doing
+                    // anything -- which is the larger half of what the explicit steering below was
+                    // for.
+                    //
+                    // WHAT IS STILL MISSING WITHOUT K is reservation: the floor is awake but not
+                    // reserved, so bulk work is steered at the same indices and a completion can
+                    // queue behind a task already running there. Priority is ORDER, not isolation.
                     if (hotN == 0) { s.PushBatch(arr, n, 0, 64, hiPri); return; }
+
 
                     // Candidate hot workers, by queue index. Bounded by the hint's own width: past
                     // worker 64 no bit exists, so those are simply always candidates.

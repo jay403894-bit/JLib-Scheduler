@@ -586,7 +586,8 @@ int main(int argc, char** argv) {
         // Both MUST precede Init: placement and priority are applied as each worker starts.
         if (pinHot)  JLib::TaskScheduler::SetHotWorkerPin(true);
         if (elevate) JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
-        if (hipri) JLib::TaskScheduler::SetHotWorkerRange(kmin, kmax);
+        // Adaptive K is gone; kmax was the ceiling, so pin K there.
+        if (hipri) JLib::TaskScheduler::SetHotWorkers(kmax ? kmax : kmin);
         JLib::TaskScheduler::Init(0);
         auto& io = JLib::IoReactor::Instance();
         if (!io.RegisterSocket(s)) { Out("RegisterSocket failed\n"); return 1; }

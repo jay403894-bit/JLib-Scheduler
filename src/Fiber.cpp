@@ -61,8 +61,21 @@ void Fiber::Resume() {
 
 void JLib::RequeueResumedBatch(Task** tasks, size_t n, bool hiPri) {
 	if (n == 0) return;
-	// minPerSegment = 1, not the default 64: this batch is a WAKE, and every fiber in it became
-	// runnable at the same instant. Handing all of them to one worker would leave the other 30
-	// stealing them back one at a time, which is most of the cost this exists to remove.
-	TaskScheduler::Instance().PushBatch(tasks, n, 0, /*minPerSegment*/1, hiPri);
+	// PINNED: THE BATCH CANNOT BE ONE BATCH. Every task here holds a fiber, and each of those fibers
+	// is pinned to whichever worker bound it, so a wake of N fibers is a wake of up to N DIFFERENT
+	// worker queues. PushBatch exists to hand a contiguous run to one worker and cannot express
+	// that, so this falls back to routing each through Requeue.
+	//
+	// The batching win is smaller than it looks here anyway. It was measured on PUSH (7.5-8.2x) and
+	// it comes from amortising one placement, one queue push and one notify across many tasks --
+	// all three of which are per-destination costs, and pinning has already fixed the destinations.
+	// What is genuinely given up is the single notify for a SignalAll that wakes many fibers on one
+	// worker; if that shows up in a profile, the fix is to group by homeWorker here, not to migrate.
+	//
+	// `hiPri` is now unused. It is kept in the signature rather than removed because the routing it
+	// used to select is decided by Requeue from the task's own tag, and changing the signature would
+	// churn every Event call site to no effect.
+	(void)hiPri;
+	auto& sched = TaskScheduler::Instance();
+	for (size_t i = 0; i < n; ++i) sched.Requeue(tasks[i]);
 }

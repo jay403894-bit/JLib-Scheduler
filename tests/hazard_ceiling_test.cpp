@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
             JLib::HazardGuard g;
             for (std::size_t k = 0; k < JLib::HazardDomain::kCellsPerReader; ++k)
                 g.Protect(k, g_src);                       // the last legal index
-            sched.Join();
+            JLib::detail::TeardownForTesting(sched);
             return 0;
         }
         if (std::strcmp(mode, "cells-over") == 0) {
@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(mode, "native-ok") == 0) {
             { JLib::HazardGuard g; g.Protect(0, g_src); }
             std::printf("native guard protected normally\n");
-            sched.Join();
+            JLib::detail::TeardownForTesting(sched);
             return 0;
         }
 

@@ -140,10 +140,159 @@ static void PrintSpread(const char* label, const Spread& s, double tasks) {
 // all CI needs. The limit is deliberately generous -- the crossover sweep is legitimately the
 // slowest section and CI runners are shared VMs -- because a false positive here would be worse
 // than the thing it is catching.
+// ---- THE BANNER HAS TO BE A CHECK, NOT AN ECHO ------------------------------------------------
+//
+// Printing K and F straight from the atomics the scheduler steers by proves nothing: it agrees with
+// itself no matter how the wiring is broken. The bands are only REAL if the workers that actually
+// park are exactly the ones the layout says may park.
+//
+//   [0, K)      reserved   -- parks only when ReservedNeverParks() is off
+//   [K, K+Fbase) floor     -- MUST NEVER PARK. This is the definition, not a tendency.
+//   [K+Fbase, N) parkable  -- should be where every park came from
+//
+// BASE, NOT LIVE F, for the must-never-park band: growth is transient, so a worker promoted during a
+// burst and shed afterwards is legitimately parkable by the time this runs. Only the configured base
+// floor is never-park for the whole run, and asserting against the live value would flag the
+// controller doing its job.
+//
+// A violation makes the WHOLE RUN JUNK rather than merely odd -- every row above was then measured
+// on a pool with a different shape than the one named at the top.
+static void PrintBandVerdict() {
+    // ---- SETTLE BEFORE READING THE BANDS, OR THE SHED TEST IS A FALSE ALARM ------------------
+    //
+    // This read F the instant the last section returned, and the last section is a SWEEP that ends
+    // mid-wave: it grows the floor and stops. The collapse cannot have fired yet -- it refuses
+    // while the 6 ms grow-hold from the final completion is still live -- so the banner printed
+    // `FLOOR DID NOT SHED: F=28` on a floor that was working exactly as designed.
+    //
+    // That is why the failure only appeared on FULL runs and never with `nosweep`: without the
+    // sweeps the last section is the burst, which already settles 25 ms internally and hands the
+    // banner a shed floor. The scheduler behaved identically in both; only the observation moved.
+    //
+    // 25 ms, matching the burst row's settle and comfortably past the 6 ms hold. After it, F above
+    // base IS the real thing the message describes -- growth fired and the collapse did not -- and
+    // the advice it gives about the collapse gate is worth following.
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    const size_t n = JLib::TaskScheduler::Instance().GetWorkerCount();
+    const size_t K = JLib::TaskScheduler::GetHotWorkers();
+    const size_t F = JLib::TaskScheduler::GetAwakeFloor();
+    const size_t Fb = JLib::TaskScheduler::GetAwakeFloorBase();
+    // BANDS CANNOT MOVE: K is static, so no verdict below can be invalidated by a mid-run
+    // band change. This read GetHotWorkerRange and compared kmax > kmin.
+    const bool bandsMoved = false;
+
+    const size_t bandF = Fb;
+
+    // ---- OBSERVED K, NOT DECLARED K ---------------------------------------------------------
+    //
+    // A RESERVED CORE THAT PARKED IS NOT RESERVED. The band's whole promise is a thread that is
+    // awake and holding no bulk work when a completion lands; a worker that slept is a parkable
+    // core wearing a reserved name, and printing `reserved [0,1)` for it is how you spend a night
+    // debugging the wrong bug. ReservedNeverParks() DEFAULTS FALSE, so by default that is exactly
+    // what [0,K) is.
+    //
+    // So the banner reports what the pool DID: a reserved worker counts only if it never parked.
+    // If none qualify, the reserved band prints as EMPTY and K reads 0, whatever was configured.
+    //
+    // This measures the never-park half only. The other half -- that [0,K) refuses loPri -- is
+    // covered by SchedulerReservedBandLiveKTest, which is where an assertion belongs; a banner
+    // should report, not assert.
+    size_t observedK = 0;
+    for (size_t q = 0; q < K; ++q)
+        if (JLib::TaskScheduler::GetWorkerParkCount(q) == 0) ++observedK;
+
+    // ONE K ACROSS THE WHOLE LINE. This printed the reserved band and the K= field from OBSERVED K
+    // while the floor band came from LIVE K, so a run where K moved showed `reserved [0,1)` and
+    // `K=1` next to `floor [7,9)` -- three numbers on one line that cannot all be true. Every band
+    // here is now spelled from the same K, and the observed count is reported as its own fact below.
+    printf("bands (OBSERVED): reserved [0,%zu)  floor [%zu,%zu)  parkable [%zu,%zu)   K=%zu %s  F=%zu (base %zu)\n",
+           K, K, K + bandF, K + bandF, n, K,
+           "pinned", F, Fb);   // K is always pinned now -- the controller is gone
+    if (K && observedK != K)
+        printf("        of the %zu workers in [0,%zu), %zu never parked\n", K, K, observedK);
+    if (K + F > n)
+        printf("        *** INVALID LAYOUT: K+F=%zu > N=%zu, so the parkable band is EMPTY ***\n",
+               K + F, n);
+
+    unsigned resvP = 0, floorP = 0, parkP = 0;
+    size_t   floorWho = 0, parkWho = 0;
+    for (size_t q = 0; q < n; ++q) {
+        const unsigned p = JLib::TaskScheduler::GetWorkerParkCount(q);
+        if (q < K)            resvP  += p;
+        else if (q < K + Fb) { floorP += p; if (p) ++floorWho; }
+        else                 { parkP  += p; if (p) ++parkWho;  }
+    }
+    printf("        observed parks: reserved %u | floor %u | parkable %u (on %zu of %zu parkable workers)\n",
+           resvP, floorP, parkP, parkWho, (n > K + Fb) ? n - (K + Fb) : 0);
+    // ATTRIBUTION BY BAND IS ONLY MEANINGFUL IF THE BANDS HELD STILL. Parks are counted per WORKER
+    // and binned here by the FINAL layout, so when K moved during the run a worker that was reserved
+    // at the moment it parked gets filed under whatever band its index sits in now. A run with
+    // K 1 -> 10 -> 8 reported `reserved 211 | floor 144` that way and NONE of them were violations.
+    // Say so, rather than printing numbers that read as findings.
+    if (bandsMoved)
+        printf("        ^ ATTRIBUTED BY THE FINAL LAYOUT, and K MOVED this run -- a worker is filed\n"
+               "          under the band its index sits in NOW, not the one it was in when it parked.\n"
+               "          These three numbers are NOT violations. Use the live-floor count below,\n"
+               "          which is evaluated AT PARK TIME.\n");
+
+    if (K && observedK != K && !bandsMoved)
+        printf("        *** K IS NOMINAL: %zu of %zu workers in [0,%zu) PARKED, so they are parkable\n"
+               "            cores with a reserved name -- read K as %zu. Either call\n"
+               "            SetReservedNeverParks(true) so the band is real, or stop calling it\n"
+               "            reserved. hiPri still routes and runs; it just is not RESERVED. ***\n",
+               K - observedK, K, K, observedK);
+    if (floorP && !bandsMoved)
+        printf("        *** JUNK RUN: %u parks on %zu FLOOR worker(s) -- the floor is defined as\n"
+               "            never-parking, so the rows above were measured on a different pool than\n"
+               "            the banner claims ***\n", floorP, floorWho);
+    // MEANING CHANGED WITH THE LAST-GATE GUARD in the worker's park path. This used to count
+    // COMPLETED parks by live-floor members -- a genuine violation, and the precursor to a stuck F.
+    // The worker now re-reads the band word AFTER the sleep commit and turns around if it has
+    // become floor, so a floor member can no longer complete a park at all; what this counts is
+    // how often that last gate CAUGHT one mid-commit.
+    //
+    // THE RACE IS NOT ADAPTIVE K'S -- that is gone, and K is static. What still moves the band
+    // under a worker committing to sleep is FLOOR GROWTH AND COLLAPSE: [K, K+F) widens on a burst
+    // and returns to base when the wave drains, so a parkable worker can become a floor member
+    // between the predicate and the sleep. Small nonzero numbers are that window being absorbed,
+    // not a defect -- the defect signal is the SHED test on the burst row, and the FLOOR DID NOT
+    // SHED banner below. `nogrow` pins F, so this should read 0 there; a nonzero count under
+    // `nogrow` means something OTHER than growth is moving the band, and that is worth chasing.
+    printf("        floor-member parks CAUGHT at the last gate: %llu  <- the worker re-checks the\n"
+           "        band word after committing to sleep and recovers if the floor moved over it;\n"
+           "        small counts are the floor GROWING over a worker mid-commit being absorbed\n"
+           "        (expect 0 under `nogrow`). A floor member COMPLETING a park is structurally\n"
+           "        impossible now -- if the SHED test fails anyway, suspect the collapse gate,\n"
+           "        not this\n",
+           JLib::TaskScheduler::GetFloorParkCount());
+    if (F > Fb)
+        printf("        *** FLOOR DID NOT SHED: F=%zu still above base %zu at the end of the run.\n"
+               "            Growth fired and the collapse did not, so every row after the one that\n"
+               "            grew it was measured on a wider pool than it asked for. ***\n", F, Fb);
+    if (!parkP && n > K + Fb)
+        printf("        NOTE: nothing parked at all. Either the pool never went idle, or the\n"
+               "        parkable band is not reachable -- check before trusting any idle-path row.\n");
+}
+
 static std::atomic<const char*> g_section{ "startup" };
 static std::atomic<bool> g_benchDone{ false };
 
-static void Section(const char* name) { g_section.store(name, std::memory_order_release); }
+static void Section(const char* name) {
+    g_section.store(name, std::memory_order_release);
+    // EVERY ROW STARTS AT THE CONFIGURED FLOOR. Push-side growth is transient by design, but the
+    // shed is gated on a hold, and the gap between two bench rows is shorter than that hold -- so a
+    // flood row handed its grown floor to the next row and every number there measured the flood's
+    // pool instead of the configured one. It showed up as a latency row opening at 16 with p99 1.70
+    // us against 0.60: not a latency regression, leftover spinners.
+    //
+    // Harness hygiene, not a scheduler behaviour: rows are supposed to be independent measurements
+    // and nothing outside a benchmark should ever call this.
+    // And the peak with it, so each row.s peak describes THAT row. Without this the DAG row would
+    // inherit a 16 from the no-op flood above it and a genuine streak leak into DAG would be
+    // invisible -- the number would already read 16 for an unrelated reason.
+    JLib::TaskScheduler::ResetAwakeFloorPeak();
+}
 
 static void StartSectionWatchdog(int perSectionSeconds) {
     std::thread([perSectionSeconds] {
@@ -191,6 +340,9 @@ static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
     // Reset HERE, not at construction: workers steal-probe continuously while idle, so anything
     // accumulated before the measured region is dead time rather than work being done.
     JLib::StealStatsReset();
+    // IS THE PARK EVEN ON THIS ROW? Without this number an A/B between park primitives on this row
+    // cannot be read: "no difference" and "the primitive was never called" print identically.
+    JLib::TaskScheduler::ResetWakeCount();
     for (int run = 0; run < kThroughputRuns; ++run) {
         JLib::WaitGroup wg;
         wg.n.store(kThroughputTasks, std::memory_order_relaxed);
@@ -214,6 +366,10 @@ static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0);
     printf("               submit %.2f ms (%.2f M/s), drain-after-submit %.2f ms\n",
         bestPush, kThroughputTasks / bestPush / 1000.0, bestDrain);
+    printf("               kernel wakes: %llu over %d runs (%.2f per 1k tasks)  <- how much of this\n"
+           "               row is the park primitive at all\n",
+           (unsigned long long)JLib::TaskScheduler::GetWakeCount(), kThroughputRuns,
+           JLib::TaskScheduler::GetWakeCount() * 1000.0 / (double)kThroughputTasks / kThroughputRuns);
     PrintSpread(nullptr, spread, kThroughputTasks);
     ReportStealStats("1p");
 }
@@ -300,16 +456,58 @@ static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
 // be awake to steal. If they slept through it, parallelism collapses to roughly one worker and the
 // speedup below drops toward 1.0. Reported as speedup against a measured single-task time so it is
 // self-calibrating rather than depending on a hand-tuned duration.
+// Workers that ran a leaf, per sweep cell. Answers the only question left when a wake fix does not
+// move a row: did the thieves arrive at all?
+static std::atomic<unsigned char> g_sweepSeen[64];
+static size_t SweepParticipants() {
+    size_t n = 0;
+    for (auto& c : g_sweepSeen) if (c.load(std::memory_order_relaxed)) ++n;
+    return n;
+}
+
 static std::atomic<unsigned long long> g_burstSink{ 0 };
+
+// HOW MANY WORKERS ACTUALLY RAN A BURST TASK. The peak floor says how many were WOKEN; this says how
+// many were USED, and the two came apart badly: a wave that promoted to 16 still finished in six
+// waves, which is three workers' worth. Waking a worker, placing work where it can reach it, and it
+// actually running that work are three separate things, and only the last one shows up in the wall
+// time. Without this the next step is guesswork about which of the three failed.
+static std::atomic<unsigned> g_burstLandedOn[64];
 static void BurstBody(void*) {
     // An xorshift CHAIN, not a summation. The obvious `acc += i * k` loop has a closed form and GCC
     // finds it: the same body measured 0.66 ms under MSVC and 0.02 ms under GCC, which silently
     // turned this into a task-overhead benchmark on one platform and a parallelism benchmark on the
     // other. Every iteration here depends on the previous one, so there is nothing to fold.
+    if (JLib::Thread::Current()) {
+        const int q = JLib::Thread::Current()->qIndex;
+        if (q >= 0 && q < 64) g_burstLandedOn[q].fetch_add(1, std::memory_order_relaxed);
+    }
     unsigned long long x = 88172645463325252ull;
     for (int i = 0; i < 3'000'000; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
     g_burstSink.fetch_add(x, std::memory_order_relaxed);
 }
+
+// ------------------------------------------------- lane pressure (ROW REMOVED WITH ADAPTIVE K)
+//
+// THE ROW THIS BODY FED IS GONE, and so is the question it asked. It existed to answer "does
+// adaptive K ever actually move", by holding the lane NON-EMPTY -- small bodies, depth more than K
+// -- rather than by burying the pool, which would have promoted for the wrong reason.
+//
+// The answer turned out to be no, and not for want of pressure: the controller promoted on
+// `missed || adv == mask`, and BOTH terms were unreachable under load -- NoteLaneMiss had no
+// callers at all, and the other term is edge-triggered, so a busier lane fired it LESS. 2.5M hiPri
+// tasks moved K by zero. The controller was removed rather than fixed; K is static now.
+//
+// The body below is left in place, unreferenced, because it is the only calibrated
+// keep-the-lane-warm workload in the file and the next lane experiment will want it. It is not
+// dead code that nobody noticed -- it is a fixture waiting for its row.
+static std::atomic<unsigned long long> g_laneSink{ 0 };
+static void LaneBody(void*) {
+    unsigned long long x = 88172645463325252ull;
+    for (int i = 0; i < 2000; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
+    g_laneSink.fetch_add(x, std::memory_order_relaxed);
+}
+
 
 static void BenchIdleBurst(JLib::TaskScheduler& sched) {
     constexpr int kBurst = 16;
@@ -327,12 +525,25 @@ static void BenchIdleBurst(JLib::TaskScheduler& sched) {
         solo = std::min(solo, MsBetween(t0, Clock::now()));
     }
 
+    // HOW WIDE DID THE POOL ACTUALLY GET? The speedup alone cannot separate "growth never fired"
+    // from "growth fired and the wave still cost this much", and those two want opposite fixes. The
+    // awake floor either side of the burst answers it structurally, immune to the timing noise the
+    // millisecond figure carries.
+    const size_t floorBeforeBurst = JLib::TaskScheduler::GetAwakeFloor();
+    JLib::TaskScheduler::ResetAwakeFloorPeak();
+    for (auto& c : g_burstLandedOn) c.store(0, std::memory_order_relaxed);
+
     double burst = 1e300;
     for (int r = 0; r < kRuns; ++r) {
         // Let the pool actually PARK before the burst; measuring a pool that is still spinning would
         // quietly answer a different question.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         JLib::WaitGroup wg; wg.n.store(kBurst, std::memory_order_relaxed);
+        // AFTER the sleep, so the parks the pool did on its way down are not counted as burst wakes.
+        // This row is 16 tasks of ~3.3 ms; a kernel wake is ~3 us. If the count here is small, the
+        // park primitive is a rounding error on this row and the row CANNOT decide between two of
+        // them -- which is a statement about the instrument, not about the primitives.
+        JLib::TaskScheduler::ResetWakeCount();
         auto t0 = Clock::now();
         for (int i = 0; i < kBurst; ++i) {
             JLib::Task* t = sched.CreateTask(BurstBody, nullptr);
@@ -343,8 +554,117 @@ static void BenchIdleBurst(JLib::TaskScheduler& sched) {
         burst = std::min(burst, MsBetween(t0, Clock::now()));
     }
 
+    // PEAK, NOT THE VALUE AT THIS LINE. The floor collapses to base the instant the wave drains and
+    // an overflow worker notices, which happens long before this printf -- so reading the live floor
+    // here measures the SHED and reports it as the growth. It printed "1 -> 1" next to a 7.02 ms
+    // wall time, and those cannot both be true: 16 tasks of 3.28 ms on one worker is ~50 ms, and
+    // 7.02 ms is two waves. The controller was working; the instrument was pointed at the wrong
+    // instant.
+    // ---- DID IT SHED, OR HAD IT SIMPLY NOT SHED YET? -----------------------------------------
+    //
+    // The floor reading taken here is worthless on its own: the last heavy body to finish calls
+    // GrowFloorIfLongBody on its way out, which refreshes the grow timestamp, and the collapse
+    // refuses for kFloorHoldNs (6 ms) after any growth. So a floor read microseconds after the
+    // burst ALWAYS looks grown, whether or not it is stuck. Reading it once and calling it a
+    // ratchet is the same mistake as reading it once and calling it a shed.
+    //
+    // A settle longer than the hold separates them: still grown after this, and the collapse is
+    // genuinely not firing.
+    const size_t floorImmediatelyAfter = JLib::TaskScheduler::GetAwakeFloor();
+    // TEMP DIAG -- THE DELTA ACROSS THE SETTLE IS THE WHOLE QUESTION. Nothing is submitted during
+    // this sleep, so the 6 ms hold must expire and heldByHold must stop growing. If it keeps
+    // climbing through 25 ms of idle, the grow timestamp is being refreshed with no tasks in
+    // flight -- something in the IDLE path is stamping it -- and no amount of waiting will ever
+    // let the collapse through. Totals cannot show this; only the delta can.
+    unsigned long long c0=0,ng0=0,hd0=0,cs0=0,dn0=0;
+    JLib::TaskScheduler::GetFloorCollapseStats(c0,ng0,hd0,cs0,dn0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const size_t floorAfterSettle = JLib::TaskScheduler::GetAwakeFloor();
+    {
+        unsigned long long c=0,ng=0,hd=0,cs=0,dn=0;
+        JLib::TaskScheduler::GetFloorCollapseStats(c,ng,hd,cs,dn);
+        printf("               collapse TOTAL:  calls=%llu notGrown=%llu heldByHold=%llu casLost=%llu SHED=%llu\n",
+               c,ng,hd,cs,dn);
+        printf("               collapse DURING THE 25ms IDLE SETTLE: calls=%llu notGrown=%llu heldByHold=%llu casLost=%llu SHED=%llu\n",
+               c-c0, ng-ng0, hd-hd0, cs-cs0, dn-dn0);
+        printf("               ^ heldByHold decays over the FIRST ~6 ms of the settle and must be\n"
+               "                 ~0 after: the last completion legitimately refreshes the grow-hold\n"
+               "                 on its way out (see the burst note above), so calls made before it\n"
+               "                 expires are correctly refused. Tens of thousands here is that 6 ms\n"
+               "                 tail at spin rate. The failure signature is heldByHold ~= calls --\n"
+               "                 the stamp being refreshed from the IDLE path for the whole settle,\n"
+               "                 with no tasks in flight -- and SHED=0 next to it.\n");
+
+        // TEMP DIAG -- A STALE STEAL HINT BLOCKS BOTH GATES AT ONCE.
+        //
+        // The collapse CALL SITE is `qIndex >= K+Fbase && advertisedCount == 0`, and the PARK gate
+        // is `advertisedCount == 0 && !onAwakeFloor`. advertisedCount is the popcount of the global
+        // steal hints, so ONE bit left set with an empty queue behind it stops the shed AND stops
+        // parking, pool-wide, forever. `calls=0` through a 25 ms idle can only mean that gate was
+        // false -- nothing else stands between a spinning floor worker and the call.
+        //
+        // So print the bits and check each one against the queue it claims work for. A set bit with
+        // an empty deque is a hint nobody will ever clear, because hints are publisher-set and
+        // owner-cleared and the owner has nothing to drain.
+        {
+            // TEMP DIAG -- DUMP THE POOL WHEN THE SHED FAILED. `calls=0` through 25 ms of idle with
+            // no stale hint means the eligible workers are not LOOPING, and the only way that is
+            // true is that they are asleep. The floor claims [K, K+F); if those indices show
+            // SLEEPING here, they were promoted into the floor while parked and never woken, which
+            // is a growth that raised a number without waking anybody -- and then nobody is left to
+            // call the collapse. This prints the answer instead of another hypothesis.
+            if (floorAfterSettle > JLib::TaskScheduler::GetAwakeFloorBase())
+                JLib::TaskScheduler::Instance().DumpPoolState(
+                    "bench: FLOOR STUCK after a 25 ms idle settle");
+            unsigned advertised = 0, stale = 0;
+            JLib::TaskScheduler::GetStaleHintReport(advertised, stale);
+            printf("               steal hints after the settle: advertised=%u  of which STALE=%u\n",
+                   advertised, stale);
+            if (stale)
+                printf("               *** %u STALE HINT(S) over EMPTY queues: advertisedCount can never\n"
+                       "                   reach 0, so the collapse call site and the park gate are both\n"
+                       "                   dead pool-wide. ***\n", stale);
+        }
+    }
+    const unsigned long long burstWakes = (unsigned long long)JLib::TaskScheduler::GetWakeCount();
+    const size_t floorPeakBurst  = JLib::TaskScheduler::GetAwakeFloorPeak();
+    const size_t floorAfterBurst = JLib::TaskScheduler::GetAwakeFloor();
     printf("burst        : %d heavy tasks from an idle pool -> %.2f ms (1 task = %.2f ms, speedup %.1fx of %d)\n",
         kBurst, burst, solo, (solo * kBurst) / burst, kBurst);
+    printf("               floor after the burst: %zu immediately, %zu after a 25 ms settle (base %zu)\n"
+           "               ^ the first is expected to be grown -- the last completion refreshes the\n"
+           "                 6 ms grow-hold on its way out. THE SECOND IS THE SHED TEST.\n",
+           floorImmediatelyAfter, floorAfterSettle, JLib::TaskScheduler::GetAwakeFloorBase());
+    printf("               kernel wakes in the LAST burst: %llu  <- a wake is ~3 us and one task here\n"
+           "               is ~3.3 ms, so unless this is in the thousands the park primitive is\n"
+           "               noise on this row and cannot be A/B'd with it\n", burstWakes);
+    printf("               awake floor: %zu before, PEAK %zu during, %zu after (base %zu).\n"
+           "               The peak is the number that matters -- the floor sheds as soon as the\n"
+           "               wave drains, so 'after' is the collapse, not the growth. %d tasks over\n"
+           "               PEAK workers is ceil(%d/peak) waves, and that caps this speedup.\n"
+           "               peak == base means push-side growth never fired.\n",
+           floorBeforeBurst, floorPeakBurst, floorAfterBurst,
+           JLib::TaskScheduler::GetAwakeFloorBase(), kBurst, kBurst);
+    {
+        // WOKEN is not USED. Peak says how many workers were promoted; this says how many ran a
+        // task. A wave that promotes to 16 and still finishes in six waves used about three of
+        // them, and no wall-clock number can tell you which of wake / place / run failed.
+        unsigned participants = 0, total = 0;
+        for (size_t q = 0; q < 64; ++q)
+            if (unsigned c = g_burstLandedOn[q].load(std::memory_order_relaxed)) {
+                ++participants; total += c;
+            }
+        printf("               workers that actually RAN a burst task: %u (of %d tasks over %d runs)\n",
+               participants, kBurst * kRuns, kRuns);
+        printf("               spread:");
+        for (size_t q = 0; q < 64; ++q)
+            if (unsigned c = g_burstLandedOn[q].load(std::memory_order_relaxed))
+                printf(" q%zu=%u", q, c);
+        printf("\n               (participants far below the peak means the wave was not REACHABLE\n"
+               "                to the workers growth woke -- a busy worker's inbox has one legal\n"
+               "                consumer, so work only becomes stealable when that worker drains it)\n");
+        (void)total;
+    }
 }
 
 static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
@@ -383,6 +703,14 @@ static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
 }
 
 // ---------------------------------------------------------------- 2. latency
+// WHERE THE PUSH ACTUALLY LANDED, indexed by the qIndex of the worker that RAN the task. This
+// reports what placement DID, not what the placement code is believed to do -- the distinction that
+// matters, because the awake floor is only doing anything if the serial round trip lands inside
+// [0, floor). A push routed to a parked worker buys a WaitOnAddress round trip through the kernel,
+// which is the old 4-8 us row and occasionally the 100 us one. Read this next to the kernel-wake
+// counter: landing off the floor and a nonzero wake count are one fact seen from two sides.
+static std::atomic<unsigned> g_landedOn[64];
+
 static void BenchLatency(JLib::TaskScheduler& sched) {
     constexpr int kIters = 20'000;
 
@@ -395,17 +723,81 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         wakeUs.reserve(kIters); loopEntryUs.reserve(kIters); stealScanUs.reserve(kIters);
     }
 
+    // ---- PER-ITERATION SAMPLES, NOT A MEAN ---------------------------------------------------
+    //
+    // This row used to report totalMs/kIters and nothing else, and that number cannot answer the
+    // question the row exists for. A run whose p50 is 0.53 us and whose max is 105.7 us prints as
+    // "0.53 us" -- the mean absorbs a hundred-microsecond outlier spread over 20,000 samples and
+    // the pathology is invisible. p50 is what a lock-free push into an already-running worker costs
+    // and it will look good either way; p99 and max are where an OS wake shows up, so THOSE are the
+    // floor test. Read them, not the headline.
+    std::vector<double> rtUs;
+    rtUs.reserve(kIters);
+
+    // ---- CATCH THE PATHOLOGICAL STATE IN THE ACT ---------------------------------------------
+    //
+    // WHY THIS EXISTS. Six runs of this binary, identical arguments, produced round trips of
+    // 2.21, 2.24, 2.48, 2.69, 4.49 -- and 664.64 us. Three hundred times, and the frame DAG row in
+    // that same run went 11 -> 486 us with it. Two independent rows going pathological together is
+    // a pool-wide STATE, not a fluke in one measurement.
+    //
+    // A summary printed at the END cannot diagnose it: by then the pool has recovered and the
+    // percentiles only say "slow". The state has to be photographed WHILE IT IS HAPPENING, which
+    // is what this does -- the first round trip to blow the threshold dumps every worker's state
+    // and all three queue classes, then the run continues so the row still reports its numbers.
+    //
+    // ONCE PER RUN. In the bad state every iteration is slow, so the first sample is as good as any
+    // and 20,000 dumps would be unreadable.
+    constexpr double kPathologicalUs = 50.0;
+    bool dumped = false;
+
+    // Both counters are per-row, so they describe THIS row and not the warmup that preceded it.
+    JLib::TaskScheduler::ResetWakeCount();
+
+    // THE FLOOR THIS ROW ACTUALLY RAN UNDER. The banner prints the CONFIGURED floor, which is not
+    // the same number: push-side growth can raise it, and the throughput rows above this one push
+    // 200,000 tasks. A previous run measured this row at floor=8 while the banner said 2 -- the
+    // burst was blamed, and the burst runs AFTER this row. Every conclusion about serial latency
+    // is conditional on this number, so it is printed with the row rather than inferred from the
+    // banner or reconstructed from the landing spread.
+    const size_t floorAtLatencyStart = JLib::TaskScheduler::GetAwakeFloor();
+    for (auto& c : g_landedOn) c.store(0, std::memory_order_relaxed);
+
     auto t0 = Clock::now();
     for (int i = 0; i < kIters; ++i) {
         JLib::WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
-        JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+        JLib::Task* t = sched.CreateTask(+[](void*) {
+            // Which worker picked this up? Thread::instance is the running worker's own TLS, so
+            // this is ground truth for placement, and it costs one relaxed increment.
+            if (JLib::Thread::Current()) {
+                const int q = JLib::Thread::Current()->qIndex;
+                if (q >= 0 && q < 64) g_landedOn[q].fetch_add(1, std::memory_order_relaxed);
+            }
+        }, nullptr);
         t->waitGroup = &wg;
         const int64_t pushNs = JLib::kLatencyStatsEnabled
             ? std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()
             : 0;
+        const auto rtStart = Clock::now();
         sched.Push(t);
         sched.WaitFor(wg);
+        const double rt = std::chrono::duration<double, std::micro>(Clock::now() - rtStart).count();
+        rtUs.push_back(rt);
+
+        if (!dumped && rt > kPathologicalUs) {
+            dumped = true;
+            printf("\n  *** PATHOLOGICAL ROUND TRIP: iteration %d took %.1f us "
+                   "(healthy is ~2 us) ***\n", i, rt);
+            printf("  Pool state AT THE MOMENT it happened follows. Read it as:\n"
+                   "    a worker AWAKE with an empty queue      -> it is searching and finding nothing\n"
+                   "    a worker with a NON-EMPTY queue         -> work is queued and not being run\n"
+                   "    'rs' non-empty                          -> a pinned resume nobody else may take\n"
+                   "    every worker busy                       -> genuine saturation, not a stall\n");
+            sched.DumpPoolState("bench: pathological round-trip latency");
+            printf("  (continuing -- the row below still reports its own numbers)\n\n");
+        }
+
         if (JLib::kLatencyStatsEnabled) {
             int64_t wakeNs = 0, preStealNs = 0, foundNs = 0;
             JLib::LatencyStatsRead(wakeNs, preStealNs, foundNs);
@@ -420,8 +812,58 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         }
     }
     double totalMs = MsBetween(t0, Clock::now());
-    printf("latency      : %d serial round-trips in %.2f ms  ->  %.2f us per push->run->wait\n",
+
+    std::sort(rtUs.begin(), rtUs.end());
+    auto pct = [&](double p) { return rtUs[(size_t)((double)(rtUs.size() - 1) * p)]; };
+    printf("latency      : %d serial round-trips in %.2f ms  ->  mean %.2f us per push->run->wait\n",
         kIters, totalMs, totalMs * 1000.0 / kIters);
+    printf("               p50 %.2f us | p99 %.2f us | max %.2f us   <- p99/max are the floor test,\n"
+           "               because an OS wake cannot hide there the way it hides in the mean\n",
+        pct(0.50), pct(0.99), rtUs.back());
+
+    // ---- DID THE FLOOR RECEIVE THE WORK? -----------------------------------------------------
+    //
+    // Two independent views of one question. A serial round trip into a pool with a live floor
+    // should wake NOBODY: placement steers at a worker that is already spinning, which picks the
+    // inbox up on its next pass. Thousands of wakes, or a low on-floor percentage, both mean
+    // placement is still routing to sleepers and the floor is decoration.
+    {
+        // THE FLOOR IS [K, K+F), NOT [0, F). This counted [0, floorN) -- which is the RESERVED band
+        // that ordinary work is deliberately masked OUT of -- and so reported "0.0% landed on the
+        // floor" on the same row as "kernel wakes: 0". Those cannot both be true, and the wake count
+        // is the one that was right: work was landing on the floor exactly as intended and the
+        // instrument was looking at the wrong band. A diagnostic left behind by a layout change does
+        // not go quiet, it lies with a plausible number.
+        const size_t floorN = JLib::TaskScheduler::GetAwakeFloor();
+        const size_t kResv  = JLib::TaskScheduler::GetHotWorkers();
+        unsigned onFloor = 0, onResv = 0, total = 0;
+        for (size_t q = 0; q < 64; ++q) {
+            const unsigned c = g_landedOn[q].load(std::memory_order_relaxed);
+            total += c;
+            if (q >= kResv && q < kResv + floorN) onFloor += c;
+            else if (q < kResv)                   onResv  += c;
+        }
+        printf("               floor during this row: %zu -> %zu (base %zu)  <- if this is above the\n"
+               "               base, an earlier row grew it and did not shed; every number in this\n"
+               "               row is then a measurement of THAT floor, not of the configured one\n",
+            floorAtLatencyStart, floorN, JLib::TaskScheduler::GetAwakeFloorBase());
+        printf("               kernel wakes this row: %llu  (a live floor should need ~0)\n",
+            (unsigned long long)JLib::TaskScheduler::GetWakeCount());
+        printf("               landed on the floor [%zu,%zu): %u of %u (%.1f%%)  -- the rest paid a wake\n",
+            kResv, kResv + floorN, onFloor, total,
+            total ? 100.0 * (double)onFloor / (double)total : 0.0);
+        if (onResv)
+            printf("               landed in the RESERVED band [0,%zu): %u  <- ordinary work is masked\n"
+                   "               out of it, so anything here is a placement leak\n", kResv, onResv);
+        if (total) {
+            printf("               landing spread:");
+            for (size_t q = 0; q < 64; ++q) {
+                const unsigned c = g_landedOn[q].load(std::memory_order_relaxed);
+                if (c) printf(" q%zu=%u", q, c);
+            }
+            printf("\n");
+        }
+    }
 
     if (!JLib::kLatencyStatsEnabled) return;
     auto med = [](std::vector<double> v) -> double {
@@ -543,6 +985,14 @@ static void BenchFrameDag(JLib::TaskScheduler& sched) {
         }
         best = std::min(best, MsBetween(t0, Clock::now()));
     }
+    // THE FLOOR THIS ROW RAN UNDER, for the same reason the latency row prints it. This row moved
+    // 3.51 -> 6.6 us when push-side spilling was added and did NOT come back when the collapse was
+    // fixed, so the cause is still open: a floor stuck at 16 (spinner contention) and a floor at 2
+    // with the spill re-routing graph nodes are different diagnoses wanting opposite fixes, and the
+    // us/graph number alone cannot tell them apart.
+    printf("               floor during this row: %zu (base %zu, peak %zu)\n",
+           JLib::TaskScheduler::GetAwakeFloor(), JLib::TaskScheduler::GetAwakeFloorBase(),
+           JLib::TaskScheduler::GetAwakeFloorPeak());
     printf("frame DAG    : %d 6-node graphs in %.2f ms best-of-%d  ->  %.0f graphs/sec, %.2f us/graph\n",
         kFrames, best, kRuns, kFrames / best * 1000.0, best * 1000.0 / kFrames);
 }
@@ -605,12 +1055,12 @@ template <int kFlops>
 static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::vector<int>& sizes) {
     printf("  %-10s |", label);
     std::vector<double> speedups, serialUs;
-    speedups.reserve(sizes.size());
+    std::vector<size_t> participants;    speedups.reserve(sizes.size());
     serialUs.reserve(sizes.size());
 
     for (int n : sizes) {
         constexpr int kRuns = 7;
-        double bestSerial = 1e300, bestPar = 1e300;
+        double bestSerial = 1e300, bestPar = 1e300;        for (auto& c : g_sweepSeen) c.store(0, std::memory_order_relaxed);
 
         // Grain: aim for ~4 chunks per worker, which is the usual load-balancing sweet spot (enough
         // pieces to even out, few enough to keep per-chunk overhead down). Never below 1.
@@ -627,6 +1077,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
 
             // --- parallel ---
             std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
+
             auto t1 = Clock::now();
             std::atomic<double> pacc{ 0.0 };
             // ParallelFor, not the removed fork-join entry point. There is no gate to dodge any more:
@@ -634,6 +1085,14 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             // whatever the pool chose to take. Cells below ~1.00x mean the splitter parallelized a
             // body too cheap to be worth it -- which nothing probe-free can refuse to do.
             sched.ParallelFor(0, n, grain, [&](int a, int b) {
+                // WHO RAN THIS LEAF. The one number that separates "the wake did not fire" from
+                // "the wake fired and the thief found nothing": if a row is slow with 2-3
+                // participants the steal scan is not reaching the non-worker lane; if it is slow
+                // with 20, the thieves arrived and the cost is per-leaf.
+                if (JLib::Thread* w = JLib::Thread::Current()) {
+                    const int q = w->qIndex;
+                    if (q >= 0 && q < 64) g_sweepSeen[q].store(1, std::memory_order_relaxed);
+                }
                 double local = 0.0;
                 for (int i = a; i < b; ++i) local += BodyCost<kFlops>(i);
                 // fetch_add on a double isn't available pre-C++20 atomics ops, so accumulate via CAS.
@@ -645,6 +1104,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
         }
 
         const double speedup = bestSerial / std::max(bestPar, 1e-9);
+        participants.push_back(SweepParticipants());
         speedups.push_back(speedup);
         serialUs.push_back(bestSerial * 1000.0);
         printf(" %5.2fx", speedup);
@@ -668,6 +1128,14 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
     if (crossover > 0) printf("   | wins from N=%-7d (serial work there: %7.1f us)\n",
                               crossover, crossoverSerialUs);
     else               printf("   | never clears %.2fx\n", kWinMargin);
+    // WORKERS THAT RAN A LEAF, per cell. A slow row with 2-3 participants means the thieves never
+    // arrived and the steal scan is the bug; a slow row with 20 means they did arrive and the cost
+    // is per-leaf. From the ratio alone those two are indistinguishable, and they want opposite
+    // fixes -- which is how an afternoon goes into fixing the wrong one.
+    printf("             distinct workers that ran a leaf (count, not an index; pool has %zu):",
+           JLib::TaskScheduler::Instance().GetWorkerCount());
+    for (size_t i = 0; i < participants.size(); ++i) printf(" %zu", participants[i]);
+    printf("\n");
 }
 
 static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
@@ -931,12 +1399,17 @@ static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
         return MsBetween(t0, Clock::now()) * 1000.0 / kIters;
     };
 
-    if (K == 0) {
+    // SKIP ONLY IF hiPri HAS NOWHERE TO BE STEERED. This tested K == 0, which stopped being the
+    // right question in 5.0.0: hiPri no longer needs a reserved lane. A hiPri push now goes to the
+    // hiPri INBOX of an awake-floor worker, and every worker drains hiPri before its own deque, so
+    // the row means something whenever there is a floor to aim at -- with or without K.
+    if (!JLib::TaskScheduler::HiPriLaneActive()
+        || JLib::TaskScheduler::GetAwakeFloorBase() == 0) {
         const double us = runArm(false);
-        printf("latency/hot  : SKIPPED -- K=0, so the lane is collapsed and a hiPri push routes to\n");
-        printf("               loPri by design. Re-run with hot=1 (or more) for this row to mean\n");
-        printf("               anything; a number here at K=0 would just be latency/cold twice.\n");
-        printf("latency/cold : %.2f us per push->run->wait (ordinary push, K=0)\n", us);
+        printf("latency/hot  : SKIPPED -- hiPri has no steer target (floor=0 and K=0), so it lands\n");
+        printf("               wherever ordinary placement sends it and this row would just be\n");
+        printf("               latency/cold twice. Re-run with floor>=1 or hot>=1.\n");
+        printf("latency/cold : %.2f us per push->run->wait\n", us);
         return;
     }
 
@@ -947,7 +1420,16 @@ static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
     const double hotUs  = runArm(true);
 
     printf("latency/cold : %.2f us per push->run->wait  (ordinary push -> any worker, may be parked)\n", coldUs);
-    printf("latency/hot  : %.2f us per push->run->wait  (hiPri push -> one of K=%zu hot workers)\n", hotUs, K);
+    // SAY THAT THIS ROW IS UNSTEERED, because next to the serial `latency` row it reads as a
+    // contradiction: 3.97 us here against 0.54 us there, same pool, same floor. They are not
+    // measuring the same thing. The serial row lands on a floor worker that is already scheduled;
+    // this one takes the ordinary placement path to whichever worker comes up, parked or not, and
+    // an OS wake is most of what it reports. That is the OLD path, kept deliberately as the
+    // before-picture -- without it there is nothing to compare the floor against.
+    printf("               ^ UNSTEERED, on purpose: this is the pre-floor round trip. The gap to\n"
+           "                 the `latency` row above IS the floor's effect, not an inconsistency.\n");
+    printf("latency/hot  : %.2f us per push->run->wait  (hiPri push -> hiPri inbox of an\n"
+           "               awake-floor worker, drained before that worker's own deque)\n", hotUs);
     if (coldUs > 0.0)
         printf("               hot is %.2fx of cold%s\n", hotUs / coldUs,
                (hotUs < coldUs) ? " (lower is better -- the lane is doing its job)"
@@ -964,8 +1446,15 @@ static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
 //   B  Event         1 and 8 waiters   hold-off 0 and 1 ms
 //   C  DirectEvent, waiter on a worker that has been allowed to PARK
 //
-// C IS THE OS ROW. It is the cost of an OS wake, not the cost of the primitive, and averaging it
-// into A would hide exactly the thing A exists to isolate. It is printed separately and labelled.
+// C IS THE PARKED-WAITER ROW, and it is only "the OS row" WHEN THE POOL CAN PARK. It is printed
+// separately from A because it prices a different thing -- getting a stopped worker running again,
+// rather than the primitive itself -- and averaging it into A hides what A exists to isolate.
+//
+// ITS MEANING NOW DEPENDS ON floor=N, so the caption is chosen at run time rather than asserted.
+// At floor=0 this is a genuine OS wake: WaitOnAddress, a kernel round trip, a cold core. With a
+// live floor the waiter's worker may never have parked at all, so the same number is no longer
+// evidence about the OS -- calling it "the OS row" there would be a caption describing the old
+// configuration. Measured at floor=2 it lands ~2.2 us, which is NOT a wake.
 //
 // THE HOLD-OFF IS THE POINT of running each arm twice. At 0 the waiter has only just parked and
 // the resume may land while the fiber is still warm; at 1 ms it has certainly settled. The gap
@@ -1032,7 +1521,7 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
                                  Clock::now().time_since_epoch()).count(),
                              std::memory_order_release);
             s_done.store(1, std::memory_order_release);
-        }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+        }, nullptr, false, JLib::TaskType::Fiber);
         if (!t) return -1.0;
         t->waitGroup = &wg;
         sched.Push(t);
@@ -1075,7 +1564,7 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         Clock::now().time_since_epoch()).count(),
                     std::memory_order_acq_rel);
-            }, &ev, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+            }, &ev, false, JLib::TaskType::Fiber);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_release); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -1155,7 +1644,14 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
         };
         const double c = medianOf(sleeper, 10);
         printf("  C DirectEvent  waiter on a PARKED pool          : %7.2f us\n", c);
-        printf("     ^ THE OS ROW. This is the wake, not the primitive. Do not average it into A.\n");
+        if (JLib::TaskScheduler::GetAwakeFloor() == 0) {
+            printf("     ^ THE OS ROW. This is the wake, not the primitive. Do not average it into A.\n");
+        } else {
+            printf("     ^ NOT the OS row at floor=%zu -- the waiter's worker need never have parked,\n"
+                   "       so this is the resume, not a kernel wake. It IS the OS row at floor=0.\n"
+                   "       Still not averaged into A: different question either way.\n",
+                   JLib::TaskScheduler::GetAwakeFloor());
+        }
     }
 }
 
@@ -1172,9 +1668,12 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
 // timed is how long a completion waits for a worker to pick it up.
 static void BenchIoPipe(JLib::TaskScheduler& sched) {
     const size_t K = JLib::TaskScheduler::GetHotWorkers();
-    if (K == 0) {
-        printf("io-pipe      : SKIPPED -- K=0. A hiPri push collapses to loPri with no lane to land\n");
-        printf("               on, so this would measure the ordinary pool and call it I/O.\n");
+    // Same rule as latency/hot: what matters is whether a hiPri push has somewhere to be steered,
+    // not whether K reserved anybody for it.
+    if (!JLib::TaskScheduler::HiPriLaneActive()
+        || JLib::TaskScheduler::GetAwakeFloorBase() == 0) {
+        printf("io-pipe      : SKIPPED -- hiPri has no steer target (floor=0 and K=0), so this would\n");
+        printf("               measure the ordinary pool and call it I/O.\n");
         return;
     }
 
@@ -1182,6 +1681,10 @@ static void BenchIoPipe(JLib::TaskScheduler& sched) {
     static std::atomic<long long> s_startNs{ 0 };
     std::vector<double> lat;
     lat.reserve(kOps);
+
+    // Lane-reachability counter, sampled around THIS row only. It is a process-wide total, so the
+    // delta is the only readable form -- latency/hot ran 20000 hiPri pushes before this.
+    const unsigned long long spill0 = JLib::TaskScheduler::GetHiPriSpillCount();
 
     std::thread reactor([&] {
         for (int i = 0; i < kOps; ++i) {
@@ -1207,10 +1710,207 @@ static void BenchIoPipe(JLib::TaskScheduler& sched) {
 
     if (lat.empty()) { printf("io-pipe      : no samples\n"); return; }
     std::sort(lat.begin(), lat.end());
-    printf("io-pipe      : completion -> job start, %zu samples, K=%zu\n", lat.size(), K);
+    printf("io-pipe      : completion -> job start, %zu samples (hiPri -> awake floor, K=%zu)\n",
+           lat.size(), K);
     printf("               p50 %.2f us   p90 %.2f us   p99 %.2f us   max %.2f us\n",
            lat[lat.size() / 2], lat[(size_t)(lat.size() * 0.90)],
            lat[(size_t)(lat.size() * 0.99)], lat.back());
+
+    // ---- DID THE LANE STAY REACHABLE, AND WHICH MECHANISM HAD TO ACT ------------------------
+    //
+    // Two different rescues, and they answer different halves of the same question:
+    //
+    //   spilled -- the PRODUCER found the reserved owner already inside a body and redirected the
+    //              push to another worker in [0, K). Zero on a healthy lane. Rising means
+    //              completions arrive faster than K retires them, which is K being too small for
+    //              the completion rate -- a configuration answer, not a fault.
+    //   staged  -- the OWNER unloaded its remaining lane tasks into its own hiPri deque on its way
+    //              into a body, so a thief in the band could take them. Only reserved workers probe
+    //              hiPri, so a staged task that never runs means the band had no spare consumer.
+    //
+    // THE SPILL CANNOT LEAVE [0, K). It walked the awake floor and then the whole awake pool until
+    // 5.0.0, which put completions behind bulk bodies on the reasoning that an awake worker costs no
+    // wake -- true, and not the question this row asks. At K == 1 there is no second reserved worker
+    // and `spilled` is structurally 0; that is the mechanism being inert, not healthy.
+    //
+    // IT IS THE ONLY LANE RESCUE NOW. `staged` was printed beside it and is gone with the lane
+    // deque -- there is no unload-at-dispatch to count, because there is nowhere to unload to.
+    const unsigned long long spilled = JLib::TaskScheduler::GetHiPriSpillCount() - spill0;
+    printf("               lane reachability this row: spilled=%llu  of %zu pushes\n",
+           spilled, (size_t)kOps);
+    printf("               ^ THIS ROW CANNOT SPILL, and 0 here is a negative control rather than a\n"
+           "                 pass: it pushes one completion and waits for it, so the reserved owner\n"
+           "                 is never inside a body when the next one arrives and the scan is never\n"
+           "                 reached. io-pipe/ovl below is the arm that can move these.\n");
+}
+
+// Sink for the overlapped row's body, so the spin cannot be optimised away.
+static std::atomic<unsigned long long> g_ioOverlapSink{ 0 };
+
+// In-flight completions in the overlapped row. FILE SCOPE, not a local constexpr: MSVC will not
+// take an enclosing function's constexpr as an array bound inside a lambda (C2131), and the array
+// has to live in the lambda because that is where the window is built.
+static constexpr size_t kIoOvlWindow = 8;   // > K on every configuration we ship
+
+// ================================================================================================
+// IO-PIPE/OVL: the same question with the lane actually under pressure.
+//
+// WHY A SECOND ROW RATHER THAN A CHANGE TO THE FIRST. The serial row measures a completion arriving
+// at an IDLE lane -- the best case, and the one that says what the lane costs when nothing is in the
+// way. It is a real number and it is not this one. Overlapping changes what p99 MEANS: it stops
+// being "how long to be picked up" and becomes "how long to be picked up given that k others are
+// already ahead of me", which is the head-of-line question. Reporting one number for both is how a
+// bench quietly answers a question nobody asked.
+//
+// TWO THINGS ARE DIFFERENT AND BOTH ARE LOAD-BEARING:
+//
+//   1. A WINDOW OF IN-FLIGHT COMPLETIONS. kWindow are pushed back to back before anything is
+//      waited on, so pushes past the K'th arrive at a reserved worker that is already running one.
+//      That is the only way HiPriSpillTarget's scan is reached at all -- its fast path is a single
+//      `busy` load, and on the serial row that load is always false.
+//
+//   2. A BODY WITH A DURATION. The serial row's body is a timestamp store, ~50 ns, so even pushed
+//      back to back the owner would be free again before the next push landed and the window would
+//      not overlap in practice. ~2 us is chosen to be longer than a push round trip and far shorter
+//      than the 400 us bulk bodies in io_overlap_test: long enough that the lane genuinely backs up,
+//      short enough that this stays a LANE measurement rather than a throughput one.
+//
+// STILL A SIDE THREAD, not a pool worker, for the same reason as the serial row: a completion
+// pushed from inside the pool is a different code path and would be mislabelled I/O.
+//
+// WHAT TO READ. p50 here is a queueing number and is expected to be worse than the serial row --
+// that is the window, not a regression. The row's actual subject is the pair on the last line:
+// `spilled` counts completions the PRODUCER redirected to another worker in [0, K) because the
+// owner was mid-body, and `staged` counts lane tasks the OWNER unloaded into its own hiPri deque on
+// its way into a body. Zero on BOTH under a window this wide would mean neither reachability
+// mechanism ever fired, which is the interesting failure -- it would say the lane is being drained
+// by luck.
+static void BenchIoPipeOverlap(JLib::TaskScheduler& sched) {
+    const size_t K = JLib::TaskScheduler::GetHotWorkers();
+    if (!JLib::TaskScheduler::HiPriLaneActive()
+        || JLib::TaskScheduler::GetAwakeFloorBase() == 0) {
+        printf("io-pipe/ovl  : SKIPPED -- same reason as io-pipe above.\n");
+        return;
+    }
+
+    constexpr int kOps = 4'000;
+
+    // ONE SLOT PER IN-FLIGHT COMPLETION. The serial row could use a single static because exactly
+    // one task existed at a time; with a window that would have every task racing to write the same
+    // cell and the latencies would be nonsense. postNs is written by the producer just before its
+    // own Push, startNs by the task itself, so the difference is per-completion.
+    struct Slot {
+        std::atomic<long long> startNs;
+        long long              postNs;
+    };
+
+    auto nowNs = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   Clock::now().time_since_epoch()).count();
+    };
+
+    // ~2 us. Calibrated against the burst body's 3'000'000 iterations for 3.28 ms (~1.09 ns each).
+    auto body = +[](void* p) {
+        Slot* s = (Slot*)p;
+        s->startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             Clock::now().time_since_epoch()).count(),
+                         std::memory_order_release);
+        unsigned long long x = 88172645463325252ull;
+        for (int i = 0; i < 2000; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
+        g_ioOverlapSink.fetch_add(x, std::memory_order_relaxed);
+    };
+
+    std::vector<double> lat;
+    lat.reserve(kOps);
+    bool ok = true;
+
+    const unsigned long long spill0    = JLib::TaskScheduler::GetHiPriSpillCount();
+    const unsigned long long strand0   = JLib::TaskScheduler::GetLaneStrandCount();
+    const unsigned long long idlePeer0 = JLib::TaskScheduler::GetLaneStrandIdlePeerCount();
+    const unsigned long long idleWide0 = JLib::TaskScheduler::GetLaneStrandIdleWideCount();
+
+    std::thread reactor([&] {
+        std::vector<Slot> slots(kIoOvlWindow);
+        for (int base = 0; base < kOps; base += (int)kIoOvlWindow) {
+            const size_t n = (kOps - base < (int)kIoOvlWindow) ? (size_t)(kOps - base) : kIoOvlWindow;
+
+            // CREATED BEFORE ANY OF THEM IS TIMED. Allocation is not what this row is measuring,
+            // and doing it inside the window would put a slab pop between two pushes that are
+            // supposed to be back to back.
+            JLib::Task* ts[kIoOvlWindow] = {};
+            size_t made = 0;
+            for (size_t j = 0; j < n; ++j) {
+                slots[j].startNs.store(0, std::memory_order_relaxed);
+                ts[j] = sched.CreateTask(body, &slots[j], /*hiPri*/ 1);
+                if (!ts[j]) break;
+                ++made;
+            }
+            if (made == 0) { ok = false; break; }
+
+            JLib::WaitGroup wg;
+            wg.n.store((int)made, std::memory_order_relaxed);
+            for (size_t j = 0; j < made; ++j) {
+                ts[j]->waitGroup = &wg;
+                slots[j].postNs  = nowNs();
+                sched.Push(ts[j]);
+            }
+            sched.WaitFor(wg);
+
+            for (size_t j = 0; j < made; ++j) {
+                const long long s = slots[j].startNs.load(std::memory_order_acquire);
+                if (s > slots[j].postNs) lat.push_back((double)(s - slots[j].postNs) / 1000.0);
+            }
+        }
+    });
+    reactor.join();
+
+    if (!ok)         { printf("io-pipe/ovl  : ERROR -- CreateTask returned null\n"); return; }
+    if (lat.empty()) { printf("io-pipe/ovl  : no samples\n"); return; }
+
+    std::sort(lat.begin(), lat.end());
+    printf("io-pipe/ovl  : completion -> job start, %zu samples, %zu in flight (hiPri, K=%zu)\n",
+           lat.size(), kIoOvlWindow, K);
+    printf("               p50 %.2f us   p90 %.2f us   p99 %.2f us   max %.2f us\n",
+           lat[lat.size() / 2], lat[(size_t)(lat.size() * 0.90)],
+           lat[(size_t)(lat.size() * 0.99)], lat.back());
+
+    const unsigned long long spilled = JLib::TaskScheduler::GetHiPriSpillCount() - spill0;
+    printf("               lane reachability this row: spilled=%llu  of %zu pushes\n",
+           spilled, (size_t)kOps);
+    printf("               ^ spilled = the producer found the owner mid-body and moved the push to\n"
+           "                 another idle worker in [0,K). It is now the ONLY lane rescue: the\n"
+           "                 staging half is gone with the lane deque, so anything not spilled at\n"
+           "                 push time waits for its owner's current body. At K=1 `spilled` is\n"
+           "                 structurally 0; there is no second reserved worker.\n");
+
+    // ---- WOULD A SHARED MPMC LANE WIN ANYTHING? THIS ROW IS WHERE IT WOULD SHOW ----------------
+    const unsigned long long strands  = JLib::TaskScheduler::GetLaneStrandCount()          - strand0;
+    const unsigned long long idlePeer = JLib::TaskScheduler::GetLaneStrandIdlePeerCount()  - idlePeer0;
+    const unsigned long long idleWide = JLib::TaskScheduler::GetLaneStrandIdleWideCount()  - idleWide0;
+    const double pctK  = strands ? (100.0 * (double)idlePeer / (double)strands) : 0.0;
+    const double pctKF = strands ? (100.0 * (double)idleWide / (double)strands) : 0.0;
+    printf("               MPMC prize: %llu dispatches stranded a backlog\n"
+           "                 %llu (%.1f%%) had an idle worker in [0,K)    <- what the spill can reach\n"
+           "                 %llu (%.1f%%) had an idle worker in [0,K+F)  <- what a SHARED lane could\n",
+           strands, idlePeer, pctK, idleWide, pctKF);
+    printf("               ^ a strand is a dispatch that left a non-empty lane inbox behind, i.e.\n"
+           "                 work that just became unreachable -- one MPSC, one legal consumer, and\n"
+           "                 that consumer is entering a body. THE GAP BETWEEN THE TWO LINES is what\n"
+           "                 changing the STRUCTURE buys that improving the spill never could: the\n"
+           "                 first is bounded by K by definition, the second is the consumer set a\n"
+           "                 pull queue would have. Neither counts the parkable band -- a parked\n"
+           "                 worker is never busy, so including it would read ~100%% forever while\n"
+           "                 costing the ~3 us wake the lane exists to avoid.\n"
+           "                 An MPMC removes MISALLOCATION, not queueing,\n"
+           "                 so when every reserved worker is busy it waits exactly as long as this\n"
+           "                 does. Near 0%% means the lane saturates cleanly, the p99 gap above is\n"
+           "                 dispatch cost rather than bad placement, and a shared queue would add\n"
+           "                 contention to buy nothing. Near 100%% means work sits behind busy\n"
+           "                 owners while peers idle -- the one case the producer-side spill cannot\n"
+           "                 reach, because it decides at PUSH time and the owner can enter a body\n"
+           "                 immediately after. Biased HIGH on purpose: a sleeping peer counts as\n"
+           "                 idle, so this is an upper bound on what an MPMC could win.\n");
+    (void)g_ioOverlapSink.load(std::memory_order_relaxed);
 }
 
 int main(int argc, char** argv) {
@@ -1230,17 +1930,13 @@ int main(int argc, char** argv) {
     // genuinely owns itself -- and because a policy nobody can reproduce is a claim, not a result.
     const char* policyName = "ideal";
     auto policy = JLib::TaskScheduler::AffinityPolicy::Ideal;
-    if (argc > 1) {
-        if (JLIB_STRICMP(argv[1], "ideal") == 0) { /* the default, but accept it explicitly */ }
-        else if (JLIB_STRICMP(argv[1], "hard") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::Hard; policyName = "hard"; }
-        else if (JLIB_STRICMP(argv[1], "none") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::None; policyName = "none"; }
-        else if (JLIB_STRICMP(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; }
-        else {
-            // Anything else, --help included, prints usage and exits. It used to fall through to
-            // the default and silently run the whole suite, so asking for help started a multi-
-            // minute benchmark under a policy you did not choose.
+
+    // Anything unrecognised, --help included, prints this and exits. It used to fall through to
+    // the default and silently run the whole suite, so asking for help started a multi-minute
+    // benchmark under a policy you did not choose.
+    auto printUsage = []() {
             printf("usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
-                   "                     [sleep|nosleep|both] [hot=N] [ev|noev]\n"
+                   "                     [sleep|nosleep|both] [hot=N] [floor=N] [ev|noev]\n"
                    "  sleep     (default) idle workers park on a condition variable.\n"
                    "  nosleep   never park. Holds every worker core; lowest dispatch latency.\n"
                    "            Measured 4.1x on latency, 2.9x on the frame DAG, 3.1x on fork-join.\n"
@@ -1276,6 +1972,17 @@ int main(int argc, char** argv) {
                    "            N is taken from the compute pool, so raising it makes the throughput\n"
                    "            rows slightly worse; latency/hot and io-pipe are what you get back,\n"
                    "            and they are the only rows that can show it. Start with hot=1.\n"
+                   "  floor=N   the AWAKE FLOOR: workers 0..N-1 never park (SetAwakeFloor). DEFAULT 0,\n"
+                   "            which is the historical behaviour -- the whole pool may go to sleep.\n"
+                   "            THIS IS NOT hot=N, and the two were briefly the same argument, which\n"
+                   "            made every paste ambiguous. hot=K picks WHICH QUEUE a hiPri push\n"
+                   "            lands in; floor=N decides whether landing anywhere costs an OS wake.\n"
+                   "            They are independent: floor=2 hot=0 is a live floor with no lane,\n"
+                   "            hot=2 floor=0 is a lane whose workers can all be asleep.\n"
+                   "            The floor only pays off if PLACEMENT steers at it, so the latency row\n"
+                   "            prints where each push actually landed and how many kernel wakes the\n"
+                   "            row cost. A high floor with a low on-floor percentage means the\n"
+                   "            feature is decoration and the wake count will say so.\n"
                    "  noev      skip latency/hot, event/resume and io-pipe. Those are the only\n"
                    "            sections that exercise the LANE and the Event primitives, and the\n"
                    "            only reason hot=N changes anything but the compute pool size --\n"
@@ -1286,8 +1993,22 @@ int main(int argc, char** argv) {
                    "fixed at Init(), so one run measures ONE configuration -- run the exe once per\n"
                    "point to compare. On macOS and Android every policy is a no-op (no usable\n"
                    "affinity API there); prefer 'none' on those so the label matches reality.\n");
-            return (JLIB_STRICMP(argv[1], "--help") == 0 || JLIB_STRICMP(argv[1], "-h") == 0) ? 0 : 2;
-        }
+    };
+
+    // ARGV[1] IS THE AFFINITY POLICY ONLY IF IT NAMES ONE, and is optional otherwise.
+    //
+    // It used to be positional-and-mandatory: any first token that was not a policy printed usage
+    // and exited. Since every OTHER argument is order-independent, that one positional slot was a
+    // trap -- `SchedulerBench floor=2 hot=2` did not run the bench under the default policy, it
+    // printed the help text, and the help text's own `[ideal|hard|none|physical]` brackets said the
+    // argument was optional. Now the policy is consumed only when recognised and the option loop
+    // starts wherever it left off, so every documented invocation actually runs.
+    int firstOpt = 1;
+    if (argc > 1) {
+        if      (JLIB_STRICMP(argv[1], "ideal") == 0)    { firstOpt = 2; }  // the default, accepted explicitly
+        else if (JLIB_STRICMP(argv[1], "hard") == 0)     { policy = JLib::TaskScheduler::AffinityPolicy::Hard;         policyName = "hard";     firstOpt = 2; }
+        else if (JLIB_STRICMP(argv[1], "none") == 0)     { policy = JLib::TaskScheduler::AffinityPolicy::None;         policyName = "none";     firstOpt = 2; }
+        else if (JLIB_STRICMP(argv[1], "physical") == 0) { policy = JLib::TaskScheduler::AffinityPolicy::PhysicalOnly; policyName = "physical"; firstOpt = 2; }
     }
 
     size_t poolSize = 0;                 // 0 = auto (hw-1)
@@ -1302,9 +2023,123 @@ int main(int argc, char** argv) {
     // hot=N: workers dedicated to the latency lane. DEFAULT 2, AND PINNED -- see the SetHotWorkers
     // call below for why a benchmark must not leave this to the controller.
     size_t hotWorkers = 2;
-    for (int a = 2; a < argc; ++a) {
+    size_t awakeFloor  = JLib::TaskScheduler::GetAwakeFloor();
+    bool   floorGrowth = true;   // `nogrow` turns the growth controller off
+    bool   neverPark   = false;  // `neverpark` makes [0,K) spin instead of sleeping -- see the flag
+    size_t splitCap = 0; bool haveSplitCap = false;   // splitcap=N  // floor=N; default = the shipped one
+    for (int a = firstOpt; a < argc; ++a) {
         if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
         if (JLIB_STRICMP(argv[a], "noev") == 0)    { runEvents = false; continue; }
+        // nogrow: pin the awake floor at its base -- no push-side spill, no completion-side growth,
+        // no redistribute. The A/B for the whole growth controller, in ONE binary, so the machine
+        // that holds the baseline can run both arms in one session instead of across two builds.
+        if (JLIB_STRICMP(argv[a], "nogrow") == 0) { floorGrowth = false; continue; }
+        // splitcap=N: how many unclaimed splits the lazy splitter tolerates before it stops
+        // publishing and runs the rest inline. 0 = split unconditionally (the old behaviour), which
+        // is the control arm for the demand cap. Default is the library.s.
+        // ---- THE K + M EXPERIMENT: BOTH BANDS ADAPTIVE AT ONCE (RETIRED) ---------------------
+        //
+        // `hotrange=MIN,MAX` ARMED ADAPTIVE K AND NO LONGER EXISTS -- neither the flag nor the
+        // controller behind it. K is STATIC: whatever `hot=N` says, for the whole run. Kept as a
+        // note rather than deleted because the shape of the experiment is the part worth
+        // remembering: the controller was provably inert (2.5M hiPri tasks moved K by zero), its
+        // promote signal was edge-triggered so load made it fire LESS, and it could not be run
+        // alongside an adaptive floor because F was defined as an offset OF K. Whoever wants both
+        // bands adaptive again needs an identity-based reserved set first, not a second controller.
+        //
+        // The floor band is [K, K+F) recomputed from LIVE atomics at every site -- see GetFloorBase.
+        // hotprio -- arm the OS thread-priority promote/demote. DEFAULT OFF (HotThreadPolicy::Normal),
+        //   which makes the whole mechanism a no-op by construction rather than by a branch. Reserved
+        //   workers run CRITICAL, ACTIVE floor workers HIGH, everyone else NORMAL, and an individual
+        //   hiPri task raises to CRITICAL for its duration wherever it lands. Elevating the whole pool
+        //   measured 5x WORSE, so this is per-band on purpose -- do not read a win here as "elevate
+        //   more".
+        if (JLIB_STRICMP(argv[a], "hotprio") == 0) {
+            JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
+            continue;
+        }
+        // spinyield=N -- yield the core every N+1 idle passes. Default 7. COUPLED TO THE FLOOR CAP:
+        //   raising it while the floor can grow wide reproduces the permanent-floor=31 pathology from
+        //   a default config. Sweep it against the SERIAL row, not just a burst row.
+        if (JLIB_STRNICMP(argv[a], "spinyield=", 10) == 0) {
+            JLib::TaskScheduler::SetSpinYieldMask((unsigned)strtoul(argv[a] + 10, nullptr, 10));
+            continue;
+        }
+        // narrowsteer -- ordinary pushes aim at the BASE floor instead of the live one (pre-5.0.0).
+        //   The default is now the wide zone; this is the A/B arm, because the narrow steer was
+        //   bought with real numbers on the serial row (p50 0.40 -> 0.90 us, 1p 10.0 -> 5.74 M/s
+        //   when spread) and giving them back has to be visible.
+        if (JLIB_STRICMP(argv[a], "narrowsteer") == 0) {
+            JLib::TaskScheduler::SetPlacementFollowsGrownFloor(false);
+            continue;
+        }
+        // park=cv | park=wait: which primitive a worker blocks on when it parks.
+        //
+        // wait (default) -- WaitOnAddress on Windows, FUTEX_WAIT on Linux.
+        // cv             -- a per-worker condition variable; puts a mutex back on the notify path.
+        //
+        // RUN THIS AGAINST throughput/1p AND THE LATENCY ROW, not against bench/futex_variance.cpp.
+        // The isolated ping-pong already says condvar has the tighter wake variance and it has said
+        // so twice; what it cannot see is the push path, which is the only place the two arms
+        // actually differ in cost. Interleave the arms -- do not run all of one then all of the other.
+        if (JLIB_STRICMP(argv[a], "park=cv") == 0) {
+            JLib::TaskScheduler::SetParkPrimitive(JLib::TaskScheduler::ParkPrimitive::CondVar);
+            continue;
+        }
+        if (JLIB_STRICMP(argv[a], "park=wait") == 0) {
+            JLib::TaskScheduler::SetParkPrimitive(JLib::TaskScheduler::ParkPrimitive::WaitAddress);
+            continue;
+        }
+        // resv=N: workers reserved for hiPri only. 0 disables reservation entirely (ordinary work may
+        // use every worker). The A/B for "what does a reserved core cost when no I/O is arriving".
+        if (JLIB_STRNICMP(argv[a], "resv=", 5) == 0) {
+            JLib::TaskScheduler::SetReservedHiPri((size_t)strtoul(argv[a] + 5, nullptr, 10));
+            continue;
+        }
+        // neverpark -- the reserved band [0,K) SPINS instead of sleeping when its lane is empty.
+        //
+        // THIS USED TO BE IMPLIED BY hot=/resv= AND NO LONGER IS. SetHotWorkers(k) sets K and
+        // nothing else now, because reservation ("do not run bulk work here") and spin ("never
+        // sleep") are separate purchases and folding them together charged every caller the ~35%
+        // ordinary-latency tax for a property most did not want. So `hot=2` alone gives a reserved
+        // band that PARKS, and the banner will correctly call that K nominal.
+        //
+        // That makes the pair the real A/B, and it is the one the io numbers came from:
+        //     hot=2              reserved, parks when idle   -- what a game wants
+        //     hot=2 neverpark    reserved, always spinning   -- what the reactor wants
+        // Measured on a busy pool, completion latency: p50 5.90 -> 2.00 us, p99 43.00 -> 6.30.
+        //
+        // `hotrange=` IS NOT PART OF THAT PAIR ANY MORE. Arming the controller now turns never-park
+        // on by itself (see SetHotWorkerRange), because the clamp that gives an armed range a
+        // minimum K of 1 exists precisely to guarantee a worker that is ALREADY SPINNING -- a
+        // reserved band that sleeps pays a kernel wake on the first hiPri arrival after every idle
+        // gap, which for bursty traffic is every burst. So this flag is about `hot=N`, the STATIC
+        // case, where reservation without the spin is a real thing to want.
+        // Applied HERE and not folded into hot= for the same reason the library stopped folding it.
+        // DEFERRED, NOT APPLIED HERE, for the reason spelled out at the SetHotWorkers call below:
+        // a setting made during the parse can be silently reverted by a setter applied after it.
+        // That already happened once with hotrange=. SetHotWorkers no longer touches this flag, so
+        // parse-time would work today -- and would break the day it does, silently.
+        if (JLIB_STRICMP(argv[a], "neverpark") == 0) { neverPark = true; continue; }
+        // leaves=N: leaves per worker the splitter mints before raising the grain itself. Default 64,
+        // which never binds. leaves=1 makes the splitter mint about as many tasks as the cursor does,
+        // which is the comparison that matters for a cheap body.
+        // minfan=N: iterations per worker below which ParallelFor refuses to fan out. 0 disables the
+        // gate entirely (pre-5.0.0 behaviour). Protects cheap bodies at small N and costs expensive
+        // ones at the same N -- sweep it against the trivial and heavy rows together.
+        if (JLIB_STRNICMP(argv[a], "minfan=", 7) == 0) {
+            JLib::TaskScheduler::SetMinItersPerWorker((size_t)strtoul(argv[a] + 7, nullptr, 10));
+            continue;
+        }
+        if (JLIB_STRNICMP(argv[a], "leaves=", 7) == 0) {
+            JLib::TaskScheduler::SetLeavesPerWorker((size_t)strtoul(argv[a] + 7, nullptr, 10));
+            continue;
+        }
+        if (JLIB_STRNICMP(argv[a], "splitcap=", 9) == 0) {
+            splitCap = (size_t)strtoul(argv[a] + 9, nullptr, 10);
+            haveSplitCap = true;
+            continue;
+        }
         if (JLIB_STRICMP(argv[a], "ev") == 0)      { runEvents = true;  continue; }
         if (JLIB_STRICMP(argv[a], "sleep") == 0) { continue; }
         if (JLIB_STRICMP(argv[a], "nosleep") == 0)      { idle = JLib::TaskScheduler::IdlePolicy::NoSleep;       idleName = "nosleep";   continue; }
@@ -1320,7 +2155,26 @@ int main(int argc, char** argv) {
             hotWorkers = (size_t)strtoul(argv[a] + 4, nullptr, 10);
             continue;
         }
-        poolSize = (size_t)strtoul(argv[a], nullptr, 10);
+        // floor=N -- THE AWAKE FLOOR, AND IT IS NOT hot=N. Two different knobs, briefly wired to the
+        // same argument, which made every paste ambiguous:
+        //   hot=N   -> K, the latency LANE. Changes WHICH QUEUE a hiPri push routes to.
+        //   floor=N -> N workers that never park. Changes whether a push has to buy an OS wake.
+        // A pool can have a live floor and no lane (floor=2 hot=0), or a lane whose workers all
+        // park (hot=2 floor=0). Tying them means a row that moved cannot be attributed to either.
+        if (JLIB_STRNICMP(argv[a], "floor=", 6) == 0) {
+            awakeFloor = (size_t)strtoul(argv[a] + 6, nullptr, 10);
+            continue;
+        }
+        // A BARE NUMBER IS THE POOL SIZE; ANYTHING ELSE IS A TYPO. This used to be an unguarded
+        // strtoul, which returns 0 for a non-numeric token -- so a misspelled flag silently
+        // selected the auto pool size and ran the full suite under a configuration nobody asked
+        // for. A mistyped knob has to be louder than a working one, not quieter.
+        if (argv[a][0] >= '0' && argv[a][0] <= '9') {
+            poolSize = (size_t)strtoul(argv[a], nullptr, 10);
+            continue;
+        }
+        printUsage();
+        return (JLIB_STRICMP(argv[a], "--help") == 0 || JLIB_STRICMP(argv[a], "-h") == 0) ? 0 : 2;
     }
 
     // "both" runs the suite once per idle policy so the two are directly comparable in one paste.
@@ -1398,7 +2252,26 @@ int main(int argc, char** argv) {
     // DEFAULT 2 rather than 0: at K=0 the lane is collapsed, latency/hot and io-pipe skip
     // themselves, and the suite silently stops covering the thing those sections exist for. Pass
     // hot=0 deliberately to measure a lane-less pool -- that is still PINNED at zero, not dynamic.
+    // ...AND `hotrange=` MUST WIN, because this call is what un-arms it. SetHotWorkers pins the
+    // range to [k,k], so applying the default hot=2 here after the parser had already called
+    // SetHotWorkerRange silently reverted adaptive K to pinned -- the run looked identical to a
+    // plain one and the banner said "pinned" next to a command line that asked for a range. The
+    // range is therefore applied HERE, in the same place and after the same parse, rather than
+    // inside the argument handler where ordering decides the outcome.
+    // hotrange= is gone with the controller; K is whatever hot=N says.
     JLib::TaskScheduler::SetHotWorkers(hotWorkers);
+
+    // AFTER the K setters, deliberately. Neither of them touches this flag any more, but this is
+    // the ordering that stays correct if one ever does again -- the same lesson hotrange= taught.
+    if (neverPark) JLib::TaskScheduler::SetReservedNeverParks(true);
+
+    // THE AWAKE FLOOR, applied separately from K on purpose (see the floor= argument). Workers
+    // 0..N-1 never park, so a push steered at one of them is picked up by a thread that is already
+    // scheduled -- no WaitOnAddress, no kernel round trip. The floor buys nothing unless placement
+    // actually steers there, which is what the latency row's landing histogram exists to check.
+    JLib::TaskScheduler::SetAwakeFloor(awakeFloor);
+    JLib::TaskScheduler::SetFloorGrowthEnabled(floorGrowth);
+    if (haveSplitCap) JLib::TaskScheduler::SetLazySplitCap(splitCap);
 
     // PRESIZE THE SLAB, because a growth allocation is MEASUREMENT NOISE HERE and nowhere else.
     //
@@ -1433,10 +2306,51 @@ int main(int argc, char** argv) {
     const size_t bannerK = JLib::TaskScheduler::GetHotWorkers();
     // "PINNED" is not decoration: it says the dynamic-K controller cannot move this mid-run, so the
     // number in the banner is the number every row below was measured under.
-    printf("config: workers=%zu  hot=%zu (PINNED)  affinity=%s  idle=%s  events=%s\n",
-           sched.GetWorkerCount(), bannerK, policyName, idleName, runEvents ? "on" : "off");
-    printf("        latency row = generic Push (never the lane);  latency/hot = hiPri push%s\n",
-           bannerK ? "" : "  [K=0: hiPri collapses to loPri, so hot rows are skipped]");
+    printf("config: workers=%zu  affinity=%s  idle=%s  events=%s  park=%s\n",
+           sched.GetWorkerCount(), policyName, idleName, runEvents ? "on" : "off",
+           JLib::TaskScheduler::GetParkPrimitive() == JLib::TaskScheduler::ParkPrimitive::CondVar
+               ? "cv" : "wait");
+    // NO RESET HERE. It used to zero the park counters so the verdict "covered the measured run"
+    // -- and it hid the fact that reserved workers park ONCE at startup and then sleep through
+    // everything, reporting them as never parking at all. Lifetime totals are the honest number:
+    // a floor worker parking is junk whenever it happened, and a reserved worker parking early and
+    // staying asleep is the behaviour you want to be able to SEE.
+    // ---- INTENT AT THE TOP, OBSERVED BAND AT THE BOTTOM --------------------------------------
+    //
+    // NO LIVE BAND HERE. Printing `reserved [0,2) floor [2,4)` before anything has run states a
+    // layout as fact when all that exists is a request -- and the run then goes on to show that
+    // [0,K) parks and F does not stay where it was put. A banner that announces a layout the pool
+    // does not have is how the wrong bug gets debugged. What is true at this point is only what was
+    // ASKED FOR, so that is all this line claims.
+    printf("requested: hot=%zu  floorBase=%zu\n",
+           hotWorkers, JLib::TaskScheduler::GetAwakeFloorBase());
+    // SAY WHEN THE KNOB IS INERT. GetHotWorkers() returns 0 unconditionally -- the RESERVED LANE is
+    // deleted, and the early return is the "provably unreachable" step. `hot=N` is accepted and does
+    // nothing, and a banner reading `hot=0` next to a command line reading `hot=5` looks like a parse
+    // failure rather than a stubbed feature. An inert knob has to announce itself.
+    //
+    // WHAT K NO LONGER GATES, since 5.0.0: hiPri itself. A hiPri push routes to the hiPri INBOX of an
+    // awake-floor worker and every worker drains hiPri before its own deque, so latency/hot and
+    // io-pipe run WITHOUT K. What K would still add is RESERVATION -- keeping ordinary work off those
+    // workers so a completion finds an IDLE core rather than merely an awake one.
+    // STALE TEXT REMOVED. This used to say "the RESERVED LANE is deleted -- K stays 0", which was
+    // true while GetHotWorkers() returned 0 unconditionally and is not now. It also fired whenever
+    // `hotrange=` was used, because that leaves the `hot=` default untouched -- so the banner said
+    // ADAPTIVE K=1 on one line and "K stays 0" on the next. A banner that contradicts itself is
+    // worse than one that says nothing.
+    // ITS OWN LINE. K and the floor answer different questions, and a row that moved has to be
+    // attributable to one of them; printing them together invites reading a lane change as a
+    // parking change. floor=0 means the whole pool may park -- the historical behaviour.
+    printf("        awake-floor=%zu  -- workers that never park (floor=N). It is what makes a\n"
+           "                        hiPri push cheap: the push is steered at a floor worker, which is\n"
+           "                        already running, so it costs no OS wake. hot=N adds RESERVATION\n"
+           "                        on top -- keeping ordinary work off those workers -- and is LIVE\n"
+           "                        again (K, [0,K)). Reservation does NOT imply never-park: add\n"
+           "                        `neverpark`, or arm a range, for that.\n",
+           JLib::TaskScheduler::GetAwakeFloor());
+    printf("        latency row = generic Push (ordinary placement);  latency/hot = hiPri push%s\n",
+           JLib::TaskScheduler::GetAwakeFloorBase() ? "" :
+               "  [floor=0 and K=0: hiPri has no steer target, so hot rows skip]");
 
     // Warmup: get every worker spun up and fibers touched before measuring anything.
     {
@@ -1466,12 +2380,14 @@ int main(int argc, char** argv) {
     // -- the same contamination that once read the frame DAG at 30.88 us against its true 22-24.
     if (runEvents) { Section("latency/hot");  BenchLatencyHotCold(sched); }
     if (runEvents) { Section("event/resume"); BenchEventResume(sched, /*sleeping arm*/ true); }
-    if (runEvents) { Section("io-pipe");      BenchIoPipe(sched); }
+    if (runEvents) { Section("io-pipe");      BenchIoPipe(sched); BenchIoPipeOverlap(sched); }
     // LAST, and deliberately. This one sleeps 50 ms before each of its five runs so the pool is
     // genuinely parked, which is the whole point of it. Run earlier, it leaves every worker cold and
     // the next section pays the wake-up: with it sitting before the frame DAG, that section read
     // 30.88 us/graph against 22.7 to 24.7 measured on its own. Anything that deliberately idles the
     // pool has to go after everything it would otherwise contaminate.
+    // The "lane pressure" row is gone with adaptive K: it existed to ask whether the
+    // controller ramps under sustained hiPri load, and there is no controller.
     Section("burst");          BenchIdleBurst(sched);
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
     if (runSweep) { Section("splitter vs cursor sweep");    BenchSplitterVsCursorCrossover(sched); }
@@ -1479,6 +2395,10 @@ int main(int argc, char** argv) {
 
     g_benchDone.store(true, std::memory_order_release);
     printf("----------------------------------------------------------------\n");
+    // VERIFIED HERE, NOT AT THE TOP. At the top nothing has parked yet, so the check would pass
+    // vacuously -- which is the failure mode it exists to prevent. This is the run's verdict on
+    // whether the layout it announced is the layout it actually ran.
+    PrintBandVerdict();
     printf("done.\n");
     return 0;
 }
@@ -1504,10 +2424,10 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
     // defaults to TaskType::Native.
     JLib::Task* left = sched.CreateTask([&sched, start, mid, BASE_CASE] {
         RecursiveForkJoinImpl(sched, start, mid, BASE_CASE);
-    }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+    }, false, JLib::TaskType::Fiber);
     JLib::Task* right = sched.CreateTask([&sched, mid, end, BASE_CASE] {
         RecursiveForkJoinImpl(sched, mid, end, BASE_CASE);
-    }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+    }, false, JLib::TaskType::Fiber);
 
     if (!left || !right) {
         printf("ERROR: CreateTask failed\n");
@@ -1559,7 +2479,7 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
         JLib::WaitGroup wg;
         JLib::Task* task = sched.CreateTask([&sched, kN, kBaseCase] {
             RecursiveForkJoinImpl(sched, 0, kN, kBaseCase);
-        }, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);  // suspends, so it needs a fiber
+        }, false, JLib::TaskType::Fiber);  // suspends, so it needs a fiber
 
         // RecursiveForkJoinImpl checks its two CreateTask results; this one never did, so an
         // exhausted allocator surfaced as a write through nullptr instead of a message.

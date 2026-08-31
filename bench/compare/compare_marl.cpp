@@ -71,8 +71,27 @@ static void Report(const char* who, const std::vector<double>& runs, const char*
            who, med, unit, lo, hi, med > 0 ? 100.0 * (hi - lo) / med : 0.0);
 }
 
+// Set in main after construction. BenchIdleTax ticks from a thread it spawns, and marl requires a
+// scheduler bound on whatever thread calls schedule(); main.s bind does not carry to it.
+static marl::Scheduler* g_marlSched = nullptr;
 static bool g_doJ = true;
 static bool g_doM = true;
+
+// THE TASK TYPE EVERY UNTAGGED JLib ROW SUBMITS, switched by the `fiberonly` flag.
+//
+// WHY THIS MAKES THE COMPARISON FAIRER RATHER THAN JUST DIFFERENT. Read the mixed-workload note
+// further down: marl fiber-backs EVERY task, and in the default configuration here only
+// TaskType::Fiber tasks do, so three quarters of this harness skips the fiber pool entirely. That
+// asymmetry is not an accident -- it IS the hybrid's claim, and those rows exist to measure it.
+//
+// But it means those rows have never compared the two schedulers' FIBER paths against each other,
+// only JLib's Native fast path against marl's fiber path. `fiberonly` is the like-for-like read:
+// every task fiber-backed on both sides. Expect it to be SLOWER than the default rows, and expect
+// that to mean nothing bad -- it is a different question, not a worse score.
+//
+// (Historically also forced by Mode::FiberOnly, which rejected Native outright -- removed in 4.0.2)
+// and says so loudly. Submitting one would abort the run.
+static JLib::TaskType g_jlType = JLib::TaskType::Native;
 static constexpr int kRuns      = 7;
 static constexpr int kWorkIters = 200;
 
@@ -98,7 +117,7 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
                 for (int i = 0; i < n; ++i) {
                     JLib::Task* t = jl.CreateTask(+[](void* p) {
                         g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kWorkIters), std::memory_order_relaxed);
-                    }, (void*)(intptr_t)i);
+                    }, (void*)(intptr_t)i, false, g_jlType);
                     if (!t) return;
                     t->waitGroup = &wg; jl.Push(t);
                 }
@@ -112,7 +131,7 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
                 for (int i = 0; i < n; ++i) {
                     batch[i] = jl.CreateTask(+[](void* p) {
                         g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kWorkIters), std::memory_order_relaxed);
-                    }, (void*)(intptr_t)i);
+                    }, (void*)(intptr_t)i, false, g_jlType);
                     if (!batch[i]) return;
                     batch[i]->waitGroup = &wg;
                 }
@@ -120,14 +139,21 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
                 jl.WaitFor(wg);
                 ab.push_back(Ms(t0, Clock::now()) * 1e6 / n);
             }
-            for (int r = 0; r < kRuns; ++r) {
-                JLib::WaitGroup wg;
-                auto t0 = Clock::now();
-                jl.PushArray(0, (size_t)n, 32, [](size_t i) {
-                    g_sink.fetch_add(Spin((uint64_t)i, kWorkIters), std::memory_order_relaxed);
-                }, &wg);
-                jl.WaitFor(wg);
-                pa.push_back(Ms(t0, Clock::now()) * 1e6 / n);
+            // PushArray BUILDS ITS OWN TASKS and does not take a type, so they are Native -- which
+            // (Mode::FiberOnly used to reject it outright and fatally.) The row sits out rather than aborting
+            // the run, and `pa` staying empty prints `--` instead of a number that was never taken.
+            // Not a gap worth closing here: the row measures a bulk-submission API, and the
+            // fiberonly question is about the per-task fiber path.
+            if (g_jlType != JLib::TaskType::Fiber) {
+                for (int r = 0; r < kRuns; ++r) {
+                    JLib::WaitGroup wg;
+                    auto t0 = Clock::now();
+                    jl.PushArray(0, (size_t)n, 32, [](size_t i) {
+                        g_sink.fetch_add(Spin((uint64_t)i, kWorkIters), std::memory_order_relaxed);
+                    }, &wg);
+                    jl.WaitFor(wg);
+                    pa.push_back(Ms(t0, Clock::now()) * 1e6 / n);
+                }
             }
         }
         if (g_doM) {
@@ -165,7 +191,7 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
                 JLib::WaitGroup wg; wg.n.store(1, std::memory_order_relaxed);
                 JLib::Task* t = jl.CreateTask(+[](void*) {
                     g_sink.fetch_add(1, std::memory_order_relaxed);
-                }, nullptr);
+                }, nullptr, false, g_jlType);
                 if (!t) return;
                 t->waitGroup = &wg; jl.Push(t); jl.WaitFor(wg);
             }
@@ -284,6 +310,123 @@ static void ReleaseAfter(int durationUs, JLib::TaskScheduler* jl, marl::Event* e
     if (ev) ev->signal();
 }
 
+// ---------------------------------------------------------------- idle-policy tax
+//
+// WHO ACTUALLY PAYS FOR A SPINNING POOL. Every other row here is blind to it by construction: the
+// harness is the only thing on the machine, so cores held by idle workers are free and a library
+// that never parks looks strictly better. It is not free in the place this library is FOR. A game
+// has a render thread, a GPU submit thread and an audio thread that want those cores, and the
+// scheduler's idle policy is a tax levied on them.
+//
+// That blind spot has bitten this project before and in exactly this shape: the synthetic frame DAG
+// says NoSleep is 2.9x BETTER (7.8 vs 22.5 us/graph) and the real 2D game says it is 23% WORSE
+// (462.0 vs 383.3 ms). Same policy, opposite sign, and the difference is entirely whether anything
+// else wanted the cores. Quoting the blocking row without this one repeats that mistake.
+//
+// THE MEASUREMENT. A victim thread does a FIXED amount of arithmetic and is timed. Alongside it, a
+// producer submits a trivial batch every 2 ms -- a frame tick -- so the pool cycles idle -> woken ->
+// idle about a hundred times while the victim runs. The submitted work is deliberately negligible
+// (~0.2 us a task); anything the victim loses is the IDLE POLICY, not competition for real work.
+//
+// Read it as the tax: victim-with-pool minus victim-alone. marl spins a full millisecond after every
+// one of those ticks, so a 2 ms tick means its workers are hot essentially always.
+static constexpr int kVictimIters  = 8000;    // ~20 us each -> ~160 ms of victim work
+static constexpr int kVictimSpin   = 20000;
+static constexpr int kTickUs       = 2000;
+static constexpr int kTasksPerTick = 8;
+
+// MORE THAN ONE VICTIM, BECAUSE ONE CANNOT BE STARVED ON THIS MACHINE. The first version ran a
+// single victim thread and measured marl's tax at 1.0% -- real, but far below the 23% the same idle
+// policy cost in the actual 2D game. The reason is that 31 spinners on 32 logical cores still leave
+// one free, so a lone victim never has to fight for it. A game does not have one other thread; it
+// has render, GPU submit, audio and main, and they are all trying to run WHILE the pool is idle.
+//
+// Four is chosen to make workers + victims exceed the core count, which is the condition under which
+// an idle policy costs anything at all. Below that this row measures nothing and says so.
+static constexpr int kVictimThreads = 4;
+
+static double RunVictim() {
+    auto t0 = Clock::now();
+    std::vector<std::thread> v;
+    v.reserve(kVictimThreads);
+    for (int t = 0; t < kVictimThreads; ++t)
+        v.emplace_back([t] {
+            uint64_t x = (uint64_t)t + 1;
+            for (int i = 0; i < kVictimIters; ++i) x = Spin(x, kVictimSpin);
+            g_sink.fetch_add(x, std::memory_order_relaxed);
+        });
+    for (auto& th : v) th.join();
+    return Ms(t0, Clock::now());
+}
+
+static void BenchIdleTax(JLib::TaskScheduler& jl) {
+    printf("  idle-policy tax -- what the pool costs a CO-RESIDENT thread, ms (lower is better)\n\n");
+
+    // Baseline FIRST and with nothing submitted, so it measures the victim alone on this machine.
+    const double base = std::min(RunVictim(), RunVictim());
+
+    JLib::TaskScheduler::ResetAwakeFloorPeak();
+    size_t floorLiveAtEnd = 0;
+    std::atomic<bool> stop{ false };
+    double withPool = -1.0;
+    if (g_doJ) {
+        std::thread ticker([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                JLib::WaitGroup wg; wg.n.store(kTasksPerTick, std::memory_order_relaxed);
+                for (int i = 0; i < kTasksPerTick; ++i) {
+                    JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr);
+                    if (!t) break;
+                    t->waitGroup = &wg; jl.Push(t);
+                }
+                jl.WaitFor(wg);
+                std::this_thread::sleep_for(std::chrono::microseconds(kTickUs));
+            }
+        });
+        withPool = RunVictim();
+        floorLiveAtEnd = JLib::TaskScheduler::GetAwakeFloor();   // BEFORE stopping the ticker
+        stop.store(true, std::memory_order_relaxed);
+        ticker.join();
+    }
+    else if (g_doM) {
+        std::thread ticker([&] {
+            // marl::schedule REQUIRES A BOUND SCHEDULER ON THE CALLING THREAD, and main's bind does
+            // not carry to a thread we spawned -- the first version of this row exited 1 on that.
+            marl::Scheduler* s = g_marlSched;
+            if (!s) return;                 // nothing to bind: leave withPool at -1 and print "--"
+            s->bind();
+            while (!stop.load(std::memory_order_relaxed)) {
+                marl::WaitGroup wg(kTasksPerTick);
+                for (int i = 0; i < kTasksPerTick; ++i) marl::schedule([wg] { wg.done(); });
+                wg.wait();
+                std::this_thread::sleep_for(std::chrono::microseconds(kTickUs));
+            }
+            marl::Scheduler::unbind();
+        });
+        withPool = RunVictim();
+        stop.store(true, std::memory_order_relaxed);
+        ticker.join();
+    }
+
+    // THE STRUCTURAL NUMBER, and the one to trust when the timing is noisy. A tick faster than
+    // kFloorHoldNs (6 ms) refreshes the grow-hold before the collapse can ever fire, so the floor
+    // ratchets to the cap and STAYS there -- the pool is then permanently spinning against the
+    // victims, which is precisely the configuration the permanent floor=31 arm measures. `live at
+    // end` is read while the ticker is still running, so a value at the cap is the ratchet caught in
+    // the act rather than a shed that had not happened yet.
+    if (g_doJ)
+        printf("     JLib floor during the row: peak %zu, live at end %zu (base %zu, tick %d us)\n",
+               JLib::TaskScheduler::GetAwakeFloorPeak(), floorLiveAtEnd,
+               JLib::TaskScheduler::GetAwakeFloorBase(), kTickUs);
+    printf("     victim alone                       %8.1f ms\n", base);
+    printf("     victim with a ticking pool         %8.1f ms\n", withPool);
+    if (base > 0 && withPool > 0)
+        printf("     TAX                                %8.1f ms  (%.1f%%)\n",
+               withPool - base, 100.0 * (withPool - base) / base);
+    printf("\n     A pool that parks should read near zero here. A pool that spins after every tick\n"
+           "     charges the victim for cores it is not using. This row is why the blocking\n"
+           "     crossover must not be quoted on its own.\n\n");
+}
+
 static void BenchBlocking(JLib::TaskScheduler& jl) {
     printf("  blocking crossover -- 25%% of tasks wait on an external signal\n");
     printf("     %d batches of %d; ms for all %d tasks, lower is better\n\n",
@@ -291,10 +434,22 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
     printf("     %8s %11s %11s %9s\n", "block us", "JLib", "marl", "ratio");
 
     const int durations[] = { 0, 50, 150, 300, 600, 2000 };
+    // HOW MUCH OF EACH ROW IS KERNEL WAKES, printed per duration.
+    //
+    // The note above attributes the D=0 gap to stateful-vs-stateless events, and that IS a real
+    // asymmetry -- but it cannot be the whole story, because raising the awake floor to 31 moved
+    // D=0 from 10.45 ms to 5.32 ms and event semantics do not change with the floor. The other
+    // candidate is the push path: 256 pushes per batch against a pool with floor=2 is up to 254
+    // wakes at ~3.5 us each, which is most of a batch on its own.
+    //
+    // "Slower here" and "woke a parked worker 2560 times" print identically without this number.
+    unsigned long long blkWakes = 0;
     for (int d : durations) {
         std::vector<double> a, b;
 
         if (g_doJ) {
+            JLib::TaskScheduler::ResetWakeCount();
+            JLib::TaskScheduler::ResetAwakeFloorPeak();
             for (int r = 0; r < 3; ++r) {
                 auto t0 = Clock::now();
                 for (int batch = 0; batch < kBatches; ++batch) {
@@ -318,11 +473,11 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                                       if (g_released.load(std::memory_order_acquire))
                                           g_ioEvent->SignalAll();
                                   });
-                              }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber)
+                              }, nullptr, false, JLib::TaskType::Fiber)
                             : jl.CreateTask(+[](void* p) {
                                   g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                    std::memory_order_relaxed);
-                              }, (void*)(intptr_t)i);
+                              }, (void*)(intptr_t)i, false, g_jlType);
                         if (!t) { printf("     JLib: CreateTask returned null\n"); return; }
                         t->waitGroup = &wg;
                         jl.Push(t);
@@ -364,10 +519,17 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
             }
         }
 
+        if (g_doJ) blkWakes = (unsigned long long)JLib::TaskScheduler::GetWakeCount();
+        const size_t blkPeakF = g_doJ ? JLib::TaskScheduler::GetAwakeFloorPeak() : 0;
         const double ja = MedOr(a), mb = MedOr(b);
         printf("     %8d", d);
         Cell(ja, 11, 2); Cell(mb, 11, 2);
-        if (ja > 0 && mb > 0) printf(" %8.2fx\n", mb / ja); else printf("        -\n");
+        if (ja > 0 && mb > 0) printf(" %8.2fx", mb / ja); else printf("        -");
+        // Per rep: 3 reps x 10 batches x 256 tasks = 7680 pushes. A number near that means the row
+        // is a wake benchmark; a number near zero means the pool stayed hot and the row is measuring
+        // whatever else it claims to measure.
+        if (g_doJ) printf("   wakes %llu / 7680   peakF %zu", blkWakes, blkPeakF);
+        printf("\n");
     }
     printf("\n     ratio > 1.00 means JLib is faster.\n\n");
 }
@@ -401,7 +563,11 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
 
     std::vector<double> a, b, c;
     for (int r = 0; r < 5; ++r) {
-        {   // A: no fiber
+        // A: no fiber. SKIPPED UNDER fiberonly, and not because of a limitation -- this row IS the
+        // Native baseline, and "no fiber" is the one thing a Fiber-task arm does not have. Forcing it
+        // to TaskType::Fiber would not rescue the row, it would silently duplicate row B and report
+        // the A->B delta as zero. `a` stays empty and prints `--`.
+        if (g_jlType != JLib::TaskType::Fiber) {
             JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
             auto t0 = Clock::now();
             for (int i = 0; i < N; ++i) {
@@ -416,7 +582,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
             auto t0 = Clock::now();
             for (int i = 0; i < N; ++i) {
                 JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr,
-                                              false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+                                              false, JLib::TaskType::Fiber);
                 t->waitGroup = &wg; jl.Push(t);
             }
             jl.WaitFor(wg);
@@ -430,7 +596,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
                 JLib::Task* t = jl.CreateTask(+[](void*) {
                     JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
                     s.WaitOnEventArmed(*g_ioEvent, [] { g_ioEvent->SignalAll(); });
-                }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+                }, nullptr, false, JLib::TaskType::Fiber);
                 t->waitGroup = &wg; jl.Push(t);
             }
             jl.WaitFor(wg);
@@ -438,10 +604,29 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
         }
     }
 
-    const double ma = Median(a), mb = Median(b), mc = Median(c);
-    printf("     %-34s %8.0f ns\n", "A  no fiber (baseline)", ma);
-    printf("     %-34s %8.0f ns   (+%.0f for the fiber)\n", "B  fiber, never suspends", mb, mb - ma);
-    printf("     %-34s %8.0f ns   (+%.0f for suspend/resume)\n", "C  fiber, suspend + resume", mc, mc - mb);
+    // MedOr, not Median: under fiberonly row A does not run, and Median indexes an empty vector.
+    // That segfaulted, after printing this section's header and nothing else -- which read as the
+    // bench simply stopping. Guarding a row and not guarding its reader is half a change.
+    const double ma = MedOr(a), mb = MedOr(b), mc = MedOr(c);
+
+    if (ma >= 0) {
+        printf("     %-34s %8.0f ns\n", "A  no fiber (baseline)", ma);
+        printf("     %-34s %8.0f ns   (+%.0f for the fiber)\n",
+               "B  fiber, never suspends", mb, mb - ma);
+    } else {
+        printf("     %-34s %8s      (no Native path in the Fiber-task arm)\n",
+               "A  no fiber (baseline)", "--");
+        printf("     %-34s %8.0f ns\n", "B  fiber, never suspends", mb);
+    }
+
+    // C - B IS THE ISOLATED COST OF THE EVENT, and it is the only line here that survives losing
+    // row A. Same task type, same body, same pool: the single difference is that C registers on an
+    // event, is signalled, parks and is resumed. Whatever separates these two numbers is what a
+    // direct fiber suspend/resume would be replacing -- and it is the number to argue from, not a
+    // round-trip row, which measures a path where main is a bare thread that spin-helps and never
+    // touches an Event at all.
+    printf("     %-34s %8.0f ns   (+%.0f for the EVENT park/resume)\n",
+           "C  fiber, suspend + resume", mc, mc - mb);
     printf("\n");
 }
 int main(int argc, char** argv) {
@@ -449,6 +634,12 @@ int main(int argc, char** argv) {
 
     size_t pool = 0;
     bool noSleep = false;
+    // fiberonly: run JLib's rows with EVERY task fiber-backed, the way marl always does.
+    //
+    // ONE CHANGE NOW, NOT TWO. This used to also flip Mode::FiberOnly, so the row confounded the
+    // task type with the park mechanism. The mode is gone (4.0.2) and its park is unconditional, so
+    // what is left is a clean Fiber-vs-Native comparison against the same scheduler.
+    bool fiberOnly = false;
     // hot=N: dedicate N workers to the low-latency lane. Included here to answer a specific
     // question -- whether K-hot changes FIBER WAKE latency. It should not: a wake preserves the
     // task's own hiPri tag (Event::WakeOne batches by t->hiPri), and every fiber in this harness is
@@ -457,7 +648,38 @@ int main(int argc, char** argv) {
     size_t hot = 0;
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "hot=", 4) == 0)     { hot = (size_t)strtoul(argv[i] + 4, nullptr, 10); continue; }
+        // floor=N -- THE LAST ASYMMETRY WITH marl THAT IS NOT WORKER COUNT.
+        //
+        // K (hot=) reserves workers, so hot=2 runs JLib on 29 compute workers against marl's 31 and
+        // is NOT a like-for-like config. The awake floor does not reserve anything -- floor workers
+        // are ordinary compute workers -- but they never PARK, and every marl worker does. Default
+        // is 2. `floor=0` makes both pools park identically, which is the strict-parity run;
+        // anything else measures the shipped policy, which is also a legitimate question.
+        // AND THE GROWTH CONTROLLER GOES WITH IT. SetAwakeFloor sets base and current, but the
+        // push-side controller can still raise the live floor above base during a burst -- so
+        // `floor=0` alone would park identically to marl right up until the first burst and then
+        // quietly stop being the parity run it was asked to be.
+        // spinyield=N -- yield the core every N+1 idle passes (default 1023). Lower is politer.
+        // The knob exists because marl's spin yields every few microseconds and this one yielded
+        // every few hundred, which is why floor=31/nosleep LOST to parking on the blocking row.
+        // widesteer -- ordinary pushes aim at the LIVE floor instead of the base floor, so a burst
+        // lands wide instead of on two workers that the other 29 then have to steal from.
+        if (strcmp(argv[i], "widesteer") == 0) {
+            JLib::TaskScheduler::SetPlacementFollowsGrownFloor(true);
+            continue;
+        }
+        if (strncmp(argv[i], "spinyield=", 10) == 0) {
+            JLib::TaskScheduler::SetSpinYieldMask((unsigned)strtoul(argv[i] + 10, nullptr, 10));
+            continue;
+        }
+        if (strncmp(argv[i], "floor=", 6) == 0) {
+            const size_t f = (size_t)strtoul(argv[i] + 6, nullptr, 10);
+            JLib::TaskScheduler::SetAwakeFloor(f);
+            if (f == 0) JLib::TaskScheduler::SetFloorGrowthEnabled(false);
+            continue;
+        }
         if (strcmp(argv[i], "nosleep") == 0)      { noSleep = true; continue; }
+        if (strcmp(argv[i], "fiberonly") == 0)    { fiberOnly = true; continue; }
         if (strcmp(argv[i], "--only=jlib") == 0)  { g_doM = false; continue; }
         if (strcmp(argv[i], "--only=marl") == 0)  { g_doJ = false; continue; }
         pool = (size_t)strtoul(argv[i], nullptr, 10);
@@ -475,17 +697,30 @@ int main(int argc, char** argv) {
         JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
     }
 
+    if (fiberOnly && g_doM) {
+        g_doM = false;
+        printf("note: fiberonly implies --only=jlib -- its park never sleeps, and a spinning pool\n"
+               "      cannot share a process with another scheduler being timed. Run --only=marl\n"
+               "      separately and compare the two pastes.\n\n");
+    }
+
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
     JLib::TaskScheduler::Init(pool);
+    // `fiberOnly` now selects the TASK TYPE only. Mode::FiberOnly was removed in 4.0.2 once it
+    // became behaviourally identical to Default -- the pinning, the direct resume and the futex park
+    // it was built for are unconditional now, and admitting Native was the last difference. The
+    // Fiber-vs-Native axis this flag selects is still a real one and is what the flag measures.
+    if (fiberOnly) g_jlType = JLib::TaskType::Fiber;
     JLib::TaskScheduler& jl = JLib::TaskScheduler::Instance();
     if (g_doJ) g_ioEvent = &jl.GetEvent("compare_io");   // the one and only registry lookup
-    if (!g_doJ) jl.Join();   // real teardown: nothing of JLib runs while marl is timed
+    if (!g_doJ) JLib::detail::TeardownForTesting(jl);   // real teardown: nothing of JLib runs while marl is timed
 
     const uint32_t workers = (uint32_t)(pool ? pool : std::thread::hardware_concurrency() - 1);
 
     marl::Scheduler::Config cfg;
     cfg.setWorkerThreadCount((int)workers);
     marl::Scheduler marlSched(cfg);
+    g_marlSched = &marlSched;
     if (g_doM) marlSched.bind();
 
     printf("\nJLib::Scheduler vs marl  (workers=%u, affinity=none, JLib idle=%s, measuring=%s)\n",
@@ -497,7 +732,8 @@ int main(int argc, char** argv) {
     if (g_doJ) {
         JLib::WaitGroup wg; wg.n.store(4096, std::memory_order_relaxed);
         for (int i = 0; i < 4096; ++i) {
-            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr);
+            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr, false,
+                                          g_jlType);
             t->waitGroup = &wg; jl.Push(t);
         }
         jl.WaitFor(wg);
@@ -511,6 +747,7 @@ int main(int argc, char** argv) {
     BenchThroughput(jl);
     BenchLatency(jl);
     BenchBlocking(jl);
+    BenchIdleTax(jl);
     BenchFiberBreakdown(jl);
 
     printf("(sink %llu -- printed only so none of the work can be optimised away)\n",
@@ -537,7 +774,7 @@ int main(int argc, char** argv) {
                 fflush(stdout);
             }
             });
-        jl.Join();
+        JLib::detail::TeardownForTesting(jl);
         joined.store(true, std::memory_order_release);
         watchdog.join();
     }

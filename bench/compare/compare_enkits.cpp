@@ -476,7 +476,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
                                       s.GetEvent("compare_io").SignalAll();
                               });
                               g_blockersLeft.fetch_sub(1, std::memory_order_acq_rel);
-                          }, nullptr, false, JLib::FiberSize::Standard, JLib::TaskType::Fiber)
+                          }, nullptr, false, JLib::TaskType::Fiber)
                         : jl.CreateTask(+[](void* p) {
                               g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                std::memory_order_relaxed);
@@ -666,7 +666,7 @@ int main(int argc, char** argv) {
     // not touch it are already gated.
     JLib::TaskScheduler::Init(pool);
     JLib::TaskScheduler& jl = JLib::TaskScheduler::Instance();
-    if (!g_doJ) jl.Join();
+    if (!g_doJ) JLib::detail::TeardownForTesting(jl);
 
     // Same worker count from the same source, or none of this means anything. JLib reserves the
     // submitting thread and spawns N workers; enkiTS counts the calling thread INSIDE its total, so
@@ -708,6 +708,6 @@ int main(int argc, char** argv) {
            (unsigned long long)g_sink.load());
 
     if (g_doE) enki_.WaitforAllAndShutdown();
-    if (g_doJ) jl.Join();
+    if (g_doJ) JLib::detail::TeardownForTesting(jl);
     return 0;
 }

@@ -77,6 +77,40 @@ marl and FiberTaskingLib run every task on a fiber. Here fibers are opt-in, so m
 for an ordinary thread pool works unchanged -- Jolt Physics runs through a `JPH::JobSystem` adapter
 and never learns fibers exist. [Why that matters](DESIGN.md#the-hybrid-is-a-correctness-boundary-not-a-performance-dial).
 
+### Weight and scope
+
+This is a **much larger library than enkiTS**, and the table above is not free:
+
+| | enkiTS | this | |
+|---|---|---|---|
+| Code lines (comments and blanks stripped) | 2,329 | 13,862 | 6.0x |
+| Total lines | 3,347 | 31,530 | 9.4x |
+| Comment + blank share | 30% | 56% | -- |
+| Public headers | 3 | 33 | 11x |
+| Scheduler object file | 0.10 MB | 1.45 MB | 14.5x |
+| Scheduled entity | 16-byte `SubTaskSet` | 64-byte `Task` | 4x |
+
+**The independent-task row follows directly from the last line of that table.** enkiTS schedules a
+range descriptor in a contiguous fixed ring -- no allocation, no pointer chase, nothing per item.
+We mint a 64-byte `Task` carrying a WaitGroup pointer, a cancel token, a fiber assignment, a type
+tag and a core preference. On "20,000 independent empty items" that is 4x the cache footprint per
+item to do a job that needs none of it. enkiTS is not beating us on execution; it is beating us by
+**not creating the object**, and making minting cheaper cannot close that -- only not minting would.
+
+**What the weight buys** is the rest of the comparison table: suspending inside a task, the DAG with
+AND/OR gates, cancellation scopes, topology-aware stealing, the I/O reactor and the timer wheel.
+The blocking row is where it pays -- a blocked task frees its worker where a thread-pool task holds
+one -- and that is a property of the architecture rather than of tuning.
+
+**What is just weight**, and the two are worth separating: `TaskScheduler.cpp` is 6,400 lines,
+startup allocates more than a thread pool needs, and 33 headers is a lot to hand someone who wanted
+a work queue. None of that is required by the design; it is accumulated surface.
+
+So these are not really competitors. **If your workload is N independent items with no dependencies
+and no blocking, enkiTS is the smaller and faster tool** and the table says so. This is a fiber
+scheduler with an I/O reactor attached, and it earns its size on suspension, latency bands and
+dependency graphs -- or it does not earn it at all.
+
 **"Model-checked" checked, not assumed**: enkiTS has no dedicated test suite at all (two ad hoc files
 sitting in its `example/` directory); Taskflow's 39-file `unittests/` suite is the most extensive of
 the three by far; marl has a real 14-file suite matched by benchmarks for most of them. None of the
@@ -88,6 +122,103 @@ cover here and, as importantly, what they don't.
 
 This was tested on my machine, third party tests have come back and some are faster than mine depending on hardware and platform.
 Needs and welcomes more testing for research!
+
+i9-13900K at Intel spec power limits, Release, **4.0.1**, 31 workers. Adaptive K armed
+(`hot=2..4`), floor base 2, `park=wait`. Two affinity policies, one library -- `ideal` is the
+default and `hard` pins each worker to a CPU.
+
+> **The library is 5.0.0 and these rows are 4.0.1**, which is what the runs they came from printed.
+> What 5.0.0 adds on top is correctness work -- two lost wakes, a yield starvation, the off-by-K
+> family, and teardown (see [CHANGELOG.md](CHANGELOG.md)) -- none of which has been re-measured here.
+> The away bit and the escape queue were **built and then reverted**: both cost throughput on the
+> bench and neither bought back a measurable win, so nothing from them is in the dispatch path.
+> Re-run `SchedulerBench` on your own machine, which has always been the advice.
+
+> **On `hard` vs `ideal`.** Measured properly, interleaved A/B/A/B, four runs of four reps each on
+> the machine above. Only one row separates them at all: the frame DAG, where `ideal` wins 4/4 with
+> ranges that do not overlap (worst `ideal` 3.88us beats best `hard` 4.04us, ~5.8% on the mean).
+> `hard` leads on `bt` and `mp` 3/4 with overlapping ranges and a wider spread within each arm,
+> which is what pinning to a core you cannot leave should look like. Burst speedup is **4.00x in
+> every cell of both arms** -- that row is saturated and currently discriminates nothing. An earlier
+> non-interleaved comparison appeared to show `hard` winning burst 4.0x to 3.2x; interleaving showed
+> that was the `ideal` arm degrading, not `hard` improving. `ideal` stays the default.
+
+| | `ideal` (default) | `hard` |
+|---|---|---|
+| Serial round trip, p50 | **0.60 µs** | **0.60 µs** |
+| ...p99 | 1.00 µs | 1.00 µs |
+| I/O completion → job start, p50 | **0.50 µs** | 0.60 µs |
+| ...p99 | 0.90 µs | 1.00 µs |
+| Single-producer submission | 3.12 M/s | 3.22 M/s |
+| Bulk submission via `PushBatch` | **14.61 M/s** | **15.11 M/s** |
+| Bulk submission, 4 producers | 7.28 M/s | 7.25 M/s |
+| 6-node frame DAG | 4.66 µs/graph | 4.70 µs/graph |
+| 1M-element recursive fork-join (10k leaves) | **0.25 ms** | 0.33 ms |
+| `ParallelFor`, compute-bound 256K | **10.95x** | 8.26x |
+| `ParallelFor`, memory-bound 16M | 4.80x | 4.00x |
+| Event resume, 1 waiter, no hold-off | 0.60 µs | 0.60 µs |
+
+**The frame DAG went 21.1 µs → 4.66 µs and fork-join 0.25 ms → 0.25 ms against the 1.4.0 table**
+below; the DAG is the row that moved most across the 2.x–4.x work (chunked edges, the awake floor,
+and the steal hints, in that order of contribution).
+
+**Read the tail, not the mean.** Both runs above printed one pathological round trip -- 72 µs and
+53 µs against a ~0.6 µs median -- and the pool dump taken at that instant shows every queue empty,
+nothing advertised, and no worker holding work. There is nothing for the scheduler to have done
+faster: that is the OS preempting the measuring thread, and it is why `max` is reported next to
+`p99` rather than folded into an average.
+
+### The lane, and where it actually wins
+
+`latency/hot` reads **1.12x of cold** (0.84 vs 0.75 µs) -- the hiPri lane is *slower* than an
+ordinary push on a serial ping-pong, and that is reported rather than hidden. On the same run the
+**io-pipe row is 0.50 µs p50 against cold's 0.75** -- the lane is 1.5x *faster* on the measurement
+it exists for.
+
+Both are true and they are not in tension. A serial ping-pong hands the lane nothing to win: the
+pool is idle, an ordinary push already lands on a spinning floor worker, so there is no OS wake to
+remove and no bulk body to avoid being buried behind. io-pipe measures a completion arriving at a
+**busy** pool, which is the state a reactor actually lives in, and there the reservation is the
+whole difference. A latency lane is worth what it saves you from, and on an idle pool it saves you
+from nothing.
+
+The residual on `latency/hot` is most likely the adaptive-K observer: while a scaling range is
+armed, every lane dispatch stamps two `MonotonicNs()` reads to feed the controller's occupancy
+input, which is ~50 ns on a ~750 ns round trip. Static K does not pay it. It can be sampled if it
+proves to matter -- only the slow promote reads that input.
+
+### Bands, measured rather than declared
+
+The bench reports what the pool **did**, not what was configured, and the two are checked against
+each other:
+
+| | `ideal` | `hard` |
+|---|---|---|
+| Reserved-band parks (must be 0 under an armed range) | **0** | **0** |
+| Floor parks (must be 0, always) | **0** | **0** |
+| Floor members caught mid-park by the last gate | 5 | 4 |
+| Awake floor: base → peak → after a 25 ms settle | 2 → 11 → **2** | 2 → 14 → **2** |
+| Adaptive K under 8.1M hiPri tasks | 2 → **4** | 2 → **4** |
+
+The floor grows under a wave and collapses back to base within the settle, every run. The
+reserved band never sleeps while a range is armed -- idleness there is expressed as the controller
+shedding K, not as a reserved worker parking, which would hand the next completion exactly the OS
+wake the band was bought to remove.
+
+**K ramps and has not yet been observed shedding within a bench run.** Promotion is one window;
+demotion is 200 ms plus three consecutive quiet windows, by design -- being late to shed costs a
+spinning core, being late to add costs latency continuously. The run ends before that elapses. It
+is reported as unverified rather than claimed as working.
+
+**The burst row is the honest weak spot.** 16 heavy tasks (3.28 ms each) from an idle pool reach
+4.0x of 16, with the floor peaking at 11-14 but only 7-11 workers actually running a task. The
+gap is structural and named in the output: a busy worker's inbox has exactly one legal consumer,
+so work becomes stealable only once that worker drains it. Growth wakes cores faster than the wave
+becomes reachable to them.
+
+<details>
+<summary><b>The 1.4.0 table, kept for method</b> -- how these are measured, and two findings that
+have not gone stale</summary>
 
 i9-13900K at Intel spec power limits, Release, **1.4.0**. Medians of five runs on the default
 affinity policy, with the observed range in brackets. **The two columns are one library under its
@@ -175,14 +306,6 @@ for pipelines whose idle gaps are under ~100 µs.
 There is deliberately no middle setting -- a spin-then-park mode was built, measured worse than both
 extremes, and removed; the reasoning is in [CHANGELOG.md](CHANGELOG.md).
 
-Structural properties, which do not vary by policy:
-
-| | |
-|---|---|
-| `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
-| Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
-| Steal protocol | single-item Chase-Lev CAS |
-
 **This machine runs Intel's specified power limits with unlimited turbo disabled**, so it boosts
 briefly and then settles near base clock under sustained load. That is the part behaving as Intel
 specifies it, not a handicap, but it is worth stating because most enthusiast boards ship with PL1
@@ -200,39 +323,87 @@ data. If a pasted run has no version line at all, it predates 1.0.1 and should b
 Run them yourself with `SchedulerBench`. It takes an affinity policy argument and defaults to the
 same one the library does.
 
+</details>
+
+Structural properties, which do not vary by policy:
+
+| | |
+|---|---|
+| `Task` struct size | 64 bytes, one cache line, `static_assert`-enforced |
+| Fiber stacks | 64 KB standard / 512 KB heavy, contiguous arena, guard-paged |
+| Steal protocol | single-item Chase-Lev CAS, bulk queues only |
+| Latency lane | intrusive MPSC inbox, one legal consumer, never stolen from |
+| Band state | one 64-bit word: F, Fbase, K, Kmax, Kmin -- CAS per field, one load per decision |
+| Escape queue | one MPMC queue, cold path only -- see [When nobody can reach a task](#when-nobody-can-reach-a-task) |
+
 
 ### Measured against enkiTS, TaskFlow and marl
 
-Same machine, same harness, same worker count, both libraries expressed the way their authors
-intended. i9-13900K at Intel spec power limits (see the caveat under [Measured](#measured)), 31
-workers, Release. **Our two columns are 1.4.0; the other three were last measured at 1.3.0** and are
-carried over unchanged -- see the note under the table for why that is still a fair comparison.
-`--` is not measured yet.
+Same machine, same harness, same worker count, each library expressed the way its authors intended.
+i9-13900K at Intel spec power limits (see the caveat under [Measured](#measured)), 31 workers,
+`affinity=none`, Release. **All four columns re-measured at 4.0.1** against enkiTS `ccd4e8c`,
+Taskflow 4.1.0 (`83f90a2`) and marl `b8406ab`.
 
-**Every column below was measured with only that scheduler running.** The harness takes `--only=jlib`
-/ `--only=enki` and starts nothing else, so no library's threads are alive while another is timed.
+**Every column was measured with only that scheduler running.** The harness takes `--only=jlib` /
+`--only=enki` / `--only=tf` and starts nothing else, so no library's threads are alive while another
+is timed. Each library's own JLib cell comes from its own harness process, which is why the
+round-trip reads 0.63 / 0.63 / 0.57 across the three -- that spread is the honest measurement noise
+on this row.
 
-| | this (Sleep) | this (NoSleep) | enkiTS | Taskflow | marl |
-|---|---|---|---|---|---|
-| Round-trip submit→run→wait | 4.3 µs | 1.70 µs | 21.7 µs | 1.30 µs | **0.88 µs** |
-| Independent tasks, per task | 67 ns | **65 ns** | 21.8 µs | 310 ns | 290 ns |
-| Range work, per item | 38 ns | 25 ns | **15 ns** | -- | -- |
-| Bulk parallel-for, 20k items | 0.36 ms | 0.18 ms | 0.373 ms | 0.49 ms | -- |
-| 25% of tasks blocked 600 µs | **7.2 ms** | 10.2 ms | 15.4 ms | -- | 8.8 ms |
+| | this | enkiTS | Taskflow | marl |
+|---|---|---|---|---|
+| Round-trip submit→run→wait | **0.63 µs** | 21.03 µs | 1.05 µs | 0.82 µs |
+| Bulk parallel-for, 20k items | **0.20 ms** | 0.34 ms | 0.48 ms | -- |
+| Independent tasks, ns/task at 20k (best API each) | 27.9 ns | **16.2 ns** | 316 ns | -- |
+| 25% of tasks blocked 600 µs | **8.85 ms** | 15.49 ms | -- | 9.68 ms |
+| ...same, minus each library's own D=0 baseline | **2.23 ms** | 6.62 ms | -- | -- |
 
-**Our two columns were re-measured at 1.4.0; the other three were not.** enkiTS, Taskflow and marl
-have not changed and their cells are carried over -- but they were taken on the same machine in the
-same harness, so the comparison still holds. The `NoSleep` round-trip cell is the one to distrust:
-it read 0.97 µs at 1.3.0 and 1.70 µs here with an **83% spread across repeats**, which is the
-harness being noisy on that row rather than a real move.
+**Where we lose, and it is not close: bulk independent-task throughput at large N.** enkiTS pushes
+20,000 empty tasks at **16.2 ns each against our best 27.9** (`PushArray`, chunk 32) -- ~1.7x, and
+it holds from 8k upward. Its `TaskSet` splits one range across workers with no per-task object at
+all, which is simply a better shape for that job than minting tasks, however cheap the minting gets.
+We are ahead at 1024 (34.7 vs 85.8 ns) where the split has not amortised yet, and behind at 64 and
+256 where our dispatch dominates. If your workload is "N independent items, no dependencies, no
+blocking", enkiTS is the faster tool and this table says so.
 
-**The bulk row was re-measured after `ParallelFor` moved to recursive splitting**, because the
-earlier figure was taken against the shared-cursor path that was mechanism-matched to enkiTS. It did
-not move: **0.355 ms against enkiTS 0.373 ms**, which is a tie either way — inside both harnesses'
-spreads (8% ours, 9% theirs). Read it as neither library having an edge on a uniform bulk range, not
-as a win. See [Parallel loops](#parallel-loops).
+**Where we win, the margins are large and the ranges do not overlap.** Round-trip is 33x enkiTS and
+1.7x Taskflow. Bulk parallel-for is 1.7x enkiTS and 2.4x Taskflow -- and although our spread on that
+row is a poor **50%** (0.181-0.282 ms), even our *worst* run beats enkiTS's *best* (0.331) and
+Taskflow's *best* (0.475), so the ordering survives the noise even though the number should not be
+quoted to three digits.
 
-**The 4.3 µs Sleep round-trip is specifically the cost of waking a FULLY PARKED worker, not a fixed
+**The blocking row is the architectural one and deserves its delta column.** Absolute times include
+each library's submission overhead, which differs; subtracting each library's own zero-block
+baseline isolates what blocking *costs it*. On that measure we are **2.8x-5.9x better across
+50-600 µs** (0.43 vs 1.20 at 50 µs, 0.64 vs 3.75 at 300, 2.23 vs 6.62 at 600), narrowing to 1.4x at
+2000 µs. That is the fiber path: a blocked task suspends and frees its worker, where a thread-pool
+task holds one. It is the reason the hybrid exists, and it is the one row where the difference is a
+property of the design rather than of tuning.
+
+**enkiTS's "N sets" column reads ~21,000 ns/task and is not a defect in enkiTS.** It is wake
+amplification -- N separate `TaskSet`s each waking the pool -- and it is in the harness only because
+it is the shape a naive port produces. The "1 set" column is enkiTS used correctly and is the number
+quoted above.
+
+> The marl column is from its own dedicated harness with interleaved arms; see
+> [Against marl, re-measured at 4.0.1](#against-marl-re-measured-at-401) for the full round-trip and
+> blocking sweeps, including the `f31` control that shows all-31-spinning is 5x *worse* than a floor
+> of two.
+
+**All three third-party libraries were re-cloned for this table**, so their columns move for reasons
+that have nothing to do with us: enkiTS and Taskflow are both at 2026-08-06 HEADs, marl is archived
+at 2026-04-27. A column is only comparable to another run of the same commit.
+
+**The bulk parallel-for row moved from a tie to a win, and the mechanism changed underneath it.**
+At 1.4.0 it read 0.355 ms against enkiTS 0.373 -- a tie inside both spreads -- measured against the
+shared-cursor path that was mechanism-matched to enkiTS. It is now 0.20 ms against 0.34: recursive
+lazy splitting with demand-driven recruitment, which is a different algorithm rather than a tuned
+one. See [Parallel loops](#parallel-loops).
+
+<details>
+<summary><b>The 4.3 µs round-trip of the 1.4.0 table, and why it is gone</b></summary>
+
+**It was specifically the cost of waking a FULLY PARKED worker, not a fixed
 floor on submission.** `BenchLatency` round-robins across every worker, so any given one only gets
 touched roughly once every pool-size iterations -- long enough to fully park every time, paying a
 real OS kernel wake on every hit. A breakdown built to answer where that time goes (build with
@@ -247,9 +418,15 @@ worker that's still warm from the last task costs. `JLIBSCHED_LATENCY_STATS` is 
 off-by-default diagnostic (same convention as `JLIBSCHED_STEAL_STATS`) for measuring this split on
 your own hardware.
 
-Blank cells are not measured yet, not zero. Versions: enkiTS at `main`, Taskflow 4.1.0, marl at `main`
-(**archived**, last commit 2026-04-27 — its column calibrates the fiber path, it is not a
-recommendation).
+**The awake floor is what retired that number.** A floor of two keeps a steer target running, so the
+round trip no longer buys a kernel wake at all -- 4.3 µs → 0.63 µs, which is the pinned-worker
+figure above arrived at by policy instead of by hand-picking a worker. The analysis stands as the
+explanation of *why* the floor exists.
+
+</details>
+
+Blank cells are not measured yet, not zero. marl's column (**archived**, last commit 2026-04-27)
+calibrates the fiber path; it is not a recommendation.
 
 **The latency row is an idle-policy axis, not an architecture one.** Taskflow and marl both keep
 their workers searching before parking — Taskflow tries ~64 steals then yields 150 more times before
@@ -344,6 +521,44 @@ than quietly emitting a confounded column.
 number, the harness faults that corrupted it first. The initial draft reported enkiTS as 15x slower
 and every one of those faults was the harness, not enkiTS -- worth reading before trusting any row
 here, and before writing a comparison of your own.
+
+### Against marl, re-measured at 4.0.1
+
+Same process, arms **interleaved** rather than run back to back, all-normal worker priority to match
+marl's. i9-13900K, 31 workers, Release. `f31` is our own floor pinned to 31 (every worker spinning)
+and `sy7` is a spin-yield interval of 7 -- both are our configuration knobs, included as controls.
+
+**Round trip (µs, lower is better)**
+
+| | jlib | jlib `sy7` | jlib `f31` | jlib `f31s` | marl |
+|---|---|---|---|---|---|
+| min | 0.524 | **0.529** | 2.715 | 2.727 | 0.788 |
+| median | 0.572 | **0.539** | 2.864 | 2.774 | 0.821 |
+
+**1.43x faster than marl at the default, 1.52x with `spinyield=7`.** The `f31` columns are the
+useful negative result: pinning all 31 workers awake is **5x worse than the default**, not better.
+Spinning is not the mechanism -- steering a push at an already-running worker is, and a floor of 2
+does that as well as a floor of 31 while leaving 29 cores alone.
+
+**Blocking crossover (ms, min of reps)** -- 25% of tasks blocked for `block µs`:
+
+| block µs | jlib | jlib `sy7` | jlib `f31` | jlib `f31s` | marl |
+|---|---|---|---|---|---|
+| 0 | 6.78 | 6.61 | 6.72 | 5.06 | **4.40** |
+| 50 | 6.71 | 6.94 | 5.87 | 5.71 | **5.25** |
+| 150 | 6.80 | 6.90 | 5.89 | 6.16 | **4.73** |
+| 300 | 6.91 | 6.77 | 6.33 | 6.81 | **6.21** |
+| 600 | 7.52 | **7.32** | 10.10 | 9.93 | 9.68 |
+| 2000 | **21.39** | 21.15 | 24.27 | 23.87 | 24.46 |
+
+**The crossover is at roughly 300-600 µs and it goes both ways.** marl is ahead below it by up to
+1.5x; we are ahead above it, by 1.3x at 600 µs and 1.14x at 2000 µs. Published in full because the
+half we lose is as informative as the half we win: marl never parks, so short blocks cost it
+nothing and cost us a wake, while long blocks let our fiber path reuse the core that marl leaves
+spinning.
+
+Reproduce with `build-compare/marl_ab.ps1`. The arms must interleave -- measuring them in separate
+sessions moved our own K=1 rows by 2x, which is machine drift being read as a result.
 
 ## Model checked
 
@@ -487,6 +702,44 @@ Every platform below runs the full test suite in CI on every push:
 | Linux / Android | AArch64 | GCC / Clang |
 | macOS | arm64 | AppleClang |
 
+### CPU features on x86-64
+
+**Nothing above baseline x86-64 is required.** There is no `/arch:` flag on any shipped translation
+unit and no SIMD intrinsic in the library, so it runs on any x86-64 CPU, including pre-AVX parts
+(Core 2, Nehalem, pre-Bulldozer, and the Goldmont-family Atoms that shipped without AVX into ~2020).
+
+| | |
+| --- | --- |
+| **AVX / AVX2 in your code** | Supported and tested. 256-bit vector state survives a suspend, a resume, and a migration to a different worker, with other fibers running AVX arithmetic in the meantime -- `tests/avx_suspend_test.cpp` asserts exactly that, adversarially. |
+| **AVX used by the library** | One instruction, on Windows x86-64 only: a `vzeroupper` at the top of `ContextSwitch`. |
+| **AVX-512** | Should behave as AVX2 does; **untested**, no hardware. See below. |
+
+**Why the library touches AVX at all.** The Windows context switch saves XMM6-15 with legacy-SSE
+`movdqa`, and legacy SSE executed while the upper halves of YMM are live pays an SSE/AVX transition.
+A fiber that parks straight out of an AVX kernel is in exactly that state, so it paid it on every
+switch: **85.8 ns against 9.2 ns**, measured on a 13900K by `bench/context_switch.cpp`. One
+`vzeroupper` recovers all of it.
+
+**It is gated, not assumed.** `vzeroupper` is itself an AVX instruction, so emitting it
+unconditionally would have quietly narrowed the floor above. Instead AVX is detected once at startup
+(`CPUID` + `OSXSAVE` + `XGETBV`, in `src/win32/FiberInit.cpp`) and the switch tests a byte. A CPU
+without AVX skips the instruction and gets the previous behaviour -- correct, and slower, which it
+would have been anyway since without AVX there is no dirty upper state to transition out of. The
+gate costs ~0.35 ns per switch, under half a percent of a suspend/resume round trip.
+
+Destroying upper vector state there is permitted rather than tolerated: those halves are volatile
+across a call under the Win64 ABI, and a context switch is an opaque call.
+
+**AVX-512 is the honest gap.** `VZEROUPPER` is documented to clear bits `[MAXVL-1:128]` of ZMM0-15,
+so a fiber parking out of a ZMM kernel should recover the same way, and ZMM16-31 are unreachable
+from legacy SSE and cannot be involved. Neither claim has been measured -- the machine this was
+developed on has AVX-512 fused off. There is no correctness risk either way (AVX-512 implies AVX,
+so detection is right and the instruction is legal); what is unverified is the speedup, not the
+behaviour.
+
+The POSIX x86-64 switch has none of this and needs none: the System V ABI makes every XMM register
+caller-saved, so that routine has no vector block and executes no legacy-SSE instruction at all.
+
 ### iOS
 
 **Untested, not supported.** iOS, tvOS, watchOS and visionOS are arm64 Darwin, so they use the same
@@ -572,7 +825,9 @@ int main() {
     sched.PushArray(0, 1000000, 4096, [](size_t i) { out[i] = std::sqrt((float)i); }, &arr);
     sched.WaitFor(arr);
 
-    sched.Join();
+    // No teardown call. The pool is process-lifetime: it drains and joins itself at exit, so
+    // there is nothing to shut down here and no way to start a second one. `Join()` was public
+    // through 4.0.2 and is not any more -- see CHANGELOG.md for 5.0.0.
 }
 ```
 
@@ -685,6 +940,15 @@ sweep against it yourself — it interleaves both arms with a same-vs-same contr
 whose control moved more than 5% on its own, so a noisy reading says so instead of publishing a
 number.
 
+**There is now a second reason, and it is the stronger one: the cursor's wins are confined to cells
+that lose to serial anyway.** Line the two sweeps up at the same N and the cursor takes `trivial`
+and `light` — which measure 0.04x and 0.19x against serial there, so "the cursor is 3.8x better" is
+a way of losing to one thread by 6x instead of by 25x. Where parallelizing is worth doing at all,
+the splitter takes every cell. A router between the two paths would therefore be optimising exactly
+the ranges whose correct answer is "run it serially", which is a gate question, not a path question.
+The tables and the four-run sign flip are in
+[DESIGN.md](DESIGN.md#do-not-route-large-uniform-ranges-to-the-cursor).
+
 ### How do I pick a grain?
 
 Mostly you don't. **`ParallelFor(begin, end, func)` derives one for you** from the two things known
@@ -738,7 +1002,51 @@ The 20k cheap-body row above is what that costs: 0.08x with a guessed grain, 0.2
 If you need to know whether a loop should have been parallel at all, `SetParallelForSerial(true)`
 answers it in one run without a rebuild.
 
+### When nobody can reach a task
+
+Every queue here has exactly one legal consumer. A worker's inbox is drained by that worker and
+nobody else -- no locks, no contention, no reasoning about who pops next. That is most of why
+dispatch is cheap, and it has one consequence worth understanding before you tune anything:
+
+**a task placed in the inbox of a worker that is inside a task body is reachable by nobody until
+that body returns.** Not slow -- closed. No thief may take it, because taking it would mean two
+consumers on a queue built for one.
+
+So placement tracks which workers are *away* (inside a body) and steers around them. That covers
+the normal case and runs out in one specific situation: the away set is set by **any** worker
+running **any** task, so on a small or busy pool every candidate can be away at once -- a worker
+running a two-nanosecond task is away exactly as one running a two-millisecond task is. Placement
+then has to commit the task to somebody, with no way to tell which body finishes first.
+
+**That is what the escape queue is for.** Ordinary work whose chosen worker is away goes to a
+single MPMC queue that *any* worker may take from, and the first one free takes it. The choice is
+deferred rather than guessed.
+
+It is deliberately **not** a global run queue, and the difference is the whole design:
+
+| | global run queue | this |
+|---|---|---|
+| Pushes that touch it | all of them | only when the chosen worker is away |
+| Workers polling it | every pass | after own queues *and* a full steal come up empty |
+| Guard | none | a depth counter -- one acquire load in the common case |
+| Affinity | lost: pulled work has no `corePref`, no band, no home worker | preserved: this is only for work placement could not express |
+
+A general global queue would put a contended line on the two hottest paths and dissolve the
+placement decisions the rest of the scheduler exists to make. This is the destination for work that
+has nowhere better -- precisely the case those decisions cannot express.
+
+Reserved workers never drain it (that band takes lane work and nothing else), and lane work is
+never diverted into it, or a completion would leave the lane it was routed to.
+
+**Nothing to configure.** It has no knob and needs none: if placement can always find an un-away
+worker, nothing ever enters it. It shows up in `DumpPoolState` alongside the away map if you want
+to see whether your workload reaches it.
+
 ### You can take garbage collection off the workers
+
+There are two reclamation schemes and each has its own switch -- `EpochManager::SetSelfReclaim` for
+epochs, `HazardDomain::SetSelfScan` for hazard pointers. Both default to on, both move work off your
+workers when turned off, and they are independent: turning one off leaves the other on the workers.
 
 Reclamation is epoch-based, and by default a **worker** performs it: once enough pointers are
 retired, whichever worker notices next stops and runs a reclaim pass. That pass scans every epoch
@@ -777,6 +1085,41 @@ have hoisted the read out of its loop anyway. And **if you disable it and then n
 retired memory grows without bound and nothing warns you.** The default is on precisely because a
 library cannot assume its embedder has a loop to tick from.
 
+#### The hazard sweep has the same switch
+
+Epochs are not the only reclamation here. Structures that must stay readable across a *suspend* use
+hazard pointers instead -- epochs cannot, because no fiber or coroutine may suspend inside an
+`EpochGuard`. That sweep also lands on a worker: on the way into idle, whichever worker gets there
+walks every hazard cell.
+
+```cpp
+JLib::HazardDomain::Instance().SetSelfScan(false);
+
+while (running) {
+    RunFrame();
+    JLib::EpochManager::Instance().Tick();     // epochs
+    JLib::HazardDomain::Instance().Scan();     // hazards
+}
+```
+
+**Three differences from `SetSelfReclaim`, and they all matter:**
+
+| | `SetSelfReclaim` | `SetSelfScan` |
+|---|---|---|
+| When you may set it | before `StartPool`, once | **any time** -- it is a relaxed atomic |
+| If you disable it and never drive it | unbounded growth, silent | **reclaims late, does not leak** |
+| Measured | p99 331 → 113 µs | **not measured** |
+
+The second row is the useful one: `Retire` still runs its own threshold-triggered scan, so this
+governs only the *worker-idle* sweep. Forgetting to call `Scan()` costs you timeliness, not memory,
+and `HazardDomain::Instance().OrphanedRetired()` is how you would notice if a thread exited holding
+a bag.
+
+The third row is a caveat rather than a recommendation. **The 3x p99 figure above is the epoch
+result and has not been reproduced for hazards** -- the hazard bag is smaller and sweeps less often,
+so it is a reason to try the switch on your own workload, not a number to expect. Measure both
+halves before assuming either pays.
+
 ### Placement is a hint, and on some platforms it is nothing
 
 `CorePref::P` / `CorePref::E` are **Windows-only**. Elsewhere the scheduler cannot tell the core
@@ -810,9 +1153,29 @@ design that assumes a `P` task always lands on a P-core.
 
 ### Hot workers: how many, and when none
 
-`SetHotWorkers(K)` reserves K workers that **never park**, and the reactor steers I/O completions at
-them. It is **off by default (K = 0)** and it is the difference between async I/O being usable in a
-hybrid pool and not.
+`SetHotWorkers(K)` reserves K workers that take **lane work only** -- no bulk task from any source,
+stolen or pushed -- and the reactor steers I/O completions at them. It is **off by default (K = 0)**
+and it is the difference between async I/O being usable in a hybrid pool and not.
+
+**Reservation and spinning are two purchases, and this API sells only the first.** `SetHotWorkers`
+does *not* imply never-park: a reserved worker still sleeps when its lane empties. It used to imply
+it, and that charged every caller who merely wanted "don't run bulk work on q0" a ~35% ordinary
+latency tax for a property most of them never asked for.
+
+| call | reserved? | never parks? | use |
+|---|---|---|---|
+| `SetHotWorkers(k)` | yes | no | a lane that must not be buried behind bulk work |
+| `SetIoHotLane(k)` | yes | yes | the I/O reactor -- see the table below |
+| `SetHotWorkers(k)` + `SetReservedNeverParks(true)` | yes | yes | the same thing, spelled out |
+
+The dispatch numbers below are the **`SetIoHotLane`** configuration. A completion landing on a
+*parked* reserved worker still pays the OS wake the band exists to remove, so reservation alone
+buys the "never buried behind a 400 us leaf" guarantee and nothing about the wake.
+
+**Adaptive K is the exception:** while a scaling range is armed (`SetHotWorkerRange(min, max)` with
+`max > min`) the reserved band never parks regardless of the flag. Idleness there has one owner --
+the controller sheds K, and a worker stops spinning by ceasing to be hot rather than by sleeping
+while still reserved.
 
 **The problem it solves.** Compute wants the pool to park when idle -- 31 threads spinning between
 frames is unacceptable. I/O wants the pool never to park, because a completion arrives *precisely*
@@ -881,9 +1244,22 @@ in the scheduler promotes a task to the lane behind your back -- see the block a
 in `TaskScheduler.h`.
 
 **Use K=0 -- the default -- if you have no latency-critical I/O.** Pure compute gains nothing from a
-hot worker and pays a core for it. K=0 costs nothing: the lane collapses and the worker loop is
-*cheaper* than a pool without the feature, because a worker that serves no lane checks one inbox, one
-deque and one steal probe per victim instead of two.
+hot worker and pays a core for it. K=0 costs nothing: the lane collapses, every push routes to the
+ordinary inboxes, and the lane check is one load of a queue that is always empty.
+
+**The lane is an MPSC inbox, not a deque, and that is a guarantee rather than an implementation
+note.** It has exactly one legal consumer -- its owner -- so lane work is never stolen and never
+staged anywhere on its way to running: the owner pops one arrival and runs it. There is no second
+structure behind it and no unload step between the producer's push and the body, which is the whole
+point on the one path that exists for latency. Two consequences worth stating plainly:
+
+* **Nothing can rescue a completion queued behind a busy owner.** That is what K is for -- a
+  reserved worker is never inside a bulk body -- and it is why a lane on an *unreserved* worker is
+  ordering, not a latency guarantee.
+* **Lane depth is presence, not a count.** An intrusive linked queue has no `size()`, so everything
+  that reads the lane asks "is there work" and never "how much".
+
+Stealing therefore touches one deque per victim, always -- there is no second probe to skip.
 
 **`SetHotThreadPolicy(Elevated)`** additionally raises the hot workers and the reactor's completion
 threads, and it is implemented on every platform -- `THREAD_PRIORITY_TIME_CRITICAL` on Windows,
@@ -898,6 +1274,59 @@ cgroups arbitrate regardless -- and a refusal is swallowed, because the unprivil
 an answer. Untested beside a live audio or present
 thread; if you see stutter rather than an I/O win, drop it and keep `SetHotWorkers` alone, which is
 where most of the measured benefit is.
+
+### The awake floor, and why growth is gated the way it is
+
+`SetAwakeFloor(N)` keeps workers `0..N-1` from ever parking. **Default 2.** It is a different knob
+from `SetHotWorkers` -- K picks *which queue* a hiPri push lands in; the floor decides whether
+landing anywhere costs an OS wake. Measured on 31 workers, 20,000 serial round trips:
+
+| floor | kernel wakes | p50 | p99 | max |
+|---|---|---|---|---|
+| 0 | ~19,400 | 4.00 µs | 5.40 µs | 90–330 µs |
+| 2 | **0** | **0.40 µs** | **0.60 µs** | ~80 µs |
+
+At floor 0 every push wakes a sleeper and the landing spread is flat (~640 per queue). At floor 2
+placement steers at a worker that is already running, and the tail that is left is preemption of a
+spinner, not a lost wake. Throughput rows are *higher* at floor 0 -- that is 29 surplus workers free
+to spin on a no-op storm, and it is not an argument against the floor.
+
+The floor **grows** when a wave arrives and **collapses** back to the base when it drains. Growth is
+gated by four filters, and every one of them exists because removing it was measured:
+
+| filter | rule | what it costs to remove |
+|---|---|---|
+| **who** | bare producer only (`Thread::GetCurrent() == nullptr`) | `TaskDAG::Fire()` releases 6 dependents back-to-back from a worker and looks exactly like a wave. Without this, every graph grew the floor and pinned it at 16: frame DAG 3.5 → 7.2 µs across 20,000 graphs. |
+| **when** | 2 pushes within 50 µs, **producer time** | see below -- no other clock works |
+| **how long** | streak ≤ 64 | a wave is bounded; a flood is not. Without a ceiling the no-op row is indistinguishable from a burst: 1p 8.35 → 4.90 M/s. |
+| **how wide** | grow by the streak, capped at N−K−1 | growing by one step per push places the tail of the wave before the floor catches up: 16 workers → 10. The cap was a flat 16 and is now "the pool minus the reserved band, minus one left parkable" -- that last worker is what keeps the collapse callable. |
+
+**Do not put a duration check on the push path.** It is the obvious idea and it cannot work:
+
+> At t=0 of a burst from an idle pool there is nothing true about the pool to observe.
+
+Sixteen pushes land in ~10 µs while the workers are still coming out of `WaitOnAddress`. So
+"has this worker been busy 200 µs" is false sixteen times, `busy` is false because nobody has picked
+anything up, and inbox depth is shallow because nothing has drained. Four separate gates were built
+on those signals and all four declined the entire submit. The **producer's own** timing needs none of
+it -- two pushes 50 µs apart is a fact about the submission, knowable on push two.
+
+A serial round trip cannot reach the streak (it pushes once, then blocks until that task completes),
+which is why the latency row is unaffected: it still lands 100% on the base floor with 0 wakes.
+
+Growth also fires from a **completion** whose body ran longer than 200 µs with a queue still behind
+it (`Thread::GrowFloorIfLongBody`). That is the complement to the push path rather than a duplicate:
+it catches a wave published *by a worker*, which the `who` filter deliberately excludes, and it can
+use the body's measured duration instead of guessing. It hands the backlog out as well as growing --
+growing alone leaves the promoted workers with nothing they can reach, because a busy worker's inbox
+has one legal consumer.
+
+Shedding runs from the idle path, one step straight back to the base, gated only on a 6 ms hold
+since the last growth. It is deliberately *not* gated on the pool being quiet: a busy pool then never
+sheds, which is how the floor once sat at 16 for an entire benchmark row.
+
+`floor=0` remains meaningful -- "every core may park", for a process that cares about background CPU
+more than about its tail.
 
 [DESIGN.md](DESIGN.md) has the rest -- the execution model, the integration contracts, and the
 decisions that were tried and removed.

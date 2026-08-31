@@ -45,8 +45,6 @@
 #include "TaskNode.h"
 #include "Event.h"
 #include "DirectEvent.h"
-#include "LockFreeList.h"
-#include "LockFreeHashMap.h"
 #include "Epochs.h"
 #include "Fiber.h"
 #include "Thread.h"

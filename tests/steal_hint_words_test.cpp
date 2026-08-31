@@ -4,8 +4,8 @@
 // THE STEAL HINT ABOVE ONE WORD -- a pool with more queues than a uint64 has bits.
 //
 // WHY THIS EXISTS. The hint bitmaps were a single 64-bit word, one bit per queue, and
-// MaybeStealable turned the hint off WHOLESALE once loPri.size() exceeded 64 -- necessarily, since
-// covering only queues 0..63 would starve every queue above them. loPri.size() is num_workers + 1
+// MaybeStealable turned the hint off WHOLESALE once deques.size() exceeded 64 -- necessarily, since
+// covering only queues 0..63 would starve every queue above them. deques.size() is num_workers + 1
 // (the non-worker lane), so the edge sat at 64 WORKERS: a 64-thread machine kept its hints and a
 // 128-thread Threadripper lost them entirely, falling back to probing every victim at the 0.2-0.9%
 // hit rate the hints were built to fix. Probe traffic goes as N^2, so the machine where the hint
@@ -53,7 +53,7 @@ static void Check(bool c, const char* what) {
 
 namespace {
 
-// Enough workers that loPri.size() (workers + 1) crosses 64 and lands in the SECOND hint word.
+// Enough workers that deques.size() (workers + 1) crosses 64 and lands in the SECOND hint word.
 constexpr size_t kWorkers = 100;
 constexpr int    kDepth   = 13;            // 8192 leaves
 
@@ -101,7 +101,7 @@ int main() {
     auto& sched = JLib::TaskScheduler::Instance();
 
     const size_t workers = sched.GetWorkerCount();
-    const size_t queues  = workers + 1;       // + the non-worker lane; this is what loPri.size() is
+    const size_t queues  = workers + 1;       // + the non-worker lane; this is what deques.size() is
     std::printf("steal hint above one word -- workers=%zu, queues=%zu, words=%zu\n\n",
                 workers, queues, (queues + 63) / 64);
 
@@ -122,7 +122,7 @@ int main() {
         std::printf("  SKIPPED -- this host has %zu queues; word 1 begins at 65.\n", queues);
         std::printf("  The multi-word hint path is UNEXERCISED here. Run this on a host with more\n");
         std::printf("  than 64 hardware threads (Threadripper/EPYC/dual-socket) to make it real.\n");
-        sched.Join();
+        JLib::detail::TeardownForTesting(sched);
         return 0;
     }
 
@@ -162,6 +162,6 @@ int main() {
     Check(allTransformed, "ParallelFor completed correctly on a multi-word pool");
 
     std::printf("\n%s\n", g_fail == 0 ? "ALL CHECKS PASSED" : "FAILURES ABOVE");
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     return g_fail == 0 ? 0 : 1;
 }

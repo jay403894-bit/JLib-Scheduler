@@ -465,6 +465,95 @@ Capture pointers, not payloads.
 
 Negative results with receipts.
 
+### Do not route large uniform ranges to the cursor
+
+`ParallelFor` has two implementations -- the lazy **splitter** (recursive halving, untaken splits run
+inline) and `RunCursorRange`, a shared atomic cursor with one task per worker. The obvious-looking
+optimisation is to pick between them by shape: send big uniform ranges to the cursor, keep the
+splitter for ragged ones. The splitter-vs-cursor sweep appears to support it. It should not be done,
+and the reason takes two tables rather than one.
+
+**First: that sweep does not hold a sign.** Four runs of the same binary, `heavy`, ratio is
+splitter/cursor so `>1` means the cursor wins:
+
+| N | 1000 | 4000 | 20000 | 100000 | 200000 | 400000 | verdict printed |
+|---|---|---|---|---|---|---|---|
+| run 1 | 7.47 | 1.12 | 1.06 | 1.50 | 1.49 | 1.59 | cursor ahead from 100000 |
+| run 2 | 7.41 | 0.57 | 0.58 | 0.51 | 0.76 | 0.77 | splitter ahead throughout |
+| run 3 | 7.42 | 0.81 | 0.82 | 0.76 | 0.87 | 0.80 | splitter ahead throughout |
+| run 4 | 7.28 | 0.78 | 0.99 | 0.89 | 0.92 | 0.79 | splitter ahead throughout |
+
+Three to one for the splitter, and run 1 is the one a routing rule would have been built on. Most
+cells in these runs carry the harness's own `?` marker -- the same-vs-same control moved more than
+5% on its own -- so the table is directional and nothing in it should be quoted to two digits.
+
+**Second, and this is the part that settles it: the cursor only wins where parallel loses.** Put the
+crossover sweep (speedup against SERIAL) beside the splitter-vs-cursor ratio at the same N:
+
+| N=4000 | vs serial | splitter vs cursor |
+|---|---|---|
+| trivial | **0.04x** -- parallel is 25x SLOWER | cursor ahead |
+| light | **0.19x** -- parallel is 5x slower | cursor ahead |
+| medium | **3.50x** -- parallel wins | splitter ahead |
+| heavy | **9.79x** -- parallel wins | splitter ahead |
+
+Every cell the cursor takes is a cell that should not have fanned out at all. The cursor being
+"3.8x better" at trivial N=4000 means it loses to serial by 6x instead of by 25x. That is not a win
+worth a branch, and a router built on it would be optimising the cases whose correct answer is
+"run it serially".
+
+**So the splitter is the default and the only path, and its bad cells are a GATE problem rather than
+a path-selection problem.** The gate is `N < workers * minItersPerWorker` -- on 31 workers that is
+1984, so N=2000 clears it by sixteen elements, and there `trivial` measures 0.05x while `heavy`
+measures 7.8x. Moving the threshold cannot separate them: N is identical and only the body differs.
+That is the stated price of being probe-free, not a defect in the splitter.
+
+**The one idea left, and why it is not the probe returning.** `GrowFloorIfLongBody` already resolves
+the same tension elsewhere -- *"a completion knows what a push can only guess"* -- by using the
+duration of a body it had to run anyway. The equivalent here is to measure the FIRST LEAF, project it
+across the remaining leaves, and stop splitting when the projection falls under dispatch cost. One
+clock read per range, no speculative sampling. The catch is structural: `RunLazyRange` splits to
+grain before it runs any leaf, so at the moment of decision there is nothing measured yet. Making
+one available means restructuring to *split one, run one, then decide* -- which is close enough to
+the removed probe that it has to be proven on the crossover sweep before it is believed, not
+argued into place.
+
+### A dense bounded key is a better index than any hash of it
+
+The scheduler shipped a `LockFreeList` and a bucketed `LockFreeHashMap` for two years and then
+removed both, because each of their consumers independently found a better structure:
+
+- **Event's waiter index** became a flat array indexed by `Fiber::poolIndex`. The keys were never
+  arbitrary -- a parked task always holds a fiber, fibers have dense stable indices, and a fiber
+  parks on one event at a time. A perfect hash already existed. The general map was strictly worse:
+  it allocated a cell per suspend, on a path documented as allocation-free.
+- **`TaskNode::dependents`** became pointer-linked edges in DAG-owned chunk storage. Graph
+  construction is single-threaded by contract, so the lock-freedom was unreachable in practice --
+  and the list cost four slab slots per node before a single edge existed.
+
+The generalisable part: **reach for a hash map when the key space is genuinely arbitrary and
+concurrent.** When the keys are already a dense bounded index, they *are* the index, and any hash of
+them is a slower spelling of an array subscript. Both of these looked like map problems and neither
+was.
+
+### A structure the library hands out must not share the library's allocator
+
+The same two containers were also the tree's only headers that called themselves general-purpose
+while taking a `TaskAllocator&` and reclaiming through `EpochManager::RetirePtr` -- so anyone
+reaching for "a lock-free hashmap" would have linked a fiber scheduler to get one.
+
+**The coupling was not the defect.** `TaskDeque`, `TaskMPSCQueue`, `TaskNode` and `Coroutine` all
+share the slab and the epoch domain, and that sharing is exactly why they are fast: no `malloc` on
+any hot path, one reclamation scheme to reason about. They are internal and never claimed otherwise.
+The defect was one structure wearing both labels.
+
+Shipping them properly would have meant templating on an allocator *and* a reclamation policy whose
+default works with no infrastructure at all -- hazard pointers, RCU, or leak-on-remove. That is a
+different data structure, not a relocated file, and a Harris list plus a fixed-bucket map is not
+worth it: a sharded `unordered_map` behind a `shared_mutex` beats bucket-of-linked-lists on nearly
+any real workload, in twenty lines. The contrast is in this repo -- `ThirdParty/concurrentqueue.h`
+is genuinely general-purpose and needs nothing injected.
+
 ### Fibers rather than C++20 coroutines
 
 Coroutines colour the call chain. A function can only suspend if it was written as a coroutine, and

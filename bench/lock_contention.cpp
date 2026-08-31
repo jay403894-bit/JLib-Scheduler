@@ -336,7 +336,7 @@ static RunResult RunOne(JLib::TaskScheduler& sched, const Scenario& sc,
         for (int i = 0; i < sc.contenders; ++i) {
             auto* t = sched.CreateTask(
                 [&st, &lat, i] { ContendLoop(st, lat[static_cast<size_t>(i)]); },
-                /*hipri*/ false, JLib::FiberSize::Standard, JLib::TaskType::Fiber);
+                /*hipri*/ false, JLib::TaskType::Fiber);
             if (!t) {
                 std::fprintf(stderr, "FATAL: could not allocate fiber contender task\n");
                 std::abort();

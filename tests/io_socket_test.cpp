@@ -93,7 +93,7 @@ int main() {
         std::printf("  SKIPPED -- IoReactor reports no backend on this platform.\n");
         std::printf("  The Linux reactor's lifecycle exists; its operations do not yet. This file\n");
         std::printf("  is compiled here so the socket shim and its portability stay verified.\n");
-        sched.Join();
+        JLib::detail::TeardownForTesting(sched);
         return 0;
     }
 

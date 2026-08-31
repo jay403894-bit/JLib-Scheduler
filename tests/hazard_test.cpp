@@ -83,7 +83,7 @@ namespace {
 
 
         // ---- reader ---------------------------------------------------------------------------
-        // Runs on a FIBER (FiberSize::Standard), which is the whole point: a fiber is the thing
+        // Runs on a FIBER, which is the whole point: a fiber is the thing
         // that migrates, so this is the context where cell ownership is load-bearing.
         WaitGroup wgReader;
         wgReader.n.store(1, std::memory_order_relaxed);
@@ -100,7 +100,7 @@ namespace {
             // Resumed, possibly on a different worker. Was our node kept alive?
             s.readerSawAlive.store(n->magic == kAlive, std::memory_order_release);
             s.readerRan.store(true, std::memory_order_release);
-        }, false, FiberSize::Standard, TaskType::Fiber);
+        }, false, TaskType::Fiber);
         reader->waitGroup = &wgReader;
         sched.Push(reader);
 
@@ -122,7 +122,7 @@ namespace {
                 g.Set(0, &local);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 g.Clear(0);
-            }, false, FiberSize::Standard, TaskType::Fiber);
+            }, false, TaskType::Fiber);
             t->waitGroup = &noiseWg;
             sched.Push(t);
         }

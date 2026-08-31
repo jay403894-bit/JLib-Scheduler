@@ -89,6 +89,39 @@ namespace ioplat {
         }
         return true;
     }
+
+    // ---- ADVANCE THE DESCRIPTORS PAST BYTES THE KERNEL ALREADY TOOK --------------------------
+    //
+    // A stream socket accepts what fits in its send buffer and reports that, so a 98 KB writev can
+    // return 32741. Re-submitting the ORIGINAL span then re-sends bytes the peer already has and
+    // fills the window with duplicates -- which is why the plan for this said "advance, do not
+    // replay". Consumes whole segments while it can, then splits the one it lands inside.
+    //
+    // Returns the new segment count and compacts to the FRONT, because `bufCount` is also the SQE's
+    // `len` and the kernel reads the array from index 0.
+    std::uint32_t AdvanceBufs(IoRequest* r, std::uint32_t consumed) noexcept {
+        struct iovec* v = Iov(r);
+        std::uint32_t n = r->bufCount;
+        std::uint32_t i = 0;
+        while (i < n && consumed > 0) {
+            if (consumed >= v[i].iov_len) { consumed -= (std::uint32_t)v[i].iov_len; ++i; continue; }
+            v[i].iov_base = static_cast<unsigned char*>(v[i].iov_base) + consumed;
+            v[i].iov_len -= consumed;
+            consumed = 0;
+        }
+        if (i == 0) return n;
+        const std::uint32_t left = n - i;
+        for (std::uint32_t k = 0; k < left; ++k) v[k] = v[i + k];
+        return left;
+    }
+
+    // Total still outstanding across the descriptors.
+    std::size_t BufsRemaining(IoRequest* r) noexcept {
+        struct iovec* v = Iov(r);
+        std::size_t t = 0;
+        for (std::uint32_t i = 0; i < r->bufCount; ++i) t += v[i].iov_len;
+        return t;
+    }
 }
 
 namespace {
@@ -100,6 +133,13 @@ namespace {
     // Sentinel user_data for the NOP that wakes a parked completion thread. Cannot collide with a
     // real request: every real user_data is an IoRequest*, and no object lives at address 1.
     constexpr std::uint64_t kWakeSentinel = 1;
+
+    // JLIB_IO_TRACE=1 -- one line per SQE published and one per CQE drained, paired by request
+    // pointer. Read once: a getenv per submit would be a syscall on the I/O path.
+    const bool ioTrace = [] {
+        const char* v = std::getenv("JLIB_IO_TRACE");
+        return v && *v && *v != '0';
+    }();
 }
 
 struct IoReactor::Impl {
@@ -262,6 +302,15 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
             IoRequest* r = reinterpret_cast<IoRequest*>(static_cast<std::uintptr_t>(c.user_data));
             if (!r) continue;
 
+            // The other half of JLIB_IO_TRACE. Paired with the SUBMIT line by `req`, so a submit
+            // with no matching CQE is visible by absence -- which is the shape of the bug this was
+            // added for, and the one thing no amount of reading the submit path can show.
+            if (ioTrace) {
+                std::fprintf(stderr, "[io] CQE    req=%p res=%d kind=%d bufCount=%u\n",
+                             (void*)r, (int)c.res, (int)r->kind, (unsigned)r->bufCount);
+                std::fflush(stderr);
+            }
+
             // io_uring reports a NEGATIVE ERRNO in res, and a non-negative res is the byte count.
             // No GetLastError equivalent and no separate `ok` flag -- one signed integer carries
             // both, which is why this cannot reuse the Windows Classify().
@@ -297,6 +346,62 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
                 res.bytes  = 0;
                 res.error  = static_cast<std::uint32_t>(-c.res);
             }
+
+            // ---- A SHORT SEND IS NOT A COMPLETION. RESUBMIT THE REMAINDER. -------------------
+            //
+            // THIS IS THE CHAIN HANG. A stream socket takes what fits in its send buffer and
+            // reports that: traced here at 32741 of 98304 requested, then 47616, then 65483. Every
+            // SQE got a CQE -- there was never a lost completion -- so the transfer was reported
+            // COMPLETE having sent a third of its bytes, and the peer waiting for the rest waited
+            // forever. A starved reader and a dropped completion look identical from the outside,
+            // which is why this read as "io_uring ate a CQE" for so long.
+            //
+            // SEND ONLY. A short RECV is the defining behaviour of a stream -- "some bytes arrived"
+            // is the answer, not a partial failure -- and retrying one would block a caller that
+            // already has what it asked for. A short SEND is the kernel saying "later", and every
+            // caller of this API, on both platforms, is written against complete-or-fail.
+            //
+            // RES > 0 IS REQUIRED, not just non-negative: a zero-byte send makes no progress, so
+            // resubmitting one is an infinite loop rather than a retry. Zero falls through and is
+            // delivered, and the caller sees a send that moved nothing.
+            //
+            // UNLINK BEFORE RESUBMIT. SubmitOp links the request on the way in, so going round
+            // again without unlinking first puts it in the shard twice and the second completion
+            // unlinks a request that is already gone. The lock is taken and dropped here rather
+            // than held across the submit, because SubmitOp takes submitMx and holding a shard lock
+            // underneath it is the two-lock inversion the cancel path documents.
+            if (res.status == IoStatus::Completed && r->kind == IoRequest::Kind::Send
+                && r->bufCount > 0 && c.res > 0
+                && static_cast<std::size_t>(c.res) < ioplat::BufsRemaining(r)) {
+
+                r->xferred += static_cast<std::uint32_t>(c.res);
+                r->bufCount = ioplat::AdvanceBufs(r, static_cast<std::uint32_t>(c.res));
+
+                {
+                    std::lock_guard<std::mutex> lk(impl->ShardFor(r).m);
+                    impl->UnlinkLocked(r);
+                }
+
+                if (ioTrace) {
+                    std::fprintf(stderr,
+                        "[io] PARTIAL req=%p sent=%d total=%u remaining=%zu segs=%u -- resubmit\n",
+                        (void*)r, (int)c.res, (unsigned)r->xferred,
+                        ioplat::BufsRemaining(r), (unsigned)r->bufCount);
+                    std::fflush(stderr);
+                }
+
+                // If the resubmit answers immediately it has already written *r->out and the
+                // request is finished; fall through to deliver so the waiter is resumed exactly
+                // once. Otherwise the kernel owns it again and this CQE is done with.
+                if (!IoReactor::Instance().SubmitPrepared(r)) continue;
+                res = r->out ? *r->out : res;
+            }
+
+            // A COMPLETED SEND REPORTS WHAT THE CALLER ASKED FOR, not the size of its last
+            // fragment. xferred is zero for anything that finished in one go, which is every
+            // transfer on Windows and most of them here.
+            if (res.status == IoStatus::Completed && r->kind == IoRequest::Kind::Send)
+                res.bytes += r->xferred;
 
             // NO ACCEPT/CONNECT FIXUP HERE, and its absence is worth stating because the Windows
             // path cannot omit it: SO_UPDATE_ACCEPT_CONTEXT / SO_UPDATE_CONNECT_CONTEXT exist
@@ -368,11 +473,46 @@ bool IoReactor::IsAvailable() noexcept {
     // once the chained path completes -- the socket test's IsAvailable skip is what re-enables the
     // coverage automatically.
     //
-    // The suspect list, narrowed by what already passes: SubmitPrepared is the only path the
-    // working sections do not exercise, so either its SQE is malformed in a way the kernel accepts
-    // without completing, or the chained transfer is legitimately pending (a WRITEV that filled the
-    // socket buffer with nobody draining it would look exactly like this). Instrument the
-    // completion loop before assuming either.
+    // ---- THE CHAIN HANG IS FIXED. THIS IS STILL false, FOR DIFFERENT REASONS ------------------
+    //
+    // IoStream's chaining completes: the cause was SHORT WRITES with no resubmit, not a lost CQE --
+    // see the block above SubmitPrepared for the trace that settled it. The concurrency section
+    // passes and the test no longer hangs.
+    //
+    // WHAT IS STILL BROKEN, and why this stays false. With the chain unblocked the test reaches
+    // sections that were never reachable before, and seven checks fail there:
+    //
+    //   * RecvFrom does not write the peer address LENGTH back on completion (msg_namelen)
+    //   * disconnect / reuse-reconnect does not work -- open on Windows too, not Linux-specific
+    //   * the accept-cancellation section fails, plausibly cascading from the socket the
+    //     disconnect section leaves behind; not yet separated
+    //
+    // None of those is a hang, so the failure mode is now honest errors rather than a stopped
+    // process -- but a caller taking the async path would still get wrong answers from three
+    // features. Flip this to `Instance().impl->ringUp` when the socket test is green, and the
+    // test's own IsAvailable skip re-enables its coverage automatically.
+    //
+    // ---- JLIB_IO_URING_FORCE=1 OVERRIDES THIS, FOR DIAGNOSIS ONLY -----------------------------
+    //
+    // The gate above is what makes the failure unreachable, which also makes it unreproducible: the
+    // socket test skips, so the one path that hangs cannot be run without editing the library. An
+    // env override lets the hang be reproduced and instrumented against an UNMODIFIED default,
+    // which matters because the thing being debugged is a timing bug and a debug edit is a
+    // confounder.
+    //
+    // NOT A FEATURE FLAG. It is deliberately an environment variable rather than an API: nothing an
+    // application links against can turn this on by accident, and a variable set in one shell does
+    // not survive into a game. When the chained path completes, this and the `return false` go
+    // together and IsAvailable becomes `Instance()->ringUp`.
+    {
+        static const bool forced = [] {
+            const char* v = std::getenv("JLIB_IO_URING_FORCE");
+            return v && *v && *v != '0';
+        }();
+        // Instance() returns a REFERENCE, not a pointer -- the "flip this to Instance()->ringUp"
+        // note above is wrong about the spelling, and would not compile.
+        if (forced) return Instance().impl->ringUp;
+    }
     return false;
 }
 
@@ -504,6 +644,28 @@ static bool SubmitOp(IoReactor::Impl* impl, IoRequest* req, IoResult* out,
         sqe->user_data = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(req));
 
         const int rc = uring::Submit(impl->ring, 0);
+
+        // ---- JLIB_IO_TRACE: WHAT WAS ACTUALLY HANDED TO THE KERNEL ---------------------------
+        //
+        // AFTER the fill and after Submit, so it reports the SQE as published and the return code
+        // together. `rc >= 1` with no CQE later is a malformed SQE or a full window; `rc == 0`
+        // means nothing was published at all, which is a different bug in a different file.
+        //
+        // Off unless the variable is set: this is one getenv-backed bool per process, and the
+        // branch predicts, but an fprintf per submit would change the timing of the thing being
+        // measured -- which for a suspected race is the whole game.
+        if (ioTrace) {
+            std::fprintf(stderr,
+                "[io] SUBMIT op=%u fd=%d addr=%#llx len=%u off=%#llx flags=%#x kind=%d "
+                "bufCount=%u iov0={%p,%zu} rc=%d req=%p\n",
+                (unsigned)sqe->opcode, (int)sqe->fd,
+                (unsigned long long)sqe->addr, (unsigned)sqe->len,
+                (unsigned long long)sqe->off, (unsigned)sqe->msg_flags,
+                (int)req->kind, (unsigned)req->bufCount,
+                Iov(req)[0].iov_base, (size_t)Iov(req)[0].iov_len,
+                rc, (void*)req);
+            std::fflush(stderr);
+        }
         if (rc < 0) {
             impl->UnlinkUnlocked(req);
             if (out) *out = IoResult{ IoStatus::Failed, 0, -rc };
@@ -515,10 +677,23 @@ static bool SubmitOp(IoReactor::Impl* impl, IoRequest* req, IoResult* out,
     return false;      // queued: stay suspended
 }
 
+// ---- THE SCALAR OPS RECORD THEIR SHAPE TOO --------------------------------------------------
+//
+// These fill Iov(req)[0] and set bufCount = 1 even though the SQE they build takes `addr`/`len`
+// directly and never reads the iovec. It costs two stores and it is what makes a re-submit
+// possible at all: SubmitPrepared and the partial-retry both work from the descriptors, so a
+// request that was first submitted scalar must have them, or the replay is over uninitialised
+// memory that ALIASES the accept path's addrlen. That was the standing (and correct) worry about
+// this file; nothing reached it because IoStream always fills its own, and now nothing can.
 bool IoReactor::SubmitRecv(IoSocket s, void* buf, std::uint32_t len, std::uint32_t flags,
                            IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
     req->kind = IoRequest::Kind::Recv;
     req->handle = reinterpret_cast<void*>(s);
+    Iov(req)[0].iov_base = buf;
+    Iov(req)[0].iov_len  = len;
+    req->bufCount = 1;
+    req->flags    = flags;
+    req->xferred  = 0;
     return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
         sqe->opcode    = IORING_OP_RECV;
         sqe->fd        = static_cast<int>(s);
@@ -532,6 +707,11 @@ bool IoReactor::SubmitSend(IoSocket s, const void* buf, std::uint32_t len, std::
                            IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
     req->kind = IoRequest::Kind::Send;
     req->handle = reinterpret_cast<void*>(s);
+    Iov(req)[0].iov_base = const_cast<void*>(buf);
+    Iov(req)[0].iov_len  = len;
+    req->bufCount = 1;
+    req->flags    = flags;
+    req->xferred  = 0;
     return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
         sqe->opcode    = IORING_OP_SEND;
         sqe->fd        = static_cast<int>(s);
@@ -574,6 +754,10 @@ bool IoReactor::SubmitSendV(IoSocket s, const IoBuffer* bufs, std::uint32_t coun
     req->kind = IoRequest::Kind::Send;
     req->bufCount = count;
     req->handle = reinterpret_cast<void*>(s);
+    // FIRST submit of this request, so the partial-send accumulator starts at zero. IoRequest is
+    // routinely reused, and a stale total here would be ADDED to a completion that never had a
+    // partial -- reporting more bytes than the caller passed. Only the re-submit path may skip this.
+    req->xferred = 0;
     (void)flags;
     return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
         sqe->opcode = IORING_OP_WRITEV;
@@ -645,6 +829,7 @@ bool IoReactor::SubmitSendTo(IoSocket s, const void* buf, std::uint32_t len, std
                              IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
     req->kind = IoRequest::Kind::Send;
     req->handle = reinterpret_cast<void*>(s);
+    req->xferred = 0;   // see SubmitSendV: a reused request must not inherit a partial total
 
     struct iovec* v = Iov(req);
     v[0].iov_base = const_cast<void*>(buf);
@@ -729,10 +914,75 @@ bool IoReactor::SubmitDisconnect(IoSocket s, bool reuse,
 
 // Re-submits a request whose fields are already filled -- IoStream's chaining path, which builds a
 // request when a transfer is queued and submits it when its turn comes.
+// ---- THE CHAIN HANG: FIXED 2026-08-30, AND IT WAS A SHORT WRITE ---------------------------------
+//
+// SOLVED, and not by the theory that stood here. This block used to say the hang was a shape
+// mismatch -- that SubmitSend/SubmitRecv never call FillBufs, so a chained re-submit replayed
+// WRITEV/READV over an uninitialised iovec aliasing the accept path's addrlen. That reasoning is
+// sound and it described a path that DOES NOT EXIST: SubmitPrepared's only caller is
+// IoStream::SubmitChained, which always calls FillBufs and always sets bufCount, so every request
+// reaching here was correctly described. The scalar-then-replay case was never reachable.
+//
+// WHAT IT ACTUALLY WAS, from JLIB_IO_TRACE against real io_uring: every SQE got a CQE -- there was
+// never a lost completion -- and the CQEs read
+//
+//     SUBMIT op=WRITEV bufCount=2 (98304 bytes)  ->  CQE res=32741
+//     SUBMIT op=WRITEV bufCount=2 (98304 bytes)  ->  CQE res=47616
+//     SUBMIT op=WRITEV bufCount=2 (98304 bytes)  ->  CQE res=65483
+//
+// SHORT WRITES. A stream socket takes what fits in its send buffer and reports that; nothing
+// advanced the descriptors or re-submitted the remainder, so the transfer was reported COMPLETE
+// having sent a third of its bytes and the peer waited forever for the rest. A starved reader and a
+// dropped completion are indistinguishable from the outside, which is why this read as a lost CQE.
+//
+// THE FIX IS IN THREE PLACES: the partial-send retry in the completion drain (which is the bug),
+// IoRequest::xferred to carry the running total, and the shape-correct replay below. The scalar
+// submits now fill their descriptors too -- so the standing worry, though it was not the bug, is
+// closed rather than left latent.
+//
+// RULED OUT AND CONFIRMED: link-before-submit and unlink-under-shard-lock are correct, the cancel
+// sentinel drops only the cancel ack, and uring::Submit(ring, 0) publishes fine -- every submit
+// traced rc=1 and every one produced a CQE.
+//
+// JLIB_IO_TRACE=1 prints one line per SQE and one per CQE, paired by request pointer, and
+// JLIB_IO_URING_FORCE=1 overrides the IsAvailable gate so the path can be run at all. Both are how
+// this was found; leave them.
+//
+// STILL DO NOT FLIP IsAvailable() -- see the note there. The chain completes now, but seven checks
+// after it do not.
 bool IoReactor::SubmitPrepared(IoRequest* req) {
     if (!req) return true;
     const bool isSend = (req->kind == IoRequest::Kind::Send);
     const IoSocket s = reinterpret_cast<IoSocket>(req->handle);
+
+    // NOTHING TO REPLAY. bufCount == 0 means this request never described a buffered transfer --
+    // an accept, a connect, or a msghdr op that owns its own iovec and would lose its peer address
+    // if replayed as SEND/RECV. Building an SQE from descriptors that were never filled is exactly
+    // the failure this refuses to have: it fails loudly instead of submitting garbage and waiting.
+    if (req->bufCount == 0) {
+        if (req->out) *req->out = IoResult{ IoStatus::Failed, 0, EINVAL };
+        return true;
+    }
+
+    // ---- ONE SEGMENT REPLAYS AS THE SOCKET-NATIVE OP ----------------------------------------
+    //
+    // SEND/RECV rather than WRITEV/READV whenever the transfer is a single span, which after a
+    // partial advance is the common case. WRITEV with off = -1 is a FILE convention, and reaching
+    // for it on a socket puts the transfer through the read/write path instead of the socket's --
+    // some kernels treat it as pwritev on a socket and simply sit there. This also carries
+    // msg_flags, which READV and WRITEV have no way to express, so MSG_* stops being silently
+    // dropped on the chained path the way it was.
+    if (req->bufCount == 1) {
+        return SubmitOp(impl, req, req->out, req->resume, CancelToken(req->token),
+                        [&](io_uring_sqe* sqe) {
+            sqe->opcode    = isSend ? IORING_OP_SEND : IORING_OP_RECV;
+            sqe->fd        = static_cast<int>(s);
+            sqe->addr      = reinterpret_cast<std::uint64_t>(Iov(req)[0].iov_base);
+            sqe->len       = static_cast<std::uint32_t>(Iov(req)[0].iov_len);
+            sqe->msg_flags = req->flags;
+        });
+    }
+
     return SubmitOp(impl, req, req->out, req->resume, CancelToken(req->token),
                     [&](io_uring_sqe* sqe) {
         sqe->opcode = isSend ? IORING_OP_WRITEV : IORING_OP_READV;

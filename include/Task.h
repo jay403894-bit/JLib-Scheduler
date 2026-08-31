@@ -15,7 +15,6 @@ namespace JLib {
     // that include Task.h without ever naming a WaitGroup. Callers get it via TaskScheduler.h.
     struct WaitGroup;
 
-    enum class FiberSize : uint8_t { Standard, Heavy };
 
     // Replaces the `noFiber` bool in 2.0: requesting suspend capability used to mean writing
     // `noFiber = false`, a double negative repeated at every call site that needed it, each
@@ -75,7 +74,8 @@ namespace JLib {
     // expansion site in Task.
     //
     //   hiPri         queue order only, never placement, never OS priority.
-    //   requiredSize  Standard or Heavy fiber stack.
+    //   (a requiredSize bit sat here: Standard or Heavy fiber stack. Removed with the heavy
+    //    stack class -- it was written by CreateTask and read by nothing.)
     //   type          Native / Fiber / Coroutine. TWO bits: three values today, room for a fourth.
     //                 Defaults to Native here as well as in CreateTask -- the predecessor field
     //                 (noFiber) defaulted the opposite way from CreateTask's parameter, which only
@@ -94,7 +94,6 @@ namespace JLib {
     //                 inverse default would make an oversight leak captures silently.
 #define JLIB_TASK_FLAG_FIELDS            \
         uint8_t   hiPri         : 1;     \
-        FiberSize requiredSize  : 1;     \
         TaskType  type          : 2;     \
         uint8_t   priorityBoost : 1;     \
         CorePref  corePref      : 2;     \
@@ -227,12 +226,12 @@ namespace JLib {
         // Members are listed in declaration order so the initialization order is the written one.
         Task()
             : fn(nullptr), data(nullptr), assignedFiber(nullptr), next(nullptr),
-              hiPri(0), requiredSize(FiberSize::Standard), type(TaskType::Native),
+              hiPri(0), type(TaskType::Native),
               priorityBoost(0), corePref(CorePref::Default), trivialDtor(0) { ; }
-        Task(Func f, void* d = nullptr, uint8_t hipri =false, FiberSize size = FiberSize::Standard)
+        Task(Func f, void* d = nullptr, uint8_t hipri = false)
             // hipri is a uint8_t taking any value; normalize rather than truncate into one bit.
             : fn(f), data(d), assignedFiber(nullptr), next(nullptr),
-              hiPri(hipri ? 1 : 0), requiredSize(size), type(TaskType::Native),
+              hiPri(hipri ? 1 : 0), type(TaskType::Native),
               priorityBoost(0), corePref(CorePref::Default), trivialDtor(0) {
         }
         virtual ~Task() {
@@ -310,7 +309,10 @@ namespace JLib {
             };
 
             probe([](TaskFlagPacking& f) { f.hiPri         = 1; });
-            probe([](TaskFlagPacking& f) { f.requiredSize  = FiberSize::Heavy; });
+            // A requiredSize probe sat here. Removing the field CHANGES THIS FINGERPRINT, which is
+            // correct and is the point: the flag block's layout really did change, so a library
+            // built before the removal must not link against a header from after it. The guard will
+            // say so by name instead of faulting at an unrelated address.
             probe([](TaskFlagPacking& f) { f.type          = TaskType::Coroutine; });
             probe([](TaskFlagPacking& f) { f.priorityBoost = 1; });
             probe([](TaskFlagPacking& f) { f.corePref      = CorePref::Wide; });

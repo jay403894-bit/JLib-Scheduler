@@ -7,6 +7,70 @@ make it wrong.
 
 ---
 
+## 2026-08-28 — The context switch pays an SSE/AVX transition, and it is 9x
+
+**A fiber that parks straight out of an AVX kernel was costing ~9x a normal switch, on every
+switch.** `ContextSwitch.asm` saves XMM6-15 with legacy-SSE `movdqa`; executing legacy SSE while the
+upper halves of YMM are live costs an SSE/AVX transition. A vectorised workload is in that state
+every time it suspends, so it paid it every time.
+
+Measured by `bench/context_switch.cpp` — all arms in ONE process against ONE pair of stacks, reps
+interleaved, medians, on a 13900K. Reproduced by two people on two machines to within 1.5%:
+
+| | ns/switch | ratio |
+|---|---|---|
+| `movdqa`, dirty upper state (what shipped) | 85.8 | 1.000x |
+| same, again — **same-vs-same control** | 85.9 | **1.001x** |
+| `vzeroupper` + `movdqa`, dirty | 9.2 | 0.107x |
+| `vmovdqa` (VEX), dirty | 9.2 | 0.108x |
+| `movdqa`, CLEAN upper state | 9.2 | 0.107x |
+
+**Three independent ways of avoiding legacy-SSE-with-dirty-upper all land on the same 9.2 ns.** That
+triangulation is what the result rests on, not on any account of the microarchitecture — the
+magnitude is larger than a reading of Raptor Lake's documented blend behaviour predicts, and no
+explanation offered here would be worth more than the three-way agreement.
+
+### The rule
+
+> **One `vzeroupper` at the top of `ContextSwitch`, gated on a CPUID'd byte.**
+>
+> It covers BOTH halves of the routine — the saves for the outgoing fiber and the loads for the
+> incoming one — because nothing between them re-dirties the upper state.
+
+**Why gated rather than unconditional: `vzeroupper` is ITSELF an AVX instruction**, and so is
+`vmovdqa`. Either one taken unconditionally raises the whole library's floor from baseline x86-64 to
+AVX (2011+) — a real change to what it claims to run on, in exchange for an optimisation that has
+nothing to optimise on a pre-AVX CPU: no AVX means no dirty upper state means no transition. The
+gate is one load from an always-hot line plus a perfectly-predicted branch, measured at **~0.35
+ns/switch** against ~76 ns saved.
+
+`JLibCtxHasAvx` is constant-initialised to 0 and only ever raised, so a switch that happens before
+the initialiser runs behaves exactly as it did before this change: correct, and slower. There is no
+ordering in which the gate fails dangerously.
+
+**Destroying upper YMM state here is legal, not a liberty.** The upper halves are volatile across a
+call under the Win64 ABI and a context switch is an opaque call, so anything live up there is
+already spilled to the fiber's own stack. `tests/avx_suspend_test.cpp` is the standing check and
+passes against the gated version — it is now load-bearing rather than reassuring, because the switch
+actively zeroes the state that test cares about.
+
+### What this rules out
+
+- **Windows only.** The POSIX x86-64 switch has NO XMM block at all — SysV makes every XMM
+  caller-saved — so it executes zero legacy-SSE instructions and has nothing to fix. AArch64 has no
+  SSE/AVX domains. Do not go looking for this elsewhere.
+- **`vmovdqa` (VEX) was measured, not dismissed** — identical at 9.2 ns. It was not taken because it
+  carries the same AVX floor while being a twenty-instruction rewrite of a routine that was already
+  correct, against a one-instruction addition.
+
+### What would make it wrong
+
+Absolute numbers moved ~1.3 ns between batches on the same binary, INCLUDING the unchanged floor
+row. Ratios held. Anyone re-running this should read the ratios and check that the same-vs-same
+control still reads ~1.00x before believing any other row.
+
+---
+
 ## 2026-08-27 — Choosing a reclamation scheme: epochs or hazards
 
 **FIRST, THE CASE WHERE THERE IS NO CHOICE.** A structure behind a fiber-aware LOCK gets hazards,
@@ -466,3 +530,161 @@ verified from the non-coroutine side, which holds the line.
 **`Retire(nullptr)` staying a silent no-op.** Making it fatal is a genuine API behaviour change:
 `free(nullptr)` semantics is what a caller reasonably expects, and lenient cleanup paths may depend
 on it. It deserves an audit of every call site before the trigger is pulled, not a quick edit.
+
+## Park primitive: WaitOnAddress vs condition variable (4.0.2, open A/B)
+
+`TaskScheduler::SetParkPrimitive` / `JLIB_PARK=cv` / bench `park=cv|park=wait` select what a worker
+blocks on when it parks. Default `WaitAddress` = `WaitOnAddress` on Windows, `FUTEX_WAIT_PRIVATE` on
+Linux. `CondVar` = a per-worker `std::mutex` + `std::condition_variable`, the pre-futex mechanism.
+
+**Why the flag exists.** `bench/futex_variance.cpp` says condvar has the tighter wake distribution,
+and it has now said so twice (stddev 0.71x, p99 0.96x, re-run at N=5000 on 2026-08-29). But that
+harness is a two-thread ping-pong: it has no push path, and the push path is the only place the two
+primitives differ in cost. **The isolated bench cannot decide this and should not be cited as if it
+had.**
+
+**What actually differs.**
+- Condvar must publish `WS_AWAKE` *inside* the waiter's mutex. A condvar has no memory, so the lock
+  is the only thing that closes the lost-wakeup window that `WaitOnAddress` closes with its value
+  compare. That puts a mutex acquire on the notify path -- which is what got condvar replaced.
+- The `WaitAddress` arm pays four seq_cst flag loads, a CAS and three inbox re-reads before it
+  blocks. The condvar arm does that same work inside the predicate, under a lock it already holds.
+- The reason the trade may have changed shape since it was first decided: `NotifyWorker` now skips
+  entirely when the target is awake, so on a floored pool the notify mutex is only taken when a
+  worker is genuinely parked.
+
+**How to read the A/B** (`build/park_ab.ps1`, interleaved arms, min across reps):
+- `latency` is a **control, not a result**. It reports `kernel wakes: 0` -- with a live floor nobody
+  parks on that row, so neither primitive is called. Movement there is the noise floor.
+- `burst` (idle pool, every wake is a kernel wake) and `throughput/1p` (one producer, 31 workers
+  running dry) are the rows where the primitive is actually exercised.
+
+**Linux is not part of this.** `FUTEX_WAIT` and `WaitOnAddress` are different primitives with
+different costs; a Windows condvar win is not a reason to touch the futex park. Linux keeps
+`WaitAddress` unless separately measured on WSL.
+
+### Correction (same day): the first A/B row could not see the park at all
+
+The A/B above was first run on `burst` and `throughput/1p` in the DEFAULT config. Both are blind to
+the thing being tested, and the wake counters now printed on those rows are what proved it:
+
+| row | kernel wakes | row time | park share |
+|---|---|---|---|
+| `burst` | 15 | 14,230 us | 0.3% |
+| `throughput/1p` | 813 / 5 runs | 66 ms | 0.7% |
+| `latency` | 0 | -- | 0% |
+
+A wake is ~3 us. Under 1% of every row, against +/-40% run-to-run noise on `burst`. Seven interleaved
+reps of that produced exactly what it had to produce -- noise with no direction -- and it would have
+printed the same had the arms differed by 2x. **The awake floor is why: its whole purpose is to keep
+workers off the park, and it succeeded.**
+
+The row that CAN decide it is the latency row with the floor switched off:
+
+```
+SchedulerBench.exe park=wait|cv floor=0 nogrow resv=0 nosweep noev
+```
+
+`latency` then does ~19,400 kernel wakes for 20,000 round-trips and the mean moves 0.57 us -> 4.34 us,
+so ~87% of the row is the park. The printed wake count is a VALIDITY CHECK on every rep: if it is not
+~20,000 the row is not exercising the park and that rep says nothing.
+
+**Generalise this.** Before A/B-ing a mechanism, print how much of the row the mechanism accounts for.
+"No difference" and "the mechanism was never called" are the same output otherwise.
+
+### Result (2026-08-29): `WaitAddress` stays. Measured, not assumed.
+
+7 interleaved reps per arm at `floor=0 nogrow resv=0`, ~19,400 wakes / 20,000 round-trips:
+
+```
+wait  mean min 4.09 med 4.18 | p50 min 4.00 med 4.10 | p99 min 5.60 med 6.50 | max min 104.20
+cv    mean min 4.32 med 4.37 | p50 min 4.20 med 4.30 | p99 min 5.90 med 6.60 | max min 103.10
+```
+
+Mean and p50 separate with **no overlap between arms** (7-vs-7, p ~ 1/3432): ~0.17 us/round-trip, ~4%.
+p99 overlaps and `max` is 103-318 us in both -- that tail is preemption, not the park.
+
+**`bench/futex_variance.cpp`'s stddev 0.71x does not transfer to the scheduler.** It measures a
+two-thread ping-pong with no push path; treat it as characterising the primitives in isolation and
+nothing more.
+
+**Why condvar loses, and it is not mainly the notify mutex:** a condvar wake must reacquire the mutex
+inside `SleepConditionVariableCS` before it can return and re-check its predicate, so the woken thread
+takes a lock before it can run. `WaitOnAddress` returns straight to the work loop.
+
+The `CondVar` arm stays in-tree as the standing negative control for this claim.
+
+### Darwin: `CondVar` is the default there, and the Windows result does not apply
+
+`ParkPrimitiveDefault()` returns `CondVar` on `__APPLE__`. Not a fallback -- the only option. Darwin
+has no address wait (`WaitOnAddress` is Windows, `FUTEX_WAIT` is Linux, `__ulock_wait` is private
+API), so the `#else` arm of the park loop is a bare `break`: **every idle worker spins on its core**,
+and the awake floor is meaningless because no worker was ever going to park.
+
+That is what the condvar buys on Darwin, and it is why the ~4% Windows loss is irrelevant there --
+the comparison on Darwin is not condvar-vs-futex, it is condvar-vs-spin. `JLIB_PARK=wait` still
+selects the spin, which makes it the negative control for exactly this claim.
+
+Consequence: the awake floor is now a real feature on all three platforms, and `GetAwakeFloor()` is
+no longer advisory anywhere. The stale "Darwin has no park" comments in `Thread.cpp` are gone.
+
+Not verified on real hardware -- no macOS runner was used for this change. Both arms are green on
+Linux (used as the POSIX proxy) and on Windows.
+
+---
+
+## Migration, mailboxes, and the lock split (design intent, not yet all implemented)
+
+### Fibers migrate, and it decides four subsystems
+
+A resumed fiber may continue on ANY worker. Full reasoning is at the top of `TaskScheduler.h`; the
+short version is that pinning exists to protect a library from `thread_local` state it cannot audit,
+and a game engine owns every job on its fibers -- so the hazard becomes a rule we enforce rather than
+a structure we build. And stack warmth decays with suspend duration while waiting for one specific
+worker does not, so under a frame deadline resuming NOW on a cold stack beats resuming later warm.
+
+What pays for it: `SlabPool::Free` routes by address, epochs use a global participant list with CAS
+rather than a per-shard scheme, and hazard cells are indexed by the fiber rather than the thread.
+
+**A sharded reclamation design (Seastar-shaped: shared-nothing per core, cross-core frees as
+messages) is cheaper and scales better -- and is unsound under migration**, because a read that
+starts on worker A and finishes on B belongs to no single shard. That branch requires pinning. Pick
+one and follow it; the expensive mistake is paying migration's costs while accepting pinning's
+constraints.
+
+### Mailboxes are faster round-trip; deques are faster parallel
+
+No single structure is both. A mailbox is one hop with a single legal consumer -- which also makes it
+*de facto* affinity, since a task returned to its owner's inbox resumes on that worker with the stack
+warm. That is pinning's benefit as a PLACEMENT rather than a rule, and the drain to the deque is the
+escape hatch for when the owner does not come back promptly.
+
+Consequence, and it cost a day to rediscover: work in an inbox is invisible to the pool until its
+owner passes through its loop. A 16-task wave of 3.3 ms bodies aimed at two never-parking workers
+reached 9 of 31 workers; the same wave through `PushBatch` reached 18-30. That was the CALLER, not
+placement -- `Push` means "start this now", `PushBatch` means "here is a pile".
+
+### The lock split: spin first, then suspend -- and two types, not one branch
+
+Parking immediately is the wrong half for a frame, where most holds are microseconds. The shape to
+build is marl's: spin for the short case, and after a timer suspend the fiber/coroutine. Uncontended
+cost stays spinlock-cheap; long holds still do not burn a core.
+
+**Two lock types, chosen by call site, not one type branching at runtime.** The invariant that makes
+suspension possible -- every running context is a fiber or coroutine -- holds INSIDE the pool and
+nowhere else. Main and bare app threads can only block, and a worker-style lock that helps (runs
+other tasks while waiting) must never be used from main, which would run arbitrary work while holding
+frame state. One type serving both means an unpredictable branch on a hot path and two different
+semantics wearing one name.
+
+### Deferred work: epoch decides WHEN, shard routing decides WHERE
+
+Keep them separate. A cross-thread free should be an intrusive push onto the owning shard's list
+(the dead slot's own first word is the link -- no allocation, and single-consumer makes it ABA-free),
+drained by the owner when its local cache runs dry.
+
+Do NOT make freeing a task. It stacks two independent deferral mechanisms on one operation -- the
+epoch's "safe at epoch N" and the mailbox's "whenever the owner gets round to it" -- so the actual
+free happens at the max of two things that do not know about each other. And a free-task must be
+allocated from the slab, so reclaiming memory would consume memory, which fails exactly under the
+pressure that makes frees urgent.

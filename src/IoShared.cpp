@@ -74,6 +74,9 @@ namespace JLib {
         req->kind      = kind;
         req->bufCount  = count;
         req->flags     = flags;
+        // Reset per transfer: this request may be recycled, and a stale partial-send total would be
+        // added to a completion that never had one. See IoRequest::xferred.
+        req->xferred   = 0;
         req->out       = out;
         req->resume    = resume;
         req->token     = token.Raw();

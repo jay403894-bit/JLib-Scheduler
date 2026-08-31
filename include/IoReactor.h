@@ -209,7 +209,24 @@ namespace JLib {
 
         // Segment count, so a QUEUED transfer can be submitted later without the caller's argument
         // list still being alive. The descriptors themselves are already in `native`.
+        //
+        // ALSO THE REPLAY SHAPE on the io_uring backend, where a request can be handed to the kernel
+        // more than once: 0 means "not a buffered transfer" (accept, connect, or a msghdr op that
+        // owns its own iovec), 1 means one segment and replays as the socket-native SEND/RECV, and
+        // >1 means vectored and replays as WRITEV/READV. Every buffered submit fills the descriptors
+        // now, including the scalar ones, so a re-submit can never disagree with the first submit
+        // about what operation it is.
         std::uint32_t bufCount = 0;
+
+        // BYTES ALREADY TRANSFERRED BY EARLIER PARTIAL COMPLETIONS of this same request.
+        //
+        // A stream socket may take fewer bytes than it was given -- measured on Linux at 32741 of
+        // 98304 -- and the caller's contract is complete-or-fail, matching Windows. So a partial
+        // send advances the descriptors and re-submits, and this carries the running total so the
+        // FINAL completion can report what the caller actually asked for rather than the size of
+        // the last fragment. Zero for anything that completes in one go, which is everything on
+        // Windows and most things everywhere.
+        std::uint32_t xferred = 0;
 
         // Called on the completion thread, OUTSIDE every lock, BEFORE `resume` is pushed. It is how
         // IoStream starts the next queued transfer the instant the current one finishes -- which is

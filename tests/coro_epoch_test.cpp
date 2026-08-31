@@ -246,6 +246,6 @@ int main() {
 
     std::printf("\n%s -- %d failure(s)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     for (int i = 0; i < g_failedCount; ++i) std::printf("  FAILED: %s\n", g_failed[i]);
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     return g_fail ? 1 : 0;
 }

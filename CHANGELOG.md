@@ -3,6 +3,519 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
+## 5.0.0 - unreleased
+
+**Two controllers, one packed word.** 4.0.1 shipped adaptive K and the awake floor as two mechanisms
+that each kept their own idea of where the bands were. This makes them share one 64-bit word, gives
+the K controller the inputs it never had, and fixes the family of bugs that a *moving* band exposed
+-- all of which were correct at K=0, which is why they survived.
+
+**Why the major bump.** This was numbered 4.0.2 while it deleted the hiPri Chase-Lev deques, changed
+what `SetHotWorkers` means, and removed `Join()` from the public API. 4.0.1 had already removed
+`PushImmediate`. Those change what the API *means*, not just what it does, and three patch numbers
+in a row were making trees that behave differently report nearly the same version.
+
+### Teardown is destructor-only, and now it actually happens
+
+- **`Join()` is no longer public.** It advertised a teardown that could be followed by a restart, and
+  no such restart has ever existed: `Init()` throws on a non-null `instance`, `Join()` never cleared
+  it, and `StartPool` is private with the constructor as its only caller. So the Join-then-Init cycle
+  its own comments described could not be reached from outside the class. Nothing depended on it --
+  Game01 never called it, which is why the task-size reporter has always been an at-exit hook.
+
+- **[CRITICAL] The destructor that was supposed to call it never ran.** `instance` was `new`'d in
+  `Init()` and deleted by nothing, in any program, ever. So `~TaskScheduler()` -- the only remaining
+  caller of `Join()` -- had never once executed, and making `Join()` private without noticing would
+  have turned teardown into unreachable code that still read as load-bearing. Every parked frame in
+  every process that ever used this library was abandoned at exit: destructors unrun, WaitGroup slots
+  never decremented, hazard records never returned. `TaskScheduler::AtExitDestroyer` closes it.
+  `tests/atexit_teardown_test.cpp` is the proof, and it is built so that silence fails.
+
+- **At exit the pool joins and then LEAKS, deliberately.** `delete instance` was tried and it
+  crashes -- reproducibly, access violation, on `Init(0); return;` with nothing parked. Not in
+  `Join()`: the drain completes and every worker stops cleanly. It dies afterwards in
+  `TaskScheduler`'s own member destruction, which is unsurprising for a path that had never run
+  being asked to run during static destruction. `Join()` is where the value is (service threads
+  stopped, primitives drained, frames unwound, workers joined); destroying the members after it buys
+  a process about to exit nothing the OS is not about to do anyway.
+
+- **`JLib::detail::TeardownForTesting(scheduler)`** replaces the public entry for the two callers
+  that legitimately need a mid-process teardown: `tests/teardown_drain_test.cpp`, where the drain is
+  the thing under test, and `bench/compare/compare_{marl,taskflow,enkits}.cpp`, which tear JLib down
+  **before timing a competitor** so an idle JLib pool is not taxing someone else's numbers. That is a
+  fairness property of every cross-library row in the README, not a convenience. It is not a restart
+  and it is not supported API.
+
+- **Which parked waiters teardown can reach, now asserted in both directions.** A waiter is woken at
+  teardown only if it can be told it did not acquire: `SchedulerMutex` and `SchedulerSemaphore` both
+  gate ejection on the waiter carrying a `result` pointer, so a plain `Lock()` or `Wait()` is left
+  parked -- waking one would return it to a caller that believes it now holds a lock or a permit it
+  never took. `SchedulerConditionVariable` ejects everyone and is not an exception: a CV may wake
+  spuriously by contract and its `Wait()` re-acquires the mutex, so a plain CV waiter is handed
+  nothing. `tests/teardown_drain_test.cpp` now has one arm per (primitive, wait-flavour) and asserts
+  the plain arms stay parked, so the policy cannot be flipped without an argument.
+  **Consequence, stated because teardown cannot detect it:** a frame parked on a plain `Wait()` never
+  unwinds, and the quiescence loop reads `busy`, the inboxes and the deques -- a parked frame is in
+  none of them, so an abandoned frame reads as a quiet pool and shutdown reports success.
+
+### The latency lane is staffed, and its overflow is reachable
+
+- **`EnableIoReactor(true)` now implies `SetIoHotLane(1)`.** That wiring never existed:
+  `SetIoHotLane` had **no callers anywhere in the tree**, so every reactor application ran at K=0 --
+  hiPri routed to the ordinary lane, no worker reserved, none kept awake. What `EnableIoReactor`
+  reserved was a *core* for the completion thread, which is pool budgeting and a different question.
+  The cost was paid on the first completion after any idle gap, which for bursty traffic is every
+  burst. Applied as a **default, not an override**: an app that already called `SetIoHotLane(k)` or
+  armed a range keeps what it asked for, in either order.
+
+- **Arming an adaptive K range now turns never-park on.** `SetHotWorkerRange(min,max)` with
+  `max > min` clamps `minK` to 1, and the stated reason for that clamp is *"at least one worker that
+  is ALREADY SPINNING and takes the completion immediately."* Never-park had been removed from this
+  path on the grounds that it *"bought a permanently spinning band even while the controller kept K
+  at its minimum of zero"* -- and the clamp makes that minimum unreachable, so the objection no
+  longer applies. **Still not on `SetHotWorkers(k)`**: a static K is the common case and most of
+  those callers want reservation, not a burnt core.
+
+- **[CRITICAL] hiPri work queued behind a busy reserved worker was reachable by nobody.** The lane
+  is an MPSC with one legal consumer, so it is exactly as reachable as its owner -- and an owner
+  inside a task body is not in `Worker()`, so it reaches neither the lane pop nor any drain of its
+  own. `TryTakeLaneTask` covers the *blocked* owner and the spin-help drain explicitly skips the
+  lane, so nothing covered the *busy* one. With `EnableIoReactor` now implying K=1 this became the
+  default path: one long completion stranded every completion behind it, for the duration of the
+  body. `TaskScheduler::HiPriSpillTarget` redirects at the **producer** -- the last point at which a
+  definitely-running thread gets to decide -- preferring the awake floor, skipping sleeping workers
+  (waking one changes which microseconds the task waits, not how many), rotating so overflow
+  spreads, and bounded to 8 probes so a loaded pool does not put a sweep on the push path.
+  **No new structure**: overflow goes to another worker's hiPri *inbox*, which every worker drains
+  before its own deque, so it keeps hiPri priority rather than being demoted into bulk work. The
+  lane stays inbox-only and the io p99 win stands. `GetHiPriSpillCount()` reports the count; a
+  rising one is the K controller's promote case, not an error.
+  Covered by `tests/hipri_spill_test.cpp`, whose negative control (spill disabled) strands **0 of 8**.
+
+### Breaking
+
+- **`SetHotWorkers(k)` no longer implies never-park.** It sets K and nothing else. Reservation
+  ("don't run bulk work here") and spinning ("never sleep") are separate purchases, and folding them
+  together charged every caller who wanted the first a ~35% ordinary-latency tax for the second.
+  **Use `SetIoHotLane(k)`** for both -- the reactor's configuration -- or call
+  `SetReservedNeverParks(true)` explicitly. `SetHotWorkerRange` no longer sets it either: merely
+  declaring a range used to buy a permanently spinning band while K sat at its minimum.
+  **Exception:** while a range is armed (`max > min`) the reserved band never parks regardless of the
+  flag. Idleness there has one owner -- the controller sheds K -- and a reserved worker that parks
+  hands the next completion exactly the OS wake the band was bought to remove.
+- **The hiPri Chase-Lev deques are deleted.** The latency lane is the MPSC inbox and nothing else.
+  A deque exists so *other* threads can steal from it; nobody steals lane work, and staging through
+  a deque added a push-and-pop by the same thread on the one path that exists for latency. The
+  gated hiPri steal in `tryStealFrom` goes with it -- an MPSC has exactly one legal consumer, so a
+  second thread popping it is a data race, not a slower steal. Saves a 32,768-slot ring per worker
+  that nothing read from. **Consequence, stated plainly:** a completion queued behind a busy owner
+  can no longer be relocated. K is what buys that back.
+- **`SetLaneWake` / `GetLaneWake`, `SetLaneHintMode` / `GetLaneHintMode` and `kLaneStealDepth` are
+  removed** -- all three were documented in 4.0.1 and all three became unreachable with the lane
+  deque. `WakeForLane` woke ordinary workers to drain a buried worker's lane, which an MPSC makes
+  impossible; it had **zero callers** by the time it was deleted, and `laneHintMode` had zero
+  readers. A knob three benches set and nothing reads is the same failure as a flag that gates
+  nothing.
+- **`HotScalingActive()` is removed.** It claimed to be the controller's master off-switch and
+  **nothing read it** -- `MaybeAdjustHotWorkers` gates on `max > min` directly. A dead flag that
+  reads live is worse than none: it invites gating a *new* mechanism on it, which is exactly what
+  almost happened to the observer below.
+- **`WorkerServesHiPri(q)` is removed.** It was `q < GetHotWorkers()` -- a third name for a question
+  the worker already answers from its pass snapshot, and a second load to answer it with.
+- **`laneSetDepth` / `laneClearDepth` defaults are 1 / 0**, from 4 / 3. See the fix below.
+- **`LockFreeList.h` and `LockFreeHashMap.h` are removed**, along with `bench/tsan_probe.cpp`.
+  They had no production caller since 2.15.0 -- both of their consumers had already migrated to
+  structures that fit their access patterns better (Event's waiter index to a flat array keyed by
+  `Fiber::poolIndex`, `TaskNode::dependents` to DAG-owned chunk storage), and the header said so.
+
+  **A data structure the library hands out must not share the library's allocator.** These did:
+  `LockFreeList` takes a `TaskAllocator&` and reclaims through `EpochManager::RetirePtr`, so
+  anyone reaching for "a lock-free hashmap" would have linked a fiber scheduler to get one.
+  Shipping them would have meant a `Reclaimer` policy whose default works with no infrastructure
+  at all -- a different data structure, not a relocated file.
+
+  **The coupling itself was never the defect.** `TaskDeque`, `TaskMPSCQueue`, `TaskNode` and
+  `Coroutine` all share the slab and the epoch domain, and that is exactly why they are fast; they
+  are internal and never claimed otherwise. `LockFreeHashMap` was the one header in the tree that
+  called itself general-purpose *and* took both. Epochs and hazards stay -- they are the
+  scheduler's own reclamation, live on the worker idle path (`HazardDomain::Instance().Scan()`),
+  and were never candidates to hand out.
+
+  The lesson the header recorded is worth more than the code and is kept: **when the keys are
+  already a dense bounded index, they are a better index than any hash of them.**
+
+### The packed band word
+
+`F` (bits 0-7), `Fbase` (8-15), `K` (16-23), `Kmax` (24-31), `Kmin` (32-39) in one
+`atomic<uint64_t>`. Every mutate is a CAS with release; `GetBands()` is one acquire load returning
+all five. The CAS refuses rather than accommodates: `K + F <= N`, `F >= Fbase`, `K <= Kmax`, and
+**F is never decremented to make room for K** -- that would make a compute worker reserved while it
+may still hold a loPri leaf. When both want space, F sheds first and K grows on a later pass.
+
+**The worker takes one snapshot per pass** and decides reserved / floor / OS priority / the collapse
+call site / the steal refusal / the stray hand-off from it. Exactly one re-read remains, immediately
+before blocking, and only to catch F *growing over* us. Previously the loop took five `GetBands()`
+plus `GetHotWorkers()` and `GetHotWorkerRange()`; the failure that produces is a worker parking on
+the old F while the notifier skips it on the new one.
+
+`Kmin` moved into the word because the scaling range was the last place K had a second home --
+`g_hotMin` / `g_hotMax` are gone.
+
+- **[CRITICAL] `GetBands()` enforces `K + F <= N` in Release, not only under `assert`.** A wrong
+  decode once returned `k = 514` (the old 16-bit layout read through the new 8-bit fields): every
+  worker believes it is reserved, the notify skip uses that k, wakes are dropped, and the pool
+  livelocks at any pool size. The asserts stay and now judge the *raw* decode, so they still fire on
+  the cause; the clamp keeps Release alive rather than hanging.
+- **[CRITICAL] `N == 1` forces `K = 0, F = 1`.** The single worker was previously kept out of the
+  park path only by `Fbase` defaulting to 2 -- `floor=0` armed the single-worker lost-wakeup path.
+
+### Lost wakes when a band sheds
+
+Both of these are invisible in steady state: the member set only *shrinks* on a shed, and that is the
+only pass on which the two readers can disagree. Symptom was an intermittent freeze that required
+`hotprio` **and** `hotrange` together -- the configuration where sheds actually happen.
+
+- **[CRITICAL] `NotifyWorker` no longer skips on band membership.** It answered "is q in the
+  never-park set right now" when the only question a skip may answer is "has q committed not to
+  block". The worker parks on the new word while the pusher skips on the old one; the push lands in
+  an inbox whose owner just blocked, inboxes are not stealable, and the task is unreachable. Skips
+  now only on `WS_AWAKE` -- the sleeper's own seq_cst state, paired with the post-`WS_SLEEPING`
+  re-test, which is the handshake `sleepwake_model.c` actually models.
+- **[CRITICAL] Park predicates use `quiescent()`, not `empty()`.** `TaskMPSCQueue::empty()` never
+  reads `head_`, so a push that has committed its `head_.exchange` but not yet stored `next` reads
+  as empty -- and one failed `pop` lies the same way. Survivable in the search loop (found next
+  pass), fatal in a park decision on an owner-only queue. `quiescent()` also reads `head_`; the
+  search loop keeps the cheap `empty()` deliberately, since `head_` is the producers' contended line.
+- **A floor member can no longer complete a park.** The post-commit re-read is now a guard: if the
+  band moved over the worker between the pre-park check and the sleep commit, it restores `WS_AWAKE`
+  and turns around. Counted and reported by the bench (1-5 catches per run under adaptive K).
+
+### The off-by-K family
+
+Four sites used floor *widths* as absolute indices. Every one is correct at `K == 0`, which is the
+default and why they all survived:
+
+- The collapse call site asked for `q >= K + Fbase`. That set can be **entirely asleep**: measured at
+  K=2/Fbase=2/F=6 on 31 workers, every worker in `[4,31)` had parked, the 25 ms idle settle recorded
+  `collapse calls=0` -- not refused, never *called* -- and F sat at 6 for the rest of the run. The
+  floor is the one band that cannot be asleep, so the shed is now driven from inside it, `[K, K+F)`,
+  which includes the base workers that spin for the whole run.
+- `SetAwakeFloor` woke `[prev, k)` instead of `[K+prev, K+k)`.
+- `SetHotWorkersEffective` woke the indices whose *reserved* membership changed, but the floor window
+  slides with K -- on a grow, its new tail `[prev+F, eff+F)` could already be parked, so a worker
+  became a floor member in its sleep.
+- `ParallelFor`'s wake victims started at `max(K, F)` instead of `K + F`, spending up to half of a
+  range's opening wave on floor workers that were already spinning.
+
+### The K controller's observer
+
+- **`laneBusyNs`, `laneTasksRun` and `laneCyclesTotal` had no writer.** `MaybeAdjustHotWorkers`
+  `exchange`d all three every window and nothing incremented them, so `low = (topTasks == 0)` was
+  unconditionally true: an enabled controller would have **shed on every window**. That is the real
+  reason adaptive K "never ramped". They are now written at dispatch, closed on **both** completion
+  arms -- Native and Coroutine `continue` out before the fiber arm, and I/O completions are exactly
+  Native and Coroutine, so closing only there would have measured zero for the entire workload K
+  exists to serve. The whole block is gated on `kmax > kmin`, read from the same snapshot the
+  controller uses, so static K pays one comparison and no clock read.
+- **The lane hint could never set.** The hint's input became presence (0/1) when the lane became an
+  inbox, but `laneSetDepth` still defaulted to 4 -- `depth >= 4` is never true against a binary
+  signal, so the bit never set, which silently killed both the controller's `adv == mask` promote
+  *and* the edge-triggered call in `UpdateLaneHint`. Defaults are now 1 / 0.
+- **`MaybeAdjustHotWorkers` is called from floor workers as well as reserved ones.** Its only caller
+  was `q < K`, which rested on "K > 0 implies never-park" -- an implication removed above. With the
+  flag off, a reserved worker parks when its lane empties and takes the controller's only caller with
+  it. Same shape as the floor collapse losing its caller. The floor cannot sleep, so it can always
+  drive it. Who calls is not what is sampled: the controller still reads `[0,K)` and nothing else.
+- **`NoteLaneMiss` is deliberately still unwired.** The hook is `if (!hiPriInboxes[chosen]->empty())
+  NoteLaneMiss(1)` immediately before the push, push-side only, never from `pop` and never on loPri.
+  It is the *fast* promote input and stays out until a static-K bench is green -- arming a controller
+  input while the static path is still being validated makes the two failures indistinguishable.
+  It is also what a shed-to-zero needs: at K=0 the promote gate has an empty mask and early-outs, so
+  `SetHotWorkerRange` floors `minK` at 1 until this lands.
+
+### Reachability: work behind a busy worker
+
+An inbox is fast because it has exactly one legal consumer -- one exchange and a store, no CAS -- and
+unreachable for the same reason: while its owner is inside a task body, nothing in it may be taken by
+anyone. Three bugs of that shape were fixed. A fourth and fifth fix were built, measured, and
+**reverted**; they are recorded below because the measurements are the useful part.
+
+**What shipped:**
+
+- **[CRITICAL] A yield loop starved everything below it.** `Worker()` checks the resumed inbox before
+  it drains the loPri inbox, which is right for a pinned resume -- nobody else may drain one, so
+  deferring it is a permanent hang -- but it assumed resumed work was BOUNDED. `CoYield` re-arms the
+  resumed inbox every pass, so "resumes first" silently became "resumes only" and both the inbox AND
+  the worker's own deque below it became unreachable. Marked at the producer (`yieldedLastPass`, a
+  plain `bool` written and read by the same thread) rather than detected at the consumer, which would
+  have meant peeking a Vyukov MPSC without advancing `tail_` -- new lock-free code to answer what the
+  producer already knows. Genuine resumes never set it, so their priority is unchanged.
+  This is what hung `avx_suspend_test`: 3 of 8 fibers started, and it was never an AVX bug.
+
+- **A blocked owner drains its own lane.** A worker blocked inside a task is not in `Worker()`, so it
+  never reaches the one pop that services its lane inbox, and no thief may cover for it. If it is
+  waiting on a lane task homed to its own inbox, that is a deadlock. `TryTakeLaneTask` takes one task
+  per help iteration; a fiber-backed lane task it cannot run is relocated to its own loPri deque.
+  **Placement matters as much as the code**: the first version sat below the steal-hint early-out,
+  which returns when nothing is advertised -- and lane work never is, so the fix compiled, looked
+  right, and changed nothing.
+
+- **A backed-up inbox is published into the stealable deque at dispatch.** When a worker takes a task
+  while holding at least `kStealHintDepth` queued items, it moves up to 32 of them into its own deque
+  -- where a thief may take them -- before disappearing into the body. Free when it does not fire:
+  one relaxed load of `inboxDepth`, a counter the worker owns and the pusher already writes.
+
+  **Bounded by deque HEADROOM, not just inbox depth**, and that second bound took two aborted runs to
+  find. An inbox is a linked list with no ceiling; a deque has one and aborts at it. So "backed up" is
+  not a licence to relocate: when a producer outruns the pool, backed-up is true on nearly every
+  dispatch, and each one walks an unbounded queue further into a bounded one -- fatal at the
+  65,536-slot ceiling on 200,000 no-op tasks, twice.
+
+**What was reverted, and what it cost.** Each was correct in intent and unaffordable in practice, and
+none of it is a tuning question -- the costs below are structural, not thresholds. **Do not re-add any
+of these without running the full bench**: every one of them passed the entire test suite, and the
+suite cannot see what they cost. That is how they got in.
+
+- **An `awayHint` bitmap** marking workers inside a task body, so placement could avoid them. It is
+  ONE shared word, so every worker doing `fetch_or` at dispatch and `fetch_and` at completion is a
+  cache line ping-ponging across the pool, per task: **throughput/1p 5.37 -> 2.93 M/s, frame DAG
+  8.45 -> 35.82 us/graph.** Its removal also closed a live bug it had left behind -- spin-help's
+  `~RestoreAway` still SET the bit on exit while nothing cleared it, so a worker that spin-helped once
+  was marked away permanently and placement avoided it forever.
+
+- **An escape queue** (`moodycamel::ConcurrentQueue<Task*>`) holding work whose chosen worker was
+  inside a task body, so any worker could take it. It WORKED -- 13 and 11 stranded of 64 became 0 of
+  64 over eight runs -- and was reverted for its TRIGGER, not its design. Diverting requires knowing
+  the owner will be busy for a LONG time, and every available signal answers a different question:
+  `busy` is true for a 50 ns task, so under load nearly every push diverted and the shared queue
+  became the main path (**frame DAG 8.45 -> 40.80 us/graph**); a dedicated bitmap is the row above.
+  Telling a short body from a long one needs a probe.
+
+- **Advertising a backlog regardless of depth** when a worker departs. `advertisedCount != 0` is
+  POOL-WIDE and gates both parking and the collapse call site, and a worker takes its next task with a
+  non-empty deque on most dispatches -- so this meant "advertise nearly always", and one shallow queue
+  kept thirty workers awake. **throughput/1p 3.12 -> 1.24 M/s, kernel wakes 169k -> 318k, frame DAG
+  4.66 -> 7.82 us/graph, and the awake floor ended at F=28 having never shed.** That is the insomnia
+  switch the park gate already documents, arrived at from the advertise side.
+
+- **A three-tier placement fallback** (`awake && !away`, else `!away`, else `awake`). Measured
+  neutral: stranded mean 1.7 against 1.8 over ten runs each, 9/10 against 10/10 on four workers. The
+  work that strands does not arrive through the fallback.
+
+**The known limitation that remains**, with both fixes for it priced above: work already queued to a
+worker that then enters a long body waits for that body. It is a bounded delay and nothing is lost.
+`busy_owner_inbox_test` and `escape_hatch_test` are kept as reproducers that REPORT the number rather
+than assert it -- if a trigger is ever found that is both accurate and free, those are the numbers it
+has to move, and the bench rows above are what it must not.
+
+### ParallelFor
+
+- **A worker's `ParallelFor` was taking the non-worker lane claim.** `NonWorkerLaneClaim`'s
+  constructor ran its `exchange` unconditionally while the caller only *read* it for non-workers, so
+  any worker-side range held the claim for its duration and a concurrent main-thread `ParallelFor`
+  degraded to the cursor path for no reason.
+- Merge damage removed: a duplicate `firstWave` definition had been glued onto the end of a comment
+  line, where it compiled because it sat inside the comment.
+
+### Measured
+
+Author's machine, i9-13900K, 31 workers, `hot=2..4` adaptive, floor base 2:
+
+| | `ideal` | `hard` |
+|---|---|---|
+| Reserved-band parks (must be 0 under a range) | **0** | **0** |
+| Floor parks (must be 0, always) | **0** | **0** |
+| Awake floor: base → peak → after 25 ms settle | 2 → 11 → **2** | 2 → 14 → **2** |
+| Adaptive K under 8.1M hiPri tasks | 2 → **4** | 2 → **4** |
+| Round trip p50 | 0.60 µs | 0.60 µs |
+| I/O completion → job start, p50 | **0.50 µs** | 0.60 µs |
+
+`latency/hot` reads 1.12x of *cold* on a serial ping-pong while io-pipe reads 0.50 µs against cold's
+0.75. Both are true: an idle ping-pong hands the lane nothing to win, because an ordinary push
+already lands on a spinning floor worker. The lane's win is a completion arriving at a **busy** pool.
+
+**Not verified:** K ramps and no shed has been observed *inside* a bench run -- demotion is 200 ms
+plus three quiet windows and the run ends first. Reported as unverified rather than claimed.
+
+### Context switch: the SSE/AVX transition, **9.3x**
+
+A fiber parking straight out of an AVX kernel left the upper halves of YMM live, and every `movdqa`
+in the XMM save/restore block then paid an SSE/AVX transition penalty. `ContextSwitch` now issues
+`vzeroupper` first. Measured by `bench/context_switch.cpp` on a 13900K, all arms in one process with
+a same-vs-same control:
+
+| | ns/switch |
+|---|---|
+| `movdqa`, dirty upper state | 85.8 |
+| **`vzeroupper` + `movdqa`** | **9.2** |
+| `movdqa`, clean upper state | 9.2 |
+
+The third row is the point: with the instruction present, a switch out of AVX code costs the same as
+a switch that never touched AVX. The penalty is gone rather than reduced.
+
+**Gated on CPUID, because `vzeroupper` is itself an AVX instruction** -- emitting it unconditionally
+would fault on a CPU without AVX, to buy an optimisation that on such a CPU has nothing to optimise
+(no AVX means no dirty upper state). The gate is a `BYTE` (`JLibCtxHasAvx`) set by a CPUID +
+`XGETBV` probe in `FiberInit.cpp`, checked with one predictable branch per switch; zero means "no
+AVX", which is also its value before the initialiser runs, so the pre-init window is safe by
+construction.
+
+Windows/x86-64 only -- the POSIX context switch has no XMM block to transition on.
+
+### WaitGroup: waiters are an intrusive stack, not registry entries
+
+`WaitGroup` gains `directWaiters`, a Treiber stack of `Fiber*` linked through a new
+`Fiber::nextWaiter`, plus `WakeAllDirect()`. A fiber waiting on a WaitGroup pushes itself and
+suspends; the last decrement walks the stack and resumes each one.
+
+Previously every `WaitFor` went through the event machinery, which mints a per-operation identity.
+The waiter list is now two stores and allocates nothing -- the same reasoning that took Event's
+waiter index to a flat `Fiber::poolIndex` array: when the waiting entity already has a stable
+identity, that identity *is* the data structure. `WakeAllDirect` clears `WAITER_BIT` before
+resuming so the group is reusable, and each `Resume()` handles the `WANTS_SUSPEND`/`SUSPENDED` race
+exactly as `Signal` did.
+
+### Fibers carry their home worker
+
+`Fiber::homeWorker`, written by the owning worker before switch-in and never from inside the fiber.
+A fiber cannot safely learn which worker it is on and record it itself: `Thread::GetCurrent()` is a
+`thread_local`, so anything derived from it before a suspend is wrong after one. Set at the one
+place a fiber becomes bound to a task rather than at `AcquireFiber`'s three return points -- a fiber
+that already has a context keeps the home it was bound with, which is the whole point of pinning.
+
+### Reclamation: `HazardDomain::SetSelfScan(bool)`
+
+The hazard sweep can now be taken off the workers, the way epoch reclamation already could with
+`EpochManager::SetSelfReclaim(false)`. Default **on**, so nothing changes unless you ask.
+
+By default a worker sweeps on its way into idle, and that is a defensible default -- the cost lands
+on a thread with nothing else to do. But it is a *latency* decision, not a correctness one: the
+sweep walks every hazard cell, and a worker taking it has stopped being available for the completion
+that arrives a microsecond later. An app with a natural idle point can own it:
+
+```cpp
+JLib::HazardDomain::Instance().SetSelfScan(false);
+// ... then, at your frame boundary:
+JLib::HazardDomain::Instance().Scan();
+```
+
+`Scan()` was already public, so nothing else changes. **This is the second half of a pair** -- an
+app that wants its workers off reclamation entirely needs both this and `SetSelfReclaim(false)`,
+because epochs and hazards are separate schemes serving different constraints (hazards exist
+precisely because no fiber or coroutine may suspend inside an `EpochGuard`).
+
+**Two ways it is deliberately unlike `SetSelfReclaim`:**
+
+- **Settable at any time.** `selfReclaim` is a plain `bool` that must be set before `StartPool`;
+  this is a relaxed atomic, read on the worker idle path and written approximately never. A stale
+  read costs one extra sweep or one skipped one and the next idle pass corrects it.
+- **Forgetting to drive it does not leak.** `Retire`'s own threshold-triggered scan still runs, so
+  this governs only the worker-idle sweep: the failure mode is "reclaims late", where
+  `SetSelfReclaim(false)` with no `Tick()` is unbounded growth. `OrphanedRetired()` is how you would
+  notice a bag left behind.
+
+**Not measured.** The comparable epoch change took p99 from 331 µs to 113 µs, which is why this
+exists -- but the hazard bag is smaller and sweeps less often, so that number is a reason to try
+the switch, not a claim about it.
+
+The worker's `scannedSinceWork` latch is now set whether or not the sweep ran. It records "this
+worker has already looked since it last ran something", which is true either way; leaving it clear
+when the sweep is declined would re-enter that branch on every idle pass for the life of the
+process -- exactly the per-pass cost the latch exists to remove.
+
+### Linux I/O reactor -- started, not complete
+
+The io_uring backend exists (`src/posix/IoReactor.cpp`, `src/posix/IoUring.cpp`) and is **not a
+stub**: accept, connect, send, recv, a peer close as a zero-byte completion, vectored send, and the
+too-many-segments refusal all pass against real io_uring in `SchedulerIoSocketTest`.
+
+**`IsAvailable()` still returns `false` on purpose.** `IoStream`'s *chained* path hangs -- every
+thread asleep, the main thread in `futex_do_wait`, which is a **lost completion**: an operation was
+submitted and no CQE ever arrived, so the completion thread sleeps in `io_uring_enter` and the
+waiter never wakes. Reporting available while that is true would be worse than reporting nothing --
+a caller would take the async path and *hang* rather than get an error, and a hang is the one
+failure this reactor's design exists to make impossible. The socket test's `IsAvailable` skip
+re-enables its own coverage automatically once this flips.
+
+Narrowed by what already passes: `SubmitPrepared` is the only path the working sections do not
+exercise, so either its SQE is malformed in a way the kernel accepts without completing, or the
+chained transfer is legitimately pending (a `WRITEV` that filled the socket buffer with nobody
+draining would look identical). Instrument the completion loop before assuming either.
+
+Still to do after that: the epoll fallback for kernels without io_uring or with it seccomp'd off
+(`IsAvailable` already reads the live ring rather than a build flag, for exactly that case), and
+POSIX cancellation -- `scope.Cancel()` alone leaves a parked read parked, so the `RequestCancel`
+requirement documented for Windows needs the same wiring on the ring. `SCHED_FIFO` stays last and
+opt-in per the port plan.
+
+### Removed tests
+
+`deque_grow_test` and `submit_limit_test` drove the **whole pool** to assert a property of one data
+structure, and deadlocked on the plumbing before ever reaching their own assertion -- so a failure
+could not say which of the two was broken. Growth is already proven by
+`tests/verify/deque_grow_model.c` under GenMC, which is the stronger check. To test a structure,
+isolate it: construct it directly in its own file and push from one thread until it grows.
+
+Also removed: `fiber_pinning_test`, `mixed_tasktype_parallelfor_test`, `io_overlap_test`,
+`dynamic_k_test`, `hot_priority_test` and `steal_reachability_test`.
+
+**New, and every one of them was written RED first** -- the fix went in only after the test
+reproduced the failure, which caught two fixes landing in the wrong place (the lane drain sitting
+below a steal-hint early-out that returns before it; the escape-queue drain sitting below the
+resumed pop it needed to precede). Both compiled, both looked right, and neither changed the bug.
+
+| test | what it pins down |
+|---|---|
+| `lane_reachability_test` | phase 1: a blocked owner still drains its own lane inbox. phase 2: K sheds under load and nothing is lost -- a guard on the UNCONDITIONAL lane pop, since gating it on `reservedForHiPri` is the plausible-looking optimisation that would break delivery silently |
+| `yield_starvation_test` | one worker, one yield-looping fiber, one queued task: resumed work must not have EXCLUSIVE priority |
+| `busy_owner_inbox_test` | four workers, one hog: REPORTS how much work waits behind a long body. A reproducer, not an assertion -- both fixes for it were priced out (see Reachability). It still asserts what holds: nothing is lost |
+| `escape_hatch_test` | two workers: the case four hides, where every candidate worker is mid-task and placement must commit anyway. Also a reporting reproducer -- the escape queue that zeroed it is reverted, and this is the number a cheaper trigger would have to move |
+
+The reachability tests are **self-watchdogged**, because the failure they hunt is a hang: a
+deadlocking test otherwise reports nothing at all -- no output, no usable exit code, just a CI
+timeout with no attribution. They print a named phase, dump the pool state, and exit.
+
+`reserved_band_live_k_test` is new and replaces `dynamic_k_test`'s coverage of the reserved band:
+three phases against a **live** K, and it was proven non-vacuous by running it against the bug it
+was written for. `awake_floor_shed_test` covers the floor's grow-and-shed cycle, which failed
+silently for a whole bench run before it existed -- a one-way controller reads as a latency
+regression rather than as a broken shed.
+
+### Diagnostics
+
+Both found while chasing the reachability bugs above, and both had already cost real time.
+
+- **[CRITICAL] The watchdog crashed the process it was called to diagnose.** Its per-lane format
+  string still carried `hiPri size=%zu cap=%zu` after the lane deque was deleted and those
+  arguments removed, so two orphan specifiers shifted the three `%s` onto pointers -- an access
+  violation, mid-line, in the one tool you reach for when a pool is already wedged. A diagnostic
+  that kills the run destroys the state it was invoked to read.
+
+- **An AWAY map was added to `DumpPoolState` and removed with the away bit itself.** Worth recording
+  because the lesson outlives the feature: while the bitmap existed, the dump printed the awake half
+  of a decision placement made from BOTH halves, and `away` was the half that failed silently -- a
+  bit never set makes the mask a no-op and every worker look available. That exact state was
+  misdiagnosed three times from this dump before the missing column was noticed, because every
+  number shown looked reasonable and the wrong one was not shown. **If a dump omits an input to a
+  decision, it will be believed anyway.**
+
+- **The bench's band verdict now settles 25 ms before reading F**, and that turned a recurring false
+  alarm off. `FLOOR DID NOT SHED: F=28` fired only on FULL runs and never with `nosweep`, which
+  looked like a scheduler bug and was an observation bug: the verdict read F the instant the last
+  section returned, and on a full run the last section is a sweep that ENDS MID-WAVE -- it grows the
+  floor and stops. The collapse correctly refuses while the 6 ms grow-hold from the final completion
+  is live. With `nosweep` the last section is the burst, which already settles internally and handed
+  the verdict a shed floor. Same scheduler both times; only the observation moved. After the settle,
+  F above base means what the message says.
+
+### Bench
+
+- **`neverpark`** flag: the reserved band spins instead of sleeping. `hot=2` alone now gives a band
+  that parks, so this is the arm that measures the lane as the reactor configures it.
+- The floor-park counter now reports catches at the last gate rather than completed violations, and
+  the settle's `heldByHold` caveat names the real failure signature (`heldByHold ≈ calls` with
+  `SHED=0`) rather than flagging the legitimate 6 ms grow-hold tail.
+
 ## 4.0.1 - 2026-08-27
 
 **Adaptive K, and the memory work that pays for it.** Everything here is opt-in or a default that

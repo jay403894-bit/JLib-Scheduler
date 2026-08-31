@@ -47,6 +47,51 @@
 // forbidden, hazard cells indexed by the thing that MIGRATES instead of by thread, the cancellation
 // model, and the tripwires. Those are the parts with no prior art to copy, which is also why they
 // are the parts that have been wrong most often.
+//
+// == THE DECISION THAT DECIDES THE OTHERS: FIBERS MIGRATE ==
+//
+// A resumed fiber may continue on ANY worker, not the one that suspended it. Everything below is
+// downstream of that, so changing it is not a local edit -- it re-opens four subsystems at once.
+//
+// WHY MIGRATE, given that pinning is the conservative default and what middleware does (marl:
+// "the fiber must belong to this worker"). Two reasons, and the first is the load-bearing one:
+//
+//   1. WE OWN EVERY JOB IN THE PROCESS. Pinning exists to protect a library from `thread_local`
+//      state it cannot audit -- the host's allocator caches, profilers, loggers -- read from a
+//      different thread than the one that wrote them. A game engine has no such foreign code on
+//      its fibers, so the hazard is a rule we can enforce ("do not cache a TLS-derived value
+//      across a suspension point") rather than a structure we must build.
+//   2. STACK WARMTH DECAYS; WAITING DOES NOT. Pinning preserves a 64 KB stack in its home core's
+//      cache -- real, but only for very short suspends. Park on an I/O completion for a
+//      millisecond and the stack is evicted several times over, so pinning then buys nothing and
+//      still costs a wait for one specific worker. Under a frame deadline, resuming NOW on a cold
+//      stack beats resuming later on a warm one.
+//
+// WHAT MIGRATION COSTS, all of it deliberate and all of it paid elsewhere:
+//
+//   * SlabPool::Free routes by ADDRESS, not by "the freeing thread owns this". A pinned design
+//      could always push to the local free list and skip the ownership question entirely.
+//   * Epochs use a GLOBAL participant list with CAS rather than a per-shard scheme. A sharded
+//      design decides reclamation locally, which is cheaper and scales better with core count --
+//      and is UNSOUND under migration, because a read that starts on worker A and finishes on B
+//      belongs to no single shard. Seastar gets the cheap version by being shared-nothing; we
+//      cannot, and the global list is the price of resume-anywhere.
+//   * Hazard cells are indexed by the FIBER, not the thread, for the same reason.
+//
+// SO IF A REWRITE EVER PINS, three things change together and none of them are optional: the
+// allocator can drop address routing, epochs/hazards can sharded per worker, and the mailbox stops
+// needing a drain-to-deque escape. Pick one branch and follow it; the expensive mistake is taking
+// the cost of migration and the constraints of pinning at the same time.
+//
+// THE MAILBOX IS THE MIDDLE GROUND, and it is why the inbox exists at all. An inbox has exactly one
+// legal consumer, so a task put back in its owner's inbox is resumed by that same worker with the
+// stack still warm -- pinning's benefit as a PLACEMENT rather than a rule. The drain to the deque is
+// the escape hatch for when the owner does not come back promptly. Too eager and short suspends
+// lose their warmth; too late and a busy owner strands work nobody else can reach.
+//
+// AND THE TRADE THAT NEVER GOES AWAY: mailboxes are faster round-trip, deques are faster parallel.
+// A mailbox is one hop and no contention; a deque is stealable the moment it is published. Latency
+// wants the first, a frame's parallel phase wants the second, and no single structure is both.
 
 #pragma once
 #define NOMINMAX
@@ -164,7 +209,32 @@ namespace JLib {
 		Cancelled,   // the scope was cancelled; NOTHING WAS ACQUIRED -- do not Unlock or Signal
 	};
 
+	class TaskScheduler;
+
+	namespace detail {
+		// NOT PUBLIC API, AND NOT A RESTART. Tears the pool down mid-process: stops the service
+		// threads, drains every registered primitive so parked frames unwind, joins the workers.
+		// The pool does NOT come back -- Init() throws on a non-null instance and always has.
+		//
+		// This exists because taking Join() off the public surface left two callers that are not
+		// applications and whose need is real:
+		//
+		//   tests/teardown_drain_test.cpp -- the drain is the thing under test, so it has to be
+		//   invoked deliberately rather than waited for at exit.
+		//
+		//   bench/compare/compare_{marl,taskflow,enkits}.cpp -- these tear JLib down BEFORE timing
+		//   the competitor, so an idle JLib pool is not taxing someone else's numbers. That is a
+		//   fairness property of the comparison, not a convenience; without it every cross-library
+		//   row in the README is measured against a machine that is also running this scheduler.
+		//
+		// Deliberately a free function in `detail` rather than a public member: an application that
+		// finds this has been told what it is, and nothing in the supported surface implies a pool
+		// can be stopped and started again.
+		void TeardownForTesting(TaskScheduler& scheduler);
+	}
+
 	class TaskScheduler {
+		friend void detail::TeardownForTesting(TaskScheduler&);
 		friend class Thread;
 		// Registers and unlinks itself in the chain below. Only these two pointers are touched.
 		friend class WaitPrimitive;
@@ -235,8 +305,11 @@ namespace JLib {
 		// WaitFor() would spin forever waiting on a task nothing is servicing. Caller must BE
 		// the main thread (only it should call ProcessMainThread).
 		void WaitForMain(WaitGroup& wg);
-		void Join();
 		void NotifyAll();
+
+		// Resume every worker's pinned park fiber -- the broadcast wake, with no kernel object on
+		// the path. See the definition for what it does NOT wake: frames parked on primitives.
+		void ResumeAll();
 
 		// Print every worker's sleep/queue state to stdout. For a watchdog that has decided the pool
 		// is wedged: a stack trace only shows workers sitting in cv.wait, which is already known.
@@ -403,10 +476,421 @@ namespace JLib {
 		// WHETHER IT HELPS DEPENDS ON WHERE WORK LANDS. If pushes are spread round-robin, K hot
 		// workers only catch K/N of them, and the answer is to STEER work at them rather than to
 		// raise K. Measure before choosing a number.
+		// ---- MODE::FIBERONLY WAS REMOVED IN 4.0.2 ----------------------------------------------
+		//
+		// It existed to answer "can the pool be pure-fiber?", and the answer turned out to be that
+		// the question was wrong. Everything the mode was built to enable -- fibers pinned to their
+		// home worker, notify as a direct resume, the per-worker resumed inbox, WaitGroup direct
+		// waiters, and the futex park behind the awake floor -- is now UNCONDITIONAL and shipped for
+		// every pool. None of it ever needed a mode; it needed the pinning invariant, and that holds
+		// in both.
+		//
+		// What the mode actually did in the end was REJECT TaskType::Native, and that was a mistake
+		// that cost a working ParallelFor: its split leaves are Native by design, because an untaken
+		// split is taken back and run inline for ~11 ns and a leaf that cheap cannot pay for a
+		// ContextSwitch plus a slab fiber. "Fiber-only" is a statement about which tasks may SUSPEND,
+		// not about what every grain costs to start -- and once Native was admitted again the mode
+		// was behaviourally identical to Default, an enum with no effect.
+		//
+		// THE RULE IT WAS TRYING TO EXPRESS SURVIVES, unchanged and unconditional:
+		//   Fiber/Coroutine -- may suspend. WaitOnEvent, WaitFor, a mutex that blocks.
+		//   Native          -- must not suspend. Enforced where it always was: assignedFiber stays
+		//                      null, so a mismarked Native task fails loudly in WaitOnEvent's guard
+		//                      rather than corrupting the worker's OS stack.
+		//
+		// A worker's own park being a fiber and a task needing a fiber were always separate
+		// questions; conflating them is what the mode encoded.
+
+
+		// Sets K, the reserved band [0, K). K ONLY -- it does not touch the never-park flag, so a
+		// reserved worker still parks when its lane is empty unless you ask otherwise. Reservation
+		// ("do not run bulk work on q0") and spin ("never sleep") are separate purchases; folding
+		// them together charged every caller a ~35% ordinary-latency tax for a property most of
+		// them never wanted.
 		static void   SetHotWorkers(size_t k);
+
+		// K + never-park together, the combination the I/O reactor wants: a completion landing on a
+		// PARKED reserved worker pays the OS wake that reserving the core was meant to remove.
+		// Measured on a busy pool: p50 5.90 -> 2.00 us, p99 43.00 -> 6.30. That win belongs to the
+		// lane, not to everyone who calls SetHotWorkers.
+		static void   SetIoHotLane(size_t k);
 		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
 		void ClampHotWorkersToPool();
 		static size_t GetHotWorkers();
+
+		// ---- THE AWAKE FLOOR: how many workers are never allowed to park ----------------------
+		//
+		// THE ONE LOAD-BEARING IDEA LEFT FROM K-HOT, with everything incidental stripped off: no
+		// lane, no hiPri queues, no priority tag on Task, no controller. Just a count.
+		//
+		// WHY IT IS NEEDED, measured rather than assumed. Letting every worker park fixed the idle
+		// tax and every bimodal row in the bench -- throughput/mp had been 1.7-2.0x bimodal in every
+		// 31-worker run and became 1.14x, and frame DAG went from 7-486 us to 6.4. But it moved the
+		// entire cost onto the WAKE: a serial round trip pays one every time (latency 4.4 us), the
+		// event/resume hold-off rows went to 9-12 us, and `burst` collapsed from 12.5x to 2.0x
+		// because waking sixteen parked workers at once is sixteen OS round trips.
+		//
+		// A floor of K resolves that without giving the idle tax back. K workers stay spinning, so
+		// the common case finds somebody already running and pays nothing; the other N-K stay parked
+		// and stop competing for cores. PickNextWorker's awake-preferred placement then has a set to
+		// steer at -- it was built for this and has had nothing to aim at, because until now either
+		// everyone spun or everyone parked.
+		//
+		// WORKERS 0..K-1 ARE THE FLOOR, by index. Not a rotating set: a stable one keeps those
+		// workers' caches warm and makes the behaviour reproducible run to run, which matters more
+		// than fairness for a set this small.
+		//
+		// DEFAULT 1. Zero is legal and means "the pool may go fully idle" -- correct for a batch
+		// process that would rather give the cores back. Anything above ~2 starts paying the idle
+		// tax again in proportion, so raise it only against a measurement.
+		// ---- DOES THE FLOOR'S RAMP WIDEN THE LANDING ZONE, OR ONLY THE AWAKE SET? -------------
+		//
+		// false -- ordinary pushes aim at [K, K+base). Workers the growth controller woke earn their
+		//          tasks by STEALING. The pre-4.0.2 behaviour.
+		// true (default since 4.0.2) -- pushes aim at [K, K+live), so a burst lands wide immediately
+		//          and a promoted worker actually receives work instead of only being awake.
+		//
+		// This is the one unbalanced tradeoff PickNextWorker documents and does not resolve: a narrow
+		// landing zone is what makes a single producer fast (spreading measured p50 0.40 -> 0.90 us,
+		// 1p 10.0 -> 5.74 M/s) and it is what makes a 256-task burst slow (the marl blocking row runs
+		// 10.0 ms with two receivers against 5.1 ms with a wide one -- 70 kernel wakes in 7680 pushes,
+		// so it is the landing zone and not the park).
+		//
+		// SWEEP IT AGAINST THE SERIAL ROW, not just the burst; the narrow steer was bought with real
+		// numbers and this gives them back if it is wrong.
+		static void   SetPlacementFollowsGrownFloor(bool on) noexcept;
+		static bool   GetPlacementFollowsGrownFloor() noexcept;
+		static void   SetAwakeFloor(size_t k) noexcept;
+		// ---- IDLE-SPIN POLITENESS ------------------------------------------------------------
+		//
+		// A worker that stays awake with nothing to do yields the core every (mask+1) search passes
+		// and CpuRelax()es in between. Default 7 (every 8 passes). LOWER IS MORE POLITE.
+		//
+		// COUPLED TO THE FLOOR GROWTH CAP. Raising this while the floor can grow wide reproduces the
+		// permanent-floor=31 pathology from a default config: thirty never-parking workers spinning
+		// rudely starve every other runnable thread on the machine.
+		//
+		// This is a knob because the right value depends on how many workers are spinning at once,
+		// which the library does not get to choose: two floor workers can afford to be rude, and
+		// thirty-one cannot. A hard spin across a full pool starves unrelated runnable threads --
+		// measured at 10 ms -> 24-40 ms on the marl blocking row, worse than simply parking. marl
+		// spins a full millisecond in that same row without the problem because it yields every few
+		// microseconds rather than every few hundred.
+		//
+		// It does NOT decide whether to park. See Thread::Worker.
+		// ---- THE FLOOR IS A THIRD BAND (M), NOT A VARIANT OF K --------------------------------
+		//
+		// GetFloorBase() is where the floor starts. USE IT FOR EVERY FLOOR BOUND; keep using
+		// GetHotWorkers() for "is this worker serving the lane right now". The two are the same
+		// number while K is static, which is exactly why the distinction has to be explicit before
+		// K is allowed to move -- otherwise a K promotion slides the floor band under running
+		// workers and every K+M site becomes a race instead of a static off-by-one.
+		//
+		// ONE FORMULA, READ FROM LIVE ATOMICS, EVERYWHERE. The bands are [0,K) reserved,
+		// [K,K+F) floor, [K+F,N) parkable, and K+F <= N is enforced by refusing a grow that would
+		// break it (see NoteFloorCrowding). A moving band is made safe by every site spelling it the
+		// same way and by the two controllers never moving in the same window -- not by freezing one
+		// of them, which is what an earlier fixed-base-at-Kmax attempt did.
+		// ---- THE WHOLE BAND LAYOUT IN ONE LOAD ------------------------------------------------
+		//
+		// USE THIS FOR ANY BAND-MEMBERSHIP DECISION. K and F live in one 64-bit word precisely so a
+		// worker can ask "which band am I in" and get an answer that was true at a single instant.
+		// Calling GetHotWorkers() and GetAwakeFloor() separately reintroduces the torn pair: the
+		// answer can mix a K from before a promotion with an F from after it, and that produced
+		// 30+ confirmed floor-worker parks per run the moment K actually started moving.
+		//
+		// The single getters remain for callers that genuinely want one number (a banner, a test,
+		// a controller adjusting its own field). They are not wrong -- they are just not a BAND.
+		// EVERY BAND FIELD, FROM ONE LOAD. kmin/kmax are the SCALING RANGE, and they are here rather
+		// than behind GetHotWorkerRange() because the worker needs them on the same pass it needs k
+		// and f: `kmax > kmin` is the "may the controller move K" predicate, and the observer that
+		// feeds that controller has to gate on the identical answer. Asking it from a second load is
+		// how the observer ends up off while the controller runs -- reading zeros, shedding K every
+		// window. Under static K, SetHotWorkers pins kmin == kmax and the whole question is false.
+		struct Bands { size_t k; size_t f; size_t fbase; size_t kmin; size_t kmax; };
+		static Bands  GetBands() noexcept;
+		static size_t GetFloorBase() noexcept;
+
+		// ---- OBSERVED PARKING, FOR CHECKING A BANNER AGAINST REALITY --------------------------
+		//
+		// How many times worker q actually blocked. A banner that prints K and F read from the same
+		// atomics the scheduler steers by is an ECHO, not a check -- it agrees with itself however
+		// the wiring is broken. These let a bench assert the DECLARED bands against what the pool
+		// did: nobody in [0,K) or [K,K+F) may appear here, and [K+F,N) should.
+		static unsigned GetWorkerParkCount(size_t q) noexcept;
+		static void     ResetWorkerParkCounts() noexcept;
+		static void   SetSpinYieldMask(unsigned mask) noexcept;
+		static unsigned GetSpinYieldMask() noexcept;
+
+		static size_t GetAwakeFloor() noexcept;
+
+		// ---- THE CONTROLLER: the floor moves itself between 1 and the pool size ---------------
+		//
+		// ALWAYS ON. A static floor cannot be right for both a serial round trip and a 16-task
+		// burst: measured at floor 1, latency was 0.35 us (12x better than parked) while `burst`
+		// ran 1.0x of 16 -- no parallelism at all, because every task queued behind the one awake
+		// worker. Floor 2 halved the latency win and only reached 1.4x. There is no constant that
+		// serves both, which is what makes this a controller rather than a tuning knob.
+		//
+		// TWO SIGNALS, BOTH DIRECTLY MEASURED -- no proxy, no occupancy inference:
+		//
+		//   PROMOTE  a push had to WAKE a parked worker. That is the floor being too small, stated
+		//            as the exact cost it causes, counted where it happens (NotifyWorker). One miss
+		//            in a 1 ms window is enough: a wake costs microseconds and a spare spinning
+		//            worker costs a fraction of a core, so this is deliberately eager.
+		//
+		//   DEMOTE   the MARGINAL floor worker -- index K-1, the one that would be given up -- ran
+		//            zero tasks for three consecutive windows. Asking about the marginal worker
+		//            rather than the average is what makes shedding possible at all: an average
+		//            over a busy floor never falls, so K would ratchet up and stay.
+		//
+		// THE RATCHET RULE, carried over from the K-hot controller and the reason it is stated here:
+		// anything keyed off "became idle" rather than "IS idle" never sheds. The demote test is
+		// re-evaluated from live counters every window, and the low-window counter RESETS on any
+		// window where the marginal worker did work.
+		//
+		// ASYMMETRIC RATES ON PURPOSE. Promotion is cheap to get wrong (one extra spinner) and
+		// expensive to delay (every dispatch pays a wake), so it fires on one miss. Demotion is
+		// expensive to get wrong (the next dispatch pays a wake) and cheap to delay, so it needs
+		// three quiet windows and its own slower clock.
+		//
+		// A CONTROLLER DECLINING TO ACT IS NOT A DEFECT. Sitting at 1 under a light serial load is
+		// the correct answer, not blindness -- one awake worker is all that workload can use.
+		static void MaybeAdjustAwakeFloor() noexcept;
+
+		// Called from NotifyWorker when it actually had to bring a parked worker back. This is the
+		// promote signal; see MaybeAdjustAwakeFloor.
+		static void NoteWakeMiss() noexcept;
+
+		// ---- LANE OVERFLOW: KEEP hiPri WORK REACHABLE WHEN ITS OWNER CANNOT REACH IT ----------
+		//
+		// Returns the worker a hiPri task should ACTUALLY go to, given the one placement picked.
+		// Normally that is `chosen` unchanged; it differs only when `chosen` already has a lane
+		// task queued AND is inside a task body, which is the one state in which the queued task
+		// is reachable by nobody.
+		//
+		// WHY THE PRODUCER DECIDES. The lane is an MPSC with exactly one legal consumer, so the
+		// only thread that can drain it is its owner -- and an owner busy inside a task is not in
+		// Worker(), so it reaches neither the lane pop nor any spill of its own. Every consumer-side
+		// fix has that same hole; the push is the last point at which a thread that is definitely
+		// running gets to decide. Same reason TryTakeLaneTask exists for the BLOCKED owner, which is
+		// the other half of this and does not cover the busy one.
+		//
+		// NOT A DEQUE, AND THAT IS THE POINT. The lane was deliberately reduced to an inbox because
+		// staging latency work into a bulk structure is an O(depth) unload -- exactly the cost the
+		// lane exists to avoid, measured at roughly half the io p99. This adds no structure: the
+		// overflow goes to another worker's hiPri INBOX, which every worker drains before its own
+		// deque, so it keeps hiPri priority instead of being demoted into bulk work.
+		static size_t HiPriSpillTarget(size_t chosen) noexcept;
+
+		// How many hiPri pushes were redirected by HiPriSpillTarget. Zero on a healthy lane; a
+		// rising count means completions are arriving faster than the reserved band retires them,
+		// which is the K controller's promote case, not an error.
+		static unsigned long long GetHiPriSpillCount() noexcept;
+
+		// ---- IS A SHARED MPMC LANE WORTH BUILDING? --------------------------------------------
+		//
+		// GetLaneStrandCount()         -- dispatches that left a non-empty lane inbox behind, i.e.
+		//                                 a backlog that just became unreachable to everyone.
+		// GetLaneStrandIdlePeerCount() -- of those, how many had ANOTHER reserved worker not in a
+		//                                 body at that instant.
+		//
+		// THE SECOND NUMBER IS THE ENTIRE CASE FOR A PULL QUEUE. An MPMC removes misallocation, not
+		// queueing: it adds no service capacity, so when every reserved worker is inside a body it
+		// waits exactly as long as an inbox does. Its win is confined to backlogs that had somebody
+		// idle to go to -- and this counts those directly instead of inferring them from a latency
+		// gap that dispatch cost also lives in.
+		//
+		// Read as a ratio. Near 0 means the lane saturates cleanly and a shared queue buys nothing
+		// but contention. Near 1 means work is sitting behind busy owners while peers idle, which
+		// is the one thing the producer-side spill structurally cannot fix -- it decides at PUSH
+		// time and the owner can enter a body immediately afterwards.
+		//
+		// Deliberately an UPPER bound: a sleeping peer counts as idle (see the definition).
+		// TWO PEER SETS. GetLaneStrandIdlePeerCount() scans [0, K) -- what the current lane can
+		// reach, and the ceiling on any producer-side fix. GetLaneStrandIdleWideCount() scans
+		// [0, K+F) -- reserved plus the awake floor, which is the consumer set a SHARED pull lane
+		// would actually have. The gap between them is what changing the structure would buy that
+		// improving the spill never could.
+		//
+		// Neither includes the parkable band, and that exclusion is what keeps the wide number
+		// meaningful: a scan over the whole pool reports ~100% forever, because a parked worker is
+		// never busy -- and waking one costs the ~3 us that the lane exists to avoid.
+		static void NoteLaneStrand(size_t ownerIndex) noexcept;
+		static unsigned long long GetLaneStrandCount() noexcept;
+		static unsigned long long GetLaneStrandIdlePeerCount() noexcept;
+		static unsigned long long GetLaneStrandIdleWideCount() noexcept;
+
+		// NoteHiPriStaged / GetHiPriStagedCount WERE HERE and are gone with the lane deque. They
+		// counted lane tasks a worker unloaded into hiPri[qIndex] at dispatch. With no deque there
+		// is no unload, so the counter had no writer -- and a diagnostic that can only ever report
+		// zero is worse than an absent one, because a reader takes the zero for a measurement.
+		// Lane reachability is now one number, the spill above.
+
+		// Lane-deque probes and successful steals. The pair localises a rescue failure to one of
+		// three places without a debugger: no probes means thieves never reached the lane (victim
+		// selection or the hint), probes without hits means they reached it and could not take
+		// (steal_if losing, or classOK declining), hits without progress means something after the
+		// steal is losing the task.
+		static void NoteLaneProbe(bool hit) noexcept;
+		static unsigned long long GetLaneProbeCount() noexcept;
+		static unsigned long long GetLaneStealCount() noexcept;
+
+		// Wake one sleeping worker to come and steal freshly staged lane work. `excludeQ` is the
+		// worker that just staged it, which is about to enter a task body and is the one thread
+		// that certainly cannot help.
+		//
+		// THE OLD LANE WAKE WAS REMOVED FOR A REASON THAT NO LONGER HOLDS. UpdateLaneHint records
+		// it: "with the hiPri deque gone there is nothing for a woken worker to steal" -- waking a
+		// worker to look at an MPSC it may not touch is pure cost, and the measurements that killed
+		// it were taken in exactly that world. With the deque back the woken worker has something
+		// it is allowed to take, which is the entire difference.
+		//
+		// AND WITHOUT IT THE STAGING IS INERT. advertisedCount is read by workers that are AWAKE
+		// and deciding whether to park; it says nothing to one already asleep. A worker stages its
+		// remainder precisely because it is about to disappear, which is usually when the rest of
+		// the pool has just gone quiet -- so the likeliest state is that every potential thief is
+		// parked and no advertisement reaches any of them. Measured that way: 8 staged, 0 stolen.
+		void NotifyLaneHelper(size_t excludeQ) noexcept;
+
+		// GROW THE FLOOR FROM THE PUSH PATH. `submitted` is how many tasks this submit is adding --
+		// 1 for a Push, N for a PushBatch, so a batch may promote in one step and a single push may
+		// not.
+		//
+		// WHY THE PUSH PATH AND NOT TASK COMPLETION. The completion-driven controller CANNOT grow
+		// the floor during the exact workload that needs it. Measured: 16 tasks of 3.28 ms each,
+		// pushed at an idle pool with F=2. Both floor workers are inside a task body for
+		// milliseconds so they reach no completion, and the other 29 are blocked in the kernel
+		// running no loop at all -- so nothing executes the controller, the floor stays at 2, and
+		// 16 tasks serialise into 8 waves. 36.20 ms, 1.5x of 16.
+		//
+		// The pusher is the only party awake during a burst, so it is the only one that can see the
+		// queue building. That is not a tuning problem -- an earlier attempt moved the completion
+		// subsample from 1-in-64 to 1-in-8 for this exact row, which is the right diagnosis aimed
+		// one level too shallow: a burst is precisely the workload with no completions until it is
+		// already over.
+		static void NoteFloorCrowding(size_t submitted) noexcept;
+
+		// Master switch for the floor GROWTH controller -- push-side spill, completion-side growth and
+		// the redistribute that follows it. Off pins the floor at its base. Exists so one binary can
+		// A/B the controller on the machine that holds the baseline, instead of across two builds.
+		// Demand cap for the lazy splitter: how many unclaimed splits a range tolerates on its own lane
+		// before it stops publishing and runs the rest inline. 0 disables the cap (split unconditionally,
+		// the pre-4.0.2 behaviour). See RunLazyRange for why the lane depth is the demand signal.
+		// How many leaves per worker the splitter mints before it raises the grain itself. The splitter
+		// costs one Task per leaf where the cursor costs one atomic, so this is the dispatch-cost knob.
+		// Iterations per worker below which ParallelFor runs the range SERIALLY. N-only, no body probe.
+		// Higher protects cheap bodies at small N; lower protects expensive ones. They are the same N,
+		// so no value serves both -- see the gate in ParallelFor.
+		static void   SetMinItersPerWorker(size_t n) noexcept;
+		static size_t GetMinItersPerWorker() noexcept;
+
+		static void   SetLeavesPerWorker(size_t n) noexcept;
+		static size_t GetLeavesPerWorker() noexcept;
+
+		static void   SetLazySplitCap(size_t n) noexcept;
+		static size_t GetLazySplitCap() noexcept;
+
+		static void SetFloorGrowthEnabled(bool on) noexcept;
+		static bool GetFloorGrowthEnabled() noexcept;
+
+		// The floor the process ASKED for, as opposed to GetAwakeFloor() which is what it is right
+		// now -- growth may hold it above the base for the length of a wave.
+		// Workers [0, R) take hiPri work only; ordinary placement skips them. R must be <= the awake
+		// floor, or a reserved worker parks and a completion pays the wake this exists to avoid.
+		// Does a reserved worker refuse to park? Default FALSE: reservation already guarantees it is
+		// not stuck inside a compute leaf, which is the property I/O needs. Never sleeping is a
+		// stronger promise that costs a spinning core, so it is opt-in and should be turned on only if
+		// the wake on the resume path is measured to matter.
+		// ---- WHICH PRIMITIVE A WORKER PARKS ON ------------------------------------------------
+		//
+		// WaitAddress -- WaitOnAddress (Windows) / FUTEX_WAIT (Linux). Default on both.
+		//                On Darwin it is NOT A PARK AT ALL: there is no address wait, so the idle
+		//                path spins. Selectable there only as a negative control.
+		// CondVar     -- a per-worker std::condition_variable. DEFAULT AND ONLY PARK ON DARWIN,
+		//                where __ulock_wait is private API. Selectable elsewhere for A/B.
+		//
+		// MEASURED, 2026-08-29, and the isolated bench got it wrong. bench/futex_variance.cpp says
+		// condvar has the tighter wake variance (stddev 0.71x, twice) -- that is a two-thread
+		// ping-pong with no push path and IT DOES NOT TRANSFER. In the scheduler, on the only row
+		// where the park is measurable (floor=0, ~19,400 wakes / 20,000 round-trips), WaitAddress
+		// won mean and p50 with no overlap across 7 interleaved reps per arm, and the p99 advantage
+		// condvar was supposed to have did not appear at all.
+		//
+		// The cost is mostly on the WAITER, not the notify mutex: a condvar wake must reacquire the
+		// mutex inside the wait before it can re-check its predicate, so the woken thread takes a
+		// lock before it can run. WaitOnAddress returns straight to the work loop.
+		//
+		// THAT IS A WINDOWS RESULT AND IT DOES NOT DEMOTE CondVar ON DARWIN, where the alternative
+		// is not FUTEX_WAIT but a busy spin. Do not "fix" the Darwin default by citing it.
+		//
+		// Re-run bench park=cv|park=wait with floor=0 before reopening any of this; a default-config
+		// row cannot see the park at all (<1% of every row) and will report a tie no matter what.
+		enum class ParkPrimitive : uint8_t { WaitAddress = 0, CondVar = 1 };
+		static void          SetParkPrimitive(ParkPrimitive p) noexcept;
+		static ParkPrimitive GetParkPrimitive() noexcept;
+
+		static bool ReservedNeverParks() noexcept;
+		static void SetReservedNeverParks(bool on) noexcept;
+
+		static size_t ReservedHiPri() noexcept;
+		static void   SetReservedHiPri(size_t r) noexcept;
+
+		static size_t GetAwakeFloorBase() noexcept;
+
+		// Shed a grown floor back to the base in one step. Called from the idle path; returns true
+		// if it actually shed. See the definition for why one step and not a ramp.
+		static bool CollapseAwakeFloorToBase() noexcept;
+		// TEMP DIAG -- remove with the counters in the .cpp
+		static void GetFloorCollapseStats(unsigned long long&, unsigned long long&, unsigned long long&, unsigned long long&, unsigned long long&) noexcept;
+
+		// High-water mark of the floor since the last reset. The floor sheds the instant a wave
+		// drains, so anything that measures a wave and THEN reads GetAwakeFloor() reads the base --
+		// it has already collapsed. Reset before the region of interest, read after.
+		static size_t GetAwakeFloorPeak() noexcept;
+		static void   ResetAwakeFloorPeak() noexcept;
+
+		// Drop a grown floor back to the base UNCONDITIONALLY -- no hold, no emptiness check.
+		//
+		// FOR MEASUREMENT HARNESSES, NOT FOR THE SCHEDULER'S OWN USE. A benchmark that runs a flood
+		// row and then a latency row will otherwise open the second one at whatever floor the first
+		// left behind, and every number in it is then a measurement of that floor rather than of
+		// the configured one -- a latency row opened at 16 reported p99 1.70 us against 0.60, which
+		// reads as a latency regression and is really leftover spinners.
+		//
+		// Do NOT call this to shed a live wave: it does not check whether anything is still queued.
+		// The scheduler's own shedding is CollapseAwakeFloorToBase, which does.
+		static void ForceAwakeFloorToBase() noexcept;
+
+		// Hand `count` tasks from worker `ownerIdx`'s OWN deque to overflow workers' inboxes.
+		//
+		// CALLED ONLY BY THE OWNER, from its own completion path. That restriction is what makes it
+		// legal at all: a Chase-Lev deque has a single-producer bottom, so nobody else may write
+		// this worker's ring -- but the owner popping its own bottom and pushing into somebody
+		// else's MPSC inbox uses only operations each side is allowed to perform.
+		//
+		// This is how a wave spreads without putting anything on the push path. See the call site
+		// for why the completion is the only place that knows a spread is warranted.
+		// Wake ONE parked worker to come and steal. Called by the splitter on the hint.s 0 -> 1 edge --
+		// once per range, never per split. See the call site.
+		void WakeOneForSteal() noexcept;
+
+		void RedistributeToOverflow(size_t ownerIdx, size_t count);
+
+		// Every placement-chosen push. The denominator for the promote ratio -- see NotePush.
+		static void NotePush() noexcept;
+
+		// Counts actual kernel wakes (WakeByAddress). The diagnostic for "is the floor receiving the
+		// work, or is placement still routing to sleepers?" -- see NoteWakeCall.
+		static void   NoteWakeCall() noexcept;
+		static void   NoteFloorPark() noexcept;            // TEMP DIAG
+		static unsigned long long GetFloorParkCount() noexcept;  // TEMP DIAG
+		// TEMP DIAG: how many steal-hint bits are set, and how many of those point at an EMPTY
+		// queue. A stale bit pins advertisedCount above zero, which kills the collapse call site
+		// AND the park gate pool-wide. REMOVE with the rest of the shed instrumentation.
+		static void   GetStaleHintReport(unsigned& advertised, unsigned& stale) noexcept;
+		static unsigned long long GetWakeCount() noexcept;
+		static void   ResetWakeCount() noexcept;
 
 		// Moves K WITHOUT touching the bounds. SetHotWorkers pins [k,k]; this is the move on its own,
 		// used by the range clamp and by the controller -- which must not rewrite the bounds it is
@@ -464,23 +948,19 @@ namespace JLib {
 		//
 		// maxK inherits SetHotWorkers' pool clamp, so at least one ORDINARY worker always survives:
 		// a pool that is entirely hot has no legal destination for ordinary work and hangs.
-		static void SetHotWorkerRange(size_t minK, size_t maxK) noexcept;
-		static void GetHotWorkerRange(size_t& minK, size_t& maxK) noexcept;
 
 		// Evaluated by ONE worker, sampled rather than every pass -- a clock read per pass per
 		// worker would cost more than the mechanism saves. Public only so Thread.cpp can call it.
-		// TRUE only when the range can actually move. Under static K -- min == max, which is the
-		// DEFAULT and what SetHotWorkers(k) pins -- none of the adaptive machinery has any effect, so
-		// none of it should run: no clock stamps, no per-pass counters, no controller call. One
-		// relaxed load of a line that changes only when the app reconfigures.
-		static bool HotScalingActive() noexcept;
-
-		static void MaybeAdjustHotWorkers() noexcept;
+		// THE "IS SCALING ON?" PREDICATE IS max > min, AND IT HAS NO ACCESSOR ON PURPOSE. There was
+		// one (HotScalingActive) and it was dead -- hard-wired to false, read by nobody, while the
+		// controller gated on max > min directly. Two spellings of one question is how the observer
+		// and the controller end up disagreeing about whether to run. Ask GetHotWorkerRange and
+		// compare; under static K, min == max (the default, and what SetHotWorkers pins), so none of
+		// the adaptive machinery runs: no clock stamps, no per-pass counters, no controller call.
 
 		// Reported by a worker whose inbox drain moved more than one lane task -- i.e. a completion had
 		// to queue behind another. Detected at depth ONE, where the saturation edge needs
 		// kLaneStealDepth, and computed for free from a count the drain already has.
-		static void NoteLaneMiss(size_t waiting) noexcept;
 
 		// WHO MAY DRAIN A BACKLOGGED LANE.
 		//
@@ -504,9 +984,11 @@ namespace JLib {
 		// At K=4 the hot set already absorbs the backlog and mode 4 is a wash. It is a safety valve
 		// for an under-provisioned lane, NOT a substitute for setting K: under Sleep it cannot help
 		// at all, and that is the default.
-		static inline std::atomic<int> laneHintMode{ 4 };
-		static void SetLaneHintMode(int m) noexcept { laneHintMode.store(m, std::memory_order_relaxed); }
-		static int  GetLaneHintMode() noexcept { return laneHintMode.load(std::memory_order_relaxed); }
+		// laneHintMode IS GONE, with the mechanism it selected. Mode 4 granted an ORDINARY worker
+		// permission to steal a buried hot worker.s lane -- a permission that means nothing now the
+		// lane is an MPSC inbox with exactly one legal consumer. Its last reader went with
+		// WakeForLane; what remained was a knob three benches set and nothing read, which is the
+		// same failure as HotScalingActive: a flag that reads live and gates nothing.
 
 		// THE SAME HINT, READ BY A PRODUCER INSTEAD OF A THIEF.
 		//
@@ -563,9 +1045,8 @@ namespace JLib {
 		// it. Against a 20us handler the wake arrives after the backlog is already gone, and all it
 		// bought was a woken core. kLaneStealDepth (4) is the throttle: the hint only sets when a
 		// worker is genuinely buried, so this is a far narrower trigger than NoSleep's "never park".
-		static inline std::atomic<int> laneWakeCount{ 0 };
-		static void SetLaneWake(int n) noexcept { laneWakeCount.store(n, std::memory_order_relaxed); }
-		static int  GetLaneWake() noexcept { return laneWakeCount.load(std::memory_order_relaxed); }
+		// laneWakeCount IS GONE. It was WakeForLane.s budget -- how many ordinary workers to pull
+		// up for a buried lane -- and WakeForLane no longer exists, so this had no reader at all.
 
 		// THE LOWER EDGE OF THE SCHMITT TRIGGER in UpdateLaneHint: once a worker is advertising a
 		// lane backlog, it keeps advertising until its depth drops to THIS, rather than until it
@@ -593,7 +1074,11 @@ namespace JLib {
 		//
 		// The recommended pair for a latency-sensitive lane on one hot core:
 		//     SetHotWorkers(1); SetLaneWake(2); SetLaneClearDepth(0);
-		static inline std::atomic<int> laneClearDepth{ 3 };
+		// DEFAULT 0, NOT 3, SINCE THE LANE BECAME AN INBOX. The signal feeding UpdateLaneHint is
+		// PRESENCE (0/1) now -- an MPSC has no size() and the hint only ever answered "is there
+		// lane work", never "how much". With a binary input the Schmitt trigger degenerates to
+		// plain tracking: set at 1, clear at 0. The old 3 would clear the bit while work existed.
+		static inline std::atomic<int> laneClearDepth{ 0 };
 		static void SetLaneClearDepth(int d) noexcept { laneClearDepth.store(d, std::memory_order_relaxed); }
 		static int  GetLaneClearDepth() noexcept { return laneClearDepth.load(std::memory_order_relaxed); }
 
@@ -608,7 +1093,12 @@ namespace JLib {
 		//
 		// The v1 objection has not gone away; it has become testable. With hysteresis, set and clear
 		// are independent, so set=2/clear=0 is a shape that could not be expressed when 4 was picked.
-		static inline std::atomic<int> laneSetDepth{ 4 };   // == kLaneStealDepth; asserted where that is declared
+		// DEFAULT 1, NOT 4, for the same reason as laneClearDepth above -- against a 0/1 presence
+		// signal a threshold of 4 is NEVER reached, which silently killed both consumers of the
+		// bit: the K controller.s `adv == mask` promote and the edge-triggered call in
+		// UpdateLaneHint. The depth-shaped knobs survive for the bench, but the depths they were
+		// tuned against (deque sizes) no longer exist.
+		static inline std::atomic<int> laneSetDepth{ 1 };
 		static void SetLaneSetDepth(int d) noexcept { laneSetDepth.store(d, std::memory_order_relaxed); }
 		static int  GetLaneSetDepth() noexcept { return laneSetDepth.load(std::memory_order_relaxed); }
 
@@ -625,7 +1115,40 @@ namespace JLib {
 		// ordering, so "picked up first" cost every worker a second inbox, a second deque and a
 		// second probe per victim to buy something close to a coin flip. It has a job now, and only
 		// where it has one.
-		static bool HiPriLaneActive() { return GetHotWorkers() > 0; }
+		// ---- HIPRI IS A ROUTE, NOT A RESERVED LANE (4.0.2) ------------------------------------
+		//
+		// This used to be `GetHotWorkers() > 0`, so with K stubbed to 0 every hiPri push collapsed to
+		// loPri and the reactor.s steering became a no-op. Priority now works WITHOUT K: a hiPri push
+		// goes to a worker.s hiPri INBOX, every worker drains hiPri before its own deque, and the
+		// AWAKE FLOOR is what makes that fast -- the push is steered at a worker that never parks, so
+		// an I/O completion lands on a running thread without buying a wake.
+		//
+		// WHAT THIS DOES NOT GIVE YOU is reservation. K kept ordinary work OFF the hot workers so a
+		// completion found an IDLE core; the floor only guarantees an AWAKE one, and placement aims
+		// bulk work at those same indices. A completion can therefore queue behind a bulk task on the
+		// worker it was steered to -- ordering wins the race, not isolation.
+		// ---- THE FLOOR-LANE VARIANT: A LANE WITHOUT A RESERVATION -----------------------------
+		//
+		// EXPERIMENT, DEFAULT OFF. Routes hiPri at the awake floor [K, K+F) instead of the reserved
+		// band, so completions land on a worker that is guaranteed AWAKE but is also running bulk.
+		// It is the configuration behind PickNextWorker's recorded "hiPri was briefly steered at the
+		// unreserved floor, and it lost" -- whose harness no longer existed when the question came
+		// back, so the claim could neither be reproduced nor re-run at a different grain.
+		//
+		// NOTHING ON THE CONSUMER SIDE CHANGES, and that is why this is a routing flag rather than a
+		// design. Every worker already pops its own hiPri inbox before its own deque, reserved or
+		// not (see Worker()'s lane block, gated only on `!task_to_run`). The inbox is per worker, it
+		// is FIFO, and ordering within it is preserved -- which is the property a strand needs and
+		// the reason a shared MPMC cannot serve this.
+		//
+		// WHAT IT GIVES UP, stated so the measurement is not read as a free win: reservation. A
+		// floor worker is awake, which buys the absence of a kernel wake, and it is NOT free, which
+		// is a different question -- a completion behind its current body waits for that body. The
+		// spill cannot help either: it searches [0, K), and this variant is for K = 0.
+		static void SetHiPriFloorLane(bool on) noexcept;
+		static bool HiPriFloorLane() noexcept;
+
+		static bool HiPriLaneActive() { return GetHotWorkers() > 0 || HiPriFloorLane(); }
 
 		// Does THIS worker serve the lane?
 		//
@@ -678,7 +1201,13 @@ namespace JLib {
 		// would strand it. The worker sites pair this with a cheap non-empty check on their OWN
 		// queues (a local cache line, one load) so anything stranded is still drained. Remote probes
 		// get no such fallback: those are the ping-pong, and there is nothing to rescue there.
-		static bool WorkerServesHiPri(size_t qIndex) { return GetHotWorkers() > qIndex; }
+		// EVERY worker serves hiPri now. It used to be the K hot workers only, which at K=0 meant
+		// nobody -- so a task in a hiPri inbox was drained by the stray path or not at all. With
+		// priority expressed as ORDER rather than as a reserved subset, every worker checks its hiPri
+		// inbox before its own deque and before stealing.
+		// WorkerServesHiPri(q) IS GONE. It was `q < GetHotWorkers()` -- a third name for the question
+		// the worker already answers as `q < bandsNow.k`, and a second load to answer it with. Ask
+		// GetBands() once per pass and compare.
 
 		// HOW HARD the I/O critical path preempts. Applies to the K hot workers AND the reactor's
 		// completion threads -- NEVER to the process, and never to the other workers.
@@ -1136,6 +1665,27 @@ namespace JLib {
 		// and never resized while the pool is running.
 		size_t GetWorkerCount() const;
 
+		// THE THREAD TABLE, indexed by worker id. Exposed so a caller can reach a specific worker's
+		// pinned fiber and suspend or resume it DIRECTLY -- `GetThreads()[w]->GetFiber()->Resume()`
+		// -- instead of going through an Event, which costs a waiter table, an arbitration and a
+		// pooled object to say the one thing this says in a pointer dereference.
+		//
+		// A REFERENCE TO THE LIVE CONTAINER, NOT A COPY, and it cannot be a copy: Thread owns a
+		// std::thread, atomics and its own park fiber, so a vector<Thread> by value would have to
+		// duplicate a running thread. Callers get the real table or nothing useful at all.
+		//
+		// AND NOT std::vector<Thread> EITHER, YET. Thread still holds joinMutex, cvWorkerDone and
+		// cvAffinity -- all non-movable -- so std::vector<Thread> does not instantiate. Those are
+		// Join's and the affinity path's, not the park's, and the park's are already gone. When
+		// Join is rebuilt and they go with it, Thread becomes movable and this can become a
+		// contiguous vector<Thread> without touching a single call site, because the subscript and
+		// the -> both still read the same.
+		//
+		// INDEX IS THE WORKER ID, so entry w is worker w's Thread and the fiber it holds is pinned
+		// to w (Fiber::homeWorker == w). That correspondence is what makes the table addressable at
+		// all; without pinning, entry w's fiber could resume anywhere.
+		const std::vector<Thread*>& GetThreads() const { return workers; }
+
 		// Pay the task slab's page faults NOW rather than during the run.
 		//
 		// As of 1.4 the slab is LAZY: `Init()` touches almost nothing, and resident memory grows
@@ -1470,9 +2020,10 @@ namespace JLib {
 		// This is the actual lever the exhaustion warning in Thread.cpp means when it says "raise
 		// standardFiberCount" -- that used to name a local variable inside StartPool with no way to
 		// reach it from outside the library. Call this before Init() instead.
-		static void SetFiberBudget(size_t standardPerWorker, size_t heavyPerWorker);
+		// ONE STACK CLASS: the 512 KB "heavy" class was deleted (nothing ever requested it, and it
+		// committed ~127 MB up front). Add a second class back when a workload needs one.
+		static void SetFiberBudget(size_t fibersPerWorker);
 		static size_t StandardFibersPerWorker();
-		static size_t HeavyFibersPerWorker();
 
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
@@ -1584,18 +2135,18 @@ namespace JLib {
 		// __cpp_impl_coroutine there reads the LIBRARY's language version and would reject every
 		// legitimate coroutine (Spawn calls this exact overload). Inlined into the header, the same
 		// macro reads the CALLER's TU, which is the thing actually being asked about.
-		Task* CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, FiberSize size, TaskType type, CorePref corePref);
+		Task* CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, TaskType type, CorePref corePref);
 
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
+		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
 #if !defined(__cpp_impl_coroutine) || __cpp_impl_coroutine < 201902L
 			assert(type != TaskType::Coroutine && "coroutines require a C++20 build");
 #endif
-			return CreateTaskImpl(fn, data, hipri, size, type, corePref);
+			return CreateTaskImpl(fn, data, hipri, type, corePref);
 		}
 
 
 		template<typename F>
-		auto CreateTask(F&& f, uint8_t hipri = false, FiberSize size = FiberSize::Standard, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
+		auto CreateTask(F&& f, uint8_t hipri = false, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			// NO SIZE CEILING, as of 4.0.1. A capture larger than the biggest slot used to be a
 			// COMPILE ERROR, which made the task path stricter than the coroutine path for no reason
@@ -1630,7 +2181,7 @@ namespace JLib {
 			if (!mem) return static_cast<L*>(nullptr);
 			L* t = ::new (mem) L(std::forward<F>(f));
  			t->hiPri = hipri;
-			t->requiredSize = size;
+
 			t->type = type;
 			t->corePref = corePref;
 			// ~LambdaTask is empty and its only member is the functor, so the destructor has work
@@ -1652,13 +2203,94 @@ namespace JLib {
 	private:
 		explicit TaskScheduler(size_t poolSize);
 
+		// ---- TEARDOWN IS NOT PUBLIC API. It happens once, at process exit. -------------------
+		//
+		// Join() WAS public through 4.0.2, and what it advertised was not true. It reads as
+		// "tear the pool down, and by implication bring it back" -- but there has never been a way
+		// back: Init() throws on a non-null `instance`, Join() does not null it, and StartPool is
+		// private with the constructor as its only caller. So the cycle Join()'s own comments
+		// describe could not be reached from outside the class. Nothing was broken by that, because
+		// nothing outside the test suite ever called it -- Game01 does not, and the task-size
+		// reporter at the bottom of this library exists in its at-exit form precisely because
+		// hooking Join produced a run that looked successful and wrote nothing.
+		//
+		// Private and destructor-only makes the real lifetime the stated one: the pool is
+		// process-lifetime, it drains exactly once, and there is no half-supported restart to
+		// reason about. That is a BREAKING CHANGE and it is why this release is 5.0.0.
+		void Join();
+
+		// WHY THIS TYPE EXISTS AT ALL. Making Join private is only half of it: `instance` is a raw
+		// pointer that was new'd and never deleted, so ~TaskScheduler() -- the one caller of Join()
+		// that remains -- never ran in any program. Private without this would not have made
+		// teardown destructor-only, it would have made teardown NEVER HAPPEN, and the drain would
+		// have become unreachable code that still looked load-bearing.
+		//
+		// WHAT IT COSTS, stated plainly because it is a real hazard and not a theoretical one. The
+		// drain resumes parked frames so they can unwind, and those frames run USER destructors --
+		// during static destruction, when statics in other translation units may already be gone.
+		// A frame that touches one of those on the way out is a use-after-destruction that will
+		// look like a crash at exit with no obvious cause. The alternative was leaving every parked
+		// frame abandoned, which is the thing Join() exists to prevent, so this is the lesser of
+		// two bad endings rather than a clean one.
+		//
+		// A nested class because `instance` and Join() are both private; a file-static struct in
+		// the .cpp would need friendship to reach either.
+		struct AtExitDestroyer { ~AtExitDestroyer(); };
+		static AtExitDestroyer atExitDestroyer;
+
 		// ---------- former SharedQueues state ----------
 		// (`nextId` removed in 1.3.4: a process-wide atomic counter whose only reader,
 		//  Thread::GenerateID(), had no callers anywhere. Never executed, so it cost no time -- but
 		//  it sat in the shared struct implying task IDs existed. Nothing assigns or reads one.)
 		std::atomic<bool> paused{ false };
-		std::vector<std::unique_ptr<TaskDeque>> loPri;
-		std::vector<std::unique_ptr<TaskDeque>> hiPri;
+
+		// THE WORK-STEALING DEQUES, one per worker plus one for the non-worker lane at the end.
+		// Named `loPri` until 5.0.1, which was a contrast with a `hiPri` array that no longer
+		// exists -- there is one deque per worker now, so the priority half of the name described
+		// nothing. Priority survives where it is still real: hiPriInboxes vs loPriInboxes.
+		//
+		// COMMENTS THROUGHOUT STILL SAY "loPri", and roughly a third of those mean the INBOX, which
+		// legitimately keeps that name. Sorting the two apart is a reading job rather than a rename,
+		// so it has not been done in the same pass that could not be checked by the compiler.
+		std::vector<std::unique_ptr<TaskDeque>> deques;
+
+		// ---- THE hiPri DEQUE IS THE BACKUP QUEUE, AND IT IS BACK (5.0.0) ---------------------
+		//
+		// It was deleted on the argument that "a Chase-Lev deque exists to be stolen from, nobody
+		// steals lane work, and a reserved worker wants an inbox and nothing else on the path that
+		// exists for latency." The first half of that is right and is preserved below. The second
+		// half assumed something that did not survive: that nothing would ever need to reach lane
+		// work except its owner.
+		//
+		// AN INBOX HAS EXACTLY ONE LEGAL CONSUMER. That is not a tuning choice, it is what an MPSC
+		// is -- so lane work is precisely as reachable as its owner, and an owner inside a task body
+		// is reachable by nobody. Every fix that keeps the lane inbox-only has the same shape: move
+		// the work to a DIFFERENT single consumer, which relocates the failure rather than removing
+		// it. Spill it to worker 3's inbox and worker 3 enters a long body, and it is stranded
+		// again. A deque has no such state: anyone may steal from it, at any time.
+		//
+		// THE ESCAPE QUEUE WAS THE OTHER ANSWER AND IT WAS REVERTED (it cost throughput on the
+		// bench and bought nothing measurable back). Something has to serve that role, and this is
+		// the structure that already does it for ordinary work.
+		//
+		// THE LATENCY PROPERTY IS KEPT, because the deque is not on the fast path. A worker pops
+		// its lane INBOX first and runs that task with no staging at all -- which is the whole of
+		// what "no unloading step" bought, and it is what the io p50/p99 numbers came from. Only the
+		// REMAINDER is staged here, at dispatch, in one batch, and only when there is a remainder.
+		// The common case -- one completion arrives, one worker takes it -- never touches this.
+		// THE LANE DEQUE IS GONE (5.0.1). `std::vector<std::unique_ptr<TaskDeque>> hiPri` sat here:
+		// one Chase-Lev ring per worker, parallel to loPri, holding lane work that a reserved
+		// worker had unloaded from its inbox on its way into a task body.
+		//
+		// A Chase-Lev deque exists so OTHER threads can steal from it. Nothing may take lane work
+		// from a reserved worker -- the lane is an MPSC inbox with exactly one legal consumer -- so
+		// the deque was serving a use it structurally could not have. What it bought was a rescue
+		// for work queued behind a LONG body on a reserved core, and the answer to that is the
+		// contract (do not run long bodies on K) plus HiPriSpillTarget, which stops the backlog
+		// forming at push time instead of unloading it afterwards.
+		//
+		// What went with it: the lane steal sweep in the steal loop, the staging unload at
+		// dispatch, the per-thief lane probe, and 32,768 ring slots per worker.
 
 		// Ingress backpressure bookkeeping. All three are no-ops unless a submit limit is set.
 		static void NoteInboxPush(size_t n);
@@ -1697,6 +2329,11 @@ namespace JLib {
 			std::function<void(int, int)>* func;
 			WaitGroup* wg;
 			int grain;
+
+			// Has this RANGE already woken a thief? Shared by every split of the range, because the
+			// wake we care about is one per range, not one per split -- see RunLazyRange's wake
+			// block for why the FIRST publish is the one that most needs it and was the one skipped.
+			std::atomic<bool> wokeForRange{ false };
 		};
 		// The deque the CALLING thread may publish onto, or nullptr if it has none. Resolved per
 		// invocation and never cached across one: a split that gets stolen resumes on a different
@@ -1706,6 +2343,32 @@ namespace JLib {
 		void RunLazyRange(int lo, int hi, LazyRangeState* st);
 		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
 		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
+		// RESUMED FIBERS, ONE QUEUE PER WORKER, DRAINED ONLY BY ITS OWNER AND NEVER INTO A DEQUE.
+		//
+		// THE POINT IS THE "NEVER INTO A DEQUE" HALF. The other two inboxes drain into the owner's
+		// deque, which is the correct thing for a task -- it becomes stealable and the pool
+		// rebalances. But a resumed fiber must NOT become stealable: it is pinned to the worker it
+		// was bound on (Fiber::homeWorker), and a thief taking it would migrate it, which is the
+		// thread_local hazard that pinning exists to remove. So resumed fibers get a queue that has
+		// no path into the deque at all, and the worker runs them straight out of it.
+		//
+		// A PREDICATE COULD NOT DO THIS JOB, which is why it is a separate structure rather than a
+		// filter on the existing drain. A thief must decide BEFORE it claims a task, and the only
+		// thing it may read before claiming is the deque's tag -- TaskDeque::StealBits -- which
+		// carries corePref and type and is immutable by contract ("written exclusively by
+		// CreateTask... nothing mutates them afterwards"). "Already holds a fiber" is mutable state
+		// acquired long after CreateTask, so it cannot ride in the tag, and dereferencing an
+		// unclaimed task to ask is the exact lifetime bug StealBits was introduced to fix.
+		// Separating by QUEUE is the only place the distinction can live.
+		//
+		// EVERY PARK PREDICATE MUST CONSULT THIS. There are four (the pre-park recheck, the Event
+		// sleep predicate, the condvar wait predicate, and the pre-sleep drain) plus the hiPriStray
+		// work-presence check. A worker that parks without checking this queue sleeps on runnable
+		// work that no other worker is permitted to take -- an unrecoverable hang, not a stall,
+		// and the same signature as the loPri-inbox hang already recorded in Worker().
+		std::vector<std::unique_ptr<TaskMPSCQueue>> resumedInboxes;
+
+
 		static GlobalFiberPool* globalPool;
 		// -----------------------------------------------
 
@@ -1885,7 +2548,7 @@ namespace JLib {
 		// it produced was not "large pools lose an optimisation" -- it was a CLIFF, in the direction
 		// that hurts most:
 		//
-		//   loPri.size() is num_workers + 1 (the non-worker lane), so the edge sat at 64 WORKERS,
+		//   deques.size() is num_workers + 1 (the non-worker lane), so the edge sat at 64 WORKERS,
 		//   not 64 CPUs. Init(0) takes hardware_concurrency - 1, so a 64-thread machine landed on
 		//   exactly 64 and kept its hints, while a 128-thread Threadripper got 127 workers and
 		//   MaybeStealable disabled the hints WHOLESALE -- every idle worker back to probing every
@@ -1898,16 +2561,81 @@ namespace JLib {
 		//
 		// FOUR WORDS = 256 QUEUES, matching topology::CpuMask::kMaxCpus so the two ceilings cannot
 		// drift apart. Cost is bounded by the POOL, not by the constant: readers walk
-		// ceil(loPri.size()/64) words, so a 32-worker pool touches exactly one and pays what it
+		// ceil(deques.size()/64) words, so a 32-worker pool touches exactly one and pays what it
 		// always did. Above 256 the guards below fall back to "always a candidate", which is the old
 		// probe-everything behaviour -- correct, just unoptimised, and on hardware nobody has yet.
 		static constexpr size_t kHintWords     = 4;
 		static constexpr size_t kMaxHintQueues = kHintWords * 64;   // 256
 
+		// ---- WHICH WORKERS ARE AWAKE. One bit per worker, maintained by the worker itself. -------
+		//
+		// THE PROBLEM IT SOLVES, and the measurement that demanded it: single-producer throughput
+		// SCALES BACKWARDS -- 10.97 M/s at 2 workers, 4.46 at 4, 2.20 at 31, for no-op tasks. More
+		// workers is strictly less throughput. That is not contention; it is a per-push cost that
+		// grows as the pool gets IDLER. Placement was pure round-robin, so with 31 workers a single
+		// producer lands on a different worker nearly every push, most of them parked, and each of
+		// those pushes buys an OS wake. With 2 workers the same pushes hit two saturated workers
+		// that are always AWAKE, NotifyWorker's skip fires, and the push is nearly free.
+		//
+		// So: pick a worker that is ALREADY RUNNING and the wake never happens. This is what marl
+		// does with its spinningWorkers[] exchange -- steering each enqueue at a worker already
+		// spinning is why a serial ping-pong there wakes nobody -- and it is the one structural
+		// difference that survived every other comparison.
+		//
+		// WRITTEN ONLY ON A TRANSITION, which is what makes it affordable. A worker sets its bit
+		// when it resumes searching and clears it when it parks; both are already expensive moments.
+		// Pushers only ever READ it, and under a steady workload the words sit shared-clean.
+		//
+		// A STALE BIT IS SAFE IN BOTH DIRECTIONS, which is why these are relaxed. Stale-set means a
+		// push chooses a worker that just parked -- NotifyWorker wakes it, exactly the old
+		// behaviour. Stale-clear means a push skips a worker that just woke -- it goes to another
+		// awake one. Neither loses work; both are the cost this is trying to reduce, not a
+		// correctness question.
+		//
+		// ALL BITS CLEAR MEANS THE WHOLE POOL IS PARKED, and then there is no awake worker to
+		// prefer -- placement falls back to round-robin and the wake is genuinely necessary.
+		std::atomic<unsigned long long> awakeHint[kHintWords]{};
+		// ---- AWAY: THIS WORKER CANNOT SERVICE ITS OWN INBOX RIGHT NOW ------------------------
+		//
+		// Set around every dispatch -- native function, fiber switch-in, coroutine resume -- and
+		// cleared when the worker is back in its search loop.
+		//
+		// WHY IT HAS TO EXIST. An inbox has exactly ONE legal consumer: its owner. Nobody steals
+		// from it. So a task placed on a worker that is inside a task body is not merely late, it
+		// is STRANDED until that body returns -- and if that body is itself waiting on the task it
+		// just pushed there, it never returns. That is a deadlock built out of two correct pieces.
+		//
+		// Same shape as the awake bitmap and read the same way: placement PREFERS to avoid these
+		// workers, and falls back to the full set rather than refusing to place at all.
+		// awayHint IS GONE. It marked workers inside a task body so placement could avoid them --
+		// correct in intent, and two atomic RMWs per task on ONE shared word in practice, which
+		// measured throughput/1p 5.37 -> 2.93 M/s and frame DAG 8.45 -> 35.82 us/graph. See
+		// UpdateBacklogHint below. The reachability it defended is now kept by publishing a
+		// BACKED-UP inbox into the stealable deque at dispatch, gated on a counter the worker
+		// already owns.
+
 		std::atomic<unsigned long long> stealHintBacklog[kHintWords]{};
 		std::atomic<unsigned long long> stealHintParallel[kHintWords]{};
 
 		// Owner-maintained, on push and pop. Writes only on a threshold crossing.
+		// ADVERTISING REGARDLESS OF DEPTH WAS TRIED AND REVERTED -- do not re-add it without
+		// running the full bench, because no unit test can see what it costs.
+		//
+		// The argument was good: UpdateBacklogHint below only sets the bit at kStealHintDepth (8)
+		// or more, which is right while the owner keeps taking passes and wrong at the one moment
+		// it stops -- a worker entering a long body will not get to a shallow backlog shortly, and
+		// below the threshold nothing else may learn it exists.
+		//
+		// WHAT IT ACTUALLY COST: `advertisedCount != 0` is POOL-WIDE and gates both parking and the
+		// collapse call site. A worker takes its next task with a non-empty deque on most
+		// dispatches, so "advertise when a worker departs" meant "advertise nearly always", and one
+		// shallow queue kept the whole pool awake. Measured over three affinity policies:
+		// throughput/1p 3.12 -> 1.24 M/s, kernel wakes 169k -> 318k, frame DAG 4.66 -> 7.82
+		// us/graph, and the awake floor ended at F=28 having never shed -- `FLOOR DID NOT SHED` on
+		// two runs of three.
+		//
+		// The case it was written for is handled at PUSH time now: work whose target is away goes
+		// to the escape queue instead of that worker's inbox, so it never needed advertising.
 		void UpdateBacklogHint(size_t q, size_t depth) noexcept {
 			if (q >= kMaxHintQueues) return;
 			auto& word = stealHintBacklog[q >> 6];
@@ -1920,10 +2648,47 @@ namespace JLib {
 		// Set by the splitter when it publishes; cleared by the owner when its lane drains. Held
 		// conservatively -- while ANY work remains the lane stays advertised, which costs a probe
 		// and can never hide a split.
-		void SetParallelHint(size_t q) noexcept {
-			if (q < kMaxHintQueues)
-				stealHintParallel[q >> 6].fetch_or(1ull << (q & 63), std::memory_order_release);
+		// Returns TRUE only on the 0 -> 1 EDGE, i.e. when this call is the one that made the lane
+		// advertise. Callers use that to wake a thief exactly once per range instead of once per
+		// split -- see the wake site in the splitter for what per-split cost looked like.
+		bool SetParallelHint(size_t q) noexcept {
+			if (q >= kMaxHintQueues) return false;
+			const unsigned long long m = 1ull << (q & 63);
+			const unsigned long long old =
+				stealHintParallel[q >> 6].fetch_or(m, std::memory_order_release);
+			return (old & m) == 0;
 		}
+		// ---- HIPRI PRESENCE, ONE BIT PER WORKER ----------------------------------------------
+		//
+		// Set when anything lands in worker q's hiPri inbox or deque; cleared by q itself when both
+		// are empty. A thief probes a remote hiPri deque ONLY when the bit says there is something
+		// there, so the common case -- no I/O in flight -- costs a register test rather than a
+		// steal_if against another worker's cache line.
+		//
+		// REUSES stealHintLane, which is the bitmap the K lane advertised through and has been
+		// unused since K was stubbed. Same shape (one word, one bit per worker, workers 0..63),
+		// same publisher-sets/owner-clears discipline, so nothing new has to be reasoned about --
+		// only the meaning of the bit changed, from "this hot worker has lane work buried" to
+		// "this worker has hiPri work at all".
+		void SetHiPriHint(size_t q) noexcept {
+			if (q >= 64) return;
+			stealHintLane.fetch_or(1ull << q, std::memory_order_release);
+		}
+		void ClearHiPriHint(size_t q) noexcept {
+			if (q >= 64) return;
+			stealHintLane.fetch_and(~(1ull << q), std::memory_order_relaxed);
+		}
+		bool HiPriHintSet(size_t q) const noexcept {
+			if (q >= 64) return true;   // past the bitmap: probe rather than miss work
+			return (stealHintLane.load(std::memory_order_acquire) & (1ull << q)) != 0;
+		}
+		// The whole word, for a worker that needs to ask "is there hiPri work ANYWHERE" rather than
+		// "at q". A reserved worker's idle decision needs exactly that: it may not take loPri, so
+		// loPri advertisements must not keep it awake. See Thread::Worker's advertisedCount.
+		unsigned long long HiPriHintWord() const noexcept {
+			return stealHintLane.load(std::memory_order_acquire);
+		}
+
 		void ClearParallelHintIfEmpty(size_t q, size_t depth) noexcept {
 			if (q >= kMaxHintQueues || depth != 0) return;
 			stealHintParallel[q >> 6].fetch_and(~(1ull << (q & 63)), std::memory_order_relaxed);
@@ -1933,7 +2698,7 @@ namespace JLib {
 		// process. Three separately-built binaries measured in three sessions is how a 2x machine
 		// drift once got read as a result.
 		// THE POOL-WIDE DISABLE IS GONE, and it is the whole point of the multi-word change. It read
-		// `loPri.size() > 64 -> return true`, which turned the hint off for EVERY queue the moment
+		// `deques.size() > 64 -> return true`, which turned the hint off for EVERY queue the moment
 		// the pool outgrew one word -- necessarily, because covering only 0..63 would have starved
 		// everything above it. With 256 bits available the guard is now per-queue, so a pool larger
 		// than one word keeps its hints; only a pool larger than 256 falls back, and then uniformly.
@@ -1950,9 +2715,46 @@ namespace JLib {
 		// before `instance` is assigned, so one unconditional static read in the worker loop took
 		// every pool-starting test down at 0xC0000409: silent, no message, nothing for ASan to find.
 		// A worker already holds `scheduler`; inside that loop, use these and never the statics.
+		// Set/clear this worker's awake bit. Called by the worker itself, on transitions only.
+		void SetAwake(size_t q, bool awake) noexcept {
+			if (q >= kMaxHintQueues) return;   // past the bitmap: no bit, and placement falls back
+			auto& word = awakeHint[q >> 6];
+			const unsigned long long m = 1ull << (q & 63);
+			if (awake) word.fetch_or(m, std::memory_order_relaxed);
+			else       word.fetch_and(~m, std::memory_order_relaxed);
+		}
+		unsigned long long AwakeHintWord(size_t wi) const noexcept {
+			return awakeHint[wi].load(std::memory_order_relaxed);
+		}
+
+		// AN ESCAPE QUEUE WAS BUILT HERE AND REVERTED. A moodycamel MPMC queue held work whose
+		// chosen worker was inside a task body, so any worker could take it -- the right answer to
+		// "an inbox has one legal consumer and its consumer is busy". It was reverted for its
+		// TRIGGER, not its design: diverting requires knowing the owner will be busy for a LONG
+		// time, and no cheap signal says that. See UpdateBacklogHint below for the measurements.
+
 		unsigned long long StealHintWord(size_t wi) const noexcept {
 			return stealHintBacklog[wi].load(std::memory_order_acquire)
 			     | stealHintParallel[wi].load(std::memory_order_acquire);
+		}
+
+		// Is ANY queue advertising stealable work right now? The same question the park condition
+		// asks, and for the floor collapse it is the difference between "the wave is over" and "this
+		// one worker lost a race for it" -- shedding on the second would shear a live wave.
+		// TEMP DIAG -- is the queue a hint bit claims work for actually empty? A set bit over an
+		// empty queue is a hint nobody will clear (publisher-sets, owner-clears, owner has nothing
+		// to drain) and it pins advertisedCount above zero pool-wide.
+		bool WorkerQueuesEmpty(size_t q) const noexcept {
+			if (q >= deques.size()) return true;
+			// hiPriInboxes is sized to the WORKERS only -- loPri has one extra for the non-worker
+			// lane, so guarding on deques.size() lets q index one past the end of the inboxes.
+			if (q >= hiPriInboxes.size()) return deques[q]->empty();
+			return deques[q]->empty() && hiPriInboxes[q]->empty();
+		}
+		bool AnyStealAdvertised() const noexcept {
+			for (size_t w = 0; w < kHintWords; ++w)
+				if (StealHintWord(w)) return true;
+			return false;
 		}
 		// The lane map is deliberately ONE word (hot workers are always the lowest indices, and K is
 		// clamped to 64 for exactly that reason), so every higher word is empty by construction
@@ -1962,7 +2764,7 @@ namespace JLib {
 		}
 
 		bool MaybeStealable(size_t q) const noexcept {
-			if (q >= kMaxHintQueues || loPri.size() > kMaxHintQueues) return true;
+			if (q >= kMaxHintQueues || deques.size() > kMaxHintQueues) return true;
 			if (!stealHintOn.load(std::memory_order_relaxed)) return true;
 			const size_t wi = q >> 6;
 			const unsigned long long bit = 1ull << (q & 63);
@@ -1990,11 +2792,10 @@ namespace JLib {
 		// v1 steal-hint failure (owner loses the race, 22,000 probes against a 9,164 baseline) with
 		// higher stakes, because here it also defeats the placement. Four is above the depth a
 		// keeping-up worker reaches and well below the 8-13 measured when one is buried.
-		static constexpr int kLaneStealDepth = 4;
-		// laneClearDepth`s default must BE the single-threshold behaviour, or the "no hysteresis" arm is
-		// not a control. Asserted rather than commented because the two live 100 lines apart.
-		static_assert(kLaneStealDepth == 4,
-			"laneSetDepth defaults to 4 and laneClearDepth to 3 == kLaneStealDepth - 1; keep all three in step");
+		// kLaneStealDepth IS GONE with the steal it throttled. It was the depth above which a
+		// SIBLING was permitted to steal from a hot worker.s lane deque; no deque, no steal, no
+		// threshold. The hint bit it once gated survives as a pure presence flag for the K
+		// controller, set/cleared against the inbox (see laneSetDepth/laneClearDepth defaults).
 
 		std::atomic<unsigned long long> stealHintLane{ 0 };
 
@@ -2052,20 +2853,28 @@ namespace JLib {
 				// so this fires once per burial rather than once per push. That rarity is what makes
 				// it affordable to do here, on the hot worker itself, microseconds before it
 				// disappears into a long handler.
-				WakeForLane(depth);
-				// AND THE PRECISE MOMENT SATURATION CAN BECOME TRUE. The sampled per-pass caller
-				// cannot be relied on for the UP direction: it rides worker 0`s loop, and a worker
-				// buried in a long task is not looping -- which is exactly when the lane saturates.
-				// This edge fires ON the worker that just got buried, so the check happens when the
-				// condition is created rather than whenever somebody next gets around to looking.
-				MaybeAdjustHotWorkers();
+				// NO LANE WAKE. The bit is a PRESENCE flag for the K controller, not a reason to
+				// wake anybody: with the hiPri deque gone there is nothing for a woken worker to
+				// steal, and the lane.s owner pops its own inbox on its next pass. Waking a
+				// worker that can only look at a queue it may not touch is the pure-cost shape
+				// this file already records for the removed hiPri steal probe.
+				//
+				// A MaybeAdjustHotWorkers() EDGE FIRED HERE AND IS GONE WITH THE CONTROLLER. The
+				// argument for it was good -- this is the moment saturation BECOMES true, on the
+				// worker that just got buried, rather than whenever somebody next samples. It did
+				// not matter, because the controller it woke never moved K in 2.5M hiPri tasks. K
+				// is static now; this bit is a steal hint and nothing else.
 			}
 			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
 		}
 
 		// Defined out of line in TaskScheduler.cpp: it touches Thread, which is only forward
 		// declared at this point.
-		void WakeForLane(size_t depth) noexcept;
+		// WakeForLane(depth) IS GONE. It woke ORDINARY workers to come and drain a buried hot
+		// worker's lane, which the lane being an MPSC inbox makes impossible: an inbox has exactly
+		// one legal consumer, so a woken worker cannot touch that lane at all. It also had ZERO
+		// callers by the time it was removed -- a mechanism that could not fire, guarded by a mode
+		// flag (laneHintMode 4) that gated nothing else.
 		bool LaneStealable(size_t w) const noexcept {
 			if (w >= 64) return false;
 			return (stealHintLane.load(std::memory_order_acquire) & (1ull << w)) != 0;
@@ -2085,7 +2894,12 @@ namespace JLib {
 		std::vector<int> pWorkers, eWorkers;
 		std::atomic<size_t> nextPWorker{ 0 }, nextEWorker{ 0 };
 		std::atomic<bool> stopFlag{ false };
-		std::vector<std::shared_ptr<Thread>> workers;
+		// RAW Thread*, NOT shared_ptr. One owner, process-length lifetime, and the table is read on the
+		// wake path -- a refcount and a control-block hop bought nothing and cost both. Also what makes
+		// the table a plain contiguous array of pointers: Thread itself holds atomics and a std::thread
+		// and so is not movable, which rules out vector<Thread>, but a pointer always is.
+		// Deleted at the two clear sites in TaskScheduler.cpp; see those for why it is safe there.
+		std::vector<Thread*> workers;
 		TaskMPSCQueue mainQ;
 		std::mutex poolMutex;
 	};

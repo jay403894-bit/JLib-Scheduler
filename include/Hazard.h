@@ -249,8 +249,30 @@ namespace JLib {
         void Retire(void* p, void (*deleter)(void*));
 
         // Frees everything in this thread's batch that no live cell names. Called automatically
-        // when a batch grows past its threshold; public so a test can force it.
+        // when a batch grows past its threshold; public so a test can force it, and so an app that
+        // turns the worker-side scan off can drive it itself -- see SetSelfScan.
         void Scan();
+
+        // ---- WHO PAYS FOR THE SWEEP ---------------------------------------------------------
+        //
+        // Workers scan on the way into idle. That is the right default -- the cost lands on a
+        // thread with nothing else to do -- but it is a LATENCY decision, not a correctness one,
+        // and the same argument that produced EpochManager::SetSelfReclaim applies here: the
+        // sweep walks every hazard cell, and a worker that takes it has stopped being available
+        // for the completion that arrives one microsecond later.
+        //
+        // Measured for the EPOCH equivalent, which is the same shape: moving the tick off the
+        // workers and onto the app's own idle point took p99 from 331 us to 113 us. This has not
+        // been separately measured -- the hazard bag is smaller and scans less often -- so treat
+        // the epoch number as the reason to TRY it, not as a claim about this one.
+        //
+        // TURN IT OFF AND YOU OWN THE SWEEP. Call Scan() from your frame boundary or idle path.
+        // Nothing else reclaims: a bag that nobody sweeps grows until its thread exits, and then
+        // becomes an orphaned retire (see OrphanedRetired below, which is how you would notice).
+        // The threshold-triggered scan inside Retire still runs -- this governs only the
+        // worker-idle sweep, so forgetting to call it degrades to "reclaims late", not "leaks".
+        void SetSelfScan(bool on) noexcept { selfScan.store(on, std::memory_order_relaxed); }
+        bool SelfScanEnabled() const noexcept { return selfScan.load(std::memory_order_relaxed); }
 
         // Diagnostics only.
         // Builds the table if needed -- reporting 0 because nobody has taken a guard yet reads as
@@ -318,6 +340,11 @@ namespace JLib {
         std::size_t fiberCount  = 0;
         std::size_t workerCount = 0;
         std::size_t readerCount = 0;
+        // ON by default: the worker-idle sweep is the right default and turning it off is an
+        // explicit trade the app makes. Atomic and relaxed because it is read on the idle path of
+        // every worker and written approximately never -- a stale read costs one extra scan or one
+        // skipped one, and the next idle pass corrects it.
+        std::atomic<bool> selfScan{ true };
     };
 
     // RAII over one reader's cells. Construct inside the traversal, destroy when the last protected

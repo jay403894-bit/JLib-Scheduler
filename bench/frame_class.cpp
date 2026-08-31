@@ -100,6 +100,6 @@ int main() {
     std::printf("\nB-A positive means the 256-byte slot is SLOWER, i.e. the 64-byte class wins.\n");
     std::printf("Read it only if the A/A row is near zero.\n");
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     return 0;
 }

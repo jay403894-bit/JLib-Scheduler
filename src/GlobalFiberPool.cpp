@@ -6,13 +6,11 @@
 
 using namespace JLib;
 
-GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
+GlobalFiberPool::GlobalFiberPool(size_t standardCount)
 	: standardArena(standardCount * kStandardStackSize),
-	heavyArena(heavyCount * kHeavyStackSize),
-	availableFibers(standardCount + heavyCount),
-	size(standardCount + heavyCount) // Initialize queue with total capacity
+	availableFibers(standardCount),
+	size(standardCount) // Initialize queue with total capacity
 {
-	// 1. Initialize standard fibers
 	standardFibers.reserve(standardCount);
 	for (size_t i = 0; i < standardCount; ++i) {
 		void* stackMem = standardArena.AllocateStack(kStandardStackSize);
@@ -22,7 +20,7 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
 		Fiber& f = standardFibers.back();
 		f.stackBase = stackMem;
 		f.stackSize = kStandardStackSize;
-		f.poolIndex = i;                        // standard fibers occupy [0, standardCount)
+		f.poolIndex = i;                        // one dense range, [0, standardCount)
 
 		// Register this fiber's EBR slot ONCE. Fibers live for the whole program (the
 		// pool is leaked, the vector is reserve()'d so it never reallocates), so the
@@ -33,27 +31,12 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount, size_t heavyCount)
 		availableFibers.enqueue(&f);
 	}
 
-	// 2. Initialize heavy fibers
-	heavyFibers.reserve(heavyCount);
-	for (size_t i = 0; i < heavyCount; ++i) {
-		void* stackMem = heavyArena.AllocateStack(kHeavyStackSize);
-		if (!stackMem) throw std::runtime_error("Failed to allocate stack");
-
-		heavyFibers.emplace_back();
-		Fiber& f = heavyFibers.back();
-		f.stackBase = stackMem;
-		f.stackSize = kHeavyStackSize;
-		f.poolIndex = standardCount + i;        // heavy fibers follow them, one dense range
-
-		EpochManager::Instance().RegisterParticipant(&f.localEpoch);  // see standard loop
-
-		// Push into the lock-free queue
-		availableFibers.enqueue(&f);
-	}
+	// A SECOND LOOP BUILT A 512 KB "HEAVY" CLASS HERE AND IS GONE. Nothing requested it -- see the
+	// note in the header -- and it committed ~127 MB on a 31-worker pool while it waited.
 }
-GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount, size_t heavyCount)
+GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount)
 {
-	return new GlobalFiberPool(standardCount, heavyCount);
+	return new GlobalFiberPool(standardCount);
 }
 
 

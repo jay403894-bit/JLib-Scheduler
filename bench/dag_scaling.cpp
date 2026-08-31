@@ -161,6 +161,6 @@ int main() {
     std::printf("\nread DOWN each block: if exec us/node is flat as fanout grows, walking dependents\n");
     std::printf("is invisible next to dispatch and edge layout is not worth reopening.\n");
 
-    sched.Join();
+    JLib::detail::TeardownForTesting(sched);
     return 0;
 }

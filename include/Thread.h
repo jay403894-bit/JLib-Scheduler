@@ -215,13 +215,87 @@ namespace JLib {
         bool isImmediate;
     };
     class Thread {
+        // MUTUAL FRIENDSHIP, and both directions are load-bearing.
+        //
+        // TaskScheduler already declares `friend class Thread`, which is how Worker() reaches the
+        // queues -- scheduler->loPriInboxes[qIndex], scheduler->resumedInboxes[qIndex] and the rest.
+        // This is the other half: the scheduler owns the thread table and drives shutdown across all
+        // of it at once, so it needs this worker's state (running, workerState) without a named
+        // accessor minted for every field it touches.
+        //
+        // The named accessors that DO exist -- GetFiber, GetThread, RequestStop -- stay, because
+        // they say what the operation MEANS at the call site. Friendship is the escape hatch for
+        // everything that has not earned a name.
+        friend class TaskScheduler;
+
     public:
         static thread_local Thread* self;
+
+        // THE WORKER RUNNING ON THIS THREAD, or nullptr on a non-worker (the app's main thread, an
+        // I/O thread). The backing pointer is private because nothing outside the scheduler may
+        // reassign it; reading it is safe and is how a task answers "which worker picked me up?",
+        // which is what the bench's placement histogram needs and what makes a claim about steering
+        // checkable rather than assumed.
+        //
+        // NOT the same as `self` above, which is declared but never assigned -- read this one.
+        static Thread* Current() noexcept { return instance; }
 
         Context schedulerCtx;
         Fiber* currentFiber = nullptr;
         Task* currentRunningTask = nullptr;
         int qIndex = 0;
+        // WS_AWAKE(0) / WS_GOING_TO_SLEEP(1) / WS_SLEEPING(2). Read by the placement path to decide
+        // whether a push it just routed will have to buy an OS wake -- see NoteWakeMiss.
+        int GetWorkerState() const noexcept { return workerState.load(std::memory_order_relaxed); }
+
+        // The OS thread itself, so a caller can join it directly -- `threads[i]->GetThread().join()`
+        // -- rather than going through Thread::Join().
+        //
+        // WHY THAT IS THE BETTER SHUTDOWN. Thread::Join() flipped `running`, notified, then waited
+        // on a condition variable for a predicate it had just satisfied itself, then joined the
+        // thread anyway. Every step but the last was ceremony around the one call that actually
+        // waits. std::thread::join() returns when the OS thread has genuinely exited, which is a
+        // stronger statement than any flag handshake was making.
+        //
+        // THE CALLER OWNS THE ORDER, and that is the point of exposing it. Shutdown is: stop the
+        // producers, cancel every parked frame so it can unwind, ResumeAll() so workers are awake to
+        // run the unwinding, THEN join. Splitting "make it stop" from "wait for it to stop" is what
+        // lets those happen in that order across the whole pool instead of one worker at a time --
+        // which is precisely what strands a fiber pinned to a worker that has already left.
+        std::thread& GetThread() { return thread; }
+
+        // Tell this worker to leave its loop. Does NOT wait -- that is GetThread().join(), and the
+        // separation is the whole point.
+        //
+        // Thread::Join() fused the two, which forced shutdown to be per-worker: stop one, wait for
+        // it, stop the next. Worker 0 was therefore already gone while 1..N were still draining, and
+        // a fiber pinned to worker 0 resumed into a queue nobody would ever pop again -- stranded
+        // mid-unwind, so its destructors never ran. Split, the caller can stop EVERY worker, wake
+        // them all, and only then wait for them, which has no such window.
+        void RequestStop() {
+            running.store(false, std::memory_order_release);
+            // AND WAKE IT. Harmless while the pool only spins -- a spinning worker sees `running`
+            // on its next pass either way -- and REQUIRED the moment a blocking park returns: a
+            // parked worker is off the run queue and never observes the flag on its own, which is
+            // a Join that waits forever on a thread told to stop that cannot hear it.
+            Wake();
+        }
+
+        // Bring this worker back to its search loop. Publishes a state CHANGE and then wakes the
+        // address, in that order, and both halves are required.
+        //
+        // TODAY THIS IS JUST THE STATE STORE, because the pool spins and a spinning worker observes
+        // it on its next pass. There is no OS call left in here.
+        //
+        // KEPT AS A NAMED OPERATION RATHER THAN INLINED, because the moment a blocking park returns
+        // this is where its signal goes, and the ORDER is the part that is easy to get wrong:
+        // publish the state change, THEN signal. A wake delivered between the waiter's last
+        // predicate check and the point it actually blocks reaches nobody and is gone -- the waiter
+        // then sleeps on a value nobody will change again. Changing the word first means a late
+        // waiter never blocks at all. That is the futex rule, and skipping it is not a theoretical
+        // lost wakeup: it hung the pool intermittently and hung Join every single time.
+        void Wake() noexcept;
+
         // True while this worker is actively executing a task (fast path OR on a fiber) --
         // a cheap heuristic hint for OTHER workers deciding whether to steal from an SMT
         // sibling (see TaskScheduler::siblingQIndex). Relaxed: a stale read just makes the
@@ -252,6 +326,13 @@ namespace JLib {
         // invisible to the ENTIRE pool -- including, potentially, the very task it is waiting for.
         // Deques are stealable, so moving the work across makes it reachable again.
         bool DrainOwnInboxesToDeques();
+
+        // Pops ONE task from this worker's own lane inbox, for a blocked owner to run while it
+        // spin-helps. Returns null if the lane is empty, or if the next lane task was fiber-backed
+        // -- which a fiberless helper cannot run, so it is relocated to the loPri deque and
+        // `relocated` is set, meaning a notify is owed. See the definition for why the owner
+        // looking at its own inbox is the only legal way that work can move.
+        Task* TryTakeLaneTask(bool& relocated);
         void Join();
         static Thread* GetCurrent();
         static void CoYield(Fiber* targetFiber);
@@ -322,12 +403,24 @@ namespace JLib {
     private:
         Fiber* AcquireFiber(Task* task);
         void ReleaseFiber(Fiber* f);
+
+        // What happens to a fiber and its task once it has switched back out. Extracted from
+        // Worker() so a bound main thread can run the identical state machine rather than a second
+        // copy of it. See the definition in Thread.cpp for the three outcomes and their traps.
+        void OnFiberReturned(Fiber* f, Task* task) noexcept;
         uint32_t FastRand();
         void WaitBackoff(int& spin_count);
         void ExecuteTask(Task* task);
         Task* AcquireWork(bool& isFork);   // inbox drain + localQ + pop_bottom + steal
         void  RunTask(Task* task, bool isFork);  // acquire/resume fiber, switch, handle DEAD/YIELD/SUSPEND
         void Worker();
+
+        // Called from BOTH completion arms after a task ends. Grows the awake floor and hands this
+        // worker.s backlog to overflow workers when the body that just ended was long enough that
+        // queueing behind it is expensive. Factored out because it lived in the two arms
+        // separately and immediately drifted: the Native arm redistributed and the fiber arm only
+        // grew, so a wave of FIBER tasks reproduced the original bug -- floor at 16, nobody fed.
+        void GrowFloorIfLongBody(long long bodyNs);
 
         TaskScheduler* scheduler;
         ThreadLocalCache<> localCache;
@@ -342,6 +435,45 @@ namespace JLib {
         // genuinely asleep only needs to know about work landing on ITSELF; stealable work on
         // OTHER workers' deques is already found for free by the unconditional steal-attempt
         // phase every awake worker runs each loop pass, with no predicate involved at all.
+        // Tasks pushed into THIS worker.s inbox and not yet drained. Per-worker rather than
+        // pool-wide so producers aiming at different workers do not share a cache line, and
+        // maintained unconditionally -- the pool-wide g_inboxDepth only counts when a submit limit
+        // is set, so it reads zero in every default configuration and cannot steer anything.
+        //
+        // EXISTS TO ANSWER "HOW MUCH", NOT "ANY". hasQueuedWork is a bool, and a bool cannot tell a
+        // 16-task wave queued behind two workers from a 6-node graph doing the same -- which is
+        // exactly the distinction the floor growth rule got wrong.
+        // ---- CONDVAR PARK ARM (A/B against WaitOnAddress/futex) ---------------------------
+        //
+        // Per-worker, so the sleep is one-waiter-one-address either way and there is no herd for
+        // either primitive to avoid. Only one of the two arms is ever used in a run; see
+        // TaskScheduler::ParkPrimitive.
+        //
+        // WHY THIS IS WORTH MEASURING IN THE SCHEDULER rather than in isolation: the isolated
+        // ping-pong says condvar has tighter wake variance, but it cannot see the two things that
+        // actually differ here -- the mutex condvar puts back on the NOTIFY path, and the fact
+        // that the WaitOnAddress arm re-reads three inboxes and four seq_cst flags before it ever
+        // blocks, work the condvar arm does under its predicate lock instead.
+        std::mutex              parkMx;
+        std::condition_variable parkCv;
+
+        // HOW MANY TIMES THIS WORKER ACTUALLY BLOCKED. Diagnostic only -- nothing steers on it.
+        // Exists so a bench can check its DECLARED bands against OBSERVED behaviour instead of
+        // printing the same atomics the scheduler already steers by, which agrees with itself
+        // whatever the wiring does. See the park site in Worker().
+        std::atomic<unsigned> parkCount{ 0 };
+
+        std::atomic<int> inboxDepth{ 0 };
+
+        // MonotonicNs at which this worker entered its CURRENT task, or 0 when it is not in one.
+        // Published so a PUSHER can ask "has this worker been busy longer than a trivial body?",
+        // which is the only signal that separates a wave of 3 ms tasks from a flood of 60 ns ones.
+        // Both look identical by queue depth, and depth alone grew the floor to 16 on a no-op flood.
+        //
+        // COSTS NOTHING NEW: the clock read already happened here for the floor-utilisation window,
+        // and only floor workers pay it -- one or two threads, not thirty-one.
+        std::atomic<long long> taskStartNs{ 0 };
+
         std::atomic<bool> hasQueuedWork{ false };
 
         // EDGE-TRIGGERED, and that is the whole safety argument for it. Cleared once per Worker()
@@ -356,6 +488,19 @@ namespace JLib {
         // arrived at by accident and with none of NoSleep's bounds. A flag the worker consumes
         // cannot do that.
         std::atomic<bool> laneWake{ false };
+
+        // "The last thing I re-queued was a YIELD, not a genuine resume."
+        //
+        // NOT ATOMIC, and that is the point: it is written by this worker in OnFiberReturned and
+        // read by this worker in its own search, both on its own thread. A yielded fiber is
+        // re-queued only by the worker that ran it (single-producer, stated at the push site), so
+        // there is no second writer and no ordering to establish.
+        //
+        // It exists because the resumed inbox is checked before the loPri inbox drain -- correct
+        // for a pinned resume, which nobody else may drain, and starvation for a yield loop, which
+        // re-arms that check forever. See the push site in Thread::OnFiberReturned and
+        // tests/yield_starvation_test.cpp.
+        bool yieldedLastPass = false;
 
         // ---- LANE DUTY CYCLE, sampled BY THE WORKER ITSELF ------------------------------------
         // How often this worker actually has lane work, counted on its own loop at its own rate.
@@ -388,6 +533,25 @@ namespace JLib {
         // question, and it does not punish a lane for being fast.
         std::atomic<unsigned> laneTasksRun{ 0 };
 
+        // Tasks this worker has picked up since the awake-floor controller last read it. Exchanged
+        // to zero per window, so it answers exactly one question: did the MARGINAL floor worker do
+        // anything this window? Zero for several windows running is the demote signal.
+        //
+        // Relaxed and per-worker: an exact count is not needed, only zero versus non-zero, and the
+        // line is this worker's own.
+        std::atomic<unsigned> tasksRun{ 0 };
+
+        // Nanoseconds this worker spent EXECUTING since the controller last read it. The saturation
+        // signal: a floor worker at ~100% is the case the wake-miss counter cannot see, because
+        // work piling onto an already-awake worker wakes nobody. That is exactly `burst` -- sixteen
+        // tasks onto one worker, no misses, and without this the floor would never grow.
+        //
+        // ACCUMULATED ONLY BY WORKERS INSIDE THE FLOOR, which is what makes the two clock reads per
+        // task affordable: there are one or two such workers, not thirty-one. The old K-hot version
+        // charged this to every lane task and its own comment called that out as a cost paid by
+        // users who never asked for scaling.
+        std::atomic<long long> busyNs{ 0 };
+
     private:
 
         // Worker sleep state, so a push can skip the wake entirely when this worker is already
@@ -404,11 +568,7 @@ namespace JLib {
         std::atomic<bool> running{ false };
         std::atomic<bool> ready{ false };
         std::atomic<bool> joining{ false };
-        std::mutex workerMutex;
-        std::mutex joinMutex;
-        std::condition_variable cvWorkerDone;
-        std::condition_variable cv;
-        std::condition_variable cvAffinity;
+
         Task* task = nullptr;
         std::thread thread;
         std::thread::native_handle_type nativeHandle;

@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
 
             std::printf("heldOff=%d sawAlive=%d freedAfter=%d\n",
                         (int)heldOff, (int)sawAlive, (int)freedAfter);
-            sched.Join();
+            JLib::detail::TeardownForTesting(sched);
             return (heldOff && sawAlive && freedAfter) ? 0 : 1;
         }
 
@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
             sched.WaitFor(wg);
 
             std::printf("heldOff=%d (outer guard still live when main scanned)\n", (int)heldOff);
-            sched.Join();
+            JLib::detail::TeardownForTesting(sched);
             return heldOff ? 0 : 1;
         }
 
@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
             g_gate.Unlock();
             sched.WaitFor(wg);
             std::printf("completed with the guard dropped before the await\n");
-            sched.Join();
+            JLib::detail::TeardownForTesting(sched);
             return 0;
         }
 
@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
                 g_reached.store(true, std::memory_order_release);
                 g_gate.Lock();                    // PARKS the fiber while the guard is held
                 g_gate.Unlock();
-            }, false, FiberSize::Standard, TaskType::Fiber);
+            }, false, TaskType::Fiber);
             t->waitGroup = &wg;
             wg.n.fetch_add(1, std::memory_order_relaxed);
             sched.Push(t);
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
             g_gate.Unlock();
             sched.WaitFor(wg);
             std::printf("fiber parked and resumed while holding a guard\n");
-            sched.Join();
+            JLib::detail::TeardownForTesting(sched);
             return 0;
         }
 
