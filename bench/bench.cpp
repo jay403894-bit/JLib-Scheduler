@@ -1320,12 +1320,23 @@ static void BenchSplitPref(JLib::TaskScheduler& sched) {
 
     for (const Case& c : cases) {
         std::vector<double> dflt, wide;
+        int seenD = 0, seenW = 0;
         constexpr int kReps = 7;
         for (int r = 0; r < kReps; ++r) {
             for (int arm = 0; arm < 2; ++arm) {
                 JLib::TaskScheduler::SetParallelSplitWide(arm != 0);
+                for (auto& s : g_sweepSeen) s.store(0, std::memory_order_relaxed);
                 const auto t0 = Clock::now();
                 sched.ParallelFor(0, c.n, 1, [&](int lo, int hi) {
+                    // WHICH WORKERS ACTUALLY GOT A SPLIT. This is the number worth trusting here:
+                    // a participant count is a COUNT, and it survives the thermal drift and
+                    // background load that make the millisecond ratio argue with itself run to run.
+                    // It also separates the two things the ratio conflates -- "Wide spread the work
+                    // further and still lost" is a complete answer; "Wide was slower" is not.
+                    if (JLib::Thread* w = JLib::Thread::Current()) {
+                        const int q = w->qIndex;
+                        if (q >= 0 && q < 64) g_sweepSeen[q].store(1, std::memory_order_relaxed);
+                    }
                     double acc = 0;
                     for (int i = lo; i < hi; ++i)
                         for (int k = 0; k < c.work; ++k) acc += (double)(i ^ k) * 1.000001;
@@ -1335,7 +1346,10 @@ static void BenchSplitPref(JLib::TaskScheduler& sched) {
                                  std::memory_order_relaxed);
                 });
                 const double ms = MsBetween(t0, Clock::now());
-                (arm ? wide : dflt).push_back(ms);
+                int seen = 0;
+                for (auto& s : g_sweepSeen) if (s.load(std::memory_order_relaxed)) ++seen;
+                if (arm) { wide.push_back(ms); seenW = (seen > seenW) ? seen : seenW; }
+                else     { dflt.push_back(ms); seenD = (seen > seenD) ? seen : seenD; }
             }
         }
         JLib::TaskScheduler::SetParallelSplitWide(false);   // leave the process on the shipped default
@@ -1344,8 +1358,9 @@ static void BenchSplitPref(JLib::TaskScheduler& sched) {
         std::sort(wide.begin(), wide.end());
         const double d = dflt[dflt.size() / 2];
         const double w = wide[wide.size() / 2];
-        printf("               %-16s default %7.3f ms | wide %7.3f ms  ->  %.2fx\n",
-               c.name, d, w, (w > 0.0) ? d / w : 0.0);
+        printf("               %-16s default %7.3f ms (%2d workers) | wide %7.3f ms (%2d workers)"
+               "  ->  %.2fx\n",
+               c.name, d, seenD, w, seenW, (w > 0.0) ? d / w : 0.0);
     }
 }
 

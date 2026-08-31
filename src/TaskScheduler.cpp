@@ -3038,20 +3038,26 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// cheapness is the whole design. Placing it Wide pushes it at a possibly-parked worker and
 		// pays a kernel wake PER SPLIT, recursively, for a task that was never certain to be needed.
 		//
-		// THE ARGUMENT IS STRUCTURAL AND THE MEASUREMENT IS NOT YET IN. `Wide` here was reverted on
-		// the strength of the splitter-vs-cursor table inverting (heavy 0.69-0.79 splitter-ahead ->
-		// 1.30-1.75 cursor-ahead), read as the splitter degrading. That reading did NOT hold: with
-		// this back at Default the table still reads cursor-ahead, so the inversion was the CURSOR
-		// improving from its own Wide lanes. Both arms moved and one run cannot separate them --
-		// and the crossover's serial baselines moved ~2x between runs, which makes those cells
-		// uncomparable until somebody runs the two arms interleaved on a quiet machine.
+		// SETTLED BY THE `splitpref` ROW, AND THE ANSWER IS "IT DOES NOT MATTER". The two arms,
+		// alternated inside one measurement, reach the SAME NUMBER OF WORKERS -- 29 of 31, every
+		// case, both arms -- and the millisecond ratio flips sign between runs of one binary
+		// (0.91/0.93 one run, 1.06/1.12 the next). Identical participation with a ratio that argues
+		// with itself is not a small effect; it is no effect.
 		//
-		// So this is Default on the speculative-cost argument alone, which stands without a number:
-		// a wake per split, for a split that may be taken straight back, is the wrong currency. If a
-		// clean A/B says otherwise, take it -- the reasoning above is a prediction, not a result.
+		// WHY, AND THIS IS THE PART WORTH KEEPING: placement barely reaches the splitter. A lazy
+		// split is halved recursively and distributed by STEALING -- that is the design, and an
+		// untaken split is taken straight back and run inline for ~11 ns. Placement decides only
+		// where the first push lands; the recursion and the thieves do the rest. So the breadth hint
+		// has almost nothing to act on here.
 		//
-		// The type is spelled out for the reason below; the pref is spelled out so nobody re-applies
-		// the cursor's reasoning here without re-running that table.
+		// THE RULE THAT FALLS OUT: Wide matters where PLACEMENT IS THE ONLY DISTRIBUTION MECHANISM,
+		// and not otherwise.
+		//   burst        16 independent tasks pushed at once, no recursion  -> 12 to 29 participants
+		//   cursor lanes N lanes created up front, nothing splits them      -> same shape as burst
+		//   splitter     recursive halving plus steals                      -> 29 either way
+		//
+		// Default therefore stays, on the cheaper-push argument rather than on Wide being worse:
+		// when two options measure the same, take the one that does not pay a kernel wake.
 		Task* t = CreateTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); },
 		                     false, TaskType::Native,
 		                     ParallelSplitWide() ? CorePref::Wide : CorePref::Default);
