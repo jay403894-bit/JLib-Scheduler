@@ -688,3 +688,48 @@ epoch's "safe at epoch N" and the mailbox's "whenever the owner gets round to it
 free happens at the max of two things that do not know about each other. And a free-task must be
 allocated from the slab, so reclaiming memory would consume memory, which fails exactly under the
 pressure that makes frees urgent.
+
+---
+
+## Slab: what to look at when memory management gets reworked (2026-08-31)
+
+Raised while fixing a flaky test, and worth having written down before anyone touches the slab.
+
+### Cross-shard deletion IS accounted for -- the question is answered
+
+`SlabPool::LiveCount()` sums per-thread shards **on demand** rather than maintaining a total, and
+its own comment states the invariant: *"Individual shards go NEGATIVE and that is correct, not a bug
+to clamp: a slot allocated on one thread and freed on another leaves +1 on one shard and -1 on the
+other. Only the total means anything."*
+
+So the accounting survives cross-shard free. Two consequences that are easy to forget:
+
+- **Never clamp a per-shard counter at zero.** Negative is the correct reading of "this thread freed
+  more than it allocated", which is the normal state for a worker that consumes tasks produced
+  elsewhere. Clamping would silently inflate the total.
+- **`LiveCount()` is a SMEAR, not a snapshot** -- shards are read one at a time while other threads
+  keep working. Anything asserting exact equality on it is asserting that no other thread touched a
+  shared counter for the duration, which is not a property of anything being tested. That is exactly
+  what made `tests/coroutine_test.cpp` flaky: 1 run in 10 read 199 of 200, with the 256-byte column
+  at 0 every time, so the size class was never what failed.
+
+### The real open question is LOCALITY, not correctness
+
+`SlabPool::Free` pushes the slot to the **freeing** thread's cache, not the one that allocated it.
+The count balances; the *slot* does not go home. A producer/consumer split -- one thread minting
+tasks, workers freeing them -- drains the producer's cache and grows the consumers', and the only
+thing bounding the drift is cache overflow spilling to the shared pool. Whether that matters is
+unmeasured. It is the first thing to instrument if slab behaviour is ever suspected, and it is a
+different question from `homeShardCtx`, which is about a slot knowing where it belongs at all.
+
+### If a test needs an EXACT answer, the counter is the wrong instrument
+
+Option 3 from the discussion, recorded because the cheap fix (settle + slack) was taken instead:
+
+> Have the allocator report which size class a **specific allocation** came from, rather than
+> inferring it from a delta on a process-wide counter.
+
+That removes the shared-counter dependency entirely and would make the 64-byte-class control exact
+instead of tolerant. It needs an allocator API addition, so it was not worth it for one flaky check
+-- but if the slab is being reworked anyway, this is nearly free to add at the same time, and it is
+the only way to assert "this frame came from that class" without a race.

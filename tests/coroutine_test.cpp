@@ -668,6 +668,41 @@ int main() {
     {
         auto* alloc = JLib::TaskScheduler::Instance().GetAllocator();
 
+        // ---- SETTLE BEFORE MEASURING. THE COUNTER IS PROCESS-WIDE. --------------------------
+        //
+        // SmallLiveCount() counts the whole process, and a 31-worker pool is running underneath
+        // this section -- the sections above it left coroutines and tasks whose frames are freed on
+        // worker threads, asynchronously, some time after the code that owned them returned. A
+        // baseline captured mid-drain is a baseline that keeps moving, and one concurrent free
+        // inside the window turns 200 into 199.
+        //
+        // AND THE COUNTER IS APPROXIMATE BY CONTRACT, which is the part that settles it. See
+        // SlabPool::LiveCount: the per-thread shards are summed ON DEMAND, one at a time, while
+        // other threads keep working -- "a smear across a short window rather than a synchronized
+        // snapshot", in its own words. Individual shards even go NEGATIVE on purpose, because a slot
+        // allocated on one thread and freed on another leaves +1 on one and -1 on the other.
+        //
+        // So exact equality was never a legitimate assertion here regardless of settling. MEASURED:
+        // 1 run in 10 read 199, with the 256-byte column at 0 on every single run -- the size class
+        // was never what failed. The check on the very next line already knew this and says so
+        // ("the scheduler is running and may allocate a Task on another thread"); it was loosened
+        // for that reason and these two were not.
+        //
+        // Waits for the counter to hold still rather than sleeping a fixed time, because "how long
+        // does a 31-worker pool take to go quiet" is a property of the machine and a constant here
+        // would be tuned to mine.
+        {
+            long long last = alloc->SmallLiveCount();
+            int stable = 0;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (stable < 20 && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                const long long now = alloc->SmallLiveCount();
+                stable = (now == last) ? stable + 1 : 0;
+                last = now;
+            }
+        }
+
         const long long bigBase   = alloc->LiveCount();
         const long long smallBase = alloc->SmallLiveCount();
 
@@ -682,13 +717,31 @@ int main() {
         std::printf("    %d live frames -> %lld small slots, %lld 256-byte slots\n",
                     kN, smallHeld, bigHeld);
 
-        Check(smallHeld >= kN, "every small frame came from the 64-byte class");
+        // ---- SLACK, AND WHY IT DOES NOT WEAKEN THE TEST -------------------------------------
+        //
+        // The settle above removes the drain that was moving the baseline, but it cannot make the
+        // pool stop: a worker may allocate or free a Task on another thread at any moment, which is
+        // exactly what the 256-byte check below has always said. So both of these get the same
+        // tolerance rather than exact equality.
+        //
+        // THIS IS NOT A LOOSENED ASSERTION IN THE WAY THAT USUALLY MEANS "STOPPED TESTING". The
+        // regression this section exists to catch is small frames silently going back to the
+        // 256-byte class -- that failure reads 0 small and 200 big, not 199 and 0. A slack of four
+        // is two orders of magnitude away from the thing being defended, and the 256-byte column is
+        // checked independently. What was actually being asserted before was "no other thread
+        // touched a shared counter for the duration", which is not a property of this feature.
+        constexpr long long kSlack = 4;
+        Check(smallHeld >= kN - kSlack, "every small frame came from the 64-byte class");
         // The 256-byte pool should be untouched by these. Not asserted as exactly zero: the
         // scheduler is running and may allocate a Task on another thread while this executes.
         Check(bigHeld < kN, "they did not consume 256-byte slots");
 
         held.clear();
-        Check(alloc->SmallLiveCount() - smallBase == 0, "and every one was returned on destruction");
+        const long long leaked = alloc->SmallLiveCount() - smallBase;
+        Check(leaked <= kSlack && leaked >= -kSlack,
+              "and every one was returned on destruction");
+        if (leaked > kSlack || leaked < -kSlack)
+            std::printf("      counter drifted by %lld (slack %lld)\n", leaked, kSlack);
     }
 
     TestCoroutineCancellableAwaiters(JLib::TaskScheduler::Instance());
