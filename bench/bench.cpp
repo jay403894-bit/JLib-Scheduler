@@ -1610,9 +1610,16 @@ static void SweepSplitterVsCursor(JLib::TaskScheduler& sched, const char* label,
         if (suspects[i]) continue;                 // the control moved on its own here
         anyTrustworthy = true;
         if (ratios[i] < kWinMargin) continue;
-        // The persistence rule still applies, but a suspect NEIGHBOUR cannot refute a good cell --
-        // treat it as absent rather than as evidence against.
-        if (i + 1 < ratios.size() && !suspects[i + 1] && ratios[i + 1] < kWinMargin) continue;
+        // PERSISTENCE NEEDS A TRUSTWORTHY CONFIRMATION, and the first version of this rule got the
+        // polarity backwards. Treating a suspect neighbour as "not evidence against" let a LONE
+        // SPIKE become a verdict: trivial read 0.47x, 1.30x, 0.49x? and reported "cursor ahead from
+        // N=100000" off the single unflagged cell in the middle -- which is precisely what the
+        // persistence rule was written to reject.
+        //
+        // A cell you do not trust cannot confirm anything. So the next cell must exist, be
+        // unflagged, AND clear the margin; anything else means unconfirmed, which is not a verdict.
+        if (i + 1 < ratios.size()
+            && (suspects[i + 1] || ratios[i + 1] < kWinMargin)) continue;
         crossover = sizes[i];
         break;
     }

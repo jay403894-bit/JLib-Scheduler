@@ -3577,8 +3577,17 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		// needs many items, but each is cheap, so the absolute cost stays bounded either way. The
 		// len/32 cap remains the backstop for a body so cheap it never clears the floor -- at which
 		// point W is tiny, k is below 2, and the range runs serially anyway.
-		const int probeCap = (len / 32 < 1) ? 1
-		                   : ((len / 32 > (int)kMinGrain) ? (int)kMinGrain : len / 32);
+		// len/32 IS THE ONLY CAP, and the absolute kMinGrain one that used to sit on top of it was
+		// a mistake. The relative bound already holds the serial prologue near 3% at every size;
+		// adding a 16-item ceiling meant a 0.5 ns/element body could never be measured at all --
+		// the reading stayed under the resolution floor, the range was declared cheap, and trivial
+		// at N=200000 lost a real 5.01x on 94.6 us of genuine work. Per-item cost being tiny does
+		// not make W tiny, and W is what decides.
+		//
+		// A large range can therefore probe thousands of items and still spend ~2% doing it, which
+		// is exactly what it takes to time a sub-nanosecond body. A small range caps out low, never
+		// clears the floor, and is correctly judged too cheap.
+		const int probeCap = (len / 32 < 1) ? 1 : (len / 32);
 		int probed = 0;
 		long long probeNs = 0;      // the LAST chunk only -- see below
 		int probeLen = 0;           // ...and its length, which is what W is extrapolated from
@@ -3605,6 +3614,20 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		// wrong-answer bug, not a slow one: the body would see duplicate indices.
 		begin += probed;
 		if (begin >= end) return;                // the whole range was the probe
+
+		// COULD NOT MEASURE IT => IT IS CHEAP. If the reading never cleared the resolution floor
+		// even after exhausting the probe cap, the body costs less per item than this clock can
+		// resolve -- and dividing a sub-resolution number produces a W made of timer noise. That is
+		// what made trivial swing 0.03x .. 0.83x across identical runs and fan out to 24 workers at
+		// N=1000, where the right answer is never to fan out at all.
+		//
+		// The inference is sound rather than a fallback: a body too cheap to time over kMinGrain
+		// items is, by that fact, too cheap to be worth a wake. Refusing here is the same answer
+		// the arithmetic would give if the arithmetic were trustworthy.
+		if (probeNs < kProbeFloorNs) {
+			func(begin, end);
+			return;
+		}
 		const long long W = (probeNs * (long long)len) / (probeLen > 0 ? probeLen : 1);
 
 		// REMEMBER IT, so the next range of this body starts hot rather than re-paying the probe.
