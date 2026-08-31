@@ -1412,6 +1412,35 @@ void TaskScheduler::WakeOneForSteal() noexcept {
 	}
 }
 
+// ---- WAKE UP TO `n` SLEEPERS FOR A LIVE RANGE ------------------------------------------------
+//
+// NOT RATE-LIMITED, AND THE OMISSION IS THE POINT. WakeOneForSteal above is spaced by
+// kStealWakeSpacingNs because its caller is the SPLITTER, which publishes repeatedly and would
+// otherwise wake on every split -- the spacing is what makes "once per range" true. This caller is
+// different: it fires once per COMPLETED LEAF, already gated on that leaf having cost more than a
+// wake, so the evidence is per-call and throttling it would discard exactly the signal it is built
+// on. Routing recruitment through the spaced path would cap the cascade at one worker per 2 us
+// window and reproduce the ramp it exists to remove.
+//
+// ONE PASS, ROTATING START. The scan visits each index once from a rotating offset, so concurrent
+// recruiters do not all target the same sleeper, and a pool with fewer sleepers than `n` simply
+// wakes what it has instead of spinning looking for more.
+void TaskScheduler::WakeForSteal(size_t n) noexcept {
+	if (!n) return;
+	const size_t sz = workers.size();
+	if (!sz) return;
+	const unsigned r = (unsigned)nextWorker.fetch_add(1, std::memory_order_relaxed);
+	size_t woken = 0;
+	for (size_t i = 0; i < sz && woken < n; ++i) {
+		const size_t idx = ((size_t)r + i) % sz;
+		Thread* w = workers[idx];
+		if (w && w->GetWorkerState() == 2 /* WS_SLEEPING */) {
+			w->NotifyWorker(/*force*/ true);
+			++woken;
+		}
+	}
+}
+
 void TaskScheduler::RedistributeToOverflow(size_t ownerIdx, size_t count) {
 	// ---- OFF BY K, SECOND INSTANCE. THE FLOOR ACCESSORS RETURN WIDTHS ------------------------
 	//
@@ -1469,7 +1498,26 @@ void TaskScheduler::ResetAwakeFloorPeak() noexcept {
 
 // Hold a grown floor at least this long. Long enough that the gaps inside a wave do not shed it,
 // short enough that the floor is back at base well before a human-scale idle period.
-static constexpr long long kFloorHoldNs = 6'000'000;   // 6 ms -- longer than one heavy body
+// ---- HOW LONG A GROWN FLOOR IS HELD BEFORE IT MAY SHED ---------------------------------------
+//
+// WAS A CONSTANT AT 6 ms, "longer than one heavy body" -- which is the right scale for the case it
+// was written for (protect a live submission wave) and the wrong one for a caller that produces
+// work on a CADENCE. A 16 ms frame loop expires this between every frame and re-pays the ramp on
+// each one; a batch job wants seconds. No single value serves both, so it is a knob, for the same
+// reason MinItersPerWorker cannot serve trivial and heavy at once.
+//
+// SIZE IT TO THE GAP YOU WANT TO HOLD THROUGH, slightly longer -- ~20 ms for a 60 Hz frame loop.
+// NOT arbitrarily large: the hold is refreshed by every growth, so a value longer than the interval
+// between waves means the floor never sheds at all and the pool is permanently NoSleep, which is
+// measured at ~3.5% stolen from the main thread in Game01 and is the thing the awake floor exists
+// to avoid paying when idle.
+static std::atomic<long long> g_floorHoldNs{ 6'000'000 };   // 6 ms, the historical default
+void TaskScheduler::SetFloorHoldMs(unsigned ms) noexcept {
+	g_floorHoldNs.store((long long)ms * 1'000'000LL, std::memory_order_relaxed);
+}
+unsigned TaskScheduler::GetFloorHoldMs() noexcept {
+	return (unsigned)(g_floorHoldNs.load(std::memory_order_relaxed) / 1'000'000LL);
+}
 
 // SHED IN ONE STEP, BACK TO THE BASE. Called from the IDLE path, which is the mirror of growth
 // being called from the PUSH path: the pusher is the only party awake during a burst, and an
@@ -1539,7 +1587,7 @@ bool TaskScheduler::CollapseAwakeFloorToBase() noexcept {
 	// pool is not what is being given up.
 
 	const long long now = MonotonicNs();
-	if (now - g_lastFloorGrowNs.load(std::memory_order_relaxed) < kFloorHoldNs) { g_cHeld.fetch_add(1, std::memory_order_relaxed); return false; }
+	if (now - g_lastFloorGrowNs.load(std::memory_order_relaxed) < g_floorHoldNs.load(std::memory_order_relaxed)) { g_cHeld.fetch_add(1, std::memory_order_relaxed); return false; }
 
 	// Straight to base rather than one step: see the base/current comment. Stepping down cannot
 	// keep up with a workload that changes in tens of microseconds, and there is nothing to
@@ -3020,6 +3068,24 @@ size_t TaskScheduler::GetLeavesPerWorker() noexcept { return g_leavesPerWorker.l
 static std::atomic<size_t> g_lazySplitCap{ 2 };
 void   TaskScheduler::SetLazySplitCap(size_t n) noexcept { g_lazySplitCap.store(n, std::memory_order_relaxed); }
 size_t TaskScheduler::GetLazySplitCap() noexcept { return g_lazySplitCap.load(std::memory_order_relaxed); }
+
+// ON BY DEFAULT, because the thing it replaces is doing nothing: a range currently wakes ONE worker
+// and waits to be discovered. The flag exists so `norecruit` can A/B the whole mechanism in one
+// binary against the floor=31 ceiling, which is what bounds its payoff.
+static std::atomic<bool> g_rangeRecruit{ true };
+void TaskScheduler::SetRangeRecruit(bool on) noexcept { g_rangeRecruit.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::RangeRecruitEnabled() noexcept { return g_rangeRecruit.load(std::memory_order_relaxed); }
+
+// 3000 ns: the measured OS wake on this machine (8.0 us resume with a 1 ms hold-off against 5.0 us
+// with none). A knob and not a constant -- it is a property of the box, and every recruitment
+// decision is a ratio against it, so a wrong value here biases the whole mechanism one way.
+static std::atomic<unsigned> g_wakeCostNs{ 3000 };
+void TaskScheduler::SetWakeCostNs(unsigned ns) noexcept {
+	// ZERO WOULD DIVIDE, and worse it would mean "wakes are free", which recruits the whole pool for
+	// any leaf at all. Clamp to something a wake cannot be cheaper than.
+	g_wakeCostNs.store(ns < 100 ? 100 : ns, std::memory_order_relaxed);
+}
+unsigned TaskScheduler::GetWakeCostNs() noexcept { return g_wakeCostNs.load(std::memory_order_relaxed); }
 
 void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 	TaskDeque* myLane = LaneForCurrentThread();

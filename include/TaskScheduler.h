@@ -812,6 +812,57 @@ namespace JLib {
 		static void   SetLazySplitCap(size_t n) noexcept;
 		static size_t GetLazySplitCap() noexcept;
 
+		// ---- RANGE RECRUITMENT: a completed leaf is EVIDENCE, not a prediction ------------------
+		//
+		// THE PROBLEM IT SOLVES. A published range wakes exactly ONE worker, on the parallel hint's
+		// 0->1 edge, and everyone else has to discover the work by happening to steal. Measured, same
+		// binary, floor as the only variable: heavy N=2000 runs 7.05x at the default floor and 22.07x
+		// at floor=31, where all 31 are already awake and looking. That 3.1x is pure ramp -- the
+		// range is limited by how many free workers SEE the work, not by the work.
+		//
+		// WHY NOT JUST SIZE THE RAMP. Because that needs the total work W at range entry, and the
+		// range does not know W -- measuring a leaf to extrapolate is a guess that is wrong exactly
+		// when the body is non-uniform. Any scheme phrased as "grow by f(W)" is playing oracle.
+		//
+		// SO RECRUIT ON EVIDENCE INSTEAD. A worker that has just RUN a leaf knows two facts, both
+		// observed and neither predicted: a range is still live (its hint bit is set), and a leaf of
+		// it cost `bodyNs`. If that exceeded the price of a wake, waking more workers pays. The
+		// worker that measured it does the recruiting.
+		//
+		// THIS IS SELF-LIMITING IN BOTH DIRECTIONS, which is the property a timer-based spin cannot
+		// have. Cheap bodies never recruit -- a trivial leaf costs nanoseconds, never clears the
+		// gate, and the range stays narrow without any iteration-count heuristic deciding for it.
+		// And recruitment stops when the range drains, because ClearParallelHintIfEmpty clears the
+		// bit and there is nothing left to recruit for. No work, no evidence, no wake.
+		//
+		// HOW MANY, and this is why it is not one-per-leaf. A leaf costing bodyNs buys bodyNs/c
+		// wakes in the time it took to run -- so waking one is absurdly conservative for a 200 us
+		// leaf against a 3 us wake, and would make full width take log2(P) LEAF DURATIONS. Waking
+		// bodyNs/c reaches full width after roughly one leaf when leaves are expensive, and never
+		// when they are cheap. Same ratio as the crossover, from the same measured c.
+		static void   SetRangeRecruit(bool on) noexcept;
+		static bool   RangeRecruitEnabled() noexcept;
+
+		// The price of one kernel wake, in nanoseconds -- the `c` above. MEASURED, not guessed:
+		// event/resume with a 1 ms hold-off costs 8.0 us against 5.0 us with none, and that ~3 us
+		// delta is the OS wake and nothing else. It is a property of the MACHINE, so it is a knob
+		// rather than a constant; a box with a cheaper wake should recruit sooner and parallelize
+		// smaller ranges, and both fall out of this one number.
+		static void   SetWakeCostNs(unsigned ns) noexcept;
+		static unsigned GetWakeCostNs() noexcept;
+
+		// How long a GROWN floor is held before it may shed back to base, in milliseconds. The
+		// timer behind "release the herd for a while": recruitment wakes workers, this decides how
+		// long they stay. Refreshed by every growth, so continued work extends it and silence ends
+		// it -- there is no fixed expiry to outlive the workload.
+		//
+		// Default 6 ms, the historical constant. Size it slightly longer than the gap you want to
+		// hold through: ~20 ms for a 60 Hz frame loop, seconds for a batch job. Do NOT set it far
+		// beyond your work's cadence -- a hold longer than the interval between waves is refreshed
+		// before it can expire, the floor never sheds, and the pool is permanently NoSleep.
+		static void   SetFloorHoldMs(unsigned ms) noexcept;
+		static unsigned GetFloorHoldMs() noexcept;
+
 		static void SetFloorGrowthEnabled(bool on) noexcept;
 		static bool GetFloorGrowthEnabled() noexcept;
 
@@ -895,6 +946,10 @@ namespace JLib {
 		// Wake ONE parked worker to come and steal. Called by the splitter on the hint.s 0 -> 1 edge --
 		// once per range, never per split. See the call site.
 		void WakeOneForSteal() noexcept;
+
+		// Wake up to `n` sleepers for a live range. Deliberately NOT spaced like WakeOneForSteal --
+		// see the definition for why throttling would discard the evidence recruitment runs on.
+		void WakeForSteal(size_t n) noexcept;
 
 		void RedistributeToOverflow(size_t ownerIdx, size_t count);
 
@@ -2806,6 +2861,15 @@ namespace JLib {
 		// TRIGGER, not its design: diverting requires knowing the owner will be busy for a LONG
 		// time, and no cheap signal says that. See UpdateBacklogHint below for the measurements.
 
+		// IS ANY PUBLISHED RANGE STILL LIVE? The second half of the recruitment gate -- see
+		// SetRangeRecruit. PARALLEL BITS ONLY, deliberately: a backlog bit means somebody has a
+		// deque worth stealing from, which is an ordinary condition and not a reason to spend
+		// wakes. Recruitment is for a range that is still handing out leaves.
+		bool AnyParallelHint() const noexcept {
+			for (size_t w = 0; w < kHintWords; ++w)
+				if (stealHintParallel[w].load(std::memory_order_acquire)) return true;
+			return false;
+		}
 		unsigned long long StealHintWord(size_t wi) const noexcept {
 			return stealHintBacklog[wi].load(std::memory_order_acquire)
 			     | stealHintParallel[wi].load(std::memory_order_acquire);

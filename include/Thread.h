@@ -422,6 +422,10 @@ namespace JLib {
         // grew, so a wave of FIBER tasks reproduced the original bug -- floor at 16, nobody fed.
         void GrowFloorIfLongBody(long long bodyNs);
 
+        // Wake sleepers for a still-live published range, sized by the leaf this worker just ran.
+        // Evidence-driven, not predicted -- see the definition.
+        void RecruitForLiveRange(long long bodyNs);
+
         TaskScheduler* scheduler;
         ThreadLocalCache<> localCache;
         static thread_local Thread* instance;

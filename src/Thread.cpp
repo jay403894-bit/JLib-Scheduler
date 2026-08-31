@@ -1034,6 +1034,69 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 // that needed it was Native, so it never ran. Then the Native arm gained the redistribute and the
 // fiber arm did not, so fiber waves grew the floor and fed nobody -- the exact 2-participants state
 // this was written to fix. Two copies of a rule are two rules.
+// ---- RECRUIT FOR A LIVE RANGE, ON EVIDENCE THIS WORKER JUST MEASURED ------------------------
+//
+// Called from both completion arms beside GrowFloorIfLongBody, and deliberately SEPARATE from it
+// even though they share a hook. That one asks "is this pool under-provisioned for a wave of long
+// tasks" and answers by moving the floor; this one asks "is a published range still handing out
+// leaves worth waking somebody for" and answers by waking sleepers directly. Different question,
+// different signal, different action -- and the comment on GrowFloorIfLongBody records that
+// merging two rules into one site has already cost this file twice.
+//
+// BOTH INPUTS ARE OBSERVED, NEITHER PREDICTED, and that is the entire design. `bodyNs` was
+// measured by running the leaf. The hint bit was set by a splitter that still has work. Nothing
+// here estimates the total size of the range, because nothing CAN: a leaf is only representative
+// of the rest if the body is uniform, and the back-loaded case is precisely where that fails. An
+// oracle is not needed to answer "should one more worker come and look".
+//
+// WHY bodyNs/c AND NOT ONE. A leaf that cost `bodyNs` proves there was at least that much work
+// available a moment ago, and in the time it took, bodyNs/c wakes could have been paid for. Waking
+// exactly one would make full width cost log2(P) LEAF DURATIONS -- which for the heavy row, whose
+// leaves are hundreds of microseconds, is slower than the ramp this replaces. Waking bodyNs/c
+// reaches full width after roughly one expensive leaf, and stays at zero for a cheap one.
+//
+// THE CHEAP-BODY CASE NEEDS NO SEPARATE RULE. A trivial leaf is nanoseconds, bodyNs/c truncates to
+// 0, and nothing is woken -- the same arithmetic that ramps heavy work refuses to touch work that
+// cannot pay for a wake. That is the behaviour MinItersPerWorker currently approximates with an
+// iteration count, which cannot distinguish the two because it never looks at the body.
+void Thread::RecruitForLiveRange(long long bodyNs) {
+	if (!TaskScheduler::RangeRecruitEnabled()) return;
+
+	const long long c = (long long)TaskScheduler::GetWakeCostNs();
+	if (bodyNs <= c) return;                       // this leaf did not pay for a wake
+
+	// SECOND, because it is the more expensive check -- a scan of the hint words against one
+	// compare. Ordering matters: the overwhelmingly common caller is a task that is not range work
+	// at all, and it should fall out on the arithmetic.
+	if (!scheduler->AnyParallelHint()) return;     // nothing live to recruit for
+
+	size_t n = (size_t)(bodyNs / c);
+	const size_t sz = scheduler->workers.size();
+	if (n > sz) n = sz;                            // cannot use more than the pool
+	scheduler->WakeForSteal(n);
+
+	// ---- AND KEEP THEM, or the wake is spent for one leaf and re-paid on the next range --------
+	//
+	// Waking a worker that parks again on its next idle pass buys one steal. The floor is what
+	// makes a wake persist, and the growth controller already has the timer for it: the shed
+	// refuses while the last growth is younger than the hold, and every further growth pushes that
+	// out -- so a workload that keeps producing expensive leaves keeps the herd out, and one that
+	// stops gets the floor back automatically. "Release the herd for x ms" with no new mechanism.
+	//
+	// HERE AND NOT AT RANGE PUBLISH, and the distinction is the whole reason this is not another
+	// failed ParallelFor experiment. A publish-time trigger fires before any leaf has run, so it
+	// would have to GUESS whether the range deserves the pool -- and growth is not free (measured:
+	// 3x on single-producer throughput). Hanging it here means it cannot fire without a leaf that
+	// already demonstrated it cost more than a wake. A range of cheap bodies never reaches this
+	// line, so it never pays.
+	//
+	// THE SAME AUTHORITY, deliberately. Per-thread spin deadlines would be a SECOND answer to "may
+	// I park" alongside the floor, and two mechanisms owning that question is the shape of the
+	// event/condvar bug that left 24 of 31 workers asleep on non-empty inboxes. The floor already
+	// owns it; this only moves it.
+	TaskScheduler::NoteFloorCrowding(n);
+}
+
 void Thread::GrowFloorIfLongBody(long long bodyNs) {
 	// Master switch: `nogrow` pins the floor at base for an A/B of the whole controller.
 	if (!TaskScheduler::GetFloorGrowthEnabled()) return;
@@ -1797,7 +1860,14 @@ void Thread::Worker() {
 				// Same call the fiber arm makes, and deliberately the SAME FUNCTION -- these two
 				// blocks were written separately and drifted within a day (the fiber copy grew the
 				// floor but never redistributed, so a wave of fiber tasks fed nobody).
-				if (busyStartNs != 0) GrowFloorIfLongBody(MonotonicNs() - busyStartNs);
+				// ONE CLOCK READ FOR BOTH. Growth and recruitment ask different questions of the
+				// same measured body -- see RecruitForLiveRange for why they are separate rules --
+				// but neither may pay for its own MonotonicNs() on the completion path.
+				if (busyStartNs != 0) {
+					const long long bodyNsHere = MonotonicNs() - busyStartNs;
+					GrowFloorIfLongBody(bodyNsHere);
+					RecruitForLiveRange(bodyNsHere);
+				}
 
 				// CLOSE THE LANE STAMP ON THIS ARM TOO. Native and Coroutine tasks `continue` from
 				// here and never reach the fiber arm's close below -- and I/O completions are
@@ -1940,6 +2010,10 @@ void Thread::Worker() {
 			// floor to 16 and then handed the woken workers nothing -- reproducing, on the fiber
 			// path, the exact 2-participants/26 ms state the redistribute was written to fix.
 			GrowFloorIfLongBody(bodyNs);
+			// The fiber arm's half of the pair. Both arms, always -- GrowFloorIfLongBody's own
+			// comment records that this rule existed on one arm only, twice, and each time the
+			// workload that needed it ran on the other one.
+			RecruitForLiveRange(bodyNs);
 
 			// RUN THE CONTROLLER on a subsample of task completions. Cheap where it is called from:
 			// a task has just finished, so this is not on the dispatch path, and the body early-outs

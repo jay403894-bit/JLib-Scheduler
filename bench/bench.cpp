@@ -2521,6 +2521,29 @@ int main(int argc, char** argv) {
         // no redistribute. The A/B for the whole growth controller, in ONE binary, so the machine
         // that holds the baseline can run both arms in one session instead of across two builds.
         if (JLIB_STRICMP(argv[a], "nogrow") == 0) { floorGrowth = false; continue; }
+        // norecruit -- the A/B arm for range recruitment. ON by default, because what it replaces
+        //   is a single wake per published range plus discovery-by-luck. The ceiling for it is the
+        //   floor=31 run, where every worker is already awake: heavy N=2000 was 7.05x at the
+        //   default floor against 22.07x there, so ~3.1x is the whole prize and an arm that gets
+        //   part of it should be read against that, not against the old number alone.
+        if (JLIB_STRICMP(argv[a], "norecruit") == 0) {
+            JLib::TaskScheduler::SetRangeRecruit(false);
+            continue;
+        }
+        // wakecost=N -- nanoseconds, the `c` every recruitment decision is a ratio against. Default
+        //   3000 (the measured OS wake here). Lower recruits sooner and wider; sweep it if the
+        //   cascade over- or under-shoots, since it is the mechanism's only tuned number.
+        if (JLIB_STRNICMP(argv[a], "wakecost=", 9) == 0) {
+            JLib::TaskScheduler::SetWakeCostNs((unsigned)strtoul(argv[a] + 9, nullptr, 10));
+            continue;
+        }
+        // floorhold=N -- milliseconds a grown floor is held before it may shed. Default 6. The
+        //   "for how long" half of release-the-herd; sweep it against a row that produces work on a
+        //   cadence, since that is the case the 6 ms constant was never sized for.
+        if (JLIB_STRNICMP(argv[a], "floorhold=", 10) == 0) {
+            JLib::TaskScheduler::SetFloorHoldMs((unsigned)strtoul(argv[a] + 10, nullptr, 10));
+            continue;
+        }
         // splitcap=N: how many unclaimed splits the lazy splitter tolerates before it stops
         // publishing and runs the rest inline. 0 = split unconditionally (the old behaviour), which
         // is the control arm for the demand cap. Default is the library.s.
