@@ -5763,10 +5763,54 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 
 		unsigned long long awakeW[kHintWords] = {};
 		unsigned long long anyAwake = 0;
-		for (size_t w = 0; w < nWords; ++w) {
+		for (size_t w = 0; w < nWords; ++w)
 			awakeW[w] = AwakeHintWord(w);
-			anyAwake |= awakeW[w];
+
+		// ---- NEVER THE RESERVED BAND, AND UNCONDITIONALLY ON F ------------------------------
+		//
+		// [0, K) takes hiPri only. A reserved worker does not drain its loPri inbox AT ALL --
+		// drainOwnInbox() opens `if (task_to_run || reservedForHiPri) return false;` (Thread.cpp)
+		// -- and that gate does not consult the floor. So this mask must not consult it either.
+		//
+		// IT USED TO LIVE INSIDE `if (const size_t baseF = GetAwakeFloorBase())` BELOW, which made
+		// "who may own ordinary work" depend on "how many cores stay off the park path". Those are
+		// different questions and GetAwakeFloorBase() only answers the second. With Fbase == 0 the
+		// mask never ran, the bitmap pick below returned an index in [0, K), and a CorePref::Default
+		// task was pushed to loPriInboxes[q < K] -- an inbox nobody may steal from and whose owner
+		// will not drain it.
+		//
+		// AND THE RESULT IS A SPIN, NOT A STALL, which is why it does not look like the other bug.
+		// The pre-park recheck still names that queue, so the worker never parks on it: it takes
+		// the `continue`, which skips the backoff, the search declines to look, and the recheck
+		// fires again. Hot, forever, with an unstealable task sitting there. Do NOT "fix" that by
+		// teaching the recheck the same gate -- silencing it turns the spin into a permanent
+		// strand. Fix the writer, which is here.
+		//
+		// REACHABLE BY CONFIGURATION, not by an exotic race: EnableIoReactor() calls
+		// SetIoHotLane(1) -> SetHotWorkers(1), so every reactor app runs K >= 1, and any app that
+		// also sets the awake floor to 0 is in it. The library default is Fbase 2, which is what
+		// kept this hidden.
+		//
+		// THE `j < hotN` FALLBACK AT THE END OF THIS FUNCTION ALREADY IMPLEMENTS THIS SENTENCE. It
+		// was simply unreachable whenever the bitmap path returned first, so the two halves of the
+		// same rule disagreed. After this move they say the same thing.
+		//
+		// Preference may fail and fall back. RESERVATION MAY NOT.
+		// Pinned by tests/verify/workerspin_model.c -- see -DPLACE_ON_RESERVED.
+		//
+		// ONE load, reused by the floor block below: kResv is the LIVE-K question ("who serves the
+		// lane right now"), floorBase is where the floor starts. Same number today, and they must
+		// still come from the same instant.
+		const Bands  pbands = GetBands();
+		const size_t kResv  = pbands.k;
+		for (size_t w = 0; w < nWords; ++w) {
+			const size_t lo = w * 64;
+			if (kResv > lo) {
+				const size_t b = kResv - lo;
+				awakeW[w] &= (b >= 64) ? 0ull : ~((1ull << b) - 1ull);
+			}
 		}
+		for (size_t w = 0; w < nWords; ++w) anyAwake |= awakeW[w];
 
 		// ---- PREFER A WORKER THAT IS ACTUALLY THERE TO DRAIN ITS INBOX ------------------------
 		//
@@ -5827,11 +5871,10 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 			//                are no longer serving anything.
 			//   floorBase -- "where does the floor band start". Must follow the floor's base, or a
 			//                growing K relocates the floor under running workers.
-			// ONE load for the pair -- see GetBands. kResv is the LIVE-K question ("who serves the
-			// lane now", ordinary work may never land there); floorBase is where the floor starts.
-			// They are the same number today and must still come from the same instant.
-			const Bands pbands = GetBands();
-			const size_t kResv     = pbands.k;
+			// kResv AND ITS MASK HAVE MOVED OUT OF THIS BLOCK -- see the note above the bitmap
+			// build. "Ordinary work may never land in [0, K)" is unconditional on F, so it cannot
+			// be enforced inside a test on the floor base. `pbands` is the load hoisted with it;
+			// floorBase reads from the same instant it always did.
 			const size_t floorBase = pbands.k;
 			// ---- DOES THE RAMP APPLY TO PLACEMENT, OR ONLY TO WAKEFULNESS? ------------------
 			//
@@ -5885,19 +5928,14 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 			// reserved worker will not run it -- which is the stall the dump caught as
 			// `1 AWAKE ... inbox 0/1/0`.
 			//
-			// Preference may fail and fall back. Reservation may not.
-			for (size_t w = 0; w < nWords; ++w) {
-				const size_t lo = w * 64;
-				if (kResv > lo) {
-					const size_t b = kResv - lo;
-					awakeW[w] &= (b >= 64) ? 0ull : ~((1ull << b) - 1ull);
-				}
-			}
-			anyAwake = 0;
-			for (size_t w = 0; w < nWords; ++w) anyAwake |= awakeW[w];
-
+			// Preference may fail and fall back. Reservation may not -- WHICH IS WHY THE MASK IS
+			// NO LONGER HERE. It ran only when this block ran, i.e. only when Fbase > 0, so the
+			// fallback it was written to defend against was undefended in exactly the
+			// configuration that needs it most. It is now unconditional, above.
+			//
 			// Now the preference: narrow to the floor if any of it is awake, otherwise use whatever
-			// non-reserved awake workers there are.
+			// non-reserved awake workers there are -- and "non-reserved" is now true by
+			// construction rather than by this block having run.
 			if (anySteer) {
 				for (size_t w = 0; w < nWords; ++w) awakeW[w] = steerW[w];
 				anyAwake = anySteer;

@@ -94,6 +94,26 @@ static _Atomic int g_parked;   /* the worker committed to sleep */
  *
  * SEARCH_MISS models drainOwnInbox()'s `if (task_to_run || reservedForHiPri) return false;` -- a
  * reserved worker whose loPri inbox the recheck still names. */
+/* -DPLACE_ON_RESERVED NAMES THE CONFIGURATION -- this worker is RESERVED and an ordinary push
+ * reached its loPri inbox. That was reachable until 2026-08-31: PickNextWorker's reserved-band mask
+ * lived inside `if (const size_t baseF = GetAwakeFloorBase())`, so with the floor base at 0 the
+ * awake bitmap still carried bits below K and a CorePref::Default task could be handed to a
+ * reserved index. The mask is now unconditional, above the bitmap pick.
+ *
+ * IT IMPLIES SEARCH_MISS RATHER THAN ADDING A SECOND CONDITION, and that is not a shortcut: being
+ * reserved IS the reason drainOwnInbox returns early. One property, not two.
+ *
+ * WHAT THIS BUILD DOES AND DOES NOT SHOW. It is mechanically identical to -DSEARCH_MISS, so it
+ * proves nothing extra about the model. It exists to keep the configuration NAMED and red, so the
+ * cost of the mask is written down somewhere that runs. THIS FILE CANNOT VERIFY THE C++ FIX -- no
+ * model here reads PickNextWorker. Whether an ordinary push can still reach loPriInboxes[q < K] is
+ * a question for the source and for a runtime test, not for GenMC. */
+#ifdef PLACE_ON_RESERVED
+  #ifndef SEARCH_MISS
+    #define SEARCH_MISS 1
+  #endif
+#endif
+
 #ifdef SEARCH_MISS
   #define SEARCH_SEES_LOPRI 0
 #else
@@ -220,6 +240,8 @@ int main(void) {
    | -DPROBE_HINT (reachability)        | **fires** -- good    | 4              |
    | (as shipped, non-reserved worker)  | no errors            | 6              |
    | -DSEARCH_MISS                      | **SAFETY VIOLATION** | 2              |
+   | -DPLACE_ON_RESERVED                | **SAFETY VIOLATION** | 2              |
+   | -DPLACE_ON_RESERVED -DSEARCH_MISS  | **SAFETY VIOLATION** | 2              |
    | -DRECHECK_HINTS_ONLY               | no errors            | 5              |
    | -DSEARCH_MISS -DRECHECK_HINTS_ONLY | **SAFETY VIOLATION** | 4              |
 
@@ -244,16 +266,32 @@ int main(void) {
    worker ever holds a loPri task, the recheck fires, the `continue` skips the backoff, the search
    declines to look, and it fires again. Hot, forever, until something else changes.
 
-   WHY THAT IS REACHABLE RATHER THAN MERELY POSSIBLE, and this is the part to check against the
-   placement rules rather than against this model: `reservedForHiPri` is `qIndex < bandsNow.k` where
-   bandsNow is a PER-PASS SNAPSHOT (1292), and K MOVES. A worker below K on this pass was above it
-   on an earlier one, and could have been given loPri work then. It does not need the push path to
-   ever target a reserved worker -- it only needs K to grow over a worker that already has an item.
+   THE ITEM COULD EXIST, AND IT WAS A PLACEMENT BUG -- FIXED 2026-08-31. This file originally
+   stopped at "what happens IF it exists" and pointed at K movement as the likely route. The actual
+   route was simpler and needed no movement at all:
 
-   WHAT THIS FILE DOES NOT SAY: whether that item can exist. That is a question about the push path,
-   the K controller's shed/grow order, and whatever drains a demoted worker's inbox -- none of which
-   are modelled here. This file says what happens IF it exists, and that the guard asymmetry is real
-   in the source as written.
+     PickNextWorker (TaskScheduler.cpp) masked the reserved band out of the awake bitmap INSIDE
+     `if (const size_t baseF = GetAwakeFloorBase())`. The bitmap pick that consumes the mask sits
+     AFTER that block and returns first. With the floor base at 0 the mask never ran, the pick
+     returned an index in [0, K), and an ordinary CorePref::Default task was pushed to
+     loPriInboxes[q < K].
+
+   The mask is now unconditional, immediately after the bitmap is built. `j < hotN` in the function's
+   tail fallback always had the right test and was simply unreachable whenever the bitmap path
+   returned; the two now implement the same sentence. Reachable by configuration rather than by a
+   race: EnableIoReactor() calls SetIoHotLane(1) -> SetHotWorkers(1), so every reactor app runs
+   K >= 1, and any app that also set the awake floor to 0 was in it. The library default is Fbase 2,
+   which is what kept it hidden.
+
+   THE FIX WENT IN THE WRITER, NOT THE RECHECK, and the reason is in this file's own terms. Teaching
+   the recheck the reservedForHiPri gate would silence it on an OWNER-DRAIN-ONLY queue, which turns
+   this spin into a permanent strand -- workerpass_model.c's assertion, not this one's. Fix what
+   puts the task there.
+
+   WHAT THIS FILE STILL CANNOT SAY: whether the fix holds. No model here reads PickNextWorker.
+   -DPLACE_ON_RESERVED keeps the broken configuration named and red so the cost of the mask is
+   written down, but "can an ordinary push still reach loPriInboxes[q < K]" is a question for the
+   source and for a runtime test.
 
    NOT MODELLED: hiPri and resumed inboxes (their drains are unguarded, so they cannot produce the
    mismatch); `running` and `paused` (not work sources -- they exit the loop rather than restart it);
