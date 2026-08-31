@@ -327,10 +327,30 @@ static void ReportStealStats(const char* label) {
     if (!JLib::kStealStatsEnabled) return;
     long long probes = 0, hits = 0;
     JLib::StealStatsRead(probes, hits);
-    printf("  steal/%s   : %lld probes, %lld hits (%.1f%% hit rate, %.2f probes per task)\n",
+    // ---- DENOMINATOR FROM THE COUNTERS, AND ENOUGH DIGITS TO SURVIVE ------------------------
+    //
+    // This divided by the compile-time kThroughputTasks * kThroughputRuns and printed %.2f, which
+    // failed twice on the 1p row: 2116 probes over a million tasks is 0.002 and rounded to "0.00",
+    // reading as "stealing never probed" when it had probed two thousand times. And the constant
+    // is only the right denominator while a row happens to push exactly that many -- it is not the
+    // row's own number, it is a guess that matches by convention.
+    //
+    // The source counters know how many tasks actually ran, so use that and fall back to the
+    // constant only when the stats build is not the one reporting.
+    //
+    // %g, NOT %f, and %.3f was not enough either. This row's values span 0.0004 (1p, which runs
+    // 99.7% of its tasks directly and essentially never steals) to 0.8 (PushBatch, where stealing
+    // is the distribution mechanism). Any fixed number of decimal places either flattens the small
+    // end to zero -- which reads as "stealing never probed" when it probed hundreds of times -- or
+    // prints meaningless trailing digits at the large end.
+    const JLib::SourceReport sr =
+        JLib::StealStatsSources(JLib::TaskScheduler::Instance().GetWorkerCount());
+    const double denom = sr.total > 0 ? (double)sr.total
+                                      : (double)(kThroughputTasks * kThroughputRuns);
+    printf("  steal/%s   : %lld probes, %lld hits (%.1f%% hit rate, %.3g probes per task)\n",
         label, probes, hits,
         probes ? 100.0 * (double)hits / (double)probes : 0.0,
-        (double)probes / (double)(kThroughputTasks * kThroughputRuns));
+        denom > 0.0 ? (double)probes / denom : 0.0);
 
     // ---- WHERE THE WORK CAME FROM, and the balance that falls out of it --------------------
     //
@@ -346,8 +366,8 @@ static void ReportStealStats(const char* label) {
     // Read a reorder as: did unstealable% go DOWN (work sat in inboxes longer) and did spread
     // improve enough to pay for it? Wall time on these rows has been too noisy to answer that,
     // which is the whole reason for counting instead.
-    const JLib::SourceReport sr =
-        JLib::StealStatsSources(JLib::TaskScheduler::Instance().GetWorkerCount());
+    // `sr` is read once above, for the probes-per-task denominator, and reused here rather than
+    // re-summed: a second read would walk 256 cache lines again for numbers that cannot have moved.
     if (sr.total > 0) {
         printf("  source/%-6s: hiInbox %lld | loInbox %lld | resumed %lld | own deque %lld | stolen %lld | direct %lld\n",
                label, sr.hiInbox, sr.loInbox, sr.resumed, sr.deque, sr.stolen, sr.direct);
