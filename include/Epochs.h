@@ -8,7 +8,7 @@
 #include <mutex>
 #include <cstdio>    // fprintf -- the debug-only EpochGuard suspend tripwire below
 #include <cassert>   // assert   -- ditto
-#include <cstdlib>   // getenv    -- the JLIB_FORCE_COUNTED diagnostic
+#include <cstdlib>   // _dupenv_s / getenv / free -- the JLIB_FORCE_COUNTED diagnostic
 #include "Task.h"
 #include "platform.h"   // kCacheLine, for the counted-epoch ring below
 #include "concurrentqueue.h"
@@ -130,9 +130,28 @@ namespace JLib {
 			// Leaking the manager lets the OS reclaim it at process exit instead.
 			// Diagnostic: route every reader through the counted path, for the mechanism comparison.
 			// Env rather than an API because it must be decided before any guard is taken.
+			// ---- NOT std::getenv, AND THIS IS A PUBLIC HEADER ---------------------------------
+			//
+			// MSVC flags getenv as C4996, and a consumer that compiles with warnings-as-errors --
+			// which is the default for a project that cares -- then cannot include this header at
+			// all. The library's own translation units can silence it locally; an application
+			// cannot be asked to. Found by building Game01 against the library rather than by
+			// building the library, which is the only way this class of defect surfaces.
+			//
+			// _dupenv_s allocates, so the result is freed. The POSIX arm keeps getenv, where it is
+			// not deprecated and the returned pointer is not owned.
 			static bool once = [] {
+#if defined(_MSC_VER)
+				char* e = nullptr;
+				size_t len = 0;
+				if (_dupenv_s(&e, &len, "JLIB_FORCE_COUNTED") == 0 && e) {
+					if (e[0] == '1') forceCounted.store(true, std::memory_order_relaxed);
+					free(e);
+				}
+#else
 				const char* e = std::getenv("JLIB_FORCE_COUNTED");
 				if (e && e[0] == '1') forceCounted.store(true, std::memory_order_relaxed);
+#endif
 				return true;
 			}();
 			(void)once;
