@@ -2776,7 +2776,11 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 				const int hi = (lo + grain > end) ? end : lo + grain;
 				(*f)(lo, hi);
 			}
-			}, false, TaskType::Native);
+			}, false, TaskType::Native, CorePref::Wide);
+		// Wide: a cursor LANE is a worker's worth of participation in one range. Steering these at
+		// the floor is self-defeating -- every lane lands on the same couple of threads and the
+		// cursor they share has nobody else pulling on it, which is the fan-out failure this whole
+		// path exists to provide.
 		// Arena exhausted: drop this lane rather than the work. The cursor is self-balancing, so the
 		// remaining workers simply take what this one would have.
 		if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
@@ -3013,8 +3017,31 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// because the DEFAULT is the wrong thing to depend on here: the cursor path states it, this one
 		// did not, and a future change to the default would silently break only the splitter -- as a
 		// regression in bare-thread ParallelFor, which is the hardest shape to attribute.
+		// ---- DEFAULT, NOT Wide, AND THAT WAS MEASURED ---------------------------------------
+		//
+		// `Wide` was tried here and lost. The argument for it looks identical to the cursor path's
+		// -- a split half exists so another worker runs it -- and it is wrong for one reason the
+		// cursor does not share: THIS SPLIT IS SPECULATIVE. The range is halved on the guess that a
+		// thief will take it, and an untaken split is taken back and run inline for ~11 ns. That
+		// cheapness is the whole design. Placing it Wide pushes it at a possibly-parked worker and
+		// pays a kernel wake PER SPLIT, recursively, for a task that was never certain to be needed.
+		//
+		// THE ARGUMENT IS STRUCTURAL AND THE MEASUREMENT IS NOT YET IN. `Wide` here was reverted on
+		// the strength of the splitter-vs-cursor table inverting (heavy 0.69-0.79 splitter-ahead ->
+		// 1.30-1.75 cursor-ahead), read as the splitter degrading. That reading did NOT hold: with
+		// this back at Default the table still reads cursor-ahead, so the inversion was the CURSOR
+		// improving from its own Wide lanes. Both arms moved and one run cannot separate them --
+		// and the crossover's serial baselines moved ~2x between runs, which makes those cells
+		// uncomparable until somebody runs the two arms interleaved on a quiet machine.
+		//
+		// So this is Default on the speculative-cost argument alone, which stands without a number:
+		// a wake per split, for a split that may be taken straight back, is the wrong currency. If a
+		// clean A/B says otherwise, take it -- the reasoning above is a prediction, not a result.
+		//
+		// The type is spelled out for the reason below; the pref is spelled out so nobody re-applies
+		// the cursor's reasoning here without re-running that table.
 		Task* t = CreateTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); },
-		                     false, TaskType::Native);
+		                     false, TaskType::Native, CorePref::Default);
 		if (!t) break;                      // slab exhausted: run the remainder inline, no error
 		t->waitGroup = st->wg;
 

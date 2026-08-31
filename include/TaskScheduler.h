@@ -1607,7 +1607,10 @@ namespace JLib {
 			for (size_t c = 0; c < chunks; ++c) {
 				const size_t lo = begin + c * chunkSize;
 				const size_t hi = (lo + chunkSize > end) ? end : lo + chunkSize;
-				Task* t = CreateTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); }, hiPri);
+				// Wide: these are chunks of one range, split precisely so other workers run them.
+				// See the splitter and cursor paths -- same argument, same currency.
+				Task* t = CreateTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); },
+				                     hiPri, TaskType::Native, CorePref::Wide);
 				if (!t) {                                   // arena exhausted: run it here
 					for (size_t i = lo; i < hi; ++i) fn(i);
 					continue;
