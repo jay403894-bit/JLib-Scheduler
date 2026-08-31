@@ -2837,6 +2837,7 @@ void Thread::Worker() {
 					const int keep = count - 1;
 					if (keep == 0 || scheduler->deques[qIndex]->push_bottom_batch(batch, keep)) {
 						for (int s = 0; s < keep; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
+						JLIBSCHED_STEAL_STAT(qIndex, ranDirect);
 						task_to_run = batch[count - 1];
 						JLIBSCHED_LATENCY_MARK(Found);
 						continue;

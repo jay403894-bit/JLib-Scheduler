@@ -349,8 +349,8 @@ static void ReportStealStats(const char* label) {
     const JLib::SourceReport sr =
         JLib::StealStatsSources(JLib::TaskScheduler::Instance().GetWorkerCount());
     if (sr.total > 0) {
-        printf("  source/%-6s: hiInbox %lld | loInbox %lld | resumed %lld | own deque %lld | stolen %lld\n",
-               label, sr.hiInbox, sr.loInbox, sr.resumed, sr.deque, sr.stolen);
+        printf("  source/%-6s: hiInbox %lld | loInbox %lld | resumed %lld | own deque %lld | stolen %lld | direct %lld\n",
+               label, sr.hiInbox, sr.loInbox, sr.resumed, sr.deque, sr.stolen, sr.direct);
         printf("               ran-from-inbox %.1f%% of %lld, stolen %.1f%%, balance spread %.2f over %zu workers\n",
                100.0 * (double)sr.unstealable / (double)sr.total, sr.total,
                100.0 * (double)sr.stolen / (double)sr.total, sr.spread, sr.active);
@@ -359,17 +359,16 @@ static void ReportStealStats(const char* label) {
         // is republished to the owner's deque IN BULK, where anyone may take it. The window in
         // which an inbox item is unrescuable is then one drain, not one task -- which is a much
         // weaker version of the case for checking inboxes first.
-        // RAW COUNT, NO PERCENTAGE, and the missing percentage is the honest part. `staged` counts
-        // every task moved inbox->deque, but the five source counters only see the acquisition
-        // sites instrumented so far -- and the DOMINANT execution path drains a batch out of the
-        // inbox and runs it straight from a local array without passing either counter. So the two
-        // numbers have different denominators and dividing them produced 43516%.
+        // THE ACCOUNTING NOW CLOSES. `direct` was the hole: the drain keeps one task and runs it
+        // without touching the deque, so with a single producer -- whose drains almost always find
+        // exactly one -- nearly every task passed no acquisition counter at all. 1p reported 2,700
+        // tasks on a row that pushes a MILLION. Every task is now direct, or staged and then taken
+        // from a deque (by its owner or a thief), or arrived through an inbox.
         //
-        // What survives, and it is the point: staged is ~1,000,000 while ran-from-inbox is ZERO.
-        // Nothing executes out of a loPri inbox. It is a STAGING queue -- work lands unstealable
-        // and is republished to the owner's deque in bulk, where anybody may take it.
-        printf("               staged inbox->deque %lld, ran-from-inbox %lld  <- inbox is a STAGING queue,\n"
-               "               not an execution queue; the two counts have different windows so do not divide them\n",
+        // `staged` remains a FLOW rather than a source and is deliberately not in the total: it
+        // counts the inbox->deque move, and the deque pop that follows is already counted.
+        printf("               staged inbox->deque %lld (a FLOW, not in the total above)\n"
+               "               inbox is a STAGING queue, not an execution queue -- ran-from-inbox %lld\n",
                sr.staged, sr.unstealable);
     }
     JLib::StealStatsReset();

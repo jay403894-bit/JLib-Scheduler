@@ -62,6 +62,13 @@ namespace JLib {
         // unstealable and is republished stealable in batches, so "an inbox item can only be run by
         // its owner" is true for a much shorter window than the structure suggests.
         std::atomic<long long> stagedFromInbox{ 0 };
+        // THE KEPT TASK, run straight out of the drain batch without ever touching the deque. This
+        // is the path that made the other counters undercount: with one producer the drain almost
+        // always finds a single task, which is now kept and run directly, so it staged nothing and
+        // passed no acquisition site. 1p reported 2,700 tasks on a row that pushes a MILLION.
+        // Counting it closes the accounting -- every task is now ranDirect, or staged and then
+        // taken from a deque, or arrived through one of the inboxes.
+        std::atomic<long long> ranDirect{ 0 };
     };
     inline constexpr size_t kStealStatSlots = 256;
     inline StealCounters g_stealStats[kStealStatSlots];
@@ -81,6 +88,7 @@ namespace JLib {
             g_stealStats[i].fromDeque.store(0, std::memory_order_relaxed);
             g_stealStats[i].fromSteal.store(0, std::memory_order_relaxed);
             g_stealStats[i].stagedFromInbox.store(0, std::memory_order_relaxed);
+            g_stealStats[i].ranDirect.store(0, std::memory_order_relaxed);
         }
     }
 
@@ -90,6 +98,7 @@ namespace JLib {
     struct SourceReport {
         long long hiInbox = 0, loInbox = 0, resumed = 0, deque = 0, stolen = 0, total = 0;
         long long staged = 0;         // inbox -> own deque, a FLOW not a source
+        long long direct = 0;         // kept from the drain batch and run without touching the deque
         long long unstealable = 0;   // hiInbox + loInbox + resumed -- work only its owner could run
         double    spread = 0.0;      // max / median over workers that ran anything
         size_t    active = 0;
@@ -106,10 +115,15 @@ namespace JLib {
             const long long st = g_stealStats[i].fromSteal.load(std::memory_order_relaxed);
             r.hiInbox += hi; r.loInbox += lo; r.resumed += rs; r.deque += dq; r.stolen += st;
             r.staged += g_stealStats[i].stagedFromInbox.load(std::memory_order_relaxed);
-            const long long t = hi + lo + rs + dq + st;
+            const long long di = g_stealStats[i].ranDirect.load(std::memory_order_relaxed);
+            r.direct += di;
+            // ranDirect is a SOURCE and belongs in the per-worker total -- it is a task that ran.
+            // stagedFromInbox is a FLOW and does not, or it would double-count against the deque
+            // pop that follows it.
+            const long long t = hi + lo + rs + dq + st + di;
             if (t > 0) per.push_back(t);
         }
-        r.total = r.hiInbox + r.loInbox + r.resumed + r.deque + r.stolen;
+        r.total = r.hiInbox + r.loInbox + r.resumed + r.deque + r.stolen + r.direct;
         r.unstealable = r.hiInbox + r.loInbox + r.resumed;
         r.active = per.size();
         if (!per.empty()) {
@@ -134,6 +148,7 @@ namespace JLib {
     struct SourceReport {
         long long hiInbox = 0, loInbox = 0, resumed = 0, deque = 0, stolen = 0, total = 0;
         long long staged = 0;         // inbox -> own deque, a FLOW not a source
+        long long direct = 0;         // kept from the drain batch and run without touching the deque
         long long unstealable = 0;
         double    spread = 0.0;
         size_t    active = 0;
