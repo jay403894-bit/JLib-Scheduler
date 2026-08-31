@@ -721,6 +721,24 @@ static void BenchThroughputMultiProducer(JLib::TaskScheduler& sched) {
 // counter: landing off the floor and a nonzero wake count are one fact seen from two sides.
 static std::atomic<unsigned> g_landedOn[64];
 
+// Body-entry and body-exit stamps for the round-trip split -- see the task body below. Plain
+// relaxed atomics: exactly one worker writes them per iteration and the serial waiter reads them
+// only after WaitFor has returned, so there is nothing to order against.
+static std::atomic<long long> g_bodyStartNs{ 0 };
+static std::atomic<long long> g_bodyEndNs{ 0 };
+
+// Round-trip microseconds above which an iteration is reported as a stall. `stall=N` overrides.
+static double g_stallUs = 50.0;
+
+// Which worker actually RAN the task, recorded by the body itself. -1 means a non-worker ran it,
+// which happens when the waiting thread helps -- see `helped` in the stall report.
+static std::atomic<int> g_bodyQ{ -1 };
+
+static inline long long NowNs() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               Clock::now().time_since_epoch()).count();
+}
+
 static void BenchLatency(JLib::TaskScheduler& sched) {
     constexpr int kIters = 20'000;
 
@@ -758,8 +776,16 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     //
     // ONCE PER RUN. In the bad state every iteration is slow, so the first sample is as good as any
     // and 20,000 dumps would be unreadable.
-    constexpr double kPathologicalUs = 50.0;
+    const double kPathologicalUs = g_stallUs;   // `stall=N` on the command line; 50 us default
     bool dumped = false;
+    double worstRtUs = 0.0;   // report on each new worst -- see the report site
+    // Stall tally by dominant segment. The comparable output of this row; see the classify site.
+    unsigned long long stallCount = 0, stallDispatch = 0, stallExecution = 0, stallCompletion = 0;
+    unsigned long long stallWithWake = 0;
+    double maxDispatchUs = 0.0, maxExecutionUs = 0.0, maxCompletionUs = 0.0;
+    // Healthy-iteration poll rate, the yardstick the stall report is read against. See the
+    // accumulate site for why it excludes the pathological iterations.
+    unsigned long long healthyPollSum = 0, healthyPollN = 0;
 
     // Both counters are per-row, so they describe THIS row and not the warmup that preceded it.
     JLib::TaskScheduler::ResetWakeCount();
@@ -829,18 +855,59 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     for (int i = 0; i < kIters; ++i) {
         JLib::WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
+        // ---- SPLIT THE ROUND TRIP AT THE TASK ITSELF -------------------------------------------
+        //
+        // The round trip is push -> WaitFor returns, and a single number for it cannot say WHERE a
+        // 50 us outlier lives. Two stamps taken inside the task body cut it into three segments
+        // that have different owners:
+        //
+        //     push  -> body start   DISPATCH. Placement, the notify, and the worker's wake.
+        //     body start -> end     EXECUTION. Nothing here but the (empty) body; a large value
+        //                           means the worker was PREEMPTED mid-task.
+        //     body end -> returned  COMPLETION + OBSERVATION. The waitGroup decrement, and this
+        //                           thread noticing it.
+        //
+        // The third segment is the one the pool dumps kept pointing at: an empty pool with a round
+        // trip still outstanding means the body finished long ago and the delay is entirely after
+        // it. Splitting it here rather than in the library keeps the instrument in the bench --
+        // the decrement path has ten call sites and none of them should grow a clock read.
+        //
+        // Stamped in the body, so no library change buys this. The gap between the body returning
+        // and the decrement is a handful of instructions, which is below what this can resolve
+        // and is not where 50 us hides.
+        g_bodyStartNs.store(0, std::memory_order_relaxed);
+        g_bodyEndNs.store(0, std::memory_order_relaxed);
         JLib::Task* t = sched.CreateTask(+[](void*) {
+            g_bodyStartNs.store(NowNs(), std::memory_order_relaxed);
             // Which worker picked this up? Thread::instance is the running worker's own TLS, so
             // this is ground truth for placement, and it costs one relaxed increment.
+            g_bodyQ.store(JLib::Thread::Current() ? JLib::Thread::Current()->qIndex : -1,
+                          std::memory_order_relaxed);
             if (JLib::Thread::Current()) {
                 const int q = JLib::Thread::Current()->qIndex;
                 if (q >= 0 && q < 64) g_landedOn[q].fetch_add(1, std::memory_order_relaxed);
             }
+            g_bodyEndNs.store(NowNs(), std::memory_order_relaxed);
         }, nullptr);
         t->waitGroup = &wg;
         const int64_t pushNs = JLib::kLatencyStatsEnabled
             ? std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()
             : 0;
+        // ---- DID THIS PUSH BUY A KERNEL WAKE? --------------------------------------------------
+        //
+        // The one question the marks cannot answer on this path, and it splits the remaining
+        // possibilities cleanly:
+        //
+        //   delta 0  no WakeByAddress was issued, so the target was AWAKE when the push chose it.
+        //            Nothing kernel-side is in the number: the delay is an awake worker not getting
+        //            round to draining its own inbox, which is a scheduling or a drain problem.
+        //   delta 1  a wake WAS issued -- the target had advertised intent to park -- so the delay
+        //            is the OS putting that thread back on a core, and no scheduler change to the
+        //            dispatch path touches it.
+        //
+        // Global, but the row is strictly serial with one task in flight, so the delta belongs to
+        // this push and nothing else.
+        const unsigned long long wakesBefore = JLib::TaskScheduler::GetWakeCount();
         const auto rtStart = Clock::now();
         // PUBLISHED BEFORE THE PUSH and cleared after the wait, so the watcher above sees a
         // non-zero start exactly for the window this thread is blocked in.
@@ -848,15 +915,185 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                                rtStart.time_since_epoch()).count(),
                            std::memory_order_release);
         sched.Push(t);
+        const long long pushDoneNs = NowNs();
         sched.WaitFor(wg);
+        // STAMPED HERE, NOT AT PRINT TIME, and the first version got this wrong in a way the
+        // output caught immediately: the completion segment was computed inside the printf that
+        // reports it, so it also contained the two printfs above it. The three segments then summed
+        // to 10.2 us on a 7.4 us round trip -- an instrument reporting more time than elapsed,
+        // which is the one arithmetic a split like this can be checked against for free.
+        const long long returnedNs = NowNs();
+        const unsigned long long wakesAfter = JLib::TaskScheduler::GetWakeCount();
+        const bool wakeDelta0 = (wakesAfter != wakesBefore);   // did this push buy a kernel wake?
+        // READ IMMEDIATELY, BEFORE ANYTHING ELSE ON THIS THREAD WAITS. They are thread_local and
+        // reset by the next bare wait, so a single intervening WaitFor would overwrite them with
+        // that wait's numbers and the report would describe the wrong iteration.
+        const unsigned wPolls  = JLib::TaskScheduler::LastBareWaitPolls();
+        const unsigned wYields = JLib::TaskScheduler::LastBareWaitYields();
+        const unsigned wHelped = JLib::TaskScheduler::LastBareWaitHelped();
         rtInFlightNs.store(0, std::memory_order_release);
         const double rt = std::chrono::duration<double, std::micro>(Clock::now() - rtStart).count();
         rtUs.push_back(rt);
 
-        if (!dumped && rt > kPathologicalUs) {
+        // ---- CLASSIFY EVERY STALL, NOT JUST THE ONE THAT GETS PRINTED --------------------------
+        //
+        // THE MAX IS NOISE, MEASURED: five identical runs of this row produced maxima of 27.5, 88.1,
+        // 49.7, 197.9 and 46.9 us -- a 7.2x spread with p50 and p99 stable to a rounding digit
+        // across all five. So a single exemplar report says nothing about a CONFIGURATION, however
+        // detailed it is, and two arms compared on one run each is not a comparison. That mistake
+        // was made twice here before this tally existed, in both directions.
+        //
+        // What survives the noise is the ATTRIBUTION. Which segment holds a stall is a property of
+        // the mechanism; how big the worst one happened to get is a property of the afternoon.
+        // Counting stalls by their dominant segment turns a rare tail event into something with a
+        // denominator, and it is the only number in this block worth comparing between arms.
+        if (rt > kPathologicalUs) {
+            ++stallCount;
+            const long long sbs = g_bodyStartNs.load(std::memory_order_relaxed);
+            const long long sbe = g_bodyEndNs.load(std::memory_order_relaxed);
+            if (sbs != 0 && sbe != 0) {
+                const double dUs = (double)(sbs - pushDoneNs) / 1000.0;
+                const double eUs = (double)(sbe - sbs)        / 1000.0;
+                const double cUs = (double)(returnedNs - sbe) / 1000.0;
+                if      (dUs >= eUs && dUs >= cUs) { ++stallDispatch;   if (dUs > maxDispatchUs)   maxDispatchUs   = dUs; }
+                else if (cUs >= dUs && cUs >= eUs) { ++stallCompletion; if (cUs > maxCompletionUs) maxCompletionUs = cUs; }
+                else                               { ++stallExecution;  if (eUs > maxExecutionUs)  maxExecutionUs  = eUs; }
+                if (wakeDelta0) ++stallWithWake;
+            }
+        }
+
+        // ON EACH NEW WORST, NOT ON THE FIRST OVER THE LINE. The original fired once, on the first
+        // iteration to exceed the threshold, and then stopped looking -- so the block described
+        // whichever outlier happened to come first, while the row's headline reported the MAX. Those
+        // are different iterations, and comparing one arm's first outlier against another arm's max
+        // is not a comparison at all. It made a spinyield A/B read as a 70 vs 89 us difference that
+        // the underlying samples did not support.
+        //
+        // Printing on every new worst means the LAST block printed is the worst one, which is the
+        // one to read and the one that matches `max` in the row below. Costs a few extra blocks on a
+        // bad run, which is cheaper than a wrong comparison.
+        if (rt > kPathologicalUs && rt > worstRtUs) {
+            worstRtUs = rt;
             dumped = true;
             printf("\n  *** PATHOLOGICAL ROUND TRIP: iteration %d took %.1f us "
                    "(healthy is ~2 us) ***\n", i, rt);
+
+            // ---- WHERE THE OUTLIER ACTUALLY LIVES ----------------------------------------
+            const long long bs = g_bodyStartNs.load(std::memory_order_relaxed);
+            const long long be = g_bodyEndNs.load(std::memory_order_relaxed);
+            if (bs != 0 && be != 0) {
+                printf("      dispatch   (push -> body start)  %8.1f us\n",
+                       (double)(bs - pushDoneNs) / 1000.0);
+                printf("      execution  (body start -> end)   %8.1f us   <- large = worker PREEMPTED\n",
+                       (double)(be - bs) / 1000.0);
+                printf("      completion (body end -> return)  %8.1f us   <- large = the WAITER\n",
+                       (double)(returnedNs - be) / 1000.0);
+                printf("      (segments should sum to about the round trip; a large excess means\n"
+                       "       the instrument is measuring itself)\n");
+
+                // ---- AND SPLIT DISPATCH ITSELF, when the build can ---------------------------
+                //
+                // "It is dispatch" is an answer that contains four more. These marks cut push ->
+                // body start at the three transitions that have different causes and different
+                // fixes:
+                //
+                //   push -> Wake      THE OS. Notify, and the target thread being scheduled again.
+                //                     A parked worker on a core in a deep C-state lives here, and
+                //                     nothing in this library can shorten it.
+                //   Wake -> PreSteal  the worker is running but has not started looking.
+                //   PreSteal -> Found the SEARCH. Large means the task was queued somewhere this
+                //                     worker had to hunt for -- or could not take.
+                //   Found -> body     the tail after the task is in hand.
+                //
+                // Requires -DJLIBSCHED_LATENCY_STATS=ON; a normal build reports zeros and this is
+                // skipped. Do not compare a stats build's absolute numbers against a normal one.
+                if (JLib::kLatencyStatsEnabled) {
+                    int64_t wNs = 0, psNs = 0, fNs = 0;
+                    JLib::LatencyStatsRead(wNs, psNs, fNs);
+                    // EACH MARK IS JUDGED SEPARATELY, and the first version's failure to do that
+                    // threw away the interesting case. Requiring all three to be current discards
+                    // the whole split whenever `Wake` is stale -- but a stale Wake is not a broken
+                    // measurement, it is a RESULT: no park exit happened, so the task was taken by a
+                    // worker that was ALREADY AWAKE and no OS wake is in this number at all. On a
+                    // grown floor that is the common case, and it is precisely the case worth
+                    // seeing, because it rules the kernel out and leaves placement and the search.
+                    const bool wakeCurrent   = (wNs  > pushDoneNs);
+                    const bool searchCurrent = (psNs > pushDoneNs && fNs >= psNs && bs >= fNs);
+                    if (searchCurrent && wakeCurrent && psNs >= wNs) {
+                        printf("        push  -> Wake      %8.1f us   <- the OS wake\n",
+                               (double)(wNs - pushDoneNs) / 1000.0);
+                        printf("        Wake  -> PreSteal  %8.1f us\n", (double)(psNs - wNs) / 1000.0);
+                        printf("        PreSteal -> Found  %8.1f us   <- the search\n",
+                               (double)(fNs - psNs) / 1000.0);
+                        printf("        Found -> body      %8.1f us\n", (double)(bs - fNs) / 1000.0);
+                    } else if (searchCurrent) {
+                        printf("        NO PARK EXIT this iteration -- the worker was already awake,\n"
+                               "        so none of this delay is an OS wake.\n");
+                        printf("        push  -> PreSteal  %8.1f us   <- placement + the worker\n"
+                               "                                          getting round to looking\n",
+                               (double)(psNs - pushDoneNs) / 1000.0);
+                        printf("        PreSteal -> Found  %8.1f us   <- the search\n",
+                               (double)(fNs - psNs) / 1000.0);
+                        printf("        Found -> body      %8.1f us\n", (double)(bs - fNs) / 1000.0);
+                    } else {
+                        // The marks are process-wide globals, so a set that predates this push
+                        // belongs to a DIFFERENT iteration and must be discarded rather than printed
+                        // as a negative or a wild number.
+                        printf("        (search marks predate this push -- discarded, they belong to\n"
+                               "         another round trip)\n");
+                    }
+                }
+                // WHICH WORKER, and it is the question the band dump cannot answer. The dump shows
+                // who was awake at DUMP time; this shows who actually ran the task. A stall that
+                // lands on one of the few SLEEPING indices while a floor of 13 spins is a placement
+                // result -- steering chose a parked worker and bought a wake it did not need to.
+                printf("      landed on worker q%d\n", g_bodyQ.load(std::memory_order_relaxed));
+                const unsigned long long wakeDelta = wakesAfter - wakesBefore;
+                printf("      kernel wakes bought by this push: %llu\n", wakeDelta);
+                // SAY WHAT THE COUNTER MEANS, NOT WHAT IT SUGGESTS. This line used to read "an
+                // awake worker did not get round to draining its own inbox", which describes a
+                // DELAY in the vocabulary of a HANG and was read that way. The task completed --
+                // that is the only reason there is a number here at all. A strand does not produce
+                // a slow round trip, it produces no round trip: the serial row waits forever and
+                // the run never finishes. Nothing in this block can report one.
+                printf(wakeDelta == 0
+                       ? "        0 -> NO NOTIFY WAS SENT. The producer read the target as WS_AWAKE\n"
+                         "        and skipped the wake, which is correct and is what avoids the\n"
+                         "        kernel cost -- but it means nothing hurries this task along. Its\n"
+                         "        latency is entirely that one worker's next poll of its own inbox,\n"
+                         "        and if the OS is not running that thread, nothing will chase it.\n"
+                         "        The task still completes; it is late, not lost.\n"
+                       : "        >0 -> a wake WAS issued: the target had advertised intent to park,\n"
+                         "        so this delay is the OS putting that thread back on a core.\n");
+            } else {
+                printf("      (no body stamps: the task had not started when the wait ended --\n"
+                       "       impossible for a WaitGroup of 1, so treat this line as a bug)\n");
+            }
+
+            // ---- AND WHETHER THIS THREAD WAS EVEN RUNNING --------------------------------
+            //
+            // THE POINT OF THE WHOLE EXERCISE. A long completion segment has two causes that look
+            // identical in every timing: the waiter spun and kept seeing the count above zero, or
+            // the waiter was not on a CPU at all. polls tells them apart without a clock.
+            //
+            // CALIBRATE AGAINST THE HEALTHY RATE PRINTED WITH THE ROW, and do not guess it. A
+            // poll is a load, a steal attempt and a CpuRelax, and the first measurement of it came
+            // out at ~125 ns -- so a HEALTHY p50 round trip spins about 4 times, not the thousand
+            // that seemed obvious before it was measured. The scale that matters is therefore:
+            //
+            //     healthy                      ~4 polls
+            //     50 us STALL, spun through    ~400 polls      (50 us / 125 ns)
+            //     50 us STALL, off-CPU         still ~4        the thread never looked
+            //
+            // Two orders of magnitude apart, which is what makes this decisive -- but the ns/poll
+            // figure is machine-specific, so read the ratio against the row's own printed rate
+            // rather than against the numbers above.
+            printf("      waiter: %u polls, %u yields, %u helped\n", wPolls, wYields, wHelped);
+            printf("        polls HIGH -> waiter ran and kept seeing n>0: the pool was late.\n"
+                   "        polls LOW  -> waiter was NOT SCHEDULED: nothing was missed.\n");
+            if (wHelped)
+                printf("        NOTE: helped>0 -- this thread RAN a stolen task during the wait,\n"
+                       "        so this round trip is not a dispatch measurement.\n");
             // NO POOL DUMP HERE, AND ITS ABSENCE IS THE FIX. One used to print at this point under
             // the heading "Pool state AT THE MOMENT it happened", which was not true: the task has
             // completed, WaitFor has returned, and a serial loop has nothing else outstanding -- so
@@ -871,6 +1108,13 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                    "   line is only the measurement. The pool is idle by now, so a dump taken\n"
                    "   here would show nothing but an idle pool and has been removed.)\n\n");
         }
+
+        // THE CALIBRATION FOR THE POLL COUNT, and it is why the pathological block can say
+        // "HIGH" and "LOW" and mean something. A poll is a load plus a steal attempt plus a
+        // CpuRelax, and how many of those fit in a microsecond is a property of THIS machine --
+        // so the healthy rate has to be measured here rather than assumed. Collected only from
+        // iterations that did not blow the threshold, so the outlier cannot skew its own baseline.
+        if (rt <= kPathologicalUs) { healthyPollSum += wPolls; healthyPollN += 1; }
 
         if (JLib::kLatencyStatsEnabled) {
             int64_t wakeNs = 0, preStealNs = 0, foundNs = 0;
@@ -899,6 +1143,32 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     printf("               p50 %.2f us | p99 %.2f us | max %.2f us   <- p99/max are the floor test,\n"
            "               because an OS wake cannot hide there the way it hides in the mean\n",
         pct(0.50), pct(0.99), rtUs.back());
+    // ---- THE COMPARABLE NUMBER, and the only one in this row that survives a rerun -------------
+    printf("               stalls >%.0f us: %llu of %d", kPathologicalUs, stallCount, kIters);
+    if (stallCount) {
+        printf("   dispatch %llu (max %.1f) | execution %llu (max %.1f) | completion %llu (max %.1f)\n",
+               stallDispatch, maxDispatchUs, stallExecution, maxExecutionUs,
+               stallCompletion, maxCompletionUs);
+        printf("               of those, %llu bought a kernel wake -- the rest hit a target that was\n"
+               "               ALREADY AWAKE, so no OS wake is in them at all\n", stallWithWake);
+        printf("               ^ COMPARE THESE COUNTS BETWEEN ARMS, NOT max. Five identical runs of\n"
+               "                 this row spanned 27.5..197.9 us of max (7.2x) with p50/p99 stable,\n"
+               "                 so a max read from one run measures the afternoon, not the config.\n");
+    } else {
+        printf("   (none)\n");
+    }
+    if (healthyPollN) {
+        const unsigned long long meanPolls = healthyPollSum / healthyPollN;
+        // ns per poll, from the p50 round trip. Guarded because a p50 fast enough to complete
+        // inside the first load -- zero polls -- is a legitimate outcome on a live floor, and it
+        // must print as "0 polls", not divide by it.
+        const double perPoll = meanPolls ? (pct(0.50) * 1000.0 / (double)meanPolls) : 0.0;
+        printf("               waiter spun %llu polls on a healthy p50 round trip (~%.0f ns/poll)\n"
+               "               ^ THE YARDSTICK for any STALL report above: a stall the waiter spun\n"
+               "                 THROUGH scales its poll count with its duration. One that reports a\n"
+               "                 healthy-looking count was not spinning -- it was off-CPU.\n",
+            meanPolls, perPoll);
+    }
 
     // ---- DID THE FLOOR RECEIVE THE WORK? -----------------------------------------------------
     //
@@ -2380,6 +2650,30 @@ int main(int argc, char** argv) {
         // park (hot=2 floor=0). Tying them means a row that moved cannot be attributed to either.
         if (JLIB_STRNICMP(argv[a], "floor=", 6) == 0) {
             awakeFloor = (size_t)strtoul(argv[a] + 6, nullptr, 10);
+            continue;
+        }
+        // ---- WHAT COUNTS AS A STALL, in microseconds ------------------------------------------
+        //
+        // 50 is the default because that is the size of the outlier being chased, but it is not a
+        // property of anything -- and a fixed trigger cannot be aimed. A row whose max lands just
+        // UNDER it (43.5 us on the run that motivated this flag) reports nothing at all, so the
+        // diagnostic is silent exactly when it nearly had something to say.
+        //
+        // Lower it to catch smaller stalls, and to exercise the report on a healthy machine.
+        if (JLIB_STRNICMP(argv[a], "stall=", 6) == 0) {
+            // VALIDATED, because the obvious use of this flag is to set it high enough to silence
+            // the report -- and strtod answers a value too large for a double with HUGE_VAL, and a
+            // non-numeric token with 0. Neither is rejected by anything downstream: 0 makes every
+            // one of 20,000 iterations a "stall", and inf silently disables the tally while the row
+            // still prints a threshold, so the output looks like a clean run rather than a disabled
+            // check. Both are answers to a question the user did not ask.
+            const double v = strtod(argv[a] + 6, nullptr);
+            if (!(v > 0.0) || v > 1.0e9) {
+                printf("bad stall= value '%s' (want microseconds, 0 < N <= 1e9); keeping %.0f\n",
+                       argv[a] + 6, g_stallUs);
+            } else {
+                g_stallUs = v;
+            }
             continue;
         }
         // A BARE NUMBER IS THE POOL SIZE; ANYTHING ELSE IS A TYPO. This used to be an unguarded

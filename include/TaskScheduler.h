@@ -913,6 +913,26 @@ namespace JLib {
 		static unsigned long long GetWakeCount() noexcept;
 		static void   ResetWakeCount() noexcept;
 
+		// ---- DID THE WAITER RUN? (bare, non-fiber WaitFor only) -------------------------------
+		//
+		// Describe the calling thread's MOST RECENT bare wait -- the spin loop a non-worker takes
+		// through WaitFor. thread_local and reset at the start of each such wait, so they are read
+		// after WaitFor returns and mean "that wait", not "all waits since startup".
+		//
+		// WHAT THEY DECIDE. A long wait has two causes that no timing can tell apart: the waiter
+		// spun and kept seeing the count above zero (the completion was genuinely outstanding), or
+		// the waiter was not scheduled at all (nothing was late; it was not there to look). polls
+		// separates them -- high means it looked and kept finding work outstanding, near-zero means
+		// it never got the chance. See the comment on BareWaitBackoff.
+		//
+		// helped is the disclaimer on the other two: a bare waiter that runs a stolen task WAS the
+		// pool for that stretch, so a round trip with helped > 0 is not a dispatch measurement.
+		//
+		// Zero for a fiber wait, which suspends instead of spinning and never enters this loop.
+		static unsigned LastBareWaitPolls()  noexcept;
+		static unsigned LastBareWaitYields() noexcept;
+		static unsigned LastBareWaitHelped() noexcept;
+
 		// Moves K WITHOUT touching the bounds. SetHotWorkers pins [k,k]; this is the move on its own,
 		// used by the range clamp and by the controller -- which must not rewrite the bounds it is
 		// being steered by. Public only so the controller can reach it; apps want SetHotWorkers.

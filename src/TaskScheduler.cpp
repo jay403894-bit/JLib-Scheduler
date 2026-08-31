@@ -4003,13 +4003,45 @@ void TaskScheduler::RunCounted(WaitGroup& wg, Task* t) {
 //
 // THE COUNTER IS THE CALLER'S, so each wait starts fresh: a loop that spun 10,000 times on its last
 // wait must not yield immediately on the next one.
+// ---- WAS THE WAITER RUNNING? ---------------------------------------------------------------
+//
+// These three exist to answer ONE question, and it is a question no timing can answer: when a bare
+// wait takes 50 us, was this thread spinning around the loop the whole time and repeatedly seeing
+// `n > 0` -- or was it not executing at all?
+//
+// The two look identical from outside. Both produce a long wait with an idle pool afterwards, and
+// a pool dump taken during one shows the same thing as a dump taken during the other, because
+// workerState says what a worker has ADVERTISED, never whether its thread holds a core. Counting
+// the loop separates them with no clock involved:
+//
+//     polls HIGH  -> the waiter ran, looked, and kept finding n > 0. The completion really was
+//                    outstanding, and the pool owns the delay.
+//     polls LOW   -> the waiter was descheduled. Nothing was missed and nothing was late; this
+//                    thread simply was not on a CPU to notice. The pool is exonerated.
+//
+// A COUNT, NOT A CLOCK, and deliberately: reading a clock in here would put a serialising
+// instruction in the loop whose scheduling behaviour is the thing under measurement. The counters
+// are thread_local and non-atomic -- only this thread writes them and only this thread reads them,
+// after its own wait has returned.
+//
+// `helped` is separate from `polls` because a bare waiter that runs a stolen task is not waiting at
+// all for that stretch: it is the pool, briefly. A round trip where helped > 0 measured something
+// other than dispatch, and reading it as dispatch latency is a mistake worth being able to catch.
+static thread_local unsigned t_bareWaitPolls  = 0;
+static thread_local unsigned t_bareWaitYields = 0;
+static thread_local unsigned t_bareWaitHelped = 0;
+
 static inline void BareWaitBackoff(unsigned& spins) noexcept {
 	// ~1 us of pause at a few hundred picoseconds each, then hand the core over. Short enough that
 	// a genuinely long wait still yields promptly, long enough to cover a dispatch round trip.
 	constexpr unsigned kSpinBeforeYield = 512;
 	if (spins < kSpinBeforeYield) { ++spins; platform::CpuRelax(); }
-	else                          { spins = 0; std::this_thread::yield(); }
+	else                          { spins = 0; ++t_bareWaitYields; std::this_thread::yield(); }
 }
+
+unsigned TaskScheduler::LastBareWaitPolls()  noexcept { return t_bareWaitPolls;  }
+unsigned TaskScheduler::LastBareWaitYields() noexcept { return t_bareWaitYields; }
+unsigned TaskScheduler::LastBareWaitHelped() noexcept { return t_bareWaitHelped; }
 void TaskScheduler::WaitFor(WaitGroup& wg) {
 	auto thread = Thread::GetCurrent();
 	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
@@ -4076,7 +4108,11 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		// zero and this behaves exactly as before -- the guard only bites on a pattern that already
 		// self-deadlocked.
 		unsigned waitSpins = 0;   // per-wait, so a long previous wait cannot make this one yield early
+		// RESET PER WAIT, like waitSpins and for the same reason: these describe THIS wait. A caller
+		// reads them after the wait returns, so they must not carry the previous one's total.
+		t_bareWaitPolls = t_bareWaitYields = t_bareWaitHelped = 0;
 		while (wg.n.load(std::memory_order_acquire) > 0) {
+			++t_bareWaitPolls;
 			bool ranSomething = false;
 			if (t_heldMutexes == 0) {
 				++t_spinHelpDepth;
@@ -4085,6 +4121,8 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 			}
 			if (!ranSomething)
 				BareWaitBackoff(waitSpins);
+			else
+				++t_bareWaitHelped;
 		}
 	}
 }
