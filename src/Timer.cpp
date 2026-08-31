@@ -432,8 +432,29 @@ namespace JLib {
     TimerQueue& TimerQueue::Instance() {
         // Function-local static, like the cancel table: no static-init-order dependency on the
         // scheduler, and no thread exists until something actually arms a timer.
-        static TimerQueue q;
-        return q;
+        //
+        // ---- DELIBERATELY LEAKED, BECAUSE Join() OUTLIVES IT ---------------------------------
+        //
+        // This was `static TimerQueue q;` and the object was therefore DESTROYED BEFORE the thing
+        // that stops it. TaskScheduler::atExitDestroyer is a namespace-scope static, constructed
+        // during static initialisation -- before main. This one is a function-local static,
+        // constructed on the first Instance() call, which happens inside Init(). Destruction is
+        // reverse of construction, so `q` went first, and then ~AtExitDestroyer -> Join() ->
+        // `TimerQueue::Instance().Stop()` locked a mutex inside an `impl` that had already been
+        // deleted.
+        //
+        // ON LINUX THAT HANGS AT PROCESS EXIT. Reproduced with no I/O and no timers armed:
+        // EnableTimers(true), Init, run one ordinary task, return from main -- never returns, 3/3.
+        // Windows survives it because the freed block is still mapped and the mutex happens to
+        // behave, which is the worst way for a use-after-free to present.
+        //
+        // A LEAK IS THE FIX, NOT A COMPROMISE. TaskScheduler::instance is leaked at exit for the
+        // same class of reason and says so. Nothing is abandoned: Join() stops the thread and joins
+        // it explicitly, so what leaks is one object in a process that is exiting, and the OS is
+        // about to reclaim it anyway. Ordering a function-local static against a namespace-scope one
+        // is not something this can win.
+        static TimerQueue* q = new TimerQueue();
+        return *q;
     }
 
     TimerHandle TimerQueue::Arm(int64_t delayNs, CancelToken token, TimerEject eject, void* ctx) {

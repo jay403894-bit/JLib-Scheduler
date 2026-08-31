@@ -605,11 +605,17 @@ bool IoReactor::IsAvailable() noexcept {
     // earlier "it passes" reading, including mine, looked at the OUTPUT and not the EXIT CODE.
     // A test that prints PASSED and then hangs is a passing test to anything that reads stdout.
     //
-    // FLIPPING THIS IS ONE LINE -- delete the `return false` -- and it should happen the moment the
-    // socket test EXITS 0 rather than merely printing PASSED. Until then a hang at process exit is
-    // worse than an honest "no async I/O here", which is the same rule that kept it false before.
-    (void)probed;
-    return false;
+    // THE TEARDOWN HANG IS FIXED and the condition above is met: the socket test EXITS 0, not
+    // merely prints PASSED. The cause was not in this file at all -- TimerQueue's singleton was a
+    // function-local static, so it was destroyed BEFORE TaskScheduler::atExitDestroyer (a
+    // namespace-scope static, constructed before main and therefore destroyed last), and
+    // ~AtExitDestroyer -> Join() -> TimerQueue::Instance().Stop() then locked a mutex in a deleted
+    // `impl`. EnableIoReactor implies EnableTimers, which is the whole reason it presented here.
+    //
+    // Localised with a 25-line probe that submits NO I/O: EnableTimers(true) alone hung, with the
+    // same worker count as SetReservedCores(1) which did not -- so it was neither the reserved
+    // band, nor the never-park floor, nor the pool size, nor anything in this reactor.
+    return probed;
 }
 
 void IoReactor::Start() noexcept {
