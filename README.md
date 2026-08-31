@@ -711,6 +711,11 @@ that. It silently links whichever one it reaches first.
 
 Every platform below runs the full test suite in CI on every push:
 
+> **The Linux tree did not build end to end until 5.0.0.** Two benches included `<windows.h>`
+> unconditionally, and as unconditional CMake targets they aborted `cmake --build` partway through --
+> so every target after them in build order was silently never produced. That is worth knowing when
+> reading any historical claim about Linux coverage: the suite ran, but not all of it existed.
+
 | OS | Arch | Toolchain |
 | --- | --- | --- |
 | Windows | x86-64 | MSVC |
@@ -807,6 +812,39 @@ other primitive here -- Event, semaphore and condition variable all cancel by wa
 and it is *not* enough for a parked read, which is sitting in the kernel's completion queue with the
 kernel holding your buffer. `IoReactor::RequestCancel(token)` is the call that issues `CancelIoEx`;
 without it a receiver with no traffic will not exit. See the comment at the bottom of `RunReceiver`.
+
+### I/O reactor: where it actually works
+
+`IoReactor::IsAvailable()` is the honest answer and you should branch on it. It reports a property of
+**this process on this kernel**, not of the build -- a container that refuses `io_uring` via seccomp
+or the `io_uring_disabled` sysctl reports false on a binary that supports it.
+
+| Platform | Backend | Status |
+| --- | --- | --- |
+| Windows x64 / ARM64 | IOCP | Complete. Sockets, files, named pipes. |
+| Linux x86-64 / AArch64 | io_uring | **Live as of 5.0.0.** Sockets pass end to end. |
+| Linux without io_uring | epoll | Compiled, **unexercised** -- no test covers it. |
+| macOS | — | `IsAvailable()` is false; no reactor. |
+
+**What "sockets pass end to end" covers**, so it is not read as more than it is: accept, connect,
+send, recv, vectored send, a peer close as a zero-byte completion, the acceptor pool, `Stop` drain,
+cancellation through nested scopes, deadlines, and `IoStream`'s chained ordering. **Not** covered:
+file I/O (`SubmitRead`/`SubmitWrite` on a regular fd) has no test on Linux, epoll has none at all,
+and nothing has run under load for longer than the suite takes. Reporting available is a claim that
+the operations work, not that the backend is seasoned.
+
+**Two escape hatches, both environment variables** so nothing an application links against can trip
+them: `JLIB_IO_URING_OFF=1` forces the synchronous path back without a rebuild, and
+`JLIB_IO_URING_FORCE=1` reports available even where the default would not. `JLIB_IO_TRACE=1` prints
+one line per submission and per completion, paired by request pointer, which is how the chained-path
+bug was found -- a submission with no matching completion is then visible by absence.
+
+**One POSIX difference worth knowing before you design around it:** `SubmitDisconnect(s, reuse=true)`
+is `DisconnectEx(TF_REUSE_SOCKET)` and has no POSIX equivalent -- a connected TCP socket cannot be
+returned to an unconnected state. Ask `IoReactor::SupportsDisconnectReuse()` rather than finding out
+by submitting; a refused disconnect leaves a half-open connection behind, and in this library's own
+test that stranded a peer in a listener's backlog and failed four unrelated checks in the next
+section.
 
 
 ## Using it

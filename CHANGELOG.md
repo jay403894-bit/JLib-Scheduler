@@ -15,6 +15,105 @@ what `SetHotWorkers` means, and removed `Join()` from the public API. 4.0.1 had 
 `PushImmediate`. Those change what the API *means*, not just what it does, and three patch numbers
 in a row were making trees that behave differently report nearly the same version.
 
+### Linux I/O is live: `IoReactor::IsAvailable()` returns true on io_uring
+
+`tests/io_socket_test.cpp` passes end to end on Linux and, more importantly, **exits 0** — accept,
+connect, send, recv, vectored send, peer close, the acceptor pool, `Stop` drain, cancellation,
+deadlines and `IoStream` chaining. It had been reporting `false` for the whole life of the backend.
+Five bugs stood in the way and four of them hid each other.
+
+- **[CRITICAL] Short writes, never resubmitted — the chain hang.** `IoStream`'s chained path hung
+  with every thread asleep, which read as io_uring dropping a completion for months. It was not:
+  every SQE got a CQE. A stream socket takes what fits in its send buffer and reports that — traced
+  at 32741 of 98304 requested, then 47616, then 65483 — and nothing advanced the descriptors, so the
+  transfer was reported *complete* having sent a third of its bytes and the peer waited forever.
+  **A starved reader and a dropped completion are indistinguishable from outside.**
+
+  Fixed with a partial-send retry in the completion drain (send only — a short *recv* is what a
+  stream *is*, and retrying one would block a caller that already has what it asked for),
+  `IoRequest::xferred` to carry the running total so the final completion reports what the caller
+  passed, and a shape-correct `SubmitPrepared`: `bufCount == 0` fails `EINVAL` instead of building an
+  SQE from descriptors nobody filled, `== 1` replays as socket-native `SEND`/`RECV` (which also
+  carries `msg_flags`, silently dropped by `WRITEV`), `> 1` as `WRITEV`/`READV`.
+
+- **[CRITICAL] `RecvFrom` never wrote the peer address length back.** `recvmsg` puts it in
+  `msg_namelen` inside the *request*; the caller's `IoAddress::len` is a separate field in a
+  suspended frame. Windows needs no such step because `WSARecvFrom` writes through a pointer to it.
+  The request now names the `IoAddress` in `aux` and the completion carries the length across,
+  clamped to capacity — `msg_namelen` is what the kernel *would* have written, so an oversized peer
+  address must not be reported as stored.
+
+- **[CRITICAL] `RequestCancel` compared cancel tokens for equality** instead of asking `IsWithin`.
+  Operations register under the scope that owns them, routinely nested inside the one a caller
+  cancels — a per-request scope under a per-connection scope is the shape a server has — so raw
+  equality matched nothing in the case the function exists for. The Windows backend has always asked
+  `IsWithin` and says so in its own comment.
+
+- **Socket reuse after disconnect has no POSIX equivalent, and the test ran the section anyway.**
+  Added `IoReactor::SupportsDisconnectReuse()` — true on Windows (`DisconnectEx`/`TF_REUSE_SOCKET`),
+  false elsewhere, because a connected TCP socket cannot be returned to an unconnected state and
+  `connect(AF_UNSPEC)` dissolves the association for *datagram* sockets only. Ask, do not discover by
+  failing: the refused disconnect left a connection in the listener's **backlog**, the next section's
+  accept completed instantly off it instead of staying pending, and four cancellation checks failed
+  for a reason unrelated to cancellation. Fixing it turned those into a hang, which is how the
+  `RequestCancel` bug surfaced. **A bug that makes a test pass for the wrong reason costs more than
+  one that fails.**
+
+- **[CRITICAL] The library did not compile on Linux at HEAD** — `std::strncpy` with no `<cstring>`,
+  which MSVC pulls in transitively via `windows.h`.
+
+`JLIB_IO_URING_FORCE=1` and `JLIB_IO_URING_OFF=1` both exist permanently, in both polarities.
+Whichever way the default points, the other direction is one environment variable away — a gate that
+makes a bug unreachable also makes it unreproducible.
+
+### [CRITICAL] Process-wide singletons were destroyed before the code that stops them
+
+`TaskScheduler::atExitDestroyer` is a namespace-scope static, constructed during static
+initialisation, before `main`. `TimerQueue`, `IoReactor` and `HazardDomain` were function-local
+statics constructed on first use — inside `Init()`. Destruction is reverse of construction, so all
+three were destroyed **first**, and then `~AtExitDestroyer` → `Join()` reached back into them.
+
+- `TimerQueue` — locked a mutex inside a deleted `impl`. **Hung Linux at process exit**, in any
+  program that enabled timers, which `EnableIoReactor` does implicitly.
+- `IoReactor` (POSIX) — `~IoReactor` sets `g_impl = nullptr`, so `Join()`'s `Stop()` would be a null
+  dereference. Dormant only because `IsAvailable()` was hardcoded false; flipping the gate armed it.
+- `IoReactor` (Windows) — same shape. Windows survives it the way it survived the timer one: the
+  freed block stays mapped and the members happen to behave. That is not a defence, it is how this
+  class of bug hides here.
+- `HazardDomain` — no user destructor, and leaked anyway. The point is not that it was dangerous; it
+  is that a destruction *order* between process-wide objects is a thing to be wrong about, and the
+  cheapest way to be right is to not have one.
+
+All four are now leaked deliberately, as `TaskScheduler::instance` already was. Nothing is
+abandoned: `Join()` stops and joins every thread explicitly, and what leaks is objects in a process
+that is exiting.
+
+**Localised with a 25-line probe that submits no I/O at all**, one mode per ingredient —
+`SetHotWorkers(1)` exits, `+ neverpark` exits, `SetReservedCores(1)` exits at 30 workers,
+`EnableTimers(true)` **hangs** at the same 30 workers. That pair killed the reserved band, the
+never-park floor, the pool size and the whole reactor in one table.
+
+### The Linux build did not complete, and had not for some time
+
+`bench/waitfor_participation.cpp` and `bench/futex_variance.cpp` include `<windows.h>`
+unconditionally. As unconditional CMake targets they aborted `cmake --build` partway through the
+tree, so **everything after them in build order was never produced** — which reads as "those tests do
+not exist on Linux" rather than as two benches being unportable. Guarded in `CMakeLists.txt` rather
+than `#ifdef`'d in the sources, because the problem was never that they do not *run* there. The full
+Linux suite now runs for the first time: **27/27**.
+
+### `tests/coroutine_test.cpp` frame-class check was flaky on Linux (3 of 8)
+
+Not a library bug — the 256-byte column read 0 on every run, so the size class was never what failed.
+The baseline was captured mid-drain (frames from earlier sections are freed on worker threads,
+asynchronously), and it asserted **exact equality on a counter that is approximate by contract**:
+`SlabPool::LiveCount` sums per-thread shards on demand, one at a time, while other threads keep
+working — *"a smear across a short window rather than a synchronized snapshot"*, in its own comment,
+with individual shards going negative on purpose. Now settles until the counter holds still, then
+tolerates a slack of 4, matching the 256-byte check beside it which had already been loosened for
+exactly this reason. Verified by negative control: with `slots64 = 0` the section reads `0 small
+slots` and fails, so a slack of 4 cannot hide a regression that reads 200 → 0. 12/12 after.
+
 ### The lane is the inbox: the hiPri Chase-Lev deques are gone
 
 - **`hiPri[]` removed.** A Chase-Lev deque exists so *other* threads can steal from it, and nothing
