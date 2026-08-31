@@ -3054,6 +3054,11 @@ size_t TaskScheduler::GetMinItersPerWorker() noexcept { return g_minItersPerWork
 // small range from splitting to grain 1; this does.
 static constexpr size_t kMinGrain = 16;
 
+// The shortest reading the width probe will divide by. Above the clock's own noise, and low enough
+// that an expensive body clears it on its FIRST item -- which is the whole point, since the probe
+// is serial time on the critical path and that path is shortest exactly when the body is dear.
+static constexpr long long kProbeFloorNs = 500;
+
 // How many thieves a range wakes on its OPENING publish. Not 1 (too slow to fill a parked pool) and
 // not a cascade (which lands 29 workers on a range that wanted 4). After the first wave, a wake
 // happens only when a previous split is still unclaimed -- demand recruits the rest.
@@ -3072,6 +3077,14 @@ size_t TaskScheduler::GetLazySplitCap() noexcept { return g_lazySplitCap.load(st
 // ON BY DEFAULT, because the thing it replaces is doing nothing: a range currently wakes ONE worker
 // and waits to be discovered. The flag exists so `norecruit` can A/B the whole mechanism in one
 // binary against the floor=31 ceiling, which is what bounds its payoff.
+// OFF BY DEFAULT. It changes what ParallelFor does on every call -- it runs the first kMinGrain
+// items on the caller before deciding anything, and it can fan out where minItersPerWorker used to
+// refuse. That is the point, and it is also exactly the kind of change that has failed here before,
+// so it is opt-in until Jay's numbers say otherwise rather than the other way round.
+static std::atomic<bool> g_measuredWidth{ false };
+void TaskScheduler::SetMeasuredWidth(bool on) noexcept { g_measuredWidth.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetMeasuredWidth() noexcept { return g_measuredWidth.load(std::memory_order_relaxed); }
+
 static std::atomic<bool> g_rangeRecruit{ true };
 void TaskScheduler::SetRangeRecruit(bool on) noexcept { g_rangeRecruit.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::RangeRecruitEnabled() noexcept { return g_rangeRecruit.load(std::memory_order_relaxed); }
@@ -3409,7 +3422,99 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 	// millisecond each runs serially. That is the trade for having no probe, and it is the safe
 	// direction -- being wrong here costs a bounded amount of parallelism on a rare shape, where
 	// being wrong the other way costs 100x on the shape a game hits every frame.
-	{
+	// ---- MEASURE ONE CHUNK, THEN LET IT ANSWER BOTH QUESTIONS ---------------------------------
+	//
+	// THE DEFECT THIS FIXES IS THE MISSING MIDDLE. Fan-out had exactly two states: serial, or
+	// workers.size() wide. Nothing between, and the choice was made by an ITERATION COUNT that
+	// never looks at the body -- so trivial work at N=256 pulled in 23 of 31 workers for about two
+	// microseconds of total work, and heavy work at the same N was refused entirely. Measured, cap
+	// off: heavy N=256 runs 6.9x and trivial N=256 runs 0.02x. Same N, same machine, same gate.
+	// No value of minItersPerWorker serves both, because the difference is not in N.
+	//
+	// A LEAF IS NOT A PROBE IF YOU HAD TO RUN IT ANYWAY. The old body probe was removed in 1.4 for
+	// costing more than it saved, and that reasoning does not reach this: the first chunk is work
+	// the range is obliged to perform, so the measurement costs two clock reads and nothing else.
+	// The result is W, and from W both answers follow -- whether to fan out at all, and how wide.
+	//
+	// WIDTH IS sqrt(W/c), NOT THE POOL. Time with k workers is about W/k plus k*c of ramp (the
+	// wakes are issued serially by one thread), and that is minimised at k = sqrt(W/c). It gives
+	// ~1 for trivial at N=256 -- correctly declining -- and ~7 for heavy at the same N, where the
+	// old gate gave 0. Checked against the crossover rows: predicted k tracked observed speedup at
+	// 70-75% efficiency across a 17x range of W.
+	//
+	// AN UNDER-ESTIMATE IS SAFE AND AN OVER-ESTIMATE IS NOT, so this is deliberately a LOWER BOUND.
+	// A non-uniform body -- the back-loaded case -- makes the first chunk unrepresentative and W
+	// too small, and the answer to that is not a better guess: range recruitment already widens on
+	// evidence as expensive leaves actually complete. The probe starts the range at a defensible
+	// width and recruitment corrects upward from measurements it did not have to predict. Neither
+	// has to be right alone.
+	//
+	// minItersPerWorker IS NOW A FLOOR THIS CAN LIFT, not a veto. It still refuses ranges the probe
+	// also declines, so nothing that was serial before becomes a 31-way fan-out by surprise; what
+	// changes is that a range the probe proves expensive is no longer blocked by an iteration count.
+	size_t fanWidth = workers.size();
+	if (GetMeasuredWidth()) {
+		const int len = end - begin;
+		// A BOUNDED FRACTION, NOT A FIXED COUNT, and getting this wrong cost heavy work 35%.
+		// The probe runs SERIALLY on the caller before anything fans out, so it is Amdahl's serial
+		// fraction and it must scale with the range. A flat kMinGrain=64 is 25% of a 256-item range
+		// -- which caps speedup at 4x no matter how many workers arrive, and measured exactly that:
+		// heavy N=256 fell 7.40x -> 4.89x purely to the probe. 1/32 keeps the serial share near 3%
+		// at every size, capped at kMinGrain so a huge range does not probe a huge chunk.
+		//
+		// NOT sized by `grain`: that is a caller's guess and has not been floored yet, so the
+		// measurement would depend on the number it exists to correct.
+		// ESCALATE ONLY IF THE MEASUREMENT IS TOO SHORT TO TRUST. The probe is SERIAL and it runs
+		// BEFORE anything fans out, so it sits directly on the critical path -- and that path is
+		// short exactly when the body is expensive. Heavy at N=256 is ~154 us of work, so ideal
+		// parallel time is ~5 us, against a flat len/32 probe of ~4.8 us: the measurement nearly
+		// doubled the critical path, and cost 7.40x -> 6.36x.
+		//
+		// So start at ONE item and stop as soon as the reading clears the clock's noise. An
+		// expensive body satisfies that on its first item and pays almost nothing; a cheap body
+		// needs many items, but each is cheap, so the absolute cost stays bounded either way. The
+		// len/32 cap remains the backstop for a body so cheap it never clears the floor -- at which
+		// point W is tiny, k is below 2, and the range runs serially anyway.
+		const int probeCap = (len / 32 < 1) ? 1
+		                   : ((len / 32 > (int)kMinGrain) ? (int)kMinGrain : len / 32);
+		int probed = 0;
+		long long probeNs = 0;      // the LAST chunk only -- see below
+		int probeLen = 0;           // ...and its length, which is what W is extrapolated from
+		for (int chunk = 1; probed < probeCap; chunk *= 2) {
+			int take = chunk;
+			if (take > probeCap - probed) take = probeCap - probed;
+			const long long p0 = MonotonicNs();
+			func(begin + probed, begin + probed + take);
+			const long long p1 = MonotonicNs();
+			probed += take;
+			// THE LAST CHUNK, NOT THE SUM, AND THIS IS NOT AN OPTIMISATION. Each step pays two
+			// clock reads, so summing them accumulates ~6 readings' worth of timer overhead into a
+			// figure that for a 0.5 ns/element body is almost entirely overhead -- which inflates W
+			// and let trivial at N=2000 fan out to 28 workers for one microsecond of work (0.19x).
+			// Each chunk is twice the last, so the final one has the best signal-to-overhead ratio
+			// available and is the only reading worth dividing by.
+			if (p1 > p0) { probeNs = p1 - p0; probeLen = take; }
+			if (probeNs >= kProbeFloorNs) break;   // enough signal to divide by
+		}
+		if (probeLen <= 0) { probeLen = probed > 0 ? probed : 1; }
+		// ADVANCE BY `probed`, NOT `probeLen`. They diverged the moment probeLen became "the last
+		// chunk" rather than "everything measured" -- the loop RAN `probed` items and advancing by
+		// the smaller number would execute the difference a second time. A silent
+		// wrong-answer bug, not a slow one: the body would see duplicate indices.
+		begin += probed;
+		if (begin >= end) return;                // the whole range was the probe
+		const long long W = (probeNs * (long long)len) / (probeLen > 0 ? probeLen : 1);
+		const long long c = (long long)GetWakeCostNs();
+		size_t k = (size_t)std::sqrt((double)W / (double)(c > 0 ? c : 1));
+		if (k > workers.size()) k = workers.size();
+		if (k < 2) {
+			// Not worth a single wake: run the remainder here. This is the trivial-body case, and
+			// it is now refused because the BODY was measured, not because N was small.
+			func(begin, end);
+			return;
+		}
+		fanWidth = k;
+	} else {
 		const int minIters = (int)workers.size() * (int)kMinItersPerWorker;
 		if (end - begin < minIters) {
 			func(begin, end);
@@ -3448,7 +3553,25 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		// exceeds workers*64 -- so the caller.s grain decides, and a caller cannot know what its own
 		// body costs. Lowering this makes the splitter mint fewer, larger leaves: less dispatch, less
 		// steal traffic, coarser load balancing. Runtime so it can be swept in one binary.
-		const size_t maxLeaves = workers.size() * GetLeavesPerWorker();
+		// fanWidth, NOT workers.size(): this is where the measured width becomes a real breadth
+		// rather than an opinion. Leaves are minted for the workers the range can justify, so a
+		// range worth two workers is cut into two workers' worth of leaves instead of thirty-one.
+		// With the measurement off, fanWidth IS workers.size() and this is the old expression.
+		// ---- WIDTH AND GRANULARITY ARE DIFFERENT QUESTIONS -----------------------------------
+		//
+		// Sizing leaves by fanWidth conflated them and cost heavy work at small N (measured: N=512
+		// 11.91x -> 8.46x). k answers "how many workers is this range worth waking", which is a
+		// RECRUITMENT question. Leaf count answers "how finely must this be cut so whoever shows up
+		// can balance", which is a LOAD-BALANCE question -- and stealing means the workers who show
+		// up are not limited to k. Minting k*L leaves makes the grain coarser, so the tail balances
+		// worse among the 31 workers that arrive anyway.
+		//
+		// TESTED, AND THE HYPOTHESIS WAS WRONG: sizing leaves by the pool instead of fanWidth did
+		// NOT recover heavy at small N (6.21x vs 6.36x at N=256, against 7.40x uncapped), so leaf
+		// granularity was not what cost it -- the serial probe on the critical path was. Leaves are
+		// therefore sized by fanWidth after all, which is the version that also narrows cheap
+		// ranges instead of minting 31 workers' worth of leaves for two microseconds of work.
+		const size_t maxLeaves = fanWidth * GetLeavesPerWorker();
 		const int floorGrain = (int)(((size_t)(end - begin) + maxLeaves - 1) / maxLeaves);
 		grain = std::max(grain, floorGrain);
 

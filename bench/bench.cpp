@@ -2526,6 +2526,14 @@ int main(int argc, char** argv) {
         //   floor=31 run, where every worker is already awake: heavy N=2000 was 7.05x at the
         //   default floor against 22.07x there, so ~3.1x is the whole prize and an arm that gets
         //   part of it should be read against that, not against the old number alone.
+        // mwidth -- derive fan-out WIDTH (and the fan-out decision) from a measured first chunk
+        //   instead of an iteration count. Opt-in: it changes what every ParallelFor call does.
+        //   Sweep it against the trivial and heavy rows TOGETHER with minfan=0 -- the claim is that
+        //   one number handles both ends, so a run that only improves one end has not shown it.
+        if (JLIB_STRICMP(argv[a], "mwidth") == 0) {
+            JLib::TaskScheduler::SetMeasuredWidth(true);
+            continue;
+        }
         if (JLIB_STRICMP(argv[a], "norecruit") == 0) {
             JLib::TaskScheduler::SetRangeRecruit(false);
             continue;

@@ -843,6 +843,28 @@ namespace JLib {
 		static void   SetRangeRecruit(bool on) noexcept;
 		static bool   RangeRecruitEnabled() noexcept;
 
+		// ---- MEASURED FAN-OUT WIDTH (opt-in) ---------------------------------------------------
+		//
+		// Runs the first kMinGrain items of a range on the calling thread, times them, and uses the
+		// result for BOTH decisions ParallelFor has to make: whether to fan out, and HOW WIDE.
+		// Width is sqrt(W/c) -- the k that minimises W/k + k*c, where c is the wake cost.
+		//
+		// WHAT IT REPLACES IS A MISSING MIDDLE, not a mis-tuned constant. Fan-out has two states
+		// today, serial or workers.size() wide, chosen by an iteration count that never looks at
+		// the body -- so trivial work at N=256 recruits 23 of 31 workers for ~2 us of work, while
+		// heavy work at the same N is refused outright (measured: 0.02x and 6.9x respectively, cap
+		// off). No value of SetMinItersPerWorker serves both, because the difference is not in N.
+		//
+		// The probe is not a cost: the first chunk is work the range must do regardless, so this is
+		// two clock reads. That is what makes it different from the body probe removed in 1.4.
+		//
+		// It is a LOWER BOUND by design -- a back-loaded body makes the first chunk unrepresentative
+		// and W too small. Range recruitment then widens on evidence as expensive leaves complete,
+		// so the probe picks a defensible start and recruitment corrects upward. With this off,
+		// ParallelFor behaves exactly as before.
+		static void   SetMeasuredWidth(bool on) noexcept;
+		static bool   GetMeasuredWidth() noexcept;
+
 		// The price of one kernel wake, in nanoseconds -- the `c` above. MEASURED, not guessed:
 		// event/resume with a 1 ms hold-off costs 8.0 us against 5.0 us with none, and that ~3 us
 		// delta is the OS wake and nothing else. It is a property of the MACHINE, so it is a knob
