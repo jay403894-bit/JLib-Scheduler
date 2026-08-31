@@ -32,7 +32,37 @@ namespace JLib {
     //
     // Enable with -DJLIBSCHED_STEAL_STATS=ON at configure time.
 #ifdef JLIBSCHED_STEAL_STATS
-    struct alignas(platform::kCacheLine) StealCounters { std::atomic<long long> probes{ 0 }; std::atomic<long long> hits{ 0 }; };
+    // ---- WHERE DID EACH TASK COME FROM? -------------------------------------------------------
+    //
+    // probes/hits answer "is stealing working". These answer a different question the search ORDER
+    // turns on: of the work a worker ran, how much came from a queue only IT could drain, versus
+    // one anybody could have taken?
+    //
+    // That distinction is the whole argument about inbox-first versus steal-first. An inbox has
+    // exactly one legal consumer, so delaying it is unrecoverable; a deque item is stealable, so
+    // delaying it costs the pool nothing. A reordering experiment has to show what it did to that
+    // mix, not just to wall time -- and wall time on this row has been unreliable all night.
+    //
+    // ALSO GIVES BALANCE FOR FREE. Summing a worker's five counters is how many tasks it ran, so
+    // the spread across workers is the load-balance number without a separate instrument.
+    //
+    // Per worker and cache-line aligned for the same reason as probes/hits: a shared counter would
+    // manufacture the contention the experiment is trying to observe.
+    struct alignas(platform::kCacheLine) StealCounters {
+        std::atomic<long long> probes{ 0 };
+        std::atomic<long long> hits{ 0 };
+        std::atomic<long long> fromHiInbox{ 0 };    // own reserved-lane inbox   -- unstealable
+        std::atomic<long long> fromLoInbox{ 0 };    // own ordinary inbox        -- unstealable
+        std::atomic<long long> fromResumed{ 0 };    // own pinned-resume inbox   -- unstealable
+        std::atomic<long long> fromDeque{ 0 };      // own deque                 -- was stealable
+        std::atomic<long long> fromSteal{ 0 };      // somebody else's deque
+        // FLOW, NOT A SOURCE, so it does not double-count against the five above: how many tasks a
+        // worker moved from its loPri INBOX into its own DEQUE in bulk. This is the number that
+        // showed the inbox is a STAGING queue rather than an execution queue -- work arrives there
+        // unstealable and is republished stealable in batches, so "an inbox item can only be run by
+        // its owner" is true for a much shorter window than the structure suggests.
+        std::atomic<long long> stagedFromInbox{ 0 };
+    };
     inline constexpr size_t kStealStatSlots = 256;
     inline StealCounters g_stealStats[kStealStatSlots];
     #define JLIBSCHED_STEAL_STAT(q, field)                                                   \
@@ -45,7 +75,49 @@ namespace JLib {
         for (size_t i = 0; i < kStealStatSlots; ++i) {
             g_stealStats[i].probes.store(0, std::memory_order_relaxed);
             g_stealStats[i].hits.store(0, std::memory_order_relaxed);
+            g_stealStats[i].fromHiInbox.store(0, std::memory_order_relaxed);
+            g_stealStats[i].fromLoInbox.store(0, std::memory_order_relaxed);
+            g_stealStats[i].fromResumed.store(0, std::memory_order_relaxed);
+            g_stealStats[i].fromDeque.store(0, std::memory_order_relaxed);
+            g_stealStats[i].fromSteal.store(0, std::memory_order_relaxed);
+            g_stealStats[i].stagedFromInbox.store(0, std::memory_order_relaxed);
         }
+    }
+
+    // Per-worker task sources, plus the balance figures that fall out of them. `spread` is
+    // max/median tasks-per-active-worker: 1.0 is perfectly even, and it is the number a search-order
+    // change should move if it is doing what its advocates claim.
+    struct SourceReport {
+        long long hiInbox = 0, loInbox = 0, resumed = 0, deque = 0, stolen = 0, total = 0;
+        long long staged = 0;         // inbox -> own deque, a FLOW not a source
+        long long unstealable = 0;   // hiInbox + loInbox + resumed -- work only its owner could run
+        double    spread = 0.0;      // max / median over workers that ran anything
+        size_t    active = 0;
+    };
+    inline SourceReport StealStatsSources(size_t workerCount) {
+        SourceReport r;
+        std::vector<long long> per;
+        if (workerCount > kStealStatSlots) workerCount = kStealStatSlots;
+        for (size_t i = 0; i < workerCount; ++i) {
+            const long long hi = g_stealStats[i].fromHiInbox.load(std::memory_order_relaxed);
+            const long long lo = g_stealStats[i].fromLoInbox.load(std::memory_order_relaxed);
+            const long long rs = g_stealStats[i].fromResumed.load(std::memory_order_relaxed);
+            const long long dq = g_stealStats[i].fromDeque.load(std::memory_order_relaxed);
+            const long long st = g_stealStats[i].fromSteal.load(std::memory_order_relaxed);
+            r.hiInbox += hi; r.loInbox += lo; r.resumed += rs; r.deque += dq; r.stolen += st;
+            r.staged += g_stealStats[i].stagedFromInbox.load(std::memory_order_relaxed);
+            const long long t = hi + lo + rs + dq + st;
+            if (t > 0) per.push_back(t);
+        }
+        r.total = r.hiInbox + r.loInbox + r.resumed + r.deque + r.stolen;
+        r.unstealable = r.hiInbox + r.loInbox + r.resumed;
+        r.active = per.size();
+        if (!per.empty()) {
+            std::sort(per.begin(), per.end());
+            const long long med = per[per.size() / 2];
+            r.spread = med > 0 ? (double)per.back() / (double)med : 0.0;
+        }
+        return r;
     }
     inline void StealStatsRead(long long& probes, long long& hits) {
         probes = 0; hits = 0;
@@ -59,6 +131,14 @@ namespace JLib {
     #define JLIBSCHED_STEAL_STAT(q, field) ((void)0)
     inline void StealStatsReset() {}
     inline void StealStatsRead(long long& probes, long long& hits) { probes = 0; hits = 0; }
+    struct SourceReport {
+        long long hiInbox = 0, loInbox = 0, resumed = 0, deque = 0, stolen = 0, total = 0;
+        long long staged = 0;         // inbox -> own deque, a FLOW not a source
+        long long unstealable = 0;
+        double    spread = 0.0;
+        size_t    active = 0;
+    };
+    inline SourceReport StealStatsSources(size_t) { return SourceReport{}; }
     inline constexpr bool kStealStatsEnabled = false;
 #endif
 

@@ -331,6 +331,47 @@ static void ReportStealStats(const char* label) {
         label, probes, hits,
         probes ? 100.0 * (double)hits / (double)probes : 0.0,
         (double)probes / (double)(kThroughputTasks * kThroughputRuns));
+
+    // ---- WHERE THE WORK CAME FROM, and the balance that falls out of it --------------------
+    //
+    // THE NUMBER TO WATCH FOR A SEARCH-ORDER CHANGE. probes/hits say whether stealing works;
+    // this says what the ordering did to the MIX. An inbox has exactly one legal consumer, so
+    // work taken from one was unrescuable -- delaying it is the only delay the pool cannot
+    // undo. A deque item could have been taken by anybody.
+    //
+    // `spread` is max/median tasks per active worker: 1.0 is perfectly even. It is the load
+    // balance figure, and it comes free from summing each worker's sources, so it needs no
+    // separate instrument and cannot disagree with one.
+    //
+    // Read a reorder as: did unstealable% go DOWN (work sat in inboxes longer) and did spread
+    // improve enough to pay for it? Wall time on these rows has been too noisy to answer that,
+    // which is the whole reason for counting instead.
+    const JLib::SourceReport sr =
+        JLib::StealStatsSources(JLib::TaskScheduler::Instance().GetWorkerCount());
+    if (sr.total > 0) {
+        printf("  source/%-6s: hiInbox %lld | loInbox %lld | resumed %lld | own deque %lld | stolen %lld\n",
+               label, sr.hiInbox, sr.loInbox, sr.resumed, sr.deque, sr.stolen);
+        printf("               ran-from-inbox %.1f%% of %lld, stolen %.1f%%, balance spread %.2f over %zu workers\n",
+               100.0 * (double)sr.unstealable / (double)sr.total, sr.total,
+               100.0 * (double)sr.stolen / (double)sr.total, sr.spread, sr.active);
+        // THE LINE THAT CORRECTED THE ARGUMENT. If this is large while ran-from-inbox is ~0, the
+        // loPri inbox is a STAGING queue, not an execution queue: work lands there unstealable and
+        // is republished to the owner's deque IN BULK, where anyone may take it. The window in
+        // which an inbox item is unrescuable is then one drain, not one task -- which is a much
+        // weaker version of the case for checking inboxes first.
+        // RAW COUNT, NO PERCENTAGE, and the missing percentage is the honest part. `staged` counts
+        // every task moved inbox->deque, but the five source counters only see the acquisition
+        // sites instrumented so far -- and the DOMINANT execution path drains a batch out of the
+        // inbox and runs it straight from a local array without passing either counter. So the two
+        // numbers have different denominators and dividing them produced 43516%.
+        //
+        // What survives, and it is the point: staged is ~1,000,000 while ran-from-inbox is ZERO.
+        // Nothing executes out of a loPri inbox. It is a STAGING queue -- work lands unstealable
+        // and is republished to the owner's deque in bulk, where anybody may take it.
+        printf("               staged inbox->deque %lld, ran-from-inbox %lld  <- inbox is a STAGING queue,\n"
+               "               not an execution queue; the two counts have different windows so do not divide them\n",
+               sr.staged, sr.unstealable);
+    }
     JLib::StealStatsReset();
 }
 

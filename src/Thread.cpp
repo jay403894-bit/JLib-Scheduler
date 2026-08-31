@@ -1723,6 +1723,10 @@ void Thread::Worker() {
 					if (!scheduler->deques[qIndex]->push_bottom_batch(batch, got))
 						TaskDeque::FatalPushRefused();
 					moved = got;
+					// THE STAGING FLOW. Counted here rather than at execution because these tasks
+					// arrive unstealable and leave stealable, and that transition is the thing the
+					// inbox-first argument turns on -- see StealCounters::stagedFromInbox.
+					for (size_t s = 0; s < got; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
 				}
 				if (moved) {
 					inboxDepth.fetch_sub((int)moved, std::memory_order_relaxed);
@@ -2155,6 +2159,7 @@ void Thread::Worker() {
 				Task* hp = nullptr;
 				if (scheduler->hiPriInboxes[qIndex]->pop(hp) && hp) {
 					task_to_run = hp;
+					JLIBSCHED_STEAL_STAT(qIndex, fromHiInbox);
 					laneSourced = true;   // K controller input -- see laneSourced
 
 					// ONE POP, ONE DECREMENT. The push incremented inboxDepth (see the hiPri
@@ -2252,6 +2257,7 @@ void Thread::Worker() {
 					if (scheduler->loPriInboxes[qIndex]->pop(fromInbox) && fromInbox) {
 						inboxDepth.fetch_sub(1, std::memory_order_relaxed);
 						task_to_run = fromInbox;
+						JLIBSCHED_STEAL_STAT(qIndex, fromLoInbox);
 						continue;
 					}
 				}
@@ -2275,6 +2281,7 @@ void Thread::Worker() {
 				Task* resumed = nullptr;
 				if (scheduler->resumedInboxes[qIndex]->pop(resumed) && resumed) {
 					task_to_run = resumed;
+					JLIBSCHED_STEAL_STAT(qIndex, fromResumed);
 					// A RESUME IS LANE WORK for a reserved worker. It is the I/O completion path
 					// itself -- a fiber coming back from an await -- and counting only hiPri pushes
 					// would read a fully-loaded reactor as an idle lane and shed the core serving it.
@@ -2302,6 +2309,7 @@ void Thread::Worker() {
 					}
 					else {
 						task_to_run = task;
+						JLIBSCHED_STEAL_STAT(qIndex, fromDeque);
 						continue;
 					}
 				}
@@ -2525,6 +2533,7 @@ void Thread::Worker() {
 					if (!s) return false;
 
 					JLIBSCHED_STEAL_STAT(qIndex, hits);
+					JLIBSCHED_STEAL_STAT(qIndex, fromSteal);
 					task_to_run = *s;
 					return true;
 				};
@@ -2788,6 +2797,8 @@ void Thread::Worker() {
 					count++;
 				}
 				TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
+				// The other staging site -- same flow, same reason. See stagedFromInbox.
+				for (int s = 0; s < count; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
 
 				// ---- SELF-HEALING, NOT JUST BALANCED ---------------------------------------
 				//
