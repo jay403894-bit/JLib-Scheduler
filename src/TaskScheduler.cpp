@@ -3591,13 +3591,43 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 		int probed = 0;
 		long long probeNs = 0;      // the LAST chunk only -- see below
 		int probeLen = 0;           // ...and its length, which is what W is extrapolated from
-		for (int chunk = 1; probed < probeCap; chunk *= 2) {
+		// ---- ONE RUNNING TIMESTAMP, AND PROPORTIONAL ESCALATION ------------------------------
+		//
+		// The probe's cost for a CHEAP body is not the items it runs, it is the CLOCK READS. At
+		// trivial N=256 the range is ~120 ns of work and doubling took four chunks -- eight
+		// MonotonicNs() calls -- which is why that cell sat at 0.50x. Two changes, neither of which
+		// touches the expensive case:
+		//
+		//   ONE TIMESTAMP PER CHUNK, not two. Each chunk's duration is the delta since the previous
+		//   reading, so N chunks cost N+1 reads instead of 2N. The gap now includes a few
+		//   instructions of loop bookkeeping, which is more honest rather than less.
+		//
+		//   ESTIMATE THE NEXT SIZE INSTEAD OF DOUBLING. If a chunk read `d` for `take` items, then
+		//   roughly take*floor/d items are needed to clear the floor -- so go there directly rather
+		//   than through every power of two. A cheap body converges in about two measurements
+		//   instead of four; an expensive one still stops after ONE item, because its first reading
+		//   already clears the floor and the loop never escalates at all.
+		//
+		// NOT one-shot-when-probeCap-is-small, which was the obvious version and is wrong: probeCap
+		// is 8 at N=256, and running 8 HEAVY items up front is the ~25% serial prologue that cost
+		// 7.40x -> 4.89x before. Escalation from 1 is what protects the expensive case, and it has
+		// to stay.
+		long long tPrev = MonotonicNs();
+		for (int chunk = 1; probed < probeCap; ) {
 			int take = chunk;
 			if (take > probeCap - probed) take = probeCap - probed;
-			const long long p0 = MonotonicNs();
 			func(begin + probed, begin + probed + take);
-			const long long p1 = MonotonicNs();
+			const long long tNow = MonotonicNs();
+			const long long p0 = tPrev, p1 = tNow;
+			tPrev = tNow;
 			probed += take;
+			// Next size: what this reading says it would take to clear the floor, clamped so a
+			// pathological reading cannot collapse to zero or explode past the cap.
+			const long long d = (p1 > p0) ? (p1 - p0) : 1;
+			long long want = ((long long)take * kProbeFloorNs) / d;
+			if (want < (long long)take * 2) want = (long long)take * 2;   // never shrink or stall
+			if (want > (long long)probeCap)  want = probeCap;
+			chunk = (int)want;
 			// THE LAST CHUNK, NOT THE SUM, AND THIS IS NOT AN OPTIMISATION. Each step pays two
 			// clock reads, so summing them accumulates ~6 readings' worth of timer overhead into a
 			// figure that for a 0.5 ns/element body is almost entirely overhead -- which inflates W
