@@ -3604,7 +3604,16 @@ void TaskScheduler::ParallelFor(int begin, int end, int grain, std::function<voi
 			// and let trivial at N=2000 fan out to 28 workers for one microsecond of work (0.19x).
 			// Each chunk is twice the last, so the final one has the best signal-to-overhead ratio
 			// available and is the only reading worth dividing by.
-			if (p1 > p0) { probeNs = p1 - p0; probeLen = take; }
+			// THE LARGEST CHUNK, NOT THE LAST ONE. The escalation doubles until it hits probeCap
+			// and then takes the REMAINDER, which is routinely SMALLER than the chunk before it --
+			// so "last" threw away the best sample for a truncated one. Whether that remainder
+			// landed large or small depends on where len/32 falls relative to a power of two,
+			// which is arbitrary in N, and it made the width non-monotonic: light measured 0, 29,
+			// 0, 0, 31 workers across increasing N, where more items can only mean more W.
+			//
+			// Largest take is deterministic and has the best signal-to-overhead ratio of any
+			// reading taken, which is the whole reason for preferring one chunk over the sum.
+			if (p1 > p0 && take >= probeLen) { probeNs = p1 - p0; probeLen = take; }
 			if (probeNs >= kProbeFloorNs) break;   // enough signal to divide by
 		}
 		if (probeLen <= 0) { probeLen = probed > 0 ? probed : 1; }
