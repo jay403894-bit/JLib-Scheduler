@@ -631,25 +631,6 @@ void Thread::Suspend(Fiber* targetFiber){
 	 GetCurrent()->currentFiber->Suspend();
  }
 
-// ---- ALWAYS-NOTIFY: THE A/B FOR "IS THERE A RACE ON THE AWAKE SKIP?" -------------------------
-//
-// The skip below is the StoreLoad half of the wake protocol: the producer stores the task, then
-// loads workerState seq_cst, and skips only on WS_AWAKE. The argument that it is safe is that the
-// worker's CAS to GOING_TO_SLEEP and its seq_cst re-check both follow that load in the single
-// total order, so a worker cannot park on work pushed before it read AWAKE.
-//
-// THAT ARGUMENT IS A PROOF SKETCH, NOT A MEASUREMENT, and this flag is how it gets tested rather
-// than asserted. Forcing every notify makes the skip unreachable: if the stalls persist unchanged,
-// the skip is not implicated and the tail lives somewhere else. If they vanish, the argument above
-// is wrong somewhere and the protocol needs re-deriving -- which would be a correctness bug, not a
-// tuning one.
-//
-// It is NOT a candidate default. Every push would pay a WakeByAddressSingle syscall, including the
-// overwhelming majority aimed at workers that are genuinely awake and need nothing -- which is the
-// cost the skip exists to avoid. This is an instrument.
-static std::atomic<bool> g_alwaysNotify{ false };
-void TaskScheduler::SetAlwaysNotify(bool on) noexcept { g_alwaysNotify.store(on, std::memory_order_relaxed); }
-bool TaskScheduler::GetAlwaysNotify() noexcept { return g_alwaysNotify.load(std::memory_order_relaxed); }
 
 void Thread::NotifyWorker(bool force){
 	// ---- THE FLOOR IS ALREADY SCHEDULED ------------------------------------------------------
@@ -716,10 +697,25 @@ void Thread::NotifyWorker(bool force){
 	// control survives it: `-DLANE_ONLY -DWEAK_LANEWAKE` is the same shape on laneWake and fails the
 	// same way. If ANOTHER input is ever added to the sleep predicate, it must be
 	// seq_cst on both sides and it must go into that model. A proof covers what it modelled.
-	// g_alwaysNotify makes this skip unreachable -- the A/B for whether the AWAKE skip is
-	// implicated in the dispatch tail. See the flag definition above.
-	if (!force && !g_alwaysNotify.load(std::memory_order_relaxed)
-	    && workerState.load(std::memory_order_seq_cst) == WS_AWAKE) return;
+	// ---- NO SKIP HERE ANY MORE. Wake() DECIDES, AND IT DECIDES ON THE PREVIOUS STATE. --------
+	//
+	// This used to load workerState and return early on WS_AWAKE. Under the permit machine that
+	// test is both unnecessary and harmful:
+	//
+	//   UNNECESSARY -- Wake() swaps to WS_NOTIFIED and only reaches the kernel when the PREVIOUS
+	//   value was WS_PARKED. A running worker costs one RMW and no syscall, which is what the skip
+	//   was buying, except now it is decided by the same operation that latches the permit instead
+	//   of by a separate load that can go stale between the two.
+	//
+	//   HARMFUL -- the load and the wake were two steps, so a worker could commit to parking
+	//   between them. The old three-state protocol survived that (the commit CAS failed), but only
+	//   because GOING_TO_SLEEP existed to fail against. There is no uncommitted state now: the CAS
+	//   to WS_PARKED IS the commitment, so a skip decided before it would be deciding on nothing.
+	//
+	// `force` is kept for the shutdown and teardown callers and is now a no-op on this path -- the
+	// swap latches regardless, and the kernel is reached exactly when somebody is parked. Left in
+	// place rather than churned through every call site for a parameter that costs nothing.
+	(void)force;
 
 	// ---- ONE THING TO SIGNAL ---------------------------------------------------------------
 	//
@@ -776,30 +772,47 @@ void Thread::Wake() noexcept {
 	// WaitOnAddress, no futex, and __ulock_wait is private API. ParkPrimitiveDefault() selects it
 	// there. Losing by 4% to a primitive that does not exist on the platform is not a reason to
 	// spin. See design/NOTES.md and memory/futex-variance-checked.md.
+	// ---- SWAP TO NOTIFIED. NOT "CAS IF PARKED", AND NOT A STORE. --------------------------
+	//
+	// The permit is latched unconditionally; only the PREVIOUS value decides whether an OS wake is
+	// owed. That is what makes a wake unloseable -- there is no state in which this write is
+	// discarded, so a wake cannot arrive "too early".
+	//
+	// A CAS THAT BAILS ON SEEING NOTIFIED IS NOT EQUIVALENT: it drops the permit while the word is
+	// EMPTY, which is exactly the window between the sleeper's fast-path check and its commit, and
+	// it loses the release edge the sleeper's park path synchronises with.
+	//
+	// A PLAIN STORE IS WORSE, and is what shipped here. Storing AWAKE erased whatever the word held
+	// -- and, separately, published "awake" while the worker was still mid-transition, which is the
+	// lie placement reads when it targets on this value.
+	//
+	// Modelled: tests/verify/sleepwake_permit_model.c. Removing BOTH this swap and the post-commit
+	// recheck is a safety violation; either alone is survivable, which is why neither may be
+	// "simplified" without reproducing that control.
+	const int prev = workerState.exchange(WS_NOTIFIED, std::memory_order_seq_cst);
+
+	// prev EMPTY or NOTIFIED: the thread is running, or already holds a permit it has not consumed.
+	// It will see this on its next pass. DO NOT touch the OS thread -- that syscall is the whole
+	// cost this protocol exists to avoid paying on a running worker.
+	if (prev != WS_PARKED) return;
+
+	// prev PARKED: it committed and is inside the wait. Only now is a syscall owed.
 	if (TaskScheduler::GetParkPrimitive() == TaskScheduler::ParkPrimitive::CondVar) {
-		{
-			std::lock_guard<std::mutex> lk(parkMx);
-			workerState.store(WS_AWAKE, std::memory_order_seq_cst);
-		}
-		// Counted on the same footing as the WaitOnAddress arm so the latency row's wake number
-		// stays comparable across the A/B. Both count "pushes that had to reach the kernel".
+		// The mutex is still required on this arm. A condvar has no value compare, so the lock is
+		// the only thing closing the notify-between-predicate-and-block window; the swap above
+		// closes it for the address-wait arms, which is why they need no lock.
+		{ std::lock_guard<std::mutex> lk(parkMx); }
 		TaskScheduler::NoteWakeCall();
 		parkCv.notify_one();
 		return;
 	}
-
-	workerState.store(WS_AWAKE, std::memory_order_seq_cst);
 #if defined(JLIB_PLATFORM_WINDOWS)
-
-	// Unconditional: signalling an address nobody waits on is a no-op, and re-testing "is it really
-	// asleep" would only reopen the window the store above just closed.
-	// COUNTED. "How many pushes had to go to the kernel" is the one number that says whether the
-	// floor is receiving the work or placement is still round-robining onto sleepers. With F=2 and
-	// a serial round trip this should be ~0; thousands means every push is waking somebody.
+	// Counted: "how many pushes had to reach the kernel". Under this protocol that is now exactly
+	// the number of pushes that found a COMMITTED sleeper, rather than every push to a non-AWAKE
+	// word -- so the number means something narrower and more useful than it did.
 	TaskScheduler::NoteWakeCall();
 	::WakeByAddressSingle(&workerState);
 #elif JLIB_PLATFORM_LINUX
-	// Same protocol, same word: store AWAKE above, then wake. See FutexWakeOne.
 	TaskScheduler::NoteWakeCall();
 	FutexWakeOne(&workerState);
 #endif
@@ -2935,9 +2948,24 @@ void Thread::Worker() {
 			}
 
 			JLIBSCHED_PHASE(qIndex, ParkGate);
-			int expected = WS_AWAKE;
-			workerState.compare_exchange_strong(expected, WS_GOING_TO_SLEEP,
-				std::memory_order_seq_cst, std::memory_order_relaxed);
+			// ---- NO EARLY ADVERTISE. THE COMMITMENT IS THE CAS TO WS_PARKED, FURTHER DOWN. ----
+			//
+			// This used to CAS WS_AWAKE -> WS_GOING_TO_SLEEP here, hundreds of lines before the
+			// worker actually blocked, and then walk the whole park block advertising an intent it
+			// usually abandoned. Two things were wrong with that and the permit machine fixes both:
+			//
+			//   IT PUBLISHED A LIE FOR THE WHOLE TRAVERSAL. A floor worker never parks, yet entered
+			//   GOING_TO_SLEEP on every idle pass to reach the collapse call site -- so a push
+			//   arriving in that window paid a wake for a worker that was never going to sleep.
+			//
+			//   IT MADE "INTENT" SOMETHING A WAKER HAD TO GUESS AT. There is no uncommitted state
+			//   now: the word reads EMPTY until the worker is actually committing, and a wake
+			//   arriving before that is LATCHED as WS_NOTIFIED rather than racing an intent.
+			//
+			// The check below stays, and is now an ordinary "did work arrive while I was deciding"
+			// test that sends this worker back to the search loop. It no longer has a state change
+			// to pair with -- the real recheck, the one the protocol depends on, is after the
+			// commit CAS.
 
 			// RECHECK after advertising, and mirror the wait predicate exactly so the two cannot
 			// disagree about what counts as work. The hasQueuedWork load is seq_cst deliberately:
@@ -2983,7 +3011,7 @@ void Thread::Worker() {
 						// above, one degree worse -- that one at least ends when its owner wakes
 						// for another reason.
 						|| !scheduler->resumedInboxes[qIndex]->quiescent()))) {
-				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+				// Never advertised, so nothing to publish back -- just go and search again.
 				JLIBSCHED_LATENCY_MARK(Wake);
 				if (!running.load(std::memory_order_acquire)) break;
 
@@ -3074,7 +3102,7 @@ void Thread::Worker() {
 				//
 				// So AWAKE is published on the paths that do NOT park, and nowhere else.
 				if (!running.load(std::memory_order_acquire)) {
-					workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+					// No state to retract: the commitment has not been published yet.
 					break;
 				}
 
@@ -3320,16 +3348,46 @@ void Thread::Worker() {
 					{
 						const TaskScheduler::Bands pb = TaskScheduler::GetBands();  // ONE load
 						if ((size_t)qIndex >= pb.k && (size_t)qIndex < pb.k + pb.f) {
-							workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+							// Never advertised an intent, so there is nothing to retract here.
 							continue;
 						}
 					}
 					scheduler->SetAwake((size_t)qIndex, false);
 
-					int sleeping = WS_SLEEPING;
-					int expectedGoing = WS_GOING_TO_SLEEP;
-					workerState.compare_exchange_strong(expectedGoing, WS_SLEEPING,
-						std::memory_order_seq_cst, std::memory_order_relaxed);
+					// ---- THE COMMIT, AND IT IS THE BLUEPRINT'S THREE STEPS ------------------
+					//
+					// 1. FAST PATH. A permit is already latched, so a wake arrived before this
+					//    suspend could commit. Consume it and go round -- never sleep on an
+					//    outstanding permit.
+					{
+						int e = WS_NOTIFIED;
+						if (workerState.compare_exchange_strong(e, WS_EMPTY,
+								std::memory_order_seq_cst, std::memory_order_relaxed)) {
+							scheduler->SetAwake((size_t)qIndex, true);
+							continue;
+						}
+					}
+
+					// 2. PUBLISH THE COMMITMENT. This CAS is the LINEARIZATION POINT with Wake:
+					//    once it succeeds a waker swapping the word sees WS_PARKED and knows it
+					//    owns the OS wake. Mirrors the fiber publishing SUSPENDED after its
+					//    context is saved.
+					int expectedEmpty = WS_EMPTY;
+					if (!workerState.compare_exchange_strong(expectedEmpty, WS_PARKED,
+							std::memory_order_seq_cst, std::memory_order_relaxed)) {
+						// 3. Failed, and the failure is INFORMATIVE rather than merely a retry:
+						//    a waker latched a permit while we were deciding. Consume it here --
+						//    the parker handles its own SUSPEND_SIGNALED, exactly as the fiber
+						//    does -- and go round.
+						if (expectedEmpty == WS_NOTIFIED) {
+							int e2 = WS_NOTIFIED;
+							workerState.compare_exchange_strong(e2, WS_EMPTY,
+								std::memory_order_seq_cst, std::memory_order_relaxed);
+						}
+						scheduler->SetAwake((size_t)qIndex, true);
+						continue;
+					}
+					int sleeping = WS_PARKED;
 
 					// ---- WHICH WORKERS ACTUALLY PARK -----------------------------------------
 					//
@@ -3365,7 +3423,20 @@ void Thread::Worker() {
 						const TaskScheduler::Bands db = TaskScheduler::GetBands();
 						if ((size_t)qIndex >= db.k && (size_t)qIndex < db.k + db.f) {
 							TaskScheduler::NoteFloorPark();   // count the catch -- the bench reports it
-							workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+							// CANCEL A COMMITTED PARK. We are past the commit CAS, so the word is
+							// WS_PARKED and a waker may already have swapped a permit onto it. CAS
+							// back rather than store: if the CAS fails the word is WS_NOTIFIED, a
+							// permit is owed to us, and consuming it here is what stops it becoming
+							// a spurious wake on the next pass.
+							{
+								int held = WS_PARKED;
+								if (!workerState.compare_exchange_strong(held, WS_EMPTY,
+										std::memory_order_seq_cst, std::memory_order_relaxed)) {
+									int got = WS_NOTIFIED;
+									workerState.compare_exchange_strong(got, WS_EMPTY,
+										std::memory_order_seq_cst, std::memory_order_relaxed);
+								}
+							}
 							scheduler->SetAwake((size_t)qIndex, true);
 							continue;
 						}
@@ -3426,7 +3497,7 @@ void Thread::Worker() {
 					if (TaskScheduler::GetParkPrimitive() == TaskScheduler::ParkPrimitive::CondVar) {
 						std::unique_lock<std::mutex> lk(parkMx);
 						parkCv.wait(lk, [&] {
-							return workerState.load(std::memory_order_seq_cst) != WS_SLEEPING
+							return workerState.load(std::memory_order_seq_cst) != WS_PARKED
 							    || !running.load(std::memory_order_acquire)
 							    || hasQueuedWork.load(std::memory_order_seq_cst)
 							    || laneWake.load(std::memory_order_seq_cst)
@@ -3436,7 +3507,7 @@ void Thread::Worker() {
 						});
 					}
 					else
-					while (workerState.load(std::memory_order_seq_cst) == WS_SLEEPING
+					while (workerState.load(std::memory_order_seq_cst) == WS_PARKED
 
 					       && running.load(std::memory_order_acquire)
 					       && !hasQueuedWork.load(std::memory_order_seq_cst)
@@ -3466,7 +3537,16 @@ void Thread::Worker() {
 #endif
 					}
 
-					workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+					// RETURNED FROM THE WAIT. The word must be WS_NOTIFIED -- the only thing that
+					// wakes an address waiter is Wake() swapping it. Consume the permit back to
+					// WS_EMPTY with a CAS, not a store: a spurious return that left WS_PARKED set
+					// must NOT be converted into "awake", because the loop predicate above has to
+					// see WS_PARKED and wait again.
+					{
+						int got = WS_NOTIFIED;
+						workerState.compare_exchange_strong(got, WS_EMPTY,
+							std::memory_order_seq_cst, std::memory_order_relaxed);
+					}
 					scheduler->SetAwake((size_t)qIndex, true);
 					JLIBSCHED_LATENCY_MARK(Wake);
 					if (!running.load(std::memory_order_acquire)) break;
@@ -3476,7 +3556,9 @@ void Thread::Worker() {
 				// THE SPIN PATH, reached only when something IS advertised -- so this worker is
 				// about to go looking again and must not be left advertising an intent to park.
 				// Published here rather than at the top of the block, which is what broke the park.
-				workerState.store(WS_AWAKE, std::memory_order_seq_cst);
+				// THE SPIN PATH. Nothing to retract: under the permit machine this worker never
+				// advertised an intent, so the word is still WS_EMPTY unless a waker latched a
+				// permit -- and consuming that belongs to the commit path, not here.
 				// NO LATENCY MARK HERE, AND REMOVING IT IS A FIX. `Wake` is specified in Thread.h as
 				// "cv.wait returns / the recheck-abort escape" -- both of them moments a worker STOPS
 				// BEING ASLEEP. This is neither: it is the spin path, taken by a worker that never

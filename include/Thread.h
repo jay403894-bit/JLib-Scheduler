@@ -517,7 +517,11 @@ namespace JLib {
         // Is this worker parked or on its way there? Used to aim a lane wake at a worker that will
         // actually pay for one -- NotifyWorker already skips an awake worker for free, but a wake
         // budget of N should be spent on N SLEEPING workers, not burned on awake ones.
-        bool Parked() const { return workerState.load(std::memory_order_seq_cst) != WS_AWAKE; }
+        // == WS_PARKED, not "!= awake". Under the permit machine WS_NOTIFIED means a wake is
+        // latched for a worker that is NOT parked -- it is running, or about to consume the permit
+        // and go round again. Treating that as parked would spend a wake budget on somebody who
+        // needs no syscall, which is the opposite of what this predicate is for.
+        bool Parked() const { return workerState.load(std::memory_order_seq_cst) == WS_PARKED; }
 
         bool Ready();
 
@@ -708,8 +712,39 @@ namespace JLib {
         // Protocol and its proof: tests/verify/sleepwake_model.c. Every transition here and the
         // load in NotifyWorker are seq_cst, and that is not defensive -- the model's -DACQ_REL_ONLY
         // negative control fails with a lost wakeup.
-        enum WorkerState : int { WS_AWAKE = 0, WS_GOING_TO_SLEEP = 1, WS_SLEEPING = 2 };
-        std::atomic<int> workerState{ WS_AWAKE };
+        // ---- THE PARK PERMIT WORD. THREE STATES, EVERY WRITE AN RMW. ------------------------
+        //
+        // Sleep IS suspend and wake IS resume, so this mirrors the fiber machine rather than
+        // approximating it. The fiber side has carried the needed window all along:
+        //
+        //     fiber                 thread
+        //     WANTS_SUSPEND         about to block, not published yet
+        //     SUSPENDED             WS_PARKED    -- the thread is actually waiting
+        //     SUSPEND_SIGNALED      WS_NOTIFIED  -- the wake won the race, permit latched
+        //     READY + requeue       consume the permit, run again
+        //     Resume                Wake
+        //
+        // WS_GOING_TO_SLEEP IS GONE and its absence is the point. It was an "intent, uncommitted"
+        // state that nothing could act on: a waker seeing it had to guess, and a wake landing
+        // between "I saw no work" and "I blocked" was dropped -- the worker then slept with work in
+        // its local deque, its inbox, or a just-resumed fiber. Here the CAS to WS_PARKED IS the
+        // commitment, exactly as the fiber publishes SUSPENDED only after its context is saved,
+        // and a wake that arrives before it is LATCHED as WS_NOTIFIED rather than lost.
+        //
+        // WS_PARKED KEEPS THE VALUE 2 ON PURPOSE. Several call sites in TaskScheduler.cpp test
+        // `GetWorkerState() == 2 /* WS_SLEEPING */` to mean "is this worker asleep". Renumbering
+        // would leave those compiling and silently meaning something else, which is the quietest
+        // possible way to break placement.
+        //
+        // NOT THE FIBER'S WORD, and never share it: Fiber Resume enqueues a task, thread Wake only
+        // unparks a core. Mixing them gives "fiber is READY, worker is PARKED, nobody runs".
+        //
+        // Modelled in tests/verify/sleepwake_permit_model.c. The proposed machine verifies clean;
+        // the control that removes BOTH the swap-wake and the post-commit recheck is a safety
+        // violation. Each mechanism alone is sufficient -- do not "simplify" either without
+        // reproducing that control.
+        enum WorkerState : int { WS_EMPTY = 0, WS_NOTIFIED = 1, WS_PARKED = 2 };
+        std::atomic<int> workerState{ WS_EMPTY };
 
         std::atomic<bool> running{ false };
         std::atomic<bool> ready{ false };

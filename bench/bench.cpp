@@ -2647,13 +2647,6 @@ int main(int argc, char** argv) {
             JLib::TaskScheduler::SetRememberedCost(true);
             continue;
         }
-        // alwaysnotify -- force every notify, making NotifyWorker's WS_AWAKE skip unreachable.
-        //   The A/B for "is there a race on the awake/sleeping state". Costs a syscall per push, so
-        //   it is an instrument and never a configuration; read the STALL RATE, not throughput.
-        if (JLIB_STRICMP(argv[a], "alwaysnotify") == 0) {
-            JLib::TaskScheduler::SetAlwaysNotify(true);
-            continue;
-        }
         if (JLIB_STRICMP(argv[a], "norecruit") == 0) {
             JLib::TaskScheduler::SetRangeRecruit(false);
             continue;

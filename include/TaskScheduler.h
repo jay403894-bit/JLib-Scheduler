@@ -916,8 +916,11 @@ namespace JLib {
 		// NOT A CANDIDATE DEFAULT. Every push would pay a WakeByAddress syscall, including the
 		// overwhelming majority aimed at workers that are awake and need nothing -- exactly the
 		// cost the skip exists to remove.
-		static void   SetAlwaysNotify(bool on) noexcept;
-		static bool   GetAlwaysNotify() noexcept;
+		// SetAlwaysNotify/GetAlwaysNotify were HERE and are gone with the permit machine. They
+		// forced every notify so the WS_AWAKE skip could be A/B'd; the skip no longer exists,
+		// because Wake() now decides from the swap's previous value instead of a separate load.
+		// The A/B answered its question first -- forcing every notify changed nothing, 10 stalls
+		// per 120,000 either way -- which is what pointed at the state machine rather than the skip.
 
 		static void   SetWakeCostNs(unsigned ns) noexcept;
 		static unsigned GetWakeCostNs() noexcept;
