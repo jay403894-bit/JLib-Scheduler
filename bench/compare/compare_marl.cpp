@@ -562,6 +562,75 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
     printf("  fiber cost breakdown -- ns per task, empty bodies, JLib only\n\n");
 
     std::vector<double> a, b, c;
+
+    // ---- ROTATE THE ARMS, AND WARM UP FIRST ---------------------------------------------------
+    //
+    // THIS ROW PRINTED AN IMPOSSIBLE NUMBER: A (no fiber) 686 ns against B (fiber, never suspends)
+    // 381 ns -- attaching a fiber measuring 305 ns CHEAPER than not attaching one. The format
+    // string reads "(+%.0f for the fiber)" and printed a negative, which is the tell.
+    //
+    // CAUSE: the arms ran in a FIXED order A, B, C, five times, never rotated. Each rep ends in
+    // WaitFor, the pool goes idle and the floor sheds -- so the NEXT rep's A is the arm that
+    // re-wakes the pool and pays the ramp back up (this program grows the floor to 30), while B and
+    // C then run into a hot pool. The bias is per-rep and systematic, so a median over five reps
+    // PRESERVES it rather than removing it. Whichever arm goes first eats the ramp, and here that
+    // was always A.
+    //
+    // FIX IS THE ONE lock_contention.cpp ALREADY LEARNED, after its A/A control showed 52% p90
+    // drift: rotate the arms inside one process with a shifting start offset so each takes its turn
+    // paying, plus an untimed warm-up so no measured rep is the one that first touches the slab and
+    // populates the fiber pool.
+    auto runA = [&]() -> double {
+        if (g_jlType == JLib::TaskType::Fiber) return -1.0;   // no Native path in the fiberonly arm
+        JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
+        auto t0 = Clock::now();
+        for (int i = 0; i < N; ++i) {
+            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr);
+            t->waitGroup = &wg; jl.Push(t);
+        }
+        jl.WaitFor(wg);
+        return Ms(t0, Clock::now()) * 1e6 / N;
+    };
+    auto runB = [&]() -> double {
+        JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
+        auto t0 = Clock::now();
+        for (int i = 0; i < N; ++i) {
+            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr, false, JLib::TaskType::Fiber);
+            t->waitGroup = &wg; jl.Push(t);
+        }
+        jl.WaitFor(wg);
+        return Ms(t0, Clock::now()) * 1e6 / N;
+    };
+    auto runC = [&]() -> double {
+        g_released.store(true, std::memory_order_release);
+        JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
+        auto t0 = Clock::now();
+        for (int i = 0; i < N; ++i) {
+            JLib::Task* t = jl.CreateTask(+[](void*) {
+                JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+                s.WaitOnEventArmed(*g_ioEvent, [] { g_ioEvent->SignalAll(); });
+            }, nullptr, false, JLib::TaskType::Fiber);
+            t->waitGroup = &wg; jl.Push(t);
+        }
+        jl.WaitFor(wg);
+        return Ms(t0, Clock::now()) * 1e6 / N;
+    };
+
+    (void)runA(); (void)runB(); (void)runC();   // untimed: reach steady state before counting
+
+    for (int r = 0; r < 6; ++r) {               // 6, so over the rotation each arm leads twice
+        for (int s = 0; s < 3; ++s) {
+            switch ((r + s) % 3) {
+                case 0: { const double v = runA(); if (v >= 0) a.push_back(v); } break;
+                case 1:   b.push_back(runB()); break;
+                default:  c.push_back(runC()); break;
+            }
+        }
+    }
+
+    // The original fixed-order loop, kept compiled out so the defect stays reproducible rather than
+    // only described. Set to 1 and A and B swap places again.
+#if 0
     for (int r = 0; r < 5; ++r) {
         // A: no fiber. SKIPPED UNDER fiberonly, and not because of a limitation -- this row IS the
         // Native baseline, and "no fiber" is the one thing a Fiber-task arm does not have. Forcing it
@@ -604,6 +673,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
         }
     }
 
+#endif
     // MedOr, not Median: under fiberonly row A does not run, and Median indexes an empty vector.
     // That segfaulted, after printing this section's header and nothing else -- which read as the
     // bench simply stopping. Guarding a row and not guarding its reader is half a change.
