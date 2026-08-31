@@ -1373,6 +1373,22 @@ void TaskScheduler::WakeOneForSteal() noexcept {
 }
 
 void TaskScheduler::RedistributeToOverflow(size_t ownerIdx, size_t count) {
+	// ---- OFF BY K, SECOND INSTANCE. THE FLOOR ACCESSORS RETURN WIDTHS ------------------------
+	//
+	// The band is [K, K+F). BandsFb() and BandsF() are COUNTS, so the grown slice is at indices
+	// [K+baseF, K+liveF) -- and `baseF + (i % span)` reads them as indices. Identical mistake to
+	// the one in PickNextWorker's growth spill, in a different function, found the same way: the
+	// runtime reporting "ordinary task placed on RESERVED worker 2 (K=3)" AFTER that one was fixed.
+	//
+	// SILENT AT K=0 AND K=2, LOUD AT K=3, exactly as before. With no reserved band the two spellings
+	// coincide; at K=2 with base F=2 it starts at index 2, the first FLOOR worker -- the wrong
+	// target for the stated purpose but still a legal one, so nothing complained. At K=3 index 2 is
+	// reserved and bulk work lands on an I/O core.
+	//
+	// One bad expression is a slip; two identical ones in two functions is the accessor names
+	// inviting it. BandsF/BandsFb read like indices at the call site and are not, and every future
+	// use will have to remember that.
+	const size_t k     = BandsK();
 	const size_t baseF = BandsFb();
 	const size_t liveF = BandsF();
 	if (liveF <= baseF || ownerIdx >= workers.size()) return;
@@ -1389,7 +1405,7 @@ void TaskScheduler::RedistributeToOverflow(size_t ownerIdx, size_t count) {
 		Task* t = *opt;
 		if (!t) break;
 
-		const size_t target = baseF + (i % span);
+		const size_t target = k + baseF + (i % span);
 		if (target >= n || !workers[target]) { Requeue(t); continue; }
 
 		loPriInboxes[target]->push(t);
