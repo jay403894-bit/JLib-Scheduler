@@ -872,7 +872,12 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 	printf("  q  state           queued busy run   inbox(hi/lo/rs)  deque(hi/lo)  phase\n");
 	for (size_t i = 0; i < workers.size(); ++i) {
 		const auto s = workers[i]->GetDebugState();
-		static const char* kNames[] = { "AWAKE", "GOING_TO_SLEEP", "SLEEPING" };
+		// THESE MUST TRACK Thread::WorkerState. They did not: after the permit machine landed, slot
+		// 1 stopped meaning GOING_TO_SLEEP and started meaning NOTIFIED -- a LATCHED PERMIT, which
+		// is a worker that is running or about to consume it, the opposite of one drifting toward
+		// sleep. The dump kept printing the old word and read as evidence of the very state the
+		// change had removed.
+		static const char* kNames[] = { "EMPTY", "NOTIFIED", "PARKED" };
 		const char* st = (s.workerState >= 0 && s.workerState <= 2) ? kNames[s.workerState] : "?";
 		// ELEVEN specifiers for ELEVEN arguments. It once had one too many: an extra %d ahead of the
 		// inbox pair desynchronised everything after it -- the deque sizes (size_t) were read
@@ -3409,8 +3414,9 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		//    The eligible set starts past max(hotN, floor): those are the workers actually parked.
 		//
 		// 2. NotifyWorker was called WITHOUT force, so it returns early on `qIndex < awakeFloor` or
-		//    on WS_AWAKE and never reaches Wake(). A parked overflow worker cannot be woken by a
-		//    steal hint -- the WaitOnAddress predicate reads its own inbox, hasQueuedWork and
+		//    because the floor check fires. WS_AWAKE no longer causes an early return --
+		//    Wake() swaps a permit unconditionally and only skips the SYSCALL. A parked
+		//    overflow worker still cannot be woken by a steal hint -- the wait predicate
 		//    laneWake, nothing pool-wide -- so if this call skips, that worker stays in the kernel
 		//    for the life of the range. force=true is what makes it a wake instead of a hint.
 		//
@@ -3486,7 +3492,7 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 			const size_t start = wb.k + wb.f;
 			if (start < workers.size()) {
 				// N at a time on the opening publish, one thereafter. Each is FORCED: without it
-				// NotifyWorker returns early on the floor check or on WS_AWAKE and never reaches
+				// NotifyWorker returns early on the floor check and never reaches
 				// Wake(), and a parked worker has no other way to learn a lane was published --
 				// its WaitOnAddress predicate reads only its own inbox, hasQueuedWork and laneWake,
 				// nothing pool-wide.
@@ -5428,9 +5434,13 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		//
 		// Measured as a clean ratchet with both included: floor 2 -> 6 -> 12 -> 15 -> 21 across
 		// consecutive runs, latency climbing with it, and the demote rule never once firing.
-		// WS_SLEEPING SPECIFICALLY -- not "anything other than AWAKE", which is what this said
-		// first and is a third false signal. A worker passes through WS_GOING_TO_SLEEP on EVERY
-		// idle pass: the pre-park recheck CASes AWAKE -> GOING_TO_SLEEP, and the spin path sets it
+		// WS_PARKED SPECIFICALLY -- not "anything other than EMPTY". This once said the
+		// latter and it was a false signal: under the OLD protocol a worker passed through
+		// WS_GOING_TO_SLEEP on every idle pass, so a floor worker that never parked read as
+		// "not awake" most times it was sampled. That state is GONE with the permit machine
+		// -- the word now reads WS_EMPTY until an actual commit -- but the test stays
+		// WS_PARKED-specific, because WS_NOTIFIED means a latched permit on a RUNNING
+		// worker and counting that as a miss would reintroduce the same false signal.
 		// back. So a floor worker that never parks at all reads as "not awake" most of the times it
 		// is sampled, and every push to it counted a miss. The floor then promoted continuously
 		// against a cost that was never paid -- floor 17 with the pool perfectly healthy.

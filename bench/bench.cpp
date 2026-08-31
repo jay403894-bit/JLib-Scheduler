@@ -971,7 +971,7 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         //   delta 0  no WakeByAddress was issued, so the target was AWAKE when the push chose it.
         //            Nothing kernel-side is in the number: the delay is an awake worker not getting
         //            round to draining its own inbox, which is a scheduling or a drain problem.
-        //   delta 1  a wake WAS issued -- the target had advertised intent to park -- so the delay
+        //   delta 1  the target was WS_PARKED, committed and inside the wait -- so the delay
         //            is the OS putting that thread back on a core, and no scheduler change to the
         //            dispatch path touches it.
         //
@@ -1126,15 +1126,22 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                 // that is the only reason there is a number here at all. A strand does not produce
                 // a slow round trip, it produces no round trip: the serial row waits forever and
                 // the run never finishes. Nothing in this block can report one.
+                // WORDED FOR THE PERMIT MACHINE. This text described the OLD protocol -- "the
+                // producer read the target as WS_AWAKE and skipped the wake" -- and there is no
+                // skip any more: Wake() swaps a permit in unconditionally and only the PREVIOUS
+                // value decides whether the kernel is touched. Leaving the old wording in place
+                // would have had the instrument explaining a mechanism that no longer exists.
                 printf(wakeDelta == 0
-                       ? "        0 -> NO NOTIFY WAS SENT. The producer read the target as WS_AWAKE\n"
-                         "        and skipped the wake, which is correct and is what avoids the\n"
-                         "        kernel cost -- but it means nothing hurries this task along. Its\n"
-                         "        latency is entirely that one worker's next poll of its own inbox,\n"
-                         "        and if the OS is not running that thread, nothing will chase it.\n"
-                         "        The task still completes; it is late, not lost.\n"
-                       : "        >0 -> a wake WAS issued: the target had advertised intent to park,\n"
-                         "        so this delay is the OS putting that thread back on a core.\n");
+                       ? "        0 -> NO SYSCALL. Wake() swapped in a permit and found the target\n"
+                         "        NOT parked (WS_EMPTY or already WS_NOTIFIED), so it was running or\n"
+                         "        already owed a wake. The permit cannot be lost -- but nothing\n"
+                         "        HURRIES the task either: its latency is that worker's next poll of\n"
+                         "        its own inbox, and if the OS is not running that thread, no wake\n"
+                         "        exists that would help. Late, not lost.\n"
+                       : "        >0 -> the target was WS_PARKED: it had COMMITTED to sleeping and\n"
+                         "        was inside the wait, so a syscall was genuinely owed. This delay\n"
+                         "        is the OS putting that thread back on a core, which no protocol\n"
+                         "        change can shorten.\n");
             } else {
                 printf("      (no body stamps: the task had not started when the wait ended --\n"
                        "       impossible for a WaitGroup of 1, so treat this line as a bug)\n");
