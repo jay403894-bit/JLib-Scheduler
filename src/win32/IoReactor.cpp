@@ -827,6 +827,12 @@ namespace JLib {
         });
     }
 
+    // DisconnectEx(TF_REUSE_SOCKET) is what this backend has and the POSIX one does not -- see the
+    // note in the header. Reported as a constant rather than probing for the extension pointer: the
+    // question is "does this platform have the concept", and a caller asking it has not submitted
+    // anything yet, so a failure to resolve DisconnectEx belongs to the submit rather than here.
+    bool IoReactor::SupportsDisconnectReuse() noexcept { return true; }
+
     bool IoReactor::SubmitDisconnect(IoSocket s, bool reuse, IoRequest* req, IoResult* out,
                                      Task* resume, CancelToken token) {
         if (!g_disconnectEx && !ResolveExtensions()) {

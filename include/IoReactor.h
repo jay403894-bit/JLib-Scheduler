@@ -442,6 +442,22 @@ namespace JLib {
         bool SubmitDisconnect(IoSocket s, bool reuse,
                               IoRequest* req, IoResult* out, Task* resume, CancelToken token);
 
+        // ---- CAN THIS BACKEND HAND A CONNECTED SOCKET BACK, UNCONNECTED, FOR REUSE? ------------
+        //
+        // `SubmitDisconnect(s, reuse=true)` is DisconnectEx(TF_REUSE_SOCKET) on Windows: the socket
+        // comes back unconnected but still bound, so a connection pool can connect() it again
+        // without paying socket() and bind(). There is no POSIX equivalent for TCP -- a connected
+        // stream socket cannot be returned to an unconnected state, and connect() to AF_UNSPEC
+        // dissolves the association for datagram sockets only. The Linux backend therefore answers
+        // `reuse=true` with EOPNOTSUPP, which is honest and is not going to change.
+        //
+        // ASK, DO NOT DISCOVER BY FAILING. A caller that finds out by submitting has already left a
+        // half-open connection behind -- in this library's own socket test that stranded a peer in
+        // the listener's backlog, and the NEXT section's accept then completed instantly from it and
+        // failed four unrelated checks. A capability that varies by platform needs a query, or every
+        // caller writes its own recovery path for a case that is knowable up front.
+        static bool SupportsDisconnectReuse() noexcept;
+
         // Submit an ALREADY-PREPARED request -- one whose kind, descriptors, flags, handle and
         // resume are set. For a chained submitter like IoStream, which prepares a transfer when the
         // caller asks and hands it to the kernel later, possibly from the completion thread.

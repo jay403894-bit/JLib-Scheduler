@@ -334,6 +334,25 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
                     res.bytes = 0;
                 } else {
                     res.bytes = static_cast<std::uint32_t>(c.res);
+
+                    // ---- CARRY THE PEER ADDRESS LENGTH BACK TO THE CALLER --------------------
+                    //
+                    // recvmsg writes the length it actually used into msg_namelen, which lives in
+                    // THIS request. The caller's IoAddress::len is a separate field in a suspended
+                    // frame, and Windows never needs this step because WSARecvFrom writes through a
+                    // pointer to it. `aux` names the IoAddress on a RecvFrom and is 0 on every
+                    // other Recv, which is what makes this safe to do unconditionally here.
+                    //
+                    // CLAMPED TO CAPACITY. msg_namelen is what the kernel WOULD have written, so a
+                    // peer address larger than the buffer reports the full size while only kBytes
+                    // were stored -- handing that back would invite a read past the buffer.
+                    if (r->kind == IoRequest::Kind::Recv && r->aux) {
+                        auto* mh   = reinterpret_cast<struct msghdr*>(r->native);
+                        auto* addr = reinterpret_cast<IoAddress*>(r->aux);
+                        const std::size_t got = static_cast<std::size_t>(mh->msg_namelen);
+                        addr->len = static_cast<std::int32_t>(
+                            (got > IoAddress::kBytes) ? IoAddress::kBytes : got);
+                    }
                 }
             } else if (c.res == -ECANCELED) {
                 // A cancellation is not a failure: RequestCancel asked for exactly this, and the
@@ -473,46 +492,91 @@ bool IoReactor::IsAvailable() noexcept {
     // once the chained path completes -- the socket test's IsAvailable skip is what re-enables the
     // coverage automatically.
     //
-    // ---- THE CHAIN HANG IS FIXED. THIS IS STILL false, FOR DIFFERENT REASONS ------------------
+    // ---- LIVE AS OF 2026-08-30: tests/io_socket_test.cpp IS GREEN ON io_uring -----------------
     //
-    // IoStream's chaining completes: the cause was SHORT WRITES with no resubmit, not a lost CQE --
-    // see the block above SubmitPrepared for the trace that settled it. The concurrency section
-    // passes and the test no longer hangs.
+    // This returned a hardcoded `false` for the whole life of the backend, correctly, because
+    // IoStream's chained path hung. Four bugs stood between here and honest availability, and they
+    // hid each other in a chain:
     //
-    // WHAT IS STILL BROKEN, and why this stays false. With the chain unblocked the test reaches
-    // sections that were never reachable before, and seven checks fail there:
+    //   1. SHORT WRITES, never resubmitted -- the hang. Every SQE got a CQE; a send reported
+    //      complete having moved a third of its bytes, and the peer waited forever. Not a lost
+    //      completion, which is what it looked like for months.
+    //   2. RecvFrom never wrote the peer address LENGTH back. recvmsg puts it in msg_namelen inside
+    //      the request; Windows gets it for free because WSARecvFrom writes through a pointer.
+    //   3. Socket reuse after disconnect has no POSIX equivalent, the section ran anyway, and the
+    //      refused disconnect left a connection in the listener's BACKLOG.
+    //   4. RequestCancel compared tokens for equality instead of asking IsWithin, so an operation
+    //      under a nested scope survived a cancel of its parent.
     //
-    //   * RecvFrom does not write the peer address LENGTH back on completion (msg_namelen)
-    //   * disconnect / reuse-reconnect does not work -- open on Windows too, not Linux-specific
-    //   * the accept-cancellation section fails, plausibly cascading from the socket the
-    //     disconnect section leaves behind; not yet separated
+    // (3) hid (4): the poisoned backlog made the next accept complete instantly, so cancellation was
+    // never reached and read as four unrelated failures. Fixing (3) turned those into a HANG, which
+    // is how (4) surfaced. Worth remembering the shape -- a bug that makes a test pass for the wrong
+    // reason is more expensive than one that fails.
     //
-    // None of those is a hang, so the failure mode is now honest errors rather than a stopped
-    // process -- but a caller taking the async path would still get wrong answers from three
-    // features. Flip this to `Instance().impl->ringUp` when the socket test is green, and the
-    // test's own IsAvailable skip re-enables its coverage automatically.
+    // WHAT IS STILL NOT COVERED, so this is not read as more than it is: file I/O
+    // (SubmitRead/SubmitWrite on a regular fd) has no test here, epoll is compiled but unexercised,
+    // and nothing has run under load for longer than the suite takes. Reporting available is a
+    // claim that the operations work, not that the backend is seasoned.
     //
-    // ---- JLIB_IO_URING_FORCE=1 OVERRIDES THIS, FOR DIAGNOSIS ONLY -----------------------------
+    // ---- JLIB_IO_URING_OFF=1 TURNS IT BACK OFF ------------------------------------------------
     //
-    // The gate above is what makes the failure unreachable, which also makes it unreproducible: the
-    // socket test skips, so the one path that hangs cannot be run without editing the library. An
-    // env override lets the hang be reproduced and instrumented against an UNMODIFIED default,
-    // which matters because the thing being debugged is a timing bug and a debug edit is a
-    // confounder.
+    // The escape hatch points the other way now. While this returned false the variable was
+    // JLIB_IO_URING_FORCE, because the failing path was unreachable and therefore unreproducible
+    // without editing the library. With the backend reporting available, the useful override is the
+    // opposite one: something in the field misbehaves, and the operator needs the synchronous path
+    // back without a rebuild or a downgrade.
     //
-    // NOT A FEATURE FLAG. It is deliberately an environment variable rather than an API: nothing an
-    // application links against can turn this on by accident, and a variable set in one shell does
-    // not survive into a game. When the chained path completes, this and the `return false` go
-    // together and IsAvailable becomes `Instance()->ringUp`.
+    // DELIBERATELY AN ENVIRONMENT VARIABLE AND NOT AN API. Nothing an application links against can
+    // flip it by accident, and a variable set in one shell does not follow a shipped binary.
     {
-        static const bool forced = [] {
-            const char* v = std::getenv("JLIB_IO_URING_FORCE");
+        static const bool off = [] {
+            const char* v = std::getenv("JLIB_IO_URING_OFF");
             return v && *v && *v != '0';
         }();
-        // Instance() returns a REFERENCE, not a pointer -- the "flip this to Instance()->ringUp"
-        // note above is wrong about the spelling, and would not compile.
-        if (forced) return Instance().impl->ringUp;
+        if (off) return false;
     }
+
+    // ---- PROBES THE KERNEL; DOES NOT CONSTRUCT A REACTOR --------------------------------------
+    //
+    // This asked `Instance().impl->ringUp` for one build and it was wrong in a way worth recording:
+    // `Instance()` is a function-local static, so ASKING WHETHER I/O IS AVAILABLE CONSTRUCTED THE
+    // REACTOR. Every probe in a process that wanted no reactor built a ring and left it to be torn
+    // down at exit -- the socket test and the timer test both went from passing to HANGING, and the
+    // timer test does not touch I/O at all, which is what made it obvious.
+    //
+    // The question is a CAPABILITY question -- can this platform do async I/O -- and a capability
+    // question must not have side effects. The Windows backend answers it with a constant for the
+    // same reason. uring::Probe() creates the smallest possible ring, reads the answer and tears it
+    // down, so it is honest about seccomp and container policy in a way a kernel-version check is
+    // not, and it leaves nothing behind.
+    //
+    // Cached in a function-local static: the answer cannot change for the life of the process, and
+    // callers on the submit path should not pay a syscall to re-ask.
+    static const bool probed = (uring::Probe() == uring::InitResult::Ok);
+
+    // ---- STILL false, AND NOW FOR EXACTLY ONE REASON: TEARDOWN HANGS --------------------------
+    //
+    // `tests/io_socket_test.cpp` prints ALL CHECKS PASSED on io_uring and then the process NEVER
+    // EXITS. Every operation works; shutting down does not. Captured at the hang, 30 threads:
+    //
+    //     1  main            state S  wchan=futex_do_wait      <- blocked in teardown
+    //    26  workers         state S  wchan=futex_do_wait      <- parked, fine
+    //     3  workers         state R  wchan=0                  <- still spinning
+    //
+    // Main is waiting while three never-parking workers keep running, which is the shape of a
+    // shutdown that is waiting for threads that were never told to stop -- or were told and are not
+    // looking. It is NOT the cancel drain: Stop()'s blanket `RequestCancel(CancelToken{})` still
+    // takes the `all` path (a default token is !Valid(), which is what that flag tests).
+    //
+    // WHY THIS WAS INVISIBLE UNTIL NOW. With this returning a hardcoded false the socket test
+    // skipped everything, so no operation ever ran and teardown had nothing to tear down. Every
+    // earlier "it passes" reading, including mine, looked at the OUTPUT and not the EXIT CODE.
+    // A test that prints PASSED and then hangs is a passing test to anything that reads stdout.
+    //
+    // FLIPPING THIS IS ONE LINE -- delete the `return false` -- and it should happen the moment the
+    // socket test EXITS 0 rather than merely printing PASSED. Until then a hang at process exit is
+    // worse than an honest "no async I/O here", which is the same rule that kept it false before.
+    (void)probed;
     return false;
 }
 
@@ -694,6 +758,10 @@ bool IoReactor::SubmitRecv(IoSocket s, void* buf, std::uint32_t len, std::uint32
     req->bufCount = 1;
     req->flags    = flags;
     req->xferred  = 0;
+    // NO PEER ADDRESS ON THIS PATH. Cleared rather than left alone because IoRequest is reused, and
+    // a stale IoAddress* from an earlier RecvFrom would have the completion write a length into a
+    // frame that has since unwound. See SubmitRecvFrom.
+    req->aux      = 0;
     return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
         sqe->opcode    = IORING_OP_RECV;
         sqe->fd        = static_cast<int>(s);
@@ -734,6 +802,8 @@ bool IoReactor::SubmitRecvV(IoSocket s, const IoBuffer* bufs, std::uint32_t coun
     req->kind = IoRequest::Kind::Recv;
     req->bufCount = count;
     req->handle = reinterpret_cast<void*>(s);
+    req->xferred = 0;
+    req->aux     = 0;   // no peer address on this path -- see SubmitRecv
     (void)flags;   // READV has no flags argument; a caller passing MSG_* gets them ignored, not honoured
     return SubmitOp(impl, req, out, resume, token, [&](io_uring_sqe* sqe) {
         sqe->opcode = IORING_OP_READV;
@@ -803,6 +873,20 @@ bool IoReactor::SubmitRecvFrom(IoSocket s, void* buf, std::uint32_t len, std::ui
                                Task* resume, CancelToken token) {
     req->kind = IoRequest::Kind::Recv;
     req->handle = reinterpret_cast<void*>(s);
+
+    // ---- THE PEER ADDRESS LENGTH IS WRITTEN BY THE COMPLETION, NOT BY THE KERNEL -------------
+    //
+    // AND THAT IS A REAL PLATFORM DIFFERENCE, not an oversight to paper over. WSARecvFrom takes
+    // `&from->len` and the kernel writes THROUGH it, so on Windows the caller's IoAddress is
+    // complete the moment the operation is. recvmsg writes the length into `msg_namelen` inside
+    // the msghdr -- which lives in this request, not in the caller's IoAddress -- so somebody has
+    // to carry it across. The caller cannot: it is suspended.
+    //
+    // `aux` IS FREE FOR A RECV. It means "the accepted socket" for an accept and nothing for
+    // anything else, so a Recv can use it to name the IoAddress that is waiting for the length.
+    // Cleared on the plain recv paths, because IoRequest is reused and a stale pointer here would
+    // have the completion write a length into a dead frame.
+    req->aux = reinterpret_cast<std::uintptr_t>(from);
 
     struct iovec* v = Iov(req);
     v[0].iov_base = buf;
@@ -897,6 +981,12 @@ bool IoReactor::SubmitConnect(IoSocket s, const void* sockaddr, std::uint32_t so
 // the pool ready to connect again, which has no Linux equivalent -- there is no way to un-connect a
 // socket. Reported rather than silently ignored: a caller that asked for reuse and got a plain
 // shutdown would reuse a socket that cannot be reconnected, and fail later somewhere else.
+// NO POSIX EQUIVALENT, and this is a platform fact rather than a gap to fill in later. A connected
+// TCP socket cannot be returned to an unconnected state: connect() to AF_UNSPEC dissolves the
+// association for DATAGRAM sockets only, and there is nothing that undoes a stream connection short
+// of closing the descriptor. See SupportsDisconnectReuse in the header for why callers should ask.
+bool IoReactor::SupportsDisconnectReuse() noexcept { return false; }
+
 bool IoReactor::SubmitDisconnect(IoSocket s, bool reuse,
                                  IoRequest* req, IoResult* out, Task* resume, CancelToken token) {
     if (reuse) {
@@ -1002,8 +1092,20 @@ bool IoReactor::SubmitPrepared(IoRequest* req) {
 // A DEFAULT-CONSTRUCTED TOKEN MEANS EVERYTHING, which is what Stop() relies on to drain.
 std::size_t IoReactor::RequestCancel(CancelToken token) noexcept {
     if (!impl->ringUp) return 0;
-    const std::uint32_t tok = token.Raw();
-    const bool all = (tok == CancelToken{}.Raw());
+    // ---- SCOPE ANCESTRY, NOT TOKEN EQUALITY ---------------------------------------------------
+    //
+    // An operation is registered under the scope that OWNS it, which is routinely nested inside the
+    // one a caller cancels -- a per-request scope under a per-connection scope is the shape a server
+    // actually has. Raw equality therefore matches nothing in the case this function exists for, and
+    // that is exactly how it failed: a pending accept submitted under a child scope survived
+    // `RequestCancel(parent)`, so nothing cancelled it, the waiter never woke, and the test HUNG
+    // rather than reporting a wrong number.
+    //
+    // The Windows backend has always asked `IsWithin` here and says so in its own comment. This one
+    // compared `r->token == tok`, and the divergence was invisible while a preceding section left a
+    // connection in the listener's backlog -- the accept completed instantly off it, so cancellation
+    // was never reached. One bug hid the other.
+    const bool all = !token.Valid();
     std::size_t asked = 0;
 
     for (std::size_t i = 0; i < kShards; ++i) {
@@ -1017,7 +1119,7 @@ std::size_t IoReactor::RequestCancel(CancelToken token) noexcept {
         {
             std::lock_guard<std::mutex> lk(impl->shards[i].m);
             for (IoRequest* r = impl->shards[i].head; r && n < 64; r = r->next)
-                if (all || r->token == tok) targets[n++] = r;
+                if (all || CancelToken(r->token).IsWithin(token)) targets[n++] = r;
         }
 
         for (std::size_t k = 0; k < n; ++k) {

@@ -794,7 +794,24 @@ int main() {
     // The check that matters is that the socket is genuinely reusable afterwards -- so it is handed
     // straight to a fresh ConnectEx, which fails outright on a socket that was merely closed.
     std::printf("DisconnectEx hands a socket back for reuse\n");
-    {
+    if (!JLib::IoReactor::SupportsDisconnectReuse()) {
+        // ---- SKIPPED, AND THE SKIP HAS TO COME FIRST ------------------------------------------
+        //
+        // Socket reuse after disconnect has no POSIX equivalent for TCP -- see
+        // IoReactor::SupportsDisconnectReuse. The backend answers EOPNOTSUPP, which is correct, and
+        // running the section anyway is what made this a FIVE-check failure rather than a two-check
+        // one: the client connects, the disconnect is refused, and the connection is left sitting in
+        // `listener`'s accept backlog. The NEXT section submits an accept expecting it to stay
+        // pending, that accept completes instantly off the backlog, and all four of its checks fail
+        // for a reason that has nothing to do with cancellation.
+        //
+        // Which is the argument for the capability query existing at all: a section that discovers
+        // an unsupported operation by attempting it has already changed the state the rest of the
+        // file runs in.
+        std::printf("  SKIPPED -- this platform cannot return a connected socket for reuse.\n"
+                    "  Not a gap: a connected TCP socket cannot be unconnected on POSIX, and the\n"
+                    "  reactor reports EOPNOTSUPP rather than pretending.\n");
+    } else {
         SOCKET c4 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in any{};
         any.sin_family = AF_INET;
