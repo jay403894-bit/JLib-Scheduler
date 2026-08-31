@@ -3038,11 +3038,16 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// cheapness is the whole design. Placing it Wide pushes it at a possibly-parked worker and
 		// pays a kernel wake PER SPLIT, recursively, for a task that was never certain to be needed.
 		//
-		// SETTLED BY THE `splitpref` ROW, AND THE ANSWER IS "IT DOES NOT MATTER". The two arms,
-		// alternated inside one measurement, reach the SAME NUMBER OF WORKERS -- 29 of 31, every
-		// case, both arms -- and the millisecond ratio flips sign between runs of one binary
-		// (0.91/0.93 one run, 1.06/1.12 the next). Identical participation with a ratio that argues
-		// with itself is not a small effect; it is no effect.
+		// SETTLED BY THE `splitpref` ROW: THE EFFECT IS BELOW WHAT CAN BE MEASURED HERE.
+		//
+		// The two arms alternate inside one measurement and reach the SAME NUMBER OF WORKERS --
+		// 28-31 of 31, every case, both arms, across three runs on two machines. The timing does not
+		// settle: paired per-rep ratios span [0.83 .. 1.42] INSIDE a single run, and the per-case
+		// median has read 0.91x, 1.06x and 1.21x for the same cell on the same binary.
+		//
+		// Read carefully, that is not "no effect" -- 7 of 9 case-medians landed above 1.00, so there
+		// may be a ~5% lean toward Wide. It is that a ~5% lean cannot be established under a +/-40%
+		// per-rep spread, and no number of reruns of a three-rep row will change that.
 		//
 		// WHY, AND THIS IS THE PART WORTH KEEPING: placement barely reaches the splitter. A lazy
 		// split is halved recursively and distributed by STEALING -- that is the design, and an

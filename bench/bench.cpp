@@ -1354,13 +1354,31 @@ static void BenchSplitPref(JLib::TaskScheduler& sched) {
         }
         JLib::TaskScheduler::SetParallelSplitWide(false);   // leave the process on the shipped default
 
+        // ---- THE SPREAD, NOT JUST THE MEDIAN -------------------------------------------------
+        //
+        // PAIRED PER REP, because the rep is the interleaved unit: arm A and arm B ran back to back
+        // under the same machine state, so their ratio is the only comparison that means anything.
+        // Taking the median of each arm separately and dividing throws that pairing away.
+        //
+        // AND THE RANGE IS PRINTED because this row was read three times as three different
+        // answers -- one cell measured 0.91x, 1.06x and 1.21x across runs while participation never
+        // moved. A single number invited "Wide loses" and then "Wide wins" from the same binary.
+        // Same discipline as the throughput rows: read the range, not the headline.
+        std::vector<double> ratio;
+        for (size_t i = 0; i < dflt.size() && i < wide.size(); ++i)
+            if (wide[i] > 0.0) ratio.push_back(dflt[i] / wide[i]);
+        std::sort(ratio.begin(), ratio.end());
+        const double rMid = ratio.empty() ? 0.0 : ratio[ratio.size() / 2];
+        const double rLo  = ratio.empty() ? 0.0 : ratio.front();
+        const double rHi  = ratio.empty() ? 0.0 : ratio.back();
+
         std::sort(dflt.begin(), dflt.end());
         std::sort(wide.begin(), wide.end());
         const double d = dflt[dflt.size() / 2];
         const double w = wide[wide.size() / 2];
         printf("               %-16s default %7.3f ms (%2d workers) | wide %7.3f ms (%2d workers)"
-               "  ->  %.2fx\n",
-               c.name, d, seenD, w, seenW, (w > 0.0) ? d / w : 0.0);
+               "  ->  %.2fx  [%.2f .. %.2f]\n",
+               c.name, d, seenD, w, seenW, rMid, rLo, rHi);
     }
 }
 
