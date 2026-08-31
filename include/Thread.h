@@ -72,6 +72,51 @@ namespace JLib {
     };
     inline constexpr size_t kStealStatSlots = 256;
     inline StealCounters g_stealStats[kStealStatSlots];
+
+    // ---- WHERE IS EACH WORKER STANDING RIGHT NOW? --------------------------------------------
+    //
+    // A BREADCRUMB, NOT A TIMER, and the distinction is what makes it usable. Timing each phase
+    // would cost a MonotonicNs() per phase against a loop pass that runs in ~100 ns -- the
+    // instrument would dominate the thing it measures, which is how the fiber breakdown ended up
+    // reporting the floor ramp. This is one relaxed byte store per transition and no clock at all.
+    //
+    // WHAT IT ANSWERS. The stall watcher already dumps every worker's state mid-stall, and that
+    // dump could say AWAKE with empty queues for thirty workers and leave you no wiser -- "awake"
+    // is a protocol word, not a location. This says which line of Worker() the thread was last at.
+    // For a 2.9 ms dispatch that is the difference between "the pool was scanning" and "the pool
+    // was not executing at all", which is the fork the whole diagnosis turns on.
+    //
+    // Relaxed is right: nothing steers on it, a stale read is a breadcrumb one phase old, and any
+    // stronger ordering would put a barrier in the hot loop to serve a diagnostic.
+    enum class WorkerPhase : unsigned char {
+        Start = 0,      // top of a pass, before any queue is consulted
+        HiPri,          // own reserved-lane inbox
+        Resumed,        // own pinned-resume inbox
+        OwnDeque,       // own deque
+        InboxDrain,     // own loPri inbox, the bulk drain
+        StealScan,      // probing other workers' deques
+        ParkGate,       // inside the park block, deciding whether to sleep
+        Parked,         // blocked in WaitOnAddress / futex / condvar
+        Running,        // executing a task body
+        Count
+    };
+    inline const char* WorkerPhaseName(unsigned char p) {
+        static const char* k[] = { "start", "hiPri", "resumed", "ownDeque", "drain",
+                                   "stealScan", "parkGate", "PARKED", "RUNNING", "?" };
+        return p < (unsigned char)WorkerPhase::Count ? k[p] : "?";
+    }
+    struct alignas(platform::kCacheLine) PhaseSlot { std::atomic<unsigned char> phase{ 0 }; };
+    inline PhaseSlot g_workerPhase[kStealStatSlots];
+    #define JLIBSCHED_PHASE(q, ph)                                                            \
+        do { const size_t _pi = (size_t)(q);                                                  \
+             if (_pi < ::JLib::kStealStatSlots)                                               \
+                 ::JLib::g_workerPhase[_pi].phase.store(                                      \
+                     (unsigned char)::JLib::WorkerPhase::ph, std::memory_order_relaxed);      \
+        } while (0)
+    inline const char* WorkerPhaseOf(size_t q) {
+        return q < kStealStatSlots
+             ? WorkerPhaseName(g_workerPhase[q].phase.load(std::memory_order_relaxed)) : "-";
+    }
     #define JLIBSCHED_STEAL_STAT(q, field)                                                   \
         do { const size_t _qi = (size_t)(q);                                                 \
              if (_qi < ::JLib::kStealStatSlots)                                              \
@@ -154,6 +199,8 @@ namespace JLib {
         size_t    active = 0;
     };
     inline SourceReport StealStatsSources(size_t) { return SourceReport{}; }
+    #define JLIBSCHED_PHASE(q, ph) ((void)0)
+    inline const char* WorkerPhaseOf(size_t) { return "-"; }
     inline constexpr bool kStealStatsEnabled = false;
 #endif
 

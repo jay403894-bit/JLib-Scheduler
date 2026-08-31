@@ -1252,6 +1252,7 @@ void Thread::Worker() {
 		// GROWING OVER US between this load and the park. That one is not a second opinion about
 		// the same question; it is a different question asked at the last safe moment.
 		const TaskScheduler::Bands bandsNow = TaskScheduler::GetBands();   // ONE load, whole pass
+		JLIBSCHED_PHASE(qIndex, Start);
 		const bool reservedForHiPri = (size_t)qIndex < bandsNow.k;
 
 		// ---- DRAIN MY OWN loPri INBOX. ONE DEFINITION, TWO CALL SITES. -------------------------
@@ -1280,6 +1281,7 @@ void Thread::Worker() {
 		// Returns true if it set task_to_run.
 		auto drainOwnInbox = [&]() -> bool {
 			if (task_to_run || reservedForHiPri) return false;
+			JLIBSCHED_PHASE(qIndex, InboxDrain);
 			size_t count = 0;
 			while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count]))
 				++count;
@@ -1874,6 +1876,7 @@ void Thread::Worker() {
 				const bool isCoroutine = (task_to_run->type == TaskType::Coroutine);
 
 				currentRunningTask = task_to_run;
+				JLIBSCHED_PHASE(qIndex, Running);
 				busy.store(true, std::memory_order_relaxed);
 				task_to_run->Execute();
 
@@ -2208,6 +2211,7 @@ void Thread::Worker() {
 			// not advertised. Nothing strands. The reverse (bit set, inbox empty) costs one
 			// failed probe.
 			if (!task_to_run) {
+				JLIBSCHED_PHASE(qIndex, HiPri);
 				Task* hp = nullptr;
 				if (scheduler->hiPriInboxes[qIndex]->pop(hp) && hp) {
 					task_to_run = hp;
@@ -2330,6 +2334,7 @@ void Thread::Worker() {
 			}
 
 			if (!task_to_run) {
+				JLIBSCHED_PHASE(qIndex, Resumed);
 				Task* resumed = nullptr;
 				if (scheduler->resumedInboxes[qIndex]->pop(resumed) && resumed) {
 					task_to_run = resumed;
@@ -2378,6 +2383,7 @@ void Thread::Worker() {
 		{
 			// --- 4. Work stealing ---
 			if (!task_to_run) {
+				JLIBSCHED_PHASE(qIndex, StealScan);
 				JLIBSCHED_LATENCY_MARK(PreSteal);
 				// Non-blocking backoff: a per-worker (thread_local, no shared/contended state --
 				// can't itself become a new source of contention) count of consecutive whole-
@@ -2905,6 +2911,7 @@ void Thread::Worker() {
 				scannedSinceWork = true;
 			}
 
+			JLIBSCHED_PHASE(qIndex, ParkGate);
 			int expected = WS_AWAKE;
 			workerState.compare_exchange_strong(expected, WS_GOING_TO_SLEEP,
 				std::memory_order_seq_cst, std::memory_order_relaxed);
@@ -3312,6 +3319,7 @@ void Thread::Worker() {
 					// junk no matter how good its numbers look.
 					//
 					// Relaxed and per-worker: no ordering is implied and nobody steers on it.
+					JLIBSCHED_PHASE(qIndex, Parked);
 					parkCount.fetch_add(1, std::memory_order_relaxed);
 
 					// ---- THE LAST GATE: A FLOOR MEMBER DOES NOT PROCEED INTO THE PARK -----------

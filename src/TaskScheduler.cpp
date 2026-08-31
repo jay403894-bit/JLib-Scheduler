@@ -857,7 +857,11 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		       awake, GetAwakeFloor(), awake ? "CAN" : "CANNOT");
 	}
 
-	printf("  q  state           queued busy run   inbox(hi/lo/rs)  deque(hi/lo)\n");
+	// `phase` is the breadcrumb -- WHERE in Worker() that thread last was. Prints "-" unless the
+	// build has JLIBSCHED_STEAL_STATS. It is the column this dump was missing: "AWAKE with empty
+	// queues" is a protocol state, not a location, and for a multi-millisecond stall the question
+	// is whether the pool was scanning, parked, or not executing at all.
+	printf("  q  state           queued busy run   inbox(hi/lo/rs)  deque(hi/lo)  phase\n");
 	for (size_t i = 0; i < workers.size(); ++i) {
 		const auto s = workers[i]->GetDebugState();
 		static const char* kNames[] = { "AWAKE", "GOING_TO_SLEEP", "SLEEPING" };
@@ -867,11 +871,12 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		// through %d, the marker string through %zu, and the trailing %s consumed an argument that
 		// was never passed. That is UB in the one dump you only ever run when something has already
 		// gone wrong. Count them against the argument list before changing this line.
-		printf(" %2d  %-14s   %d      %d    %d       %d/%d/%d           %zu/%zu%s\n",
+		printf(" %2d  %-14s   %d      %d    %d       %d/%d/%d           %zu/%zu  %-9s%s\n",
 			s.qIndex, st, (int)s.hasQueuedWork, (int)s.busy, (int)s.running,
 			(int)!hiPriInboxes[i]->empty(), (int)!loPriInboxes[i]->empty(),
 			(int)!resumedInboxes[i]->empty(),
 			(size_t)(hiPriInboxes[i]->empty() ? 0 : 1), deques[i]->size(),
+			WorkerPhaseOf((size_t)s.qIndex),
 			// The signature: parked, but holding work nobody else can take. `rs` belongs here more
 			// than either of the others -- a resumed fiber is pinned, so "nobody else can take it"
 			// is true of that queue by design rather than by accident of scheduling.
