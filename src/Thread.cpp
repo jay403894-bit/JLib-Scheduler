@@ -2797,8 +2797,6 @@ void Thread::Worker() {
 					count++;
 				}
 				TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
-				// The other staging site -- same flow, same reason. See stagedFromInbox.
-				for (int s = 0; s < count; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
 
 				// ---- SELF-HEALING, NOT JUST BALANCED ---------------------------------------
 				//
@@ -2820,20 +2818,35 @@ void Thread::Worker() {
 				else if (count)
 					inboxDepth.fetch_sub((int)count, std::memory_order_relaxed);
 				if (count > 0) {
-					if (scheduler->deques[qIndex]->push_bottom_batch(batch, count)) {
-						auto opt = scheduler->deques[qIndex]->pop_bottom();
-						if (opt) {
-							task_to_run = *opt;
-							JLIBSCHED_LATENCY_MARK(Found);
-							continue;
-						}
+					// ---- PUBLISH ALL BUT ONE, AND RUN THAT ONE DIRECTLY -----------------------
+					//
+					// This pushed all `count` and then IMMEDIATELY popped one back off. pop_bottom
+					// takes the most recently pushed, so the pair cancelled exactly: the task that
+					// came back was always batch[count-1]. Publishing count-1 and running that last
+					// one is the same outcome for one fewer push and one fewer pop.
+					//
+					// PUBLISH FIRST, RUN SECOND, and the order is the point rather than an
+					// accident. Keeping one back and running it BEFORE publishing the rest would
+					// delay making count-1 tasks stealable by a whole task body -- hundreds of
+					// microseconds for a heavy one, during which the pool cannot see work that is
+					// sitting right there. Publishing first costs nothing and keeps visibility
+					// identical to what it was.
+					//
+					// count == 1 skips the batch call entirely: there is nothing to publish, and
+					// push_bottom_batch(batch, 0) is a call to move no tasks.
+					const int keep = count - 1;
+					if (keep == 0 || scheduler->deques[qIndex]->push_bottom_batch(batch, keep)) {
+						for (int s = 0; s < keep; ++s) JLIBSCHED_STEAL_STAT(qIndex, stagedFromInbox);
+						task_to_run = batch[count - 1];
+						JLIBSCHED_LATENCY_MARK(Found);
+						continue;
 					}
-					else {
-						// Same as the hiPri branch above: these are already out of the inbox, so
-						// dropping them loses them silently. Requeue rather than discard.
-						for (size_t i = 0; i < count; ++i)
-							if (batch[i]) scheduler->Requeue(batch[i]);
-					}
+					// PUSH REFUSED. Same as the hiPri branch above: these are already out of the
+					// inbox, so dropping them loses them silently. Requeue rather than discard --
+					// and requeue ALL of them, including the one this pass meant to keep, because
+					// nothing has run yet and the deque would not take the others.
+					for (size_t i = 0; i < count; ++i)
+						if (batch[i]) scheduler->Requeue(batch[i]);
 				}
 			}
 		}
