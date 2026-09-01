@@ -812,6 +812,26 @@ static std::atomic<unsigned> g_landedOn[64];
 // blocks are rare by construction (one per row), and the alternative is unreadable output.
 static std::mutex g_reportMx;
 
+// ---- THE CORE-SHARING WITNESS ---------------------------------------------------------------
+//
+// THE ONE MEASUREMENT THAT SETTLES "pool late" WITHOUT ANOTHER SCHEDULER CHANGE. The remaining
+// trips read: dispatch ~100 us, body 0.1 us, completion 0.1 us, 1800+ waiter polls, 0 kernel wakes,
+// target in phase `drain` and not busy. Every one of those is consistent with the worker simply not
+// being ON A CPU -- and with only three runnable threads in the process (the waiter and the two
+// floor workers, everything else in WaitOnAddress), the most likely reason is that the waiter is
+// sitting on the core the target needs.
+//
+// IT IS A BUSY-WAIT AGAINST THE ONLY THREAD THAT CAN FINISH THE WAIT. The waiter polls at NORMAL
+// priority and yields ~3 times in 100 us; the task is in q1's loPri inbox, which is owner-drain-only,
+// so `helped` is 0 by construction -- the bench thread cannot take the work it is waiting on. Ideal
+// affinity does not keep it off [0, F).
+//
+// SAMPLED ON BOTH SIDES OF THE WAIT because the waiter can migrate: before it starts polling and
+// after it returns. Either matching the body's core is the collision. This does not prove causation
+// on one sample, but "same core" turns a hypothesis into a number, and "never the same core" kills
+// it outright -- which is the more useful outcome.
+static std::atomic<unsigned> g_bodyCpu{ ~0u };
+
 static std::atomic<long long> g_bodyStartNs{ 0 };
 static std::atomic<long long> g_bodyEndNs{ 0 };
 
@@ -873,6 +893,8 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     unsigned long long stallPoolLate = 0, stallWaiterLate = 0, stallUnclassified = 0;
     // A THIRD PARTY CAN BE LATE: the thread calling Push. Measured directly, not inferred.
     unsigned long long stallPusherLate = 0;
+    // How many stalls had the waiter on the same core the body ended up running on.
+    unsigned long long stallSameCore = 0;
     unsigned long long stallWithWake = 0;
     double maxDispatchUs = 0.0, maxExecutionUs = 0.0, maxCompletionUs = 0.0;
     // Healthy-iteration poll rate, the yardstick the stall report is read against. See the
@@ -1015,6 +1037,10 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             // this is ground truth for placement, and it costs one relaxed increment.
             g_bodyQ.store(JLib::Thread::Current() ? JLib::Thread::Current()->qIndex : -1,
                           std::memory_order_relaxed);
+            // WHICH CORE the worker was on when it finally ran this. Paired with the waiter's own
+            // core below, this is the witness for "the waiter and the worker were sharing a
+            // timeslice" -- see the note at the report. One KUSER_SHARED_DATA read on Windows.
+            g_bodyCpu.store(JLib::platform::CurrentCpu(), std::memory_order_relaxed);
             if (JLib::Thread::Current()) {
                 const int q = JLib::Thread::Current()->qIndex;
                 if (q >= 0 && q < 64) g_landedOn[q].fetch_add(1, std::memory_order_relaxed);
@@ -1066,6 +1092,9 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         const long long pushIssuedNs = NowNs();
         sched.Push(t);
         const long long pushDoneNs = NowNs();
+        // The waiter's core on both sides of the wait -- see g_bodyCpu. It can migrate mid-wait, so
+        // one sample would be weak evidence and two are cheap.
+        const unsigned waiterCpuPre = JLib::platform::CurrentCpu();
         sched.WaitFor(wg);
         // STAMPED HERE, NOT AT PRINT TIME, and the first version got this wrong in a way the
         // output caught immediately: the completion segment was computed inside the printf that
@@ -1073,6 +1102,7 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // to 10.2 us on a 7.4 us round trip -- an instrument reporting more time than elapsed,
         // which is the one arithmetic a split like this can be checked against for free.
         const long long returnedNs = NowNs();
+        const unsigned waiterCpuPost = JLib::platform::CurrentCpu();
         const unsigned long long wakesAfter = JLib::TaskScheduler::GetWakeCount();
         const bool wakeDelta0 = (wakesAfter != wakesBefore);   // did this push buy a kernel wake?
         // READ IMMEDIATELY, BEFORE ANYTHING ELSE ON THIS THREAD WAITS. They are thread_local and
@@ -1137,6 +1167,14 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                 // have sent the next week into the scheduler.
                 const double healthyRate = (healthyPollN && healthyPollSum)
                                          ? (double)healthyPollSum / (double)healthyPollN : 0.0;
+                // CORE COLLISION, tallied so it is not a one-sample anecdote. Counted alongside the
+                // WHO-was-late classes rather than instead of them: a stall can be "pool late"
+                // AND have the waiter parked on the target's core, and that pair is the whole
+                // hypothesis.
+                {
+                    const unsigned bc = g_bodyCpu.load(std::memory_order_relaxed);
+                    if (bc != ~0u && (bc == waiterCpuPre || bc == waiterCpuPost)) ++stallSameCore;
+                }
                 const double pushUs = (double)(pushDoneNs - pushIssuedNs) / 1000.0;
                 if (pushUs >= rt * 0.5) { ++stallPusherLate; }
                 else if (healthyRate > 0.0) {
@@ -1290,6 +1328,21 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             // Two orders of magnitude apart, which is what makes this decisive -- but the ns/poll
             // figure is machine-specific, so read the ratio against the row's own printed rate
             // rather than against the numbers above.
+            // ---- DID THE WAITER AND THE WORKER WANT THE SAME CORE? --------------------------
+            //
+            // The decisive line when dispatch is large, body and completion are tiny, polls are
+            // high and kernel wakes are 0. All of those are consistent with the target simply not
+            // being ON A CPU -- and the waiter is a NORMAL-priority busy-wait that yields ~3 times
+            // in 100 us, against a target it CANNOT help (the task is in an owner-drain-only inbox,
+            // which is why `helped` is 0 by construction rather than by bad luck).
+            {
+                const unsigned bcpu = g_bodyCpu.load(std::memory_order_relaxed);
+                const bool     same = (bcpu != ~0u) && (bcpu == waiterCpuPre || bcpu == waiterCpuPost);
+                printf("      cores: waiter %u -> %u, body ran on %u   %s\n",
+                       waiterCpuPre, waiterCpuPost, bcpu,
+                       same ? "<-- SAME CORE: the waiter was sitting on the core the target needed"
+                            : "(different cores -- core contention is NOT the explanation here)");
+            }
             printf("      waiter: %u polls, %u yields, %u helped\n", wPolls, wYields, wHelped);
             printf("        polls HIGH -> waiter ran and kept seeing n>0: the pool was late.\n"
                    "        polls LOW  -> waiter was NOT SCHEDULED: nothing was missed.\n");
@@ -1358,7 +1411,14 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         printf("               WHO was late:  pool %llu | waiter %llu | pusher %llu",
                stallPoolLate, stallWaiterLate, stallPusherLate);
         if (stallUnclassified) printf(" | unclassified %llu", stallUnclassified);
-        printf("\n"
+        printf("\n               of those, %llu had the WAITER ON THE SAME CORE the body ran on\n"
+               "                 -> the waiter is a NORMAL-priority busy-wait that cannot help (the\n"
+               "                    task is in an owner-drain-only inbox, so `helped` is 0 by\n"
+               "                    construction) and Ideal affinity does not keep it off [0, F).\n"
+               "                    A HIGH count here means the fix is the WAITER's placement or\n"
+               "                    politeness, not the scheduler. A ZERO count kills that theory.\n",
+               stallSameCore);
+        printf(""
                "                 pusher -> most of the trip was spent INSIDE Push, which is a few\n"
                "                           atomics. That thread was descheduled there; neither the\n"
                "                           pool nor the waiter was late. Measured, not inferred.\n"
