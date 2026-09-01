@@ -1259,3 +1259,52 @@ the WORKER then wakes it locally (`Thread.cpp`'s own-inbox push) without ever re
 and the Event path generally, which was a poor choice of instrument -- the property under test is
 just "mailbox a task with a fiber attached and switch into it", and an Event drags in the waiter
 table, SignalAll enumeration and batch resume, none of which was verified first.
+
+### WIDTH vs REACHABILITY: which knob a row is actually limited by
+
+Two different constraints, and each row is limited by exactly one. Getting them confused is why the
+same controller looks brilliant on one row and useless on the next.
+
+**F (the awake floor) FIXES WIDTH.** It is a HIT-RATE CONTROLLER: keep the next Push landing on a
+worker that is already awake, so it costs no OS wake. The latency row is that law working -- `F 2->2`,
+`placement HIT the floor 20000/20000`, `kernel wakes 0`.
+
+**Wide FIXES REACHABILITY.** It skips the awake-map steer entirely and falls through to the full-pool
+rotation, paying wakes to put work where anyone can run it.
+
+**MEASURED, BOTH DIRECTIONS, SAME DAY:**
+
+| row | limited by | what fixed it |
+|---|---|---|
+| blocking crossover | WIDTH -- 15 of 31 workers never ran a task because the ceiling was 16 | raising the F ceiling 16 -> 29: **9.50 -> 6.25 ms**, idle tax unchanged |
+| burst | REACHABILITY -- 16 heavies land on two staged inboxes | `wide`: **~4.6x -> ~11.7x**, and the floor never grows at all |
+
+Burst, four runs: `dflt` 9.92 / 10.90 / 11.52 / 13.21 ms at peak 9-14 with 7-12 participants, against
+`wide` 4.40 / 4.41 / 4.64 / 5.07 ms at peak **2** with **31**. Stable, not a single reading.
+
+**WHY MORE F CANNOT FIX THE BURST.** An inbox has exactly ONE legal consumer, so a wave staged on two
+workers is not stealable however many pollers you wake -- the extra ones just spin. That is precisely
+what `GROWTH OVERSHOOT: peak 13, participants 10` counts, and why the burst row's grown workers show
+up as floorSpin rather than as throughput.
+
+**THE RULE:** grow F when work is ALREADY STEALABLE; skip the steer when it is not. Do not ask the
+hit-rate controller to also be Cilk.
+
+### THE FORKING THESIS: mechanism is invariant, policy is not
+
+What makes variants cheap is that the line is already drawn, and today's work sits entirely on one
+side of it.
+
+**INVARIANT ACROSS ANY POOL DESIGN** -- built, verified, and not re-litigated by a fork:
+the PERMIT MACHINE (four states, every write an RMW, swap-to-wake, CAS-to-PARKED as the linearization
+point, model-checked with the controls going RED); the FIBER STATE MACHINE (the WANTS_SUSPEND /
+SUSPENDED / SUSPEND_SIGNALED CAS dance that makes a signal landing mid-park safe); the COROUTINE
+library; the I/O reactor.
+
+**POLICY, AND THEREFORE FORKABLE**: adaptive F vs adaptive K vs a fixed floor; steer-at-the-floor vs
+wide; park promptly vs spin-then-park; pinned vs migratable fibers. A server build optimising
+throughput would plausibly make K the important controller and take a different position on width
+and parking -- none of which touches the four things above.
+
+That split is why "fork it and try variants" is a real plan rather than a rewrite. The expensive,
+provable parts are done once.
