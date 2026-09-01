@@ -997,6 +997,48 @@ namespace JLib {
 		static void SetFloorGrowthEnabled(bool on) noexcept;
 		static bool GetFloorGrowthEnabled() noexcept;
 
+		// ---- HOW WIDE MAY A BURST TAKE THE FLOOR? --------------------------------------------
+		//
+		// 0 = UNLIMITED, and that is the default and the shipped behaviour: growth may take the
+		// live floor to the whole pool and CollapseAwakeFloorToBase returns it to base when the
+		// wave drains. A fork-join row is routinely observed at `peak 30` on a 31-worker pool and
+		// back to 2 after. That IS "burst to a temporary NoSleep and shed the same way" -- it
+		// already works, and this knob does not add it.
+		//
+		// WHAT THIS ADDS IS A CEILING, which is the part an application could not express. Growth
+		// is transient, but transient is not free: every promoted worker is a core that stops
+		// yielding to whatever else the machine is doing, and an app that shares the box with an
+		// audio thread, a render thread or another process may want the burst bounded well below
+		// the pool. Setting it to 4 says "grow up to four extra cores, then queue instead".
+		//
+		// THE OLD OBJECTION TO A WIDE FLOOR NO LONGER HOLDS, and it is worth writing down because
+		// the note beside SetSpinYieldMask still records it: lifting the cap made the marl blocking
+		// row WORSE (15.5/17.6/13.5 against 10.3/10.5/9.9) because thirty never-parking workers
+		// with a RUDE spin starved everything else runnable. That was the spin, not the width --
+		// "the honest fix is the spin, not the cap" -- and the spin has since been fixed twice
+		// over: the yield interval went 1024 -> 8 idle passes, and the yield is now phase-staggered
+		// by qIndex so a wide floor cannot step off the core in lockstep.
+		//
+		// A CEILING, NOT A BASE. SetAwakeFloor(N) is a PERMANENT floor and is a different and much
+		// more expensive thing: `floor=31` as a base measures a 3.3-17 us round trip against 0.6 at
+		// base=2, because 31 never-parking workers starve the submitter. The danger was never a
+		// floor that grows -- it is a floor that does not SHED.
+		//
+		// THE ARGUMENT IS THE MAXIMUM LIVE FLOOR WIDTH, NOT A NUMBER OF EXTRA WORKERS. It is
+		// compared against live F directly, so with a base of 2, SetFloorGrowthCap(2) forbids
+		// growth entirely (F is already at the ceiling) and SetFloorGrowthCap(6) allows four more.
+		// A cap at or below the base is therefore equivalent to SetFloorGrowthEnabled(false), and
+		// `growcap=2 floor=2` duly measured `peak 2` on a fork-join row that reaches `peak 30`
+		// uncapped. Naming it maxExtraWorkers, as the first draft did, would have had every caller
+		// off by the base.
+		//
+		// Clamped to the structural limit, so a value larger than the pool gets the pool rather
+		// than wrapping. Settable before Init and honoured live; lowering it does not retroactively
+		// shed a floor that is already wider, it only refuses further growth -- the collapse still
+		// returns the floor to base when the wave drains.
+		static void   SetFloorGrowthCap(size_t maxLiveFloorWidth) noexcept;
+		static size_t GetFloorGrowthCap() noexcept;
+
 		// The floor the process ASKED for, as opposed to GetAwakeFloor() which is what it is right
 		// now -- growth may hold it above the base for the length of a wave.
 		// Workers [0, R) take hiPri work only; ordinary placement skips them. R must be <= the awake

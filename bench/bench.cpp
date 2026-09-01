@@ -3163,6 +3163,17 @@ int main(int argc, char** argv) {
             continue;
         }
         // yieldfloor=N -- a floor of N or fewer NEVER yields; it stays in CpuRelax. Default 4.
+        // growcap=N -- MAXIMUM LIVE FLOOR WIDTH a burst may grow to. 0 = unlimited, the default and
+        //   the shipped behaviour: growth already reaches the whole pool and sheds on idle
+        //   (`fork-join ... peak 30` on a 31-worker pool). This bounds it.
+        //   N IS THE WIDTH, NOT EXTRA WORKERS: with floor=2, growcap=2 forbids growth entirely and
+        //   measured `peak 2` where uncapped reaches 30; growcap=6 allows four more.
+        //   NOT SetAwakeFloor: that is a PERMANENT base and costs a 3.3-17 us round trip at 31
+        //   against 0.6 at 2. A ceiling on a TRANSIENT burst is a different and far cheaper thing.
+        if (JLIB_STRNICMP(argv[a], "growcap=", 8) == 0) {
+            JLib::TaskScheduler::SetFloorGrowthCap((size_t)strtoul(argv[a] + 8, nullptr, 10));
+            continue;
+        }
         //   yield() is politeness aimed at a WIDE spinning set. At F=2 the steer set has two bits,
         //   so a yield on either is a coin flip that a push lands on the core that just stepped off
         //   -- and the re-aim cannot invent a third floor worker. Set 0 to restore the old

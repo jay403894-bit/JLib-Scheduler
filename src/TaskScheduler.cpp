@@ -2016,7 +2016,14 @@ static constexpr bool kWakeOnRangePublish = false;
 // starve the submitter. What makes raising this safe is that growth is TRANSIENT -- it raises the
 // live floor only, and CollapseAwakeFloorToBase returns it to base when the wave drains. The cap was
 // bounding the wrong thing: the danger is a floor that does not SHED, not a floor that grows.
-static constexpr size_t kFloorGrowCap = 0;
+// WAS A COMPILE-TIME CONSTANT PINNED AT 0. The value and its meaning are unchanged -- 0 is
+// unlimited -- but an application could not reach it, so "grow, but not past N" was inexpressible.
+// See SetFloorGrowthCap in the header for why a CEILING is a different and far cheaper thing than
+// SetAwakeFloor's permanent base, and for why the old wide-floor objection was the spin rather than
+// the width.
+static std::atomic<size_t> g_floorGrowCap{ 0 };
+void   TaskScheduler::SetFloorGrowthCap(size_t n) noexcept { g_floorGrowCap.store(n, std::memory_order_relaxed); }
+size_t TaskScheduler::GetFloorGrowthCap() noexcept { return g_floorGrowCap.load(std::memory_order_relaxed); }
 
 // How deep a floor worker's inbox must be before queueing behind it is worth waking a core for.
 // 4 sits between the two workloads that have to be told apart: a 6-node frame graph puts ~3 behind
@@ -2121,7 +2128,11 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// Minus one more so a parkable worker always exists -- the pool must retain somewhere to put a
 	// worker that has genuinely run out of work, or "parkable" is a band with no members.
 	if (n <= kNow + 1) return;              // no room for a floor at all: refuse rather than wrap
-	size_t cap = kFloorGrowCap ? kFloorGrowCap : (n - kNow - 1);
+	// The app's ceiling if it set one, otherwise the structural limit. Clamped to the structural
+	// limit either way, so a caller passing a number larger than the pool gets the pool and not a
+	// wrap -- the `n <= kNow + 1` guard above is what keeps that subtraction safe.
+	const size_t userCap = GetFloorGrowthCap();
+	size_t cap = userCap ? userCap : (n - kNow - 1);
 	if (cap > n - kNow - 1) cap = n - kNow - 1;
 
 	// THE EARLY-OUT IS THE STEADY-STATE COST: two relaxed loads once the floor has reached the cap.
