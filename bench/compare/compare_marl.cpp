@@ -28,6 +28,7 @@
 #define NOMINMAX
 #endif
 #include <TaskScheduler.h>
+#include <Thread.h>          // Thread::Current()->qIndex -- the blocking row's participant census
 #include <marl/scheduler.h>
 #include <marl/waitgroup.h>
 #include <marl/event.h>
@@ -52,6 +53,32 @@ static inline uint64_t Spin(uint64_t seed, int iters) {
     return x;
 }
 static std::atomic<uint64_t> g_sink{ 0 };
+
+// ---- WHICH WORKERS ACTUALLY RAN A TASK IN THE BLOCKING ROW ---------------------------------
+//
+// peakF is a POLICY number -- how wide the floor was allowed to be -- not an observation of how
+// many workers did work, and the blocking row has only ever printed the policy one. That matters
+// because the row's whole story turns out to be width: nogrow/peakF 2 -> 37 ms, floor=8/peakF 16 ->
+// 9.1 ms, nosleep/peakF 30 -> 6.6 ms. Wakes stay near zero across all three and explain nothing,
+// because with awake-preference placement roughly 1% of pushes ever find a sleeper.
+//
+// So this counts what peakF only implies. If participants track peakF the width story holds; if
+// they do not -- 16 on the floor but 4 running tasks -- the floor is a claim and the real limit is
+// somewhere else entirely. Those two want opposite fixes, which is the same reason the ParallelFor
+// sweep carries this counter.
+static std::atomic<unsigned char> g_blkSeen[64];
+static inline void NoteBlkWorker() {
+    if (JLib::Thread* w = JLib::Thread::Current()) {
+        const int q = w->qIndex;
+        if (q >= 0 && q < 64) g_blkSeen[q].store(1, std::memory_order_relaxed);
+    }
+}
+static void ResetBlkSeen() { for (auto& c : g_blkSeen) c.store(0, std::memory_order_relaxed); }
+static size_t BlkParticipants() {
+    size_t n = 0;
+    for (auto& c : g_blkSeen) if (c.load(std::memory_order_relaxed)) ++n;
+    return n;
+}
 
 static double Median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
@@ -450,12 +477,16 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
     // "Slower here" and "woke a parked worker 2560 times" print identically without this number.
     unsigned long long blkWakes = 0;
     for (int d : durations) {
-        std::vector<double> a, b;
+        std::vector<double> a, b, blkPart;
 
         if (g_doJ) {
             JLib::TaskScheduler::ResetWakeCount();
             JLib::TaskScheduler::ResetAwakeFloorPeak();
             for (int r = 0; r < 3; ++r) {
+                // PER REP, and the count below is a MEDIAN, because the ms figure is a median. A
+                // union across the three reps would be a different statistic from the number it
+                // sits beside, and the two would drift apart exactly when the row got interesting.
+                ResetBlkSeen();
                 auto t0 = Clock::now();
                 for (int batch = 0; batch < kBatches; ++batch) {
                     g_released.store(d == 0, std::memory_order_release);
@@ -473,6 +504,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                             // Armed, so a release that already happened is caught by self-signalling
                             // rather than missed -- the same race-freedom marl gets from Mode::Manual.
                             ? jl.CreateTask(+[](void*) {
+                                  NoteBlkWorker();
                                   JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
                                   s.WaitOnEventArmed(*g_ioEvent, [] {
                                       if (g_released.load(std::memory_order_acquire))
@@ -480,6 +512,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                                   });
                               }, nullptr, false, JLib::TaskType::Fiber)
                             : jl.CreateTask(+[](void* p) {
+                                  NoteBlkWorker();
                                   g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                    std::memory_order_relaxed);
                               }, (void*)(intptr_t)i, false, g_jlType);
@@ -491,6 +524,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                     if (rel.joinable()) rel.join();
                 }
                 a.push_back(Ms(t0, Clock::now()));
+                blkPart.push_back((double)BlkParticipants());
             }
         }
         if (g_doM) {
@@ -533,7 +567,10 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
         // Per rep: 3 reps x 10 batches x 256 tasks = 7680 pushes. A number near that means the row
         // is a wake benchmark; a number near zero means the pool stayed hot and the row is measuring
         // whatever else it claims to measure.
-        if (g_doJ) printf("   wakes %llu / 7680   peakF %zu", blkWakes, blkPeakF);
+        // `ran` is the OBSERVATION; peakF is the POLICY. When they disagree, believe `ran`: a floor
+        // of 16 with 4 workers running tasks means the floor is a claim and the limit is elsewhere.
+        if (g_doJ) printf("   wakes %llu / 7680   peakF %zu   ran %.0f",
+                          blkWakes, blkPeakF, MedOr(blkPart));
         printf("\n");
     }
     printf("\n     ratio > 1.00 means JLib is faster.\n\n");
