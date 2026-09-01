@@ -2388,6 +2388,109 @@ static void BenchSplitPref(JLib::TaskScheduler& sched) {
     }
 }
 
+// ------------------------------------------------- batchpref: does PushBatch want Wide?
+//
+// WHY THIS ROW EXISTS AT ALL. The `batchwide` flag was first read off two whole-run throughput/bt
+// numbers and the answer was not usable: best 14.41 -> 16.95 M/s, but the WORST went 13.50 -> 12.83
+// and the spread went 1.07x -> 1.32x. Best-of-N systematically flatters the noisier arm -- more
+// spread is more chances at a good one -- and the box drifted 16.47 -> 14.41 between two sittings of
+// the same binary. Neither is fixable by running it more times.
+//
+// SO: ARMS ALTERNATE INSIDE ONE LOOP, exactly as splitpref above and SweepSplitterVsCursor do, and
+// for the same recorded reason -- a block-measured A-then-B comparison produced a fictional
+// splitter-vs-cursor gap once already (1.4.0 CHANGELOG). Paired ratios cancel the drift that made
+// the whole-run numbers unreadable.
+//
+// AND A SAME-VS-SAME CONTROL RUNS BESIDE IT. Two DEFAULT arms, ratioed against each other, measure
+// what this harness reports when nothing changed. A cell whose control moved more than the arms did
+// is measuring the afternoon, and is marked rather than believed.
+//
+// WHAT A WIN WOULD MEAN, and it is not one thing. Wide skips the entire awake-map block in
+// PickNextWorker -- gated on `pref == CorePref::Default` -- so it is a CHEAPER push as well as a
+// wider one. On a producer-bound row that alone can be the whole effect. The kernel-wake counts
+// printed beside each arm separate them: unchanged means the win was the skipped placement work.
+static void BenchBatchPref(JLib::TaskScheduler& sched) {
+    printf("\nbatchpref    : does PushBatch want Wide? ratio = default_ms/wide_ms; >1.00 means Wide wins\n");
+    printf("               arms ALTERNATE inside one loop -- the whole-run comparison of this was\n"
+           "               unreadable (best +17%%, worst -5%%, spread 1.07x -> 1.32x). '?' marks a\n"
+           "               cell whose same-vs-same control moved more than the arms did.\n");
+
+    struct Case { const char* name; int n; int chunk; int work; };
+    const Case cases[] = {
+        { "stream N=200000 chunk=64", 200000, 64,   0 },   // the throughput/bt shape
+        { "chunky N=20000  chunk=64",  20000, 64,  64 },   // real bodies, still a stream
+        { "burst  N=64     chunk=64",     64, 64, 4096 },  // one batch of heavy tasks: the burst shape
+    };
+
+    for (const Case& c : cases) {
+        std::vector<JLib::Task*> chunk((size_t)c.chunk);
+        // ONE ARM. `wide` selects the flag; `work` is identical in both, so the only difference is
+        // where PushBatch places. Completion is waited for INSIDE the timed region here (unlike
+        // SweepRequeueVsPushBatch, which times dispatch only) because the question is whether the
+        // wider placement pays off in WALL CLOCK, not whether the producer clears its hands faster.
+        auto runArm = [&](bool wide) -> double {
+            JLib::TaskScheduler::SetPushBatchWide(wide);
+            JLib::WaitGroup wg;
+            wg.n.store(c.n, std::memory_order_relaxed);
+            const auto t0 = Clock::now();
+            int made = 0;
+            for (int i = 0; i < c.n; ++i) {
+                JLib::Task* t = (c.work == 0)
+                    ? sched.CreateTask(+[](void*) {}, nullptr)
+                    : sched.CreateTask(+[](void* p) {
+                          const int w = (int)(intptr_t)p;
+                          double acc = 0;
+                          for (int k = 0; k < w; ++k) acc += (double)k * 1.000001;
+                          g_sink.store(g_sink.load(std::memory_order_relaxed) + acc,
+                                       std::memory_order_relaxed);
+                      }, (void*)(intptr_t)c.work);
+                if (!t) return -1.0;
+                t->waitGroup = &wg;
+                chunk[(size_t)made++] = t;
+                if (made == c.chunk) { sched.PushBatch(chunk.data(), (size_t)made, 0); made = 0; }
+            }
+            if (made) sched.PushBatch(chunk.data(), (size_t)made, 0);
+            sched.WaitFor(wg);
+            return MsBetween(t0, Clock::now());
+        };
+
+        constexpr int kReps = 7;
+        std::vector<double> ratio, control;
+        unsigned long long wakesD = 0, wakesW = 0;
+        for (int r = 0; r < kReps; ++r) {
+            JLib::TaskScheduler::ResetWakeCount();
+            const double d = runArm(false);
+            wakesD += JLib::TaskScheduler::GetWakeCount();
+            JLib::TaskScheduler::ResetWakeCount();
+            const double w = runArm(true);
+            wakesW += JLib::TaskScheduler::GetWakeCount();
+            // THE CONTROL IS A THIRD DEFAULT ARM, ratioed against the first. Same flag, same work --
+            // whatever this reports is the harness's own noise on this cell.
+            const double d2 = runArm(false);
+            if (d < 0 || w < 0 || d2 < 0) break;
+            if (w  > 0.0) ratio.push_back(d / w);
+            if (d2 > 0.0) control.push_back(d / d2);
+        }
+        JLib::TaskScheduler::SetPushBatchWide(false);   // leave the process on the shipped default
+
+        auto mid = [](std::vector<double>& v) {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        };
+        const double rMid = mid(ratio);
+        const double cMid = mid(control);
+        // SUSPECT WHEN THE CONTROL MOVED AS MUCH AS THE ARMS DID. Distance from 1.00 on each side.
+        const bool suspect = ratio.empty() || control.empty()
+                          || std::fabs(cMid - 1.0) >= std::fabs(rMid - 1.0);
+        printf("               %-26s  %.2fx%s  (control %.2fx)  wakes dflt=%llu wide=%llu\n",
+               c.name, rMid, suspect ? "?" : " ", cMid,
+               wakesD, wakesW);
+    }
+    printf("               wakes UNCHANGED across arms means a win came from the CHEAPER push --\n"
+           "               Wide skips the awake-map steer -- and not from the extra width.\n");
+}
+
 // ------------------------------------------------- inbox-drain dispatch: Requeue loop vs PushBatch
 // Worker()'s immediate/fork inbox drain (Thread.cpp, "2. Immediate task execution") empties a
 // worker's own inbox one task at a time via Requeue() before that worker pins to a persistent
@@ -3723,6 +3826,7 @@ int main(int argc, char** argv) {
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
     if (runSweep) { Section("splitter vs cursor sweep");    BenchSplitterVsCursorCrossover(sched); }
     if (runSweep) { Section("splitpref");                   BenchSplitPref(sched); }
+    if (runSweep) { Section("batchpref");                   BenchBatchPref(sched); }
     if (runSweep) { Section("requeue vs pushbatch");        BenchRequeueVsPushBatch(sched); }
 
     g_benchDone.store(true, std::memory_order_release);
