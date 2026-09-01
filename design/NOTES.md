@@ -901,3 +901,34 @@ A HANG INTO A CORRUPTION, which is why this is the piece to model before writing
 Note the free list is moodycamel and that is CORRECT here even though it was the wrong answer for
 ordered completions: a free list has no ordering requirement, any fiber is as good as any other.
 Same library, opposite verdict, for a real reason.
+
+### pushIO must be able to FAIL, and what that implies
+
+**K IS NOT A THROUGHPUT BOTTLENECK -- a pop and a few atomics per completion, millions/sec on one
+thread -- BUT IT IS A SERIALIZATION POINT.** Without a fallible push a full mailbox means K spins or
+blocks, and the whole pipeline stops behind one slow kworker.
+
+**THIS IS THE LESSON THE REST OF THE SESSION KEPT TEACHING.** The loPri strand existed because push
+always succeeded, the queue was unbounded, and a self-healing net quietly rehomed the consequence --
+so no caller ever had to own a policy. A bounded push that returns false forces one. Precedent
+already exists: TaskDeque's push_bottom_batch refuses and the caller requeues rather than dropping.
+
+    TaskMPSCQueue::push is `void push(Task*)` -- infallible and unbounded. pushIO is a NEW bounded
+    variant; inboxDepth already exists per worker as the counter, so it is a depth test and a false
+    return rather than new plumbing.
+
+**JAY'S RULE:** strict round-robin, re-aim on false until it lands, WITHOUT advancing to the next
+task -- so a completion is placed before another is considered -- and if every kworker refuses, park
+it in K's own std::queue backlog, which is safe unsynchronised because K is single-threaded.
+
+**TWO THINGS THAT RULE IMPLIES:**
+
+  - **DRAIN THE BACKLOG BEFORE PULLING NEW COMPLETIONS.** Otherwise K keeps accepting from the
+    reactor while its own queue grows -- unbounded memory, and the backlogged items starve behind an
+    endless stream of fresh ones, serving the OLDEST completions LAST. That inverts the ordering the
+    bounded mailbox was there to protect.
+  - **ROUND-ROBIN REQUIRES "AT MOST ONE OUTSTANDING OPERATION PER CONNECTION" AS A REACTOR-LEVEL
+    INVARIANT.** Two completions for the SAME socket landing on different kworkers can be handled
+    concurrently, which breaks stream ordering -- and nothing in pushIO can fix that, because by then
+    they are on separate threads. It is normally free (the next recv is not issued until the current
+    one completes) but it is a CONTRACT the reactor must state, not a property that happens to hold.
