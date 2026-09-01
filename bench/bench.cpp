@@ -743,6 +743,29 @@ static void BenchIdleBurst(JLib::TaskScheduler& sched, JLib::CorePref pref) {
             }
         printf("               workers that actually RAN a burst task: %u (of %d tasks over %d runs)\n",
                participants, kBurst * kRuns, kRuns);
+
+        // ---- WHAT DID GROWTH OVERSHOOT BY? --------------------------------------------------
+        //
+        // THE COST OF AN UNBOUNDED GROW CAP, AS A NUMBER RATHER THAN AN ARGUMENT. Both facts were
+        // already printed -- PEAK above, participants here -- and nobody was subtracting them. A
+        // grown worker that never runs a task is not free: it is a parkable core turned into a
+        // spinner for the length of the grow-hold, and every one of them competes with the
+        // submitter and with whatever else the machine is doing. That is the same tax a permanent
+        // wide floor charges, for the duration of the burst.
+        //
+        // IT DOES NOT SETTLE THE DEFAULT ON ITS OWN, and the counter-measurement is recorded at
+        // kFloorGrowCap: capping the ramp at 16 pinned `peakF 16` on every duration of the marl
+        // blocking crossover and ran that row at 10.0 ms against 5.1 ms uncapped. So growth width
+        // is worth 2x when the wave genuinely needs it and pure cost when it does not, and the two
+        // workloads disagree. This line is what makes the disagreement measurable per row instead
+        // of arguable.
+        if (floorPeakBurst > participants)
+            printf("               GROWTH OVERSHOOT: peak %zu, participants %u -- %zu grown worker(s)\n"
+                   "               never ran a task and spun until the collapse. Cross-read with the\n"
+                   "               marl blocking row before capping: width is worth 2x there.\n",
+                   floorPeakBurst, participants, floorPeakBurst - (size_t)participants);
+        else
+            printf("               growth overshoot: none -- every grown worker ran at least one task\n");
         printf("               spread:");
         for (size_t q = 0; q < 64; ++q)
             if (unsigned c = g_burstLandedOn[q].load(std::memory_order_relaxed))
