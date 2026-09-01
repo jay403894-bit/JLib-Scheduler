@@ -47,6 +47,7 @@ set(JLIBSCHED_VERSION "5.0.0")
 # they exist to measure. Turn on only for an experiment, and do not compare its numbers against a
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
+option(JLIBSCHED_RETRY_STATS "Record CAS retries per call -- max and buckets, not an average (diagnostic; sits inside CAS loops)" OFF)
 option(JLIBSCHED_HOT_OCCUPANCY_STATS "Witness whether an idle hot worker has a backlogged sibling (diagnostic; scans hot deques)" OFF)
 option(JLIBSCHED_LANE_WAKE_STATS "Count lane-hint edges and the wakes they send (diagnostic; two relaxed counters)" OFF)
 
@@ -361,6 +362,13 @@ if(JLIBSCHED_STEAL_STATS)
 endif()
 if(JLIBSCHED_STEAL_STATS)
     message(STATUS "JLib::Scheduler: steal-path instrumentation ON (diagnostic build, not for perf numbers)")
+endif()
+# PUBLIC for the same reason as the steal counters: RetryStats.h is a header, so the library and
+# anything reading the report must agree on whether the cells exist. Half the program compiled with
+# them and half without is two different structs and a silently wrong answer.
+if(JLIBSCHED_RETRY_STATS)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_RETRY_STATS=1)
+    message(STATUS "JLib::Scheduler: CAS retry distribution ON (diagnostic build, not for perf numbers)")
 endif()
 if(JLIBSCHED_HOT_OCCUPANCY_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_HOT_OCCUPANCY_STATS=1)

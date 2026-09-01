@@ -49,6 +49,7 @@
 #include <Event.h>        // event/resume section
 #include <DirectEvent.h>  // event/resume section
 #include <Thread.h>    // StealStatsRead/Reset -- no-ops unless built with JLIBSCHED_STEAL_STATS
+#include <RetryStats.h> // RetryStatsReport -- no-op unless built with JLIBSCHED_RETRY_STATS
 #include <platform.h>  // SpinHintName -- stamped into the banner, see CpuRelax
 #include <chrono>
 #include <functional>  // RunCursorRange takes std::function<void(int,int)>&
@@ -3684,6 +3685,18 @@ int main(int argc, char** argv) {
     // vacuously -- which is the failure mode it exists to prevent. This is the run's verdict on
     // whether the layout it announced is the layout it actually ran.
     PrintBandVerdict();
+    // CAS RETRY DISTRIBUTION, if this build carries it. Prints nothing otherwise -- an absent
+    // section is honest about a build that did not measure; a section of zeroes would read as
+    // "measured, no contention", which is the opposite claim.
+    //
+    // WHOLE-RUN TOTALS, deliberately not per-row. The question this answers is "does any CAS loop
+    // in this scheduler ever spin pathologically", and a single outlier anywhere is the answer.
+    // Attributing it to a row comes second, and only if the buckets say there is something to
+    // attribute.
+    if (JLib::kRetryStatsEnabled) {
+        printf("----------------------------------------------------------------\n");
+        JLib::RetryStatsReport();
+    }
     printf("done.\n");
     return 0;
 }

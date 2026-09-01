@@ -3,6 +3,7 @@
 
 #include "../include/Thread.h"
 #include "../include/Hazard.h"
+#include "../include/RetryStats.h"   // CAS retry distribution; compiles away without JLIBSCHED_RETRY_STATS
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
@@ -1191,6 +1192,10 @@ static inline bool BandsScaling(uint64_t w) noexcept {
 // F WRITER. Clamped to [Fbase, N-K] -- never below the configured base, never into the reserved band
 // or past the pool. Returns the previous F.
 static inline size_t BandsSetF(size_t f, size_t n) noexcept {
+	// THE MOST CONTENDED CAS IN THE SCHEDULER, structurally: g_bands is ONE global word and every
+	// floor change -- push-side growth, the collapse, K moves -- goes through it. If a retry storm
+	// exists anywhere, this is the first place to look.
+	JLib::RetryProbe bandsProbe(JLib::RetrySite::Bands);
 	uint64_t cur = g_bands.load(std::memory_order_relaxed), next;
 	size_t prev;
 	do {
@@ -1204,7 +1209,10 @@ static inline size_t BandsSetF(size_t f, size_t n) noexcept {
 		if (n >= 2) { const size_t room = (n > k + 1) ? n - k - 1 : 0;   // K + F <= N, one left parkable
 		              if (want > room) want = room; }
 		next = BandPut(cur, kBandF, want);
-	} while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed));
+		// The Miss() is only reached when the CAS FAILED -- && short-circuits on success -- so the
+		// loop keeps its exact shape and the probe counts exactly the retries.
+	} while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed)
+	         && (bandsProbe.Miss(), true));
 	return prev;
 }
 // Conditional F write for the collapse: succeeds only if F is still `expected`, and preserves
@@ -4724,11 +4732,15 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		//      WANTS_SUSPEND and would erase a SUSPEND_SIGNALED that step 3 just produced.
 		current->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
 
+		// EVERY FIBER PARKING ON THE SAME GROUP HITS THIS ONE HEAD. The blocking workload is 64
+		// waiters per batch, so if a wait-side storm exists it is here rather than in the park.
+		JLib::RetryProbe wgProbe(JLib::RetrySite::WaitGroupPush);
 		Fiber* head = wg.directWaiters.load(std::memory_order_relaxed);
 		do {
 			current->nextWaiter = head;
 		} while (!wg.directWaiters.compare_exchange_weak(
-					head, current, std::memory_order_acq_rel, std::memory_order_relaxed));
+					head, current, std::memory_order_acq_rel, std::memory_order_relaxed)
+				 && (wgProbe.Miss(), true));
 
 		const int old = wg.n.fetch_or(WaitGroup::WAITER_BIT, std::memory_order_acq_rel);
 		if ((old & WaitGroup::COUNT_MASK) == 0) {
@@ -5510,6 +5522,77 @@ size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWork
 // rather than the new default because it changes a contract users already build against, and a
 // scheduler that silently starts resuming elsewhere would break exactly the code that was relying
 // on it not doing so, with no diagnostic.
+#ifdef JLIBSCHED_RETRY_STATS
+namespace JLib {
+	size_t RetrySlotForCurrentThread() noexcept {
+		// A worker gets its own qIndex; anything else -- main, a test driver, the timer thread --
+		// goes to the spill slot. Folding those onto worker 0 would attribute a bare thread's
+		// contention to a worker that never saw it.
+		if (Thread* w = Thread::Current()) {
+			const int q = w->qIndex;
+			if (q >= 0 && (size_t)q < kRetrySpillSlot) return (size_t)q;
+		}
+		return kRetrySpillSlot;
+	}
+
+	void RetryStatsReset() noexcept {
+		for (size_t s = 0; s < (size_t)RetrySite::Count; ++s)
+			for (size_t i = 0; i < kRetrySlots; ++i) {
+				RetryCell& c = g_retry[s][i];
+				c.calls.store(0, std::memory_order_relaxed);
+				c.retries.store(0, std::memory_order_relaxed);
+				c.maxRetries.store(0, std::memory_order_relaxed);
+				c.ge8.store(0, std::memory_order_relaxed);
+				c.ge64.store(0, std::memory_order_relaxed);
+				c.ge512.store(0, std::memory_order_relaxed);
+				c.ge4096.store(0, std::memory_order_relaxed);
+			}
+	}
+
+	void RetryStatsReport() {
+		printf(
+			"  CAS retries per call (max and buckets, NOT retries/calls -- an average cannot see\n"
+			"  one call that spun ten thousand times next to ten million that did not)\n");
+		// STDOUT THROUGHOUT, NOT STDERR. The bench writes its tables to stdout, and the two streams
+		// buffer independently -- the first run of this landed mid-line inside the band verdict
+		// ("K=2  CAS retries per call"). A report that corrupts the line above it is worse than one
+		// that is missing.
+		printf("  %-12s %14s %14s %8s %10s %8s %7s %8s\n",
+			"site", "calls", "retries", "MAX", ">=8", ">=64", ">=512", ">=4096");
+		for (size_t s = 0; s < (size_t)RetrySite::Count; ++s) {
+			unsigned long long calls = 0, retries = 0, b8 = 0, b64 = 0, b512 = 0, b4096 = 0;
+			unsigned mx = 0;
+			for (size_t i = 0; i < kRetrySlots; ++i) {
+				const RetryCell& c = g_retry[s][i];
+				calls   += c.calls.load(std::memory_order_relaxed);
+				retries += c.retries.load(std::memory_order_relaxed);
+				b8      += c.ge8.load(std::memory_order_relaxed);
+				b64     += c.ge64.load(std::memory_order_relaxed);
+				b512    += c.ge512.load(std::memory_order_relaxed);
+				b4096   += c.ge4096.load(std::memory_order_relaxed);
+				// MAX ACROSS SLOTS, not summed. The worst single call anywhere is the number; each
+				// slot already holds its own worst.
+				const unsigned m = c.maxRetries.load(std::memory_order_relaxed);
+				if (m > mx) mx = m;
+			}
+			// A SITE THAT WAS NEVER CALLED PRINTS AS SUCH. Zeroes would read as "measured, no
+			// contention", which is the opposite of "this path never ran in this build".
+			if (calls == 0) {
+				printf("  %-12s %14s\n", kRetrySiteNames[s], "(never called)");
+				continue;
+			}
+			printf("  %-12s %14llu %14llu %8u %10llu %8llu %7llu %8llu\n",
+				kRetrySiteNames[s], calls, retries, mx, b8, b64, b512, b4096);
+		}
+		printf(
+			"  ^ MAX far above the buckets = one outlier, not a pattern -- look for a single\n"
+			"    unlucky interleaving. A populated >=512 column is a real storm and is what an\n"
+			"    exponential backoff in the failure path would be for. All-zero buckets with a\n"
+			"    small MAX means the loop is not the problem, whatever the timing tail says.\n");
+	}
+}
+#endif
+
 void TaskScheduler::SetBareWaitHelp(bool on) noexcept { g_bareWaitHelp.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::BareWaitHelp() noexcept { return g_bareWaitHelp.load(std::memory_order_relaxed); }
 
