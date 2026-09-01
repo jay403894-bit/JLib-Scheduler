@@ -47,10 +47,37 @@ target, and takes no part in placement.
   handler completes, or issues the next operation and returns
 ```
 
-**The reactor** owns the backlog. It pops a completion, tries `PushIO` round-robin, and on `false`
-parks the item in a plain `std::queue` — no mutex, because that queue's only producer and only
-consumer are the same thread. It drains the backlog **before** pulling anything new.
+**The reactor** owns the backlog, and the backlog is **TWO STACKS, NOT A QUEUE**:
 
+```
+    OS completion source
+            |
+            v
+       in-stack          push arrivals here (LIFO, one store)
+            |
+            |  reverse, and ONLY when out-stack is empty
+            v
+      out-stack  --->  PushIO()      pop from here (FIFO order restored)
+```
+
+**IT ALLOCATES NOTHING.** `Task` already carries `std::atomic<Task*> next` — the field
+`TaskMPSCQueue` links through — so each stack is a single member pointer, push and pop are two
+stores, and the reverse is a pointer walk. A `std::queue` is `std::deque`-backed and allocates in
+chunks; on a path whose entire job is to absorb a burst that already failed to be pushed, an
+allocation is the last thing wanted. No synchronisation either: both stacks are touched only by the
+reactor thread.
+
+**FIFO IS PRESERVED AND THE AMORTISED COST IS O(1).** Arrivals `a, b, c` sit on the in-stack as
+`c, b, a`; reversing yields `a, b, c` on the out-stack, which pops oldest-first. Each item is pushed
+once, moved once, popped once.
+
+> **REVERSE ONLY WHEN THE OUT-STACK IS EMPTY.** This is the one way to get the structure wrong:
+> reversing while the out-stack still holds items puts newer arrivals *ahead* of older ones that
+> were already waiting, and the ordering the backlog exists to protect is silently inverted. It
+> fails as a fairness bug, not a crash.
+
+The loop is therefore: pop the out-stack; if it is empty and the in-stack is not, reverse; only if
+both are empty accept new completions from the OS.
 **K threads** pop their own queue and RESUME the completion's coroutine handle. The handler runs until
 its next `co_await` or until it returns; the frame is heap-allocated and owned by the coroutine, so
 there is nothing to borrow and nothing to give back. One to three threads; two means one is usually
@@ -246,9 +273,11 @@ its own threads is unknown and untested.
    `PushIO` cannot fix this; by then they are on separate threads. Normally free — the next `recv`
    is not issued until the current completes — but it is a **reactor contract**, not a happy
    accident.
-3. **The backlog drains before new completions are pulled.** Otherwise the reactor keeps accepting
-   while its own queue grows: unbounded memory, and the oldest completions served last, inverting
-   the ordering the bounded mailbox exists to protect.
+3. **The backlog drains before new completions are pulled, and the out-stack is reversed into only
+   when it is EMPTY.** Otherwise the reactor keeps accepting while its own backlog grows: unbounded
+   memory, and the oldest completions served last, inverting the ordering the bounded mailbox exists
+   to protect. The two-stack structure gives FIFO amortised O(1) with no allocation -- and reversing
+   early is the one way to break it, silently, as a fairness bug rather than a crash.
 4. **Exactly one resume in flight per frame.** A coroutine handle is not pinned, which is what makes
    round-robin legal — but not-pinned is not the same as safe-to-resume-twice. A cancel racing a
    completion must never put the same handle in two K queues. **This is the invariant that pinning

@@ -984,3 +984,8 @@ Superseded by that document, and NOT to be re-derived from the sections above:
     because the scheduler's PLACEMENT path is not thread-safe even though the queue is. A reactor
     retrying inside the shared push would obstruct an application thread pushing to F.
   - "K may be demoted to a function" -- K stays 1-3 real dispatch threads.
+  - "the backlog is a std::queue" (twice above) -- it is TWO INTRUSIVE STACKS. Task already carries
+    `std::atomic<Task*> next`, so in-stack and out-stack are one member pointer each and the whole
+    structure allocates NOTHING; a std::queue is std::deque-backed and allocates in chunks, on the
+    one path whose entire job is absorbing a burst. Reverse into the out-stack ONLY when it is empty
+    -- reversing early puts newer arrivals ahead of older ones and inverts the ordering silently.
