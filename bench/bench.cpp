@@ -866,7 +866,39 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     // burst was blamed, and the burst runs AFTER this row. Every conclusion about serial latency
     // is conditional on this number, so it is printed with the row rather than inferred from the
     // banner or reconstructed from the landing spread.
+    // ---- SHED THE PREVIOUS ROW'S FLOOR BEFORE MEASURING THIS ONE ----------------------------
+    //
+    // ForceAwakeFloorToBase() EXISTS FOR THIS AND HAD NO CALLERS. Its own comment names the exact
+    // symptom -- "a latency row opened at 16 reported p99 1.70 us against 0.60, which reads as a
+    // latency regression and is really leftover spinners" -- and the row below has been opening at
+    // whatever floor the 200,000-task throughput rows above it left behind. Recording the grown
+    // floor (as this row already did) makes the number ATTRIBUTABLE; shedding first makes it a
+    // measurement of the CONFIGURED floor, which is the thing the flag asked for.
+    //
+    // FORCE, NOT CollapseAwakeFloorToBase. The collapse is the scheduler's own shed: it honours a
+    // ~6 ms hold and checks that nothing is queued, so calling it here would sometimes shed and
+    // sometimes not, and the row would silently alternate between two different experiments. This
+    // is a measurement harness with nothing in flight -- the unconditional one is correct here and
+    // is documented as harness-only.
+    //
+    // THE SETTLE IS NOT COSMETIC. F is a word; a worker only observes it on its next pass, and a
+    // promoted worker that has not yet come round is still spinning and still a placement target.
+    // Sleep past that, then read what actually happened rather than assuming the call worked.
+    const size_t floorBeforeShed = JLib::TaskScheduler::GetAwakeFloor();
+    JLib::TaskScheduler::ForceAwakeFloorToBase();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
     const size_t floorAtLatencyStart = JLib::TaskScheduler::GetAwakeFloor();
+    const size_t floorBaseHere       = JLib::TaskScheduler::GetAwakeFloorBase();
+    if (floorBeforeShed != floorAtLatencyStart)
+        printf("    (shed the previous row's floor before measuring: F %zu -> %zu)\n",
+               floorBeforeShed, floorAtLatencyStart);
+    // SAY SO IF IT DID NOT TAKE. A row that still opens above its base is measuring leftover
+    // spinners, and that is worth a loud line rather than a number nobody can attribute.
+    if (floorAtLatencyStart > floorBaseHere)
+        printf("    *** FLOOR DID NOT SHED: F=%zu still above base %zu at the START of this row --\n"
+               "        every number below is a measurement of THAT floor, not of the configured one.\n",
+               floorAtLatencyStart, floorBaseHere);
     for (auto& c : g_landedOn) c.store(0, std::memory_order_relaxed);
 
     // ---- THE STALL HAS TO BE SAMPLED WHILE IT IS HAPPENING ----------------------------------
@@ -1275,9 +1307,21 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             floorAtLatencyStart, floorN, JLib::TaskScheduler::GetAwakeFloorBase());
         printf("               kernel wakes this row: %llu  (a live floor should need ~0)\n",
             (unsigned long long)JLib::TaskScheduler::GetWakeCount());
-        printf("               landed on the floor [%zu,%zu): %u of %u (%.1f%%)  -- the rest paid a wake\n",
-            kResv, kResv + floorN, onFloor, total,
-            total ? 100.0 * (double)onFloor / (double)total : 0.0);
+        // 100.0% ONLY WHEN IT IS ALL OF THEM. %.1f rounded 19999/20000 to "100.0%", so a row with a
+        // push that missed the floor -- the one interesting event in twenty thousand -- read as
+        // perfect. That is the same failure as a control that cannot go red: the number nobody
+        // questions is the number that stops being evidence. Off-by-a-few now prints the MISS
+        // COUNT, which is what a reader actually wants to chase, and the percentage is truncated
+        // rather than rounded so it can never round UP into looking complete.
+        {
+            const unsigned missed = total - onFloor;
+            const double   pct    = total ? (double)onFloor * 100.0 / (double)total : 0.0;
+            const double   shown  = (missed == 0) ? 100.0 : (double)((long long)(pct * 10.0)) / 10.0;
+            printf("               landed on the floor [%zu,%zu): %u of %u (%.1f%%)",
+                   kResv, kResv + floorN, onFloor, total, shown);
+            if (missed == 0) printf("  -- every push, no wake paid\n");
+            else             printf("  -- %u MISSED and paid a wake\n", missed);
+        }
         if (onResv)
             printf("               landed in the RESERVED band [0,%zu): %u  <- ordinary work is masked\n"
                    "               out of it, so anything here is a placement leak\n", kResv, onResv);
