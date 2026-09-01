@@ -423,7 +423,19 @@ static double RunVictim() {
 }
 
 static void BenchIdleTax(JLib::TaskScheduler& jl) {
-    printf("  idle-policy tax -- what the pool costs a CO-RESIDENT thread, ms (lower is better)\n\n");
+    // ONE POOL PER RUN, AND JLib WINS THE TIE. The arms below are `if (g_doJ) ... else if (g_doM)`,
+    // so a BOTH-ARMS run measures JLib and never marl -- which is not a bug (two pools ticking at
+    // once would each be measuring the other) but it does mean marl's tax has to be asked for
+    // separately with --only=marl, and until it is, this row is one-sided.
+    //
+    // THAT MATTERS MORE THAN IT LOOKS. marl spins ~1 ms before parking, so in any burst arriving
+    // near prior activity its workers are already hot and reachable -- which is a large part of why
+    // it wins the blocking row. Idle CPU is what buys that, and this is the row that charges for
+    // it. Quoting the blocking crossover without marl's own number here compares a pool that parks
+    // against one that does not, and calls the difference scheduling.
+    printf("  idle-policy tax -- what the pool costs a CO-RESIDENT thread, ms (lower is better)\n");
+    printf("     [measuring: %s -- the other arm needs its own --only= run]\n\n",
+           g_doJ ? "JLib" : (g_doM ? "marl" : "neither"));
 
     // Baseline FIRST and with nothing submitted, so it measures the victim alone on this machine.
     const double base = std::min(RunVictim(), RunVictim());
