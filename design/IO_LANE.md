@@ -42,7 +42,7 @@ target, and takes no part in placement.
         v
   K[0..n)   dispatch threads, 1-3 (2 is probably right: one always on duty)
         |
-        |  pop own IOMPSCQueue -> borrow fiber -> run handler -> return fiber
+        |  pop own IOMPSCQueue -> resume the coroutine handle -> it awaits again or completes
         v
   handler completes, or issues the next operation and returns
 ```
@@ -51,8 +51,10 @@ target, and takes no part in placement.
 parks the item in a plain `std::queue` — no mutex, because that queue's only producer and only
 consumer are the same thread. It drains the backlog **before** pulling anything new.
 
-**K threads** pop their own queue, borrow a fiber, run the handler, return the fiber. One to three of
-them; two means one is always on duty while the other is between re-aims.
+**K threads** pop their own queue and RESUME the completion's coroutine handle. The handler runs until
+its next `co_await` or until it returns; the frame is heap-allocated and owned by the coroutine, so
+there is nothing to borrow and nothing to give back. One to three threads; two means one is usually
+on duty while the other is between re-aims.
 
 **F workers** never see any of this. The I/O lane never reads the task inbox and F never reads an I/O
 queue.
@@ -87,50 +89,73 @@ strand existed because push always succeeded, the queue was unbounded, and a sel
 rehomed the consequence — so no caller ever had to own a policy. A push that can return `false`
 forces one. Precedent exists: `TaskDeque::push_bottom_batch` refuses and makes its caller requeue.
 
-### 3.3 One fiber pool, bisected — not two pools
+### 3.3 Coroutines, opt-in, C++20 — and the fiber pool is not involved at all
 
-A reserved slice of the existing `GlobalFiberPool` for the I/O lane, rather than a second pool.
+**REVERSED 2026-09-01.** An earlier draft of this document chose fibers, for C++17 and for two safety
+properties pinning gives away. Jay's call is coroutines, and it is the right one: it simplifies the
+pool question out of existence and it keeps the cost where it belongs.
 
-**This is what makes it safe.** Two pools would mint colliding `poolIndex` values, and exactly two
-sites index flat arrays by that:
+**THE LIBRARY CORE STAYS C++17.** Only the I/O path is C++20, and only for applications that opt in.
+That is already the shape that shipped — `IoAsync.h`: "`co_await` for asynchronous I/O. C++20 — and
+the ONLY C++20 in the reactor", over a C++17 engine. Not everyone wants an I/O reactor; nobody who
+declines it should pay a language-version bump for it.
 
-- `Event::EnsureTable()` — `slots = new std::atomic<Task*>[TotalCount()]`
-- `Hazard.cpp:129` — sizes by `TotalCount()`
+**AND THE FIBER POOL IS NOT INVOLVED.** A coroutine frame is a heap allocation sized to its own
+locals, served by the existing coroutine frame pool. It does not come from `GlobalFiberPool`, so:
 
-Two pools means I/O fiber `poolIndex 5` and compute fiber `poolIndex 5` write **the same Event waiter
-slot**. Silent corruption, not an error. One bisected pool keeps a single index space and the problem
-does not exist.
+- no bisected pool, no reserved slice, no index accounting
+- no `poolIndex` collision — `Event::EnsureTable()` and `Hazard.cpp` size flat arrays by
+  `GlobalFiberPool::TotalCount()`, and an I/O frame never appears in that space at all
+- no 64 KB stack per anything
 
-### 3.4 Fiber per completion, not per operation
+An earlier draft spent two sections on how to divide the fiber pool safely. **With coroutines there
+is nothing to divide.**
 
-The budget is bounded by **concurrent handlers**, not open connections:
+### 3.4 A frame per operation, and linear async comes back with it
 
-| | per operation | **per completion** |
+With fibers, a frame costs a 64 KB stack from a fixed arena, so a frame per *operation* meant a
+pre-`Init` ceiling on simultaneous connections (1000 × 64 KB = 64 MB committed) and forced a frame
+per *completion* instead — which in turn forced handlers into a state machine: store state on the
+connection and return, never `co_await` twice.
+
+**A coroutine frame is small and heap-allocated, so per-operation is simply affordable**, and the
+handler-style constraint lifts with it:
+
+```cpp
+    auto n = co_await RecvAsync(conn, buf, sizeof buf, 0, tok);
+    // ...
+    co_await SendAsync(conn, reply, n, 0, tok);      // just works; state lives in the frame
+```
+
+The frame holds the continuation across both awaits. No connection-side state machine, and the
+budget is bounded by outstanding operations at their real cost rather than by a stack apiece.
+
+### 3.5 What choosing coroutines costs
+
+Pinning was doing real work in the fiber draft, and giving it up hands back two hazards. Both are
+listed as invariants in §4 rather than left in prose:
+
+| | fibers (rejected) | **coroutines (chosen)** |
 |---|---|---|
-| budget | max in-flight ops — 1000 conns × 64 KB = **64 MB committed** | ~K thread count — **tens of fibers** |
-| routing | pinned; assign once at operation start | free round-robin |
+| language | C++17 throughout | **C++20 on the opt-in I/O path only** |
+| frame cost | 64 KB stack, fixed arena | small heap frame, existing frame pool |
+| pool interaction | bisected `GlobalFiberPool`, index accounting | **none** |
+| handler style | state machine (per-completion) | **linear `co_await`** |
+| routing | pinned; assign once per operation | free round-robin, which is what §2 does |
+| double resume | prevented by construction | **must be prevented — invariant 4** |
+| `thread_local` | stable across suspends | **breaks after every await — invariant 5** |
+| suspend depth | anywhere in the call stack | only at a `co_await` |
 
-`GlobalFiberPool::kStandardStackSize` is 64 KB and the arena is one fixed allocation at `StartPool`,
-so per-operation would put a hard pre-`Init` ceiling on simultaneous connections. Per-completion does
-not.
+The last row is the one to keep in view: a handler cannot suspend from inside an ordinary function it
+calls. In practice I/O handlers are shallow — await, process, await — so this is rarely felt, but it
+is a real restriction and the fiber path does not have it.
 
-**The cost is handler style.** A handler needing a second I/O op stores state on the connection and
-returns, rather than awaiting inline. State machine, not linear async. That is also *why*
-round-robin is legal: no continuation state lives in a fiber between completions.
-
-### 3.5 Fibers, not coroutines
-
-Keeps the I/O path **C++17**, matching the project's stated constraint. It also dissolves two hazards
-the coroutine version has: a frame resumed on two threads, and a handler observing a different thread
-after every await.
-
-> **Correction on record.** This document's author claimed twice that the lane had a structural
-> ceiling because "completions resume pinned fibers". The *preserved* reactor is coroutines —
-> `IoAsync.h`: "`co_await` for asynchronous I/O. C++20 — and the ONLY C++20 in the reactor", with
-> `await_suspend(std::coroutine_handle<P>)`. `resumedInboxes` is the **fiber** path and a different
-> mechanism. The conclusion drawn from that confusion — that an ordered MPMC FIFO was required — was
-> wrong, and this design needs no such queue.
-
+> **Correction on record, and it is the mistake that cost the most.** This document's author claimed
+> twice that the lane had a structural ceiling because "completions resume PINNED fibers", and
+> concluded from it that an ordered MPMC FIFO was required. The reactor is coroutines;
+> `resumedInboxes` is the fiber path and a **different mechanism** that happens to sit beside it.
+> Coroutine handles are not pinned, round-robin is legal, and **no MPMC FIFO is needed anywhere in
+> this design.**
 ### 3.6 `IsThreadAvailable`, and it reuses the fourth state
 
 Push only to a K thread that is actually on a core. That question is already answered by the permit
@@ -224,14 +249,19 @@ its own threads is unknown and untested.
 3. **The backlog drains before new completions are pulled.** Otherwise the reactor keeps accepting
    while its own queue grows: unbounded memory, and the oldest completions served last, inverting
    the ordering the bounded mailbox exists to protect.
-4. **A fiber returns to the free list only after the reactor guarantees no further completion.**
-   Otherwise the next acquire hands out the same `Fiber*` and a stale completion resumes the wrong
-   frame — ABA, same pointer, different owner.
-5. **No Native handlers on this path.** A Native handler runs to completion on the dispatch thread
+4. **Exactly one resume in flight per frame.** A coroutine handle is not pinned, which is what makes
+   round-robin legal — but not-pinned is not the same as safe-to-resume-twice. A cancel racing a
+   completion must never put the same handle in two K queues. **This is the invariant that pinning
+   was providing for free**, and choosing coroutines means it has to be enforced instead. It is also
+   the one to model first: cancellation on this path already has a sharp edge — `scope.Cancel()`
+   alone leaves a parked read parked — and a double resume is a corruption where that is a hang.
+5. **A handler may resume on a different K thread after every await.** Correct for the frame, fatal
+   for any `thread_local` or same-thread assumption inside it. **The fiber path guarantees the
+   opposite**, so the two contracts must be documented as opposites rather than assumed alike — the
+   confusion between those two mechanisms is what produced the pinning error recorded in §3.5.
+6. **No Native handlers on this path.** A Native handler runs to completion on the dispatch thread
    and *is* a stolen consumer. Reject, do not tolerate: code that survives a violation is defending
    against it, not permitting it.
-
----
 
 ## 5. Open questions
 
@@ -240,9 +270,10 @@ while the other re-aims, which may make the wake cost irrelevant — or the lane
 **Unmeasured.** The measurement is completions/sec against kernel wakes, the same shape as the
 existing `kernel wakes this row: 0` line for the floor.
 
-**Invariant 4 is the one to model first.** Cancellation on this path already has a sharp edge —
-`scope.Cancel()` alone leaves a parked read parked — and recycling turns that known **hang** into a
-**corruption**, which is strictly worse. Model before writing.
+**Invariant 4 is the one to model first.** It is the one choosing coroutines took ON, and it is the
+only hazard in this design that fails silently rather than loudly. Cancellation here already has a
+sharp edge -- `scope.Cancel()` alone leaves a parked read parked -- and a double resume turns that
+known **hang** into a **corruption**, which is strictly worse. Model before writing.
 
 **How many K threads, and does it scale with cores?** Probably not: I/O concurrency scales with
 in-flight operations and per-completion CPU, not with the machine. `EnableIoReactor(bool, unsigned
@@ -259,5 +290,5 @@ a dispatch thread does real work, the stolen-consumer problem is rebuilt one lay
   dump columns. Worth doing as its own commit with the suite green either side — not folded into a
   behaviour change.
 - `IOMPSCQueue` and its model.
-- The bisected pool and its index accounting.
+- A model for invariant 4 -- one resume in flight per frame, against a cancel racing a completion.
 - `PushIO`, the `friend` declaration, and the reactor-side backlog.
