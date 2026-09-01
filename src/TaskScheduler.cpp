@@ -6029,7 +6029,39 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 				if (j >= pc) { j -= pc; continue; }
 				// Clear the j lowest set bits; the CTZ then names the (j+1)-th.
 				for (unsigned c = 0; c < j; ++c) word &= word - 1;
-				const size_t idx = w * 64 + platform::CountTrailingZeros64(word);
+				size_t idx = w * 64 + platform::CountTrailingZeros64(word);
+
+				// ---- RE-AIM OFF A YIELDING WORKER ------------------------------------------
+				//
+				// THE BITMAP CANNOT ANSWER THIS, which is why the check is here and not a second
+				// hint word. A bit says awake or not-awake, and YIELD is neither: the worker owes
+				// no syscall (it is runnable and returns on its own) but it is NOT on the core
+				// right now, so a push aimed at it waits a scheduling quantum. Clearing the bit
+				// during the yield would collapse YIELD into PARKED for placement and lose exactly
+				// the distinction that makes YIELD worth having -- and it would be a second source
+				// of truth to keep in step with the word. The word is the source; this reads it.
+				//
+				// ONE LOAD, ON A LINE THE PUSHER IS ABOUT TO TOUCH ANYWAY. The caller is about to
+				// push to this worker's inbox, bump its inboxDepth, MarkQueuedWork and NotifyWorker
+				// -- all on the same object. This does not add a cache miss to the push path, and
+				// it is asked only of the ONE candidate already chosen, never of the pool.
+				//
+				// ONE STEP, NOT A LOOP, AND DELIBERATELY BEST-EFFORT. `word`'s lowest set bit is
+				// the candidate, so clearing it hands us the next one for free -- no popcount, no
+				// rescan. If there is no alternative in this word we keep the yielding worker, and
+				// that is CORRECT rather than a compromise: yieldstate_model.c's -DTARGET_YIELDED
+				// is GREEN. The swap still latches the permit, the worker's return CAS sees
+				// NOTIFIED and rescans, and nothing is lost. Aiming elsewhere buys latency, so
+				// best-effort is the right amount of effort to spend on it -- and the state can
+				// change the instant after this load either way.
+				if (idx < workers.size()
+				    && workers[idx]->GetWorkerState() == Thread::WS_YIELD) {
+					const unsigned long long rest = word & (word - 1);
+					if (rest) {
+						const size_t alt = w * 64 + platform::CountTrailingZeros64(rest);
+						if (alt < workers.size()) idx = alt;
+					}
+				}
 				// NO PER-PUSH SPILL HERE, and both attempts at one are worth recording so they are
 				// not retried. The idea was: prefer an awake worker UNLESS it is already occupied,
 				// so a burst fans out instead of piling onto the single floor worker.

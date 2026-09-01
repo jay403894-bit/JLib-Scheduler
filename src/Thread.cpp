@@ -3636,15 +3636,17 @@ void Thread::Worker() {
 							continue;                       // go round; something is there
 						}
 
-						// THE BITMAP TOO, because PLACEMENT READS THE BITMAP AND NOT THIS WORD.
-						// The fourth state exists so there is ONE source of truth, and that only
-						// holds if the bit is derived from the same transition rather than
-						// maintained separately. Two relaxed RMWs on one idle pass in eight.
-						scheduler->SetAwake((size_t)qIndex, false);
-
+						// THE AWAKE BIT STAYS SET ACROSS THE YIELD, and clearing it here was the
+						// first attempt. It is wrong twice over. A bit says awake or not-awake,
+						// and YIELD is neither -- this worker owes NO syscall, so advertising it
+						// as not-awake collapses YIELD into PARKED for placement and throws away
+						// the one distinction the fourth state exists to make. It is also a second
+						// source of truth for a question the word already answers, which is the
+						// shape that keeps drifting in this file's history.
+						//
+						// PickNextWorker reads the WORD instead, of the one candidate it has
+						// already chosen -- see the re-aim note there.
 						std::this_thread::yield();
-
-						scheduler->SetAwake((size_t)qIndex, true);
 
 						// AFTER: CAS back, NEVER store. A plain store(WS_EMPTY) here wipes a permit
 						// that landed while we were off the core -- and the producer that latched
