@@ -1113,3 +1113,24 @@ resolution (p50 stable to 0-2%).
 - The growth gate already uses the push-local-counter idea, and rejected depth for it explicitly:
   "it cannot use depth. 200,000 no-ops pile up behind two workers exactly like sixteen 3.3 ms bodies
   do, and gating on depth grew the floor to 16 on the no-op row: 1p 10.0 -> 5.2 M/s."
+
+### REJECTED: removing inboxDepth's producer-side write
+
+Proposed after the cache-line win, on the reasoning that the worker is its ONLY reader (the
+publish-to-stealable gate) and could therefore observe depth locally, deleting an atomic RMW from
+every push. It cannot, for a reason that is specific and fatal:
+
+**A WORKER CAN ONLY LEARN ITS DEPTH BY CONSUMING.** A worker-local "consecutive pops" counter
+reaches the threshold of 8 only after the worker has RUN eight tasks. In `burst/dflt` those are
+3.3 ms bodies, so the publish would fire ~26 ms into a 9.9 ms row -- long after the wave needed to
+become stealable, and reachability is what that row is limited by. The producer's write is what
+makes depth known BEFORE anything runs, which is the whole value of it.
+
+Two other shapes were already tried and are recorded at the gate:
+- drain whenever the inbox is non-empty: one producer walked its whole backlog into one deque and
+  hit the 65,536-slot ceiling on 200,000 no-op tasks.
+- an away-bit maintained on the dispatch path: throughput/1p 5.37 -> 2.93 M/s, frame DAG
+  8.45 -> 35.82 us/graph.
+
+So the push path's remaining atomics are all load-bearing, and after the colocation they share one
+coherence line. Closing the rest of the gap to marl needs a profiler, not more reading.
