@@ -721,6 +721,8 @@ int main(int argc, char** argv) {
     // untagged, so they wake on the ordinary lane no matter what K is. Measuring it is how that
     // claim stops being an assertion.
     size_t hot = 0;
+    // -1 == not given. Applied AFTER Init -- see the floor= case below for why.
+    long floorArg = -1;
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "hot=", 4) == 0)     { hot = (size_t)strtoul(argv[i] + 4, nullptr, 10); continue; }
         // floor=N -- THE LAST ASYMMETRY WITH marl THAT IS NOT WORKER COUNT.
@@ -747,10 +749,21 @@ int main(int argc, char** argv) {
             JLib::TaskScheduler::SetSpinYieldMask((unsigned)strtoul(argv[i] + 10, nullptr, 10));
             continue;
         }
+        // DEFERRED TO AFTER Init(), and that is a BUG FIX, not tidiness.
+        //
+        // SetAwakeFloor was called here, during argument parsing, which runs BEFORE
+        // TaskScheduler::Init -- so `instance` was null and it did two wrong things at once. It
+        // passed `workers.size()` as ZERO to BandsSetF, and its promotion half ("A PROMOTION MUST
+        // WAKE THE WORKERS IT JUST PROMOTED ... without this the floor is a claim rather than a
+        // fact") early-returns on !instance, so the workers were never woken.
+        //
+        // THE SYMPTOM WAS A NUMBER THAT CANNOT EXIST: `floor=8` printed `peakF 6`. A peak below the
+        // base is impossible if the base was ever really 8, which is how the run was caught.
+        //
+        // `nogrow` was unaffected and stays where it is: it sets a plain global that does not need
+        // the instance.
         if (strncmp(argv[i], "floor=", 6) == 0) {
-            const size_t f = (size_t)strtoul(argv[i] + 6, nullptr, 10);
-            JLib::TaskScheduler::SetAwakeFloor(f);
-            if (f == 0) JLib::TaskScheduler::SetFloorGrowthEnabled(false);
+            floorArg = (long)strtol(argv[i] + 6, nullptr, 10);
             continue;
         }
         // `nogrow` -- KEEP THE BASE, DISABLE THE GROWTH CONTROLLER. Same spelling as bench.cpp.
@@ -805,6 +818,35 @@ int main(int argc, char** argv) {
     // it was built for are unconditional now, and admitting Native was the last difference. The
     // Fiber-vs-Native axis this flag selects is still a real one and is what the flag measures.
     if (fiberOnly) g_jlType = JLib::TaskType::Fiber;
+    // NOW the instance exists, so SetAwakeFloor can size against a real worker count and can wake
+    // the workers it promotes. See the floor= parse above.
+    if (floorArg >= 0) {
+        JLib::TaskScheduler::SetAwakeFloor((size_t)floorArg);
+        if (floorArg == 0) JLib::TaskScheduler::SetFloorGrowthEnabled(false);
+    }
+
+    // ---- A JLib FLOOR CONTAMINATES THE marl COLUMN, AND IT IS NOT SUBTLE --------------------
+    //
+    // Both pools live for the whole program, and JLib's floor workers do not park. So while marl is
+    // being timed, N JLib workers are spinning on N cores that marl is not getting -- and marl's
+    // own numbers then depend on a JLib flag, which makes the ratio a property of neither
+    // scheduler.
+    //
+    // MEASURED, ACCIDENTALLY: two runs differing ONLY in a JLib floor setting moved marl's d=0 cell
+    // from 4.54 ms to 14.58 ms. 3.2x, on the arm that was supposed to be the control.
+    //
+    // The `fiberonly` note below already says "a spinning pool cannot share a process with another
+    // scheduler being timed" and forces --only=jlib. That is the same hazard; it was just scoped to
+    // one flag instead of to the condition. This warns rather than refuses, because the DEFAULT
+    // floor contaminates too (base 2 is still two cores) and refusing would leave no both-arms run
+    // at all -- but a pasted table now says so out loud.
+    if (g_doJ && g_doM && floorArg > 0) {
+        printf("WARNING: floor=%ld with BOTH arms. JLib's floor workers do not park, so marl is\n"
+               "         timed while %ld cores are held spinning -- its column is not comparable to\n"
+               "         a run with a different floor. Use --only=jlib and --only=marl separately\n"
+               "         and compare the pastes.\n\n", floorArg, floorArg);
+    }
+
     JLib::TaskScheduler& jl = JLib::TaskScheduler::Instance();
     if (g_doJ) g_ioEvent = &jl.GetEvent("compare_io");   // the one and only registry lookup
     if (!g_doJ) JLib::detail::TeardownForTesting(jl);   // real teardown: nothing of JLib runs while marl is timed
