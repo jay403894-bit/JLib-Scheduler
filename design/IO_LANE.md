@@ -273,33 +273,71 @@ its own threads is unknown and untested.
    `PushIO` cannot fix this; by then they are on separate threads. Normally free — the next `recv`
    is not issued until the current completes — but it is a **reactor contract**, not a happy
    accident.
-3. **The backlog drains before new completions are pulled, and the out-stack is reversed into only
+3. **The backlog is BOUNDED, and overflow drops DELIBERATELY.** An unbounded backlog converts a
+   latency problem into an out-of-memory one. Drops belong at the backlog as a stated policy with a
+   counter, not as an emergent consequence of the OS socket buffer overflowing because nobody
+   drained it -- late packets on one owner beat lost packets on two, but silent loss beats neither.
+4. **The backlog drains before new completions are pulled, and the out-stack is reversed into only
    when it is EMPTY.** Otherwise the reactor keeps accepting while its own backlog grows: unbounded
    memory, and the oldest completions served last, inverting the ordering the bounded mailbox exists
    to protect. The two-stack structure gives FIFO amortised O(1) with no allocation -- and reversing
    early is the one way to break it, silently, as a fairness bug rather than a crash.
-4. **Exactly one resume in flight per frame.** A coroutine handle is not pinned, which is what makes
+5. **Exactly one resume in flight per frame.** A coroutine handle is not pinned, which is what makes
    round-robin legal — but not-pinned is not the same as safe-to-resume-twice. A cancel racing a
    completion must never put the same handle in two K queues. **This is the invariant that pinning
    was providing for free**, and choosing coroutines means it has to be enforced instead. It is also
    the one to model first: cancellation on this path already has a sharp edge — `scope.Cancel()`
    alone leaves a parked read parked — and a double resume is a corruption where that is a hang.
-5. **A handler may resume on a different K thread after every await.** Correct for the frame, fatal
+6. **A handler may resume on a different K thread after every await.** Correct for the frame, fatal
    for any `thread_local` or same-thread assumption inside it. **The fiber path guarantees the
    opposite**, so the two contracts must be documented as opposites rather than assumed alike — the
    confusion between those two mechanisms is what produced the pinning error recorded in §3.5.
-6. **No Native handlers on this path.** A Native handler runs to completion on the dispatch thread
+7. **No Native handlers on this path.** A Native handler runs to completion on the dispatch thread
    and *is* a stolen consumer. Reject, do not tolerate: code that survives a violation is defending
    against it, not permitting it.
 
 ## 5. Open questions
 
-**Sleep or spin for the K threads.** A wake is ~3–4 µs. Two threads means one is usually on duty
-while the other re-aims, which may make the wake cost irrelevant — or the lane may need a spin.
-**Unmeasured.** The measurement is completions/sec against kernel wakes, the same shape as the
-existing `kernel wakes this row: 0` line for the floor.
+**Sleep or spin for the K threads — and the answer is probably neither, alone.**
 
-**Invariant 4 is the one to model first.** It is the one choosing coroutines took ON, and it is the
+The concern: if K parks, every completion pays a wake, and a K that spins-and-yields instead will
+suffer the same yield misses the floor did, ending in dropped packets.
+
+**THE WAKE IS PER IDLE PERIOD, NOT PER COMPLETION.** K parks only when its queue is empty. Under
+sustained traffic it never parks: the next completion finds `WS_EMPTY` — on core, scanning — and
+costs nothing. The ~3–4 µs is paid on the idle→busy edge, once per burst.
+
+    60 Hz client   one packet per 16.7 ms      a 4 µs wake is 0.025% of the interval
+    busy server    continuous arrivals         K never parks; no wake at all
+
+The configuration where parking genuinely hurts is **sparse traffic with a sub-10 µs latency
+requirement** — real, but not the shape this library is aimed at.
+
+**THE YIELD MISS IS ALREADY HANDLED BY §2.** `PushIO` round-robins and re-aims on `false`,
+`IsThreadAvailable` skips a K in `WS_YIELD`, and two threads mean one is on duty while the other is
+off-core. A yield miss costs a re-aim, not a drop. This is the same fix the floor got: the miss is
+not prevented, it is made cheap.
+
+**DROPPED PACKETS COME FROM THE REACTOR STALLING, NOT FROM K.** The OS socket buffer overflows when
+nobody drains it, and the reactor is a dedicated thread doing only pop / push / backlog — it sustains
+far more than a NIC delivers. K falling behind grows the backlog; it does not stop the drain. Drops
+must therefore be a **bounded, deliberate policy at the backlog**, not an emergent consequence:
+*late packets on one owner beat lost packets on two.* An unbounded backlog converts a latency problem
+into an out-of-memory one, which is worse.
+
+**THE SHAPE TO REACH FOR IS SPIN-THEN-PARK**, which this codebase already uses twice:
+
+- `BareWaitBackoff` — CpuRelax ×512, then `std::this_thread::yield()`
+- marl, measured — spins ~1 ms, then parks; an adaptive floor with no config
+
+So: spin briefly after the last completion, covering back-to-back arrivals with no wake at all, then
+park. Sustained load never sleeps; idle load never burns a core. One knob, and the default should be
+chosen the way `kYieldFloorMin` was — small, with the reasoning written down.
+
+**ALL OF THE ABOVE IS REASONING, NOT MEASUREMENT.** The number that settles it is completions/sec
+against kernel wakes on this lane, the same shape as `kernel wakes this row: 0` for the floor. Until
+that exists, the spin duration is a guess and should be a knob rather than a constant.
+**Invariant 5 is the one to model first.** It is the one choosing coroutines took ON, and it is the
 only hazard in this design that fails silently rather than loudly. Cancellation here already has a
 sharp edge -- `scope.Cancel()` alone leaves a parked read parked -- and a double resume turns that
 known **hang** into a **corruption**, which is strictly worse. Model before writing.
@@ -319,5 +357,7 @@ a dispatch thread does real work, the stolen-consumer problem is rebuilt one lay
   dump columns. Worth doing as its own commit with the suite green either side — not folded into a
   behaviour change.
 - `IOMPSCQueue` and its model.
-- A model for invariant 4 -- one resume in flight per frame, against a cancel racing a completion.
+- A model for invariant 5 -- one resume in flight per frame, against a cancel racing a completion.
+- A spin-then-park policy for the K threads, with the spin duration as a knob rather than a constant
+  until completions/sec against kernel wakes has been measured on this lane.
 - `PushIO`, the `friend` declaration, and the reactor-side backlog.
