@@ -76,6 +76,10 @@ static void Report(const char* who, const std::vector<double>& runs, const char*
 static marl::Scheduler* g_marlSched = nullptr;
 static bool g_doJ = true;
 static bool g_doM = true;
+// Printed in the blocking row's header so a saved run says WHICH ARM produced it. Two runs of this
+// harness differ only by a command-line word, and a pasted table that does not name its arm is the
+// single easiest way to compare two numbers that were never comparable.
+static bool g_noGrow = false;
 
 // THE TASK TYPE EVERY UNTAGGED JLib ROW SUBMITS, switched by the `fiberonly` flag.
 //
@@ -428,7 +432,8 @@ static void BenchIdleTax(JLib::TaskScheduler& jl) {
 }
 
 static void BenchBlocking(JLib::TaskScheduler& jl) {
-    printf("  blocking crossover -- 25%% of tasks wait on an external signal\n");
+    printf("  blocking crossover -- 25%% of tasks wait on an external signal   [floor growth: %s]\n",
+           g_noGrow ? "OFF (nogrow)" : "on");
     printf("     %d batches of %d; ms for all %d tasks, lower is better\n\n",
            kBatches, kBatch, kBatches * kBatch);
     printf("     %8s %11s %11s %9s\n", "block us", "JLib", "marl", "ratio");
@@ -746,6 +751,25 @@ int main(int argc, char** argv) {
             const size_t f = (size_t)strtoul(argv[i] + 6, nullptr, 10);
             JLib::TaskScheduler::SetAwakeFloor(f);
             if (f == 0) JLib::TaskScheduler::SetFloorGrowthEnabled(false);
+            continue;
+        }
+        // `nogrow` -- KEEP THE BASE, DISABLE THE GROWTH CONTROLLER. Same spelling as bench.cpp.
+        //
+        // WHY THIS ROW NEEDS IT. The blocking crossover prints `peakF 16` at EVERY block duration,
+        // including 0 -- the floor grows to 16 whether a task waits 0 us or 2000 us. And the JLib
+        // column is FLAT (9.66 -> 9.12 ms across 0 -> 600 us) while marl's rises with the block, so
+        // whatever JLib is paying is not the waiting. A cost that is constant, present at d=0, and
+        // accompanied by the floor growing every single time is a description of the growth
+        // controller, whose own measured burst figure is 8-10 ms.
+        //
+        // `floor=0` already disabled growth, but it also pins the base to zero, so it moved two
+        // things at once and could not isolate this. This changes one.
+        //
+        // AND IT IS AN A/B, NOT AN ESTIMATE, which is the point: a timer says "slow" and a wake
+        // counter cannot see a CAS retry storm at all. This either moves the number or it does not.
+        if (strcmp(argv[i], "nogrow") == 0) {
+            JLib::TaskScheduler::SetFloorGrowthEnabled(false);
+            g_noGrow = true;
             continue;
         }
         if (strcmp(argv[i], "nosleep") == 0)      { noSleep = true; continue; }
