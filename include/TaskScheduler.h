@@ -1842,8 +1842,29 @@ namespace JLib {
 
 		// Cancellable WaitFor: returns Cancelled if `tok` fires while still waiting, Ok if the group
 		// completed. Cancelling ends THIS WAIT ONLY -- the count is untouched, the outstanding tasks
-		// still run and still decrement, and any other waiter on the same group is unaffected. Use
-		// WaitGroup::CancelWaiters(tok) to release such waiters eagerly. See the definition.
+		// still run and still decrement, and any other waiter on the same group is unaffected.
+		//
+		// ############ INCOMPLETE. A FIBER THAT PARKS HERE CAN WAIT FOREVER. ############
+		//
+		// YOU MUST CALL wg.CancelWaiters(tok) YOURSELF. scope.Cancel() DOES NOT REACH THIS WAIT.
+		//
+		// WHY: the token stored by this wait is PASSIVE. It is a filter applied by whoever walks
+		// WaitGroup::cancellable -- it is not a wake, and holding one creates no path out. The
+		// cancellation machinery dispatches ejection BY TYPE, and that table is Event,
+		// SchedulerSemaphore, SchedulerConditionVariable and IoAcceptor (see Timer.cpp's Eject*
+		// functions and IoShared.cpp). THERE IS NO EjectWaitGroup.
+		//
+		// So a parked fiber here is released by exactly two things: the group COMPLETING, or an
+		// explicit wg.CancelWaiters(tok). Cancel the scope on a group that will never complete --
+		// which is what cancelling usually means -- and nothing wakes it. A parked fiber cannot
+		// poll a flag.
+		//
+		// tests/waitgroup_cancel_test.cpp passes only because it calls inner.CancelWaiters(...) by
+		// hand on the line after scope.Cancel(). Remove that line and it hangs. It is ~2% flaky
+		// today for a related reason: whether the group happens to complete first.
+		//
+		// THE FIX IS NOT ANOTHER ENTRY IN THE DISPATCH TABLE -- a table that must list every
+		// primitive is the same bug waiting for the next primitive. See design/NOTES.md.
 		WaitResult WaitFor(WaitGroup& wg, CancelToken tok);
 		bool Push(uint8_t cpu_affinity, Task* task);
 		bool Requeue(Task* task);

@@ -1135,7 +1135,7 @@ Two other shapes were already tried and are recorded at the gate:
 So the push path's remaining atomics are all load-bearing, and after the colocation they share one
 coherence line. Closing the rest of the gap to marl needs a profiler, not more reading.
 
-### KNOWN FLAKY: SchedulerWaitGroupCancelTest, ~2%, PRE-EXISTING
+### KNOWN FLAKY: SchedulerWaitGroupCancelTest, ~2%, PRE-EXISTING (root cause found -- see below)
 
 Measured 2026-09-01 while landing the fiber-death cleanup hook, because an intermittent failure on a
 WaitGroup test immediately after touching the fiber ACQUIRE path is exactly the thing not to wave
@@ -1151,3 +1151,50 @@ would break."
 
 **RECORDED SO THE BASELINE DOES NOT HAVE TO BE MEASURED AGAIN.** A ~2% flake is invisible in a single
 run and looks like a regression the first time a change happens to hit it.
+
+### ROOT CAUSE of the WaitGroup flake above: WaitFor(wg, token) HAS NO DELIVERY PATH
+
+The note above records the flake as pre-existing with the mechanism unknown. It is known now, and
+it is not a race -- it is a hole in the design. Jay named it: "you fell on an infinite lock, nothing
+signals the event to let you out, and you expected the token to work."
+
+**A TOKEN IS PASSIVE.** Storing one in `WaitGroup::cancellable` creates no path out. It is a FILTER
+applied by whoever walks that list, and walking is what has to be caused.
+
+**AND NOTHING CAUSES IT FOR WaitGroup.** Cancellation dispatches ejection BY TYPE, and the table is:
+
+    Timer.cpp    EjectEvent               -> Event::CancelWaiters()
+    Timer.cpp    EjectSemaphore           -> SchedulerSemaphore::CancelWaiters(tok)
+    Timer.cpp    EjectConditionVariable   -> SchedulerConditionVariable::CancelWaiters(tok)
+    IoShared.cpp / IoReactor_stub.cpp     -> IoAcceptor::CancelWaiters(tok)
+
+There is no `EjectWaitGroup`. So a fiber parked in `WaitFor(wg, tok)` is released by exactly two
+things: the group COMPLETING, or an explicit `wg.CancelWaiters(tok)`. Cancel a scope on a group that
+will never complete -- which is what cancelling usually means -- and the fiber waits forever. A
+parked fiber cannot poll a flag.
+
+**THE TEST PASSES ONLY BECAUSE IT DOES THE DISPATCH BY HAND**, one line after `scope.Cancel()`:
+
+    scope.Cancel();
+    const std::size_t woken = inner.CancelWaiters(scope.Token());   // the system never does this
+
+Delete that line and it hangs. The ~2% flake is the same hole seen through a different interleaving
+-- whether the group happens to complete before the test gives up -- which is also why it produces no
+failure output: it is a hang, not a failed assertion, and it is load-sensitive because load decides
+the ordering (3/100 with builds running, 0/200 on a quiet box).
+
+**A RETRACTION, RECORDED BECAUSE THE REASONING WAS WRONG IN A USEFUL WAY.** Before this was found, I
+argued the bug was the raw `uint32_t token` stored beside a pooled `DirectEvent*` -- identity kept
+next to the object rather than in it. That is wrong: CancelToken is a 16-bit slot + 16-bit
+GENERATION precisely so a stale handle stops resolving ("that generation check is the whole reason
+the handle is not a bare pointer"), and the list hygiene is correct and documented on both paths
+("REMOVE BEFORE WAKE, never the reverse"). Both halves were already protected. The bug was never
+identity; it was that nobody ever looks.
+
+**THE FIX IS NOT ANOTHER Eject* ENTRY.** A dispatch table that must name every primitive is the same
+bug waiting for the next primitive -- WaitGroup was simply the one that got forgotten. What removes
+the class is making the WAITER responsible for its own exit rather than depending on another party
+choosing to walk a list: a bounded deadline after which it wakes and re-checks. That is the point of
+the timer in the primitives rewrite, and it is a different thing from the timed worker sleep that was
+rejected: a worker's park is signal-driven BY CONTRACT, so a timeout there masks a lost wakeup, while
+a cancellable wait's release depends on an external decision that may never arrive.
