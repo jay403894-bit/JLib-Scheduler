@@ -3677,8 +3677,34 @@ void Thread::Worker() {
 
 				if (onAwakeFloor) {
 					dbgSpinTick.store(++spinTick, std::memory_order_relaxed);
-					if ((spinTick & TaskScheduler::GetSpinYieldMask()) == 0) {
-						if (yieldWithHandshake()) continue;
+
+					// ---- A TINY FLOOR DOES NOT YIELD AT ALL ----------------------------------
+					//
+					// yield() exists so a LARGE spinning set does not pin the machine -- the marl
+					// blocking row, where thirty never-parking workers with a rude spin starved
+					// everything else runnable. Two cores in CpuRelax do not have that problem, and
+					// on a two-bit steer set the yield is actively harmful: a latency row measured
+					// 708 pushes in 20,000 aiming at a worker that had just published WS_YIELD.
+					// With F=2 the steer set has TWO bits, so a yield on either is a coin flip that
+					// the pick landed on the one that stepped off the core. 683 re-aimed to the
+					// sibling; the 25 that stayed are both floor cores in a yield window at once.
+					// Re-aim cannot invent a third floor worker.
+					//
+					// So the handshake, the re-aim and those leftover quanta are all cost paid to
+					// be polite to a problem a small floor does not have. Gate the yield on the
+					// floor being big enough for politeness to matter.
+					const size_t liveF = TaskScheduler::GetAwakeFloor();
+					if (liveF > TaskScheduler::kYieldFloorMin) {
+						// PHASE-STAGGERED BY qIndex, so a large floor cannot enter YIELD in
+						// lockstep. Same mask, different phase per worker: q and q+1 cannot take
+						// the yield arm on the same pass, so the re-aim always has a sibling that
+						// is still EMPTY. This is orthogonal to the gate above -- the gate removes
+						// the yield below the threshold, the stagger desynchronises it above --
+						// so the two never confound a measurement at any single F.
+						if (((spinTick + (unsigned)qIndex) & TaskScheduler::GetSpinYieldMask()) == 0) {
+							if (yieldWithHandshake()) continue;
+						}
+						else platform::CpuRelax();
 					}
 					else platform::CpuRelax();
 					continue;

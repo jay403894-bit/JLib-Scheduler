@@ -643,6 +643,20 @@ namespace JLib {
 		static void   SetSpinYieldMask(unsigned mask) noexcept;
 		static unsigned GetSpinYieldMask() noexcept;
 
+		// BELOW THIS FLOOR SIZE, A FLOOR WORKER DOES NOT YIELD AT ALL -- it stays in CpuRelax.
+		//
+		// yield() is there so a LARGE never-parking set does not pin the machine (thirty spinners
+		// starving everything else runnable). A handful of cores in CpuRelax do not do that, and
+		// below the threshold the yield costs more than it saves: with F=2 the steer set has two
+		// bits, so a yield on either is a coin flip that a push lands on the core that just stepped
+		// off. Measured on a latency row: 708 pushes in 20,000 aimed at a WS_YIELD worker, 683
+		// re-aimed to the sibling, 25 with both floor cores in a yield window at once. The re-aim
+		// cannot invent a third floor worker, so the only fix at F=2 is not to yield.
+		//
+		// 4 is a judgement, not a measurement. It is above the F=2 and F=3 configurations the
+		// latency rows actually use and well below the grown floors the politeness was written for.
+		static constexpr size_t kYieldFloorMin = 4;
+
 		static size_t GetAwakeFloor() noexcept;
 
 		// ---- THE CONTROLLER: the floor moves itself between 1 and the pool size ---------------

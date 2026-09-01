@@ -68,6 +68,7 @@
 #include <cstdint>
 #include <vector>
 #include <thread>
+#include <mutex>       // g_reportMx -- the watcher and the serial loop both print
 #include <atomic>     // the section watchdog
 #include <cstdlib>    // std::_Exit, used by the watchdog
 #include <algorithm>
@@ -794,6 +795,23 @@ static std::atomic<unsigned> g_landedOn[64];
 // Body-entry and body-exit stamps for the round-trip split -- see the task body below. Plain
 // relaxed atomics: exactly one worker writes them per iteration and the serial waiter reads them
 // only after WaitFor has returned, so there is nothing to order against.
+// ---- ONE LOCK FOR BOTH REPORT BLOCKS ---------------------------------------------------------
+//
+// THE TWO PRINTERS RUN ON DIFFERENT THREADS AND WERE INTERLEAVING ON STDOUT. The watcher thread
+// prints STALL IN PROGRESS and the whole pool table; the serial loop prints PATHOLOGICAL ROUND TRIP
+// and its dispatch/execution/completion split. Nothing ordered them, so `queuedTasks=0` would land
+// in the middle of the segment lines and a per-worker row would be cut in half by a timing number.
+//
+// THAT MAKES EVERY DIAGNOSTIC ADDED THIS SESSION UNREADABLE, which is worse than not having them:
+// flr, tick and a YIELD state can all be correct in the code and still arrive as noise. A dump you
+// cannot parse is not evidence, and two people already read a spliced dump as one snapshot.
+//
+// A MUTEX, NOT A BUFFER. The watcher's whole value is that it samples the pool WHILE the trip is
+// stuck -- deferring its output to a side buffer would keep the sample honest but delay it past the
+// row that explains it. Holding a lock across a printf block is fine here: this is a bench, the
+// blocks are rare by construction (one per row), and the alternative is unreadable output.
+static std::mutex g_reportMx;
+
 static std::atomic<long long> g_bodyStartNs{ 0 };
 static std::atomic<long long> g_bodyEndNs{ 0 };
 
@@ -859,6 +877,12 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
 
     // Both counters are per-row, so they describe THIS row and not the warmup that preceded it.
     JLib::TaskScheduler::ResetWakeCount();
+    // AND THE YIELD COUNTERS, for exactly the same reason. They were cumulative across the whole
+    // process, so the pool dump's "N pushes aimed at a YIELDing worker" summed every row including
+    // the throughput floods that grow the floor -- a number that cannot be attributed to any row
+    // and therefore cannot answer whether a change to the yield policy did anything. Two runs of
+    // the same binary read 708 and 4303 on that cumulative counter and neither was evidence.
+    JLib::TaskScheduler::ResetYieldCounters();
 
     // THE FLOOR THIS ROW ACTUALLY RAN UNDER. The banner prints the CONFIGURED floor, which is not
     // the same number: push-side growth can raise it, and the throughput rows above this one push
@@ -934,6 +958,8 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                                           Clock::now().time_since_epoch()).count();
                 if ((double)(now - started) / 1000.0 > kPathologicalUs) {
                     watcherDumped.store(true, std::memory_order_relaxed);
+                    // Serialise against the PATHOLOGICAL ROUND TRIP block -- see g_reportMx.
+                    std::lock_guard<std::mutex> reportLk(g_reportMx);
                     printf("\n  *** STALL IN PROGRESS: this round trip has been outstanding for\n"
                            "      %.1f us and has NOT completed. The pool state below is being read\n"
                            "      WHILE it is stuck, which is the state the old dump could never\n"
@@ -1077,6 +1103,9 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         if (rt > kPathologicalUs && rt > worstRtUs) {
             worstRtUs = rt;
             dumped = true;
+            // Serialise against the watcher's STALL IN PROGRESS block -- see g_reportMx. Held for
+            // the whole report, segments included, so the two never splice.
+            std::lock_guard<std::mutex> reportLk(g_reportMx);
             printf("\n  *** PATHOLOGICAL ROUND TRIP: iteration %d took %.1f us "
                    "(healthy is ~2 us) ***\n", i, rt);
 
@@ -1307,6 +1336,17 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             floorAtLatencyStart, floorN, JLib::TaskScheduler::GetAwakeFloorBase());
         printf("               kernel wakes this row: %llu  (a live floor should need ~0)\n",
             (unsigned long long)JLib::TaskScheduler::GetWakeCount());
+        // PER-ROW, next to the wake count, because they answer the same question from two sides:
+        // a push that costs nothing is one that neither bought a syscall nor landed on a core that
+        // had stepped off. At F <= kYieldFloorMin the floor does not yield at all, so this should
+        // read 0 -- and if it does not, the gate is not doing what it claims.
+        {
+            const unsigned aim = JLib::TaskScheduler::YieldAimCount();
+            const unsigned re  = JLib::TaskScheduler::YieldReaimCount();
+            printf("               aimed at a YIELDing worker: %u of %u", aim, total);
+            if (aim == 0) printf("  (the floor never left the core this row)\n");
+            else          printf(", %u re-aimed, %u kept it (a quantum late)\n", re, aim - re);
+        }
         // 100.0% ONLY WHEN IT IS ALL OF THEM. %.1f rounded 19999/20000 to "100.0%", so a row with a
         // push that missed the floor -- the one interesting event in twenty thousand -- read as
         // perfect. That is the same failure as a control that cannot go red: the number nobody
