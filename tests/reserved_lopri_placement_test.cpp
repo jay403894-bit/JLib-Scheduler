@@ -82,6 +82,7 @@ static void Arm(const char* name, size_t floor) {
     // arm green for the wrong reason.
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
+    JLib::TaskScheduler::ResetYieldCounters();
     g_ran.store(0, std::memory_order_relaxed);
     for (int i = 0; i < kMaxW; ++i) g_ranOn[i].store(0, std::memory_order_relaxed);
 
@@ -109,6 +110,14 @@ static void Arm(const char* name, size_t floor) {
     }
     std::printf("  created %d, ran %d, on [0,%zu) = %d, on [%zu,%zu) = %d\n",
                 created, ran, k, onReserved, k, n, onCompute);
+
+    // INFORMATIONAL, NOT ASSERTED. The yield window is timing-dependent -- whether a push lands
+    // while a floor worker is off the core depends on the machine, not on the code under test --
+    // so asserting a count here would be a flake generator. It is printed because a mechanism whose
+    // rate is never shown is a mechanism nobody can A/B: "no difference" and "it never ran" look
+    // identical. ARM 2 runs with a floor, so this is where a non-zero count should appear.
+    std::printf("  yield re-aim: %u push(es) aimed at a YIELDing worker, %u re-aimed\n",
+                JLib::TaskScheduler::YieldAimCount(), JLib::TaskScheduler::YieldReaimCount());
 
     // THE INVARIANT. A task placed on a reserved worker's loPri inbox can never run: nobody may
     // drain it. So a short count IS a placement violation.

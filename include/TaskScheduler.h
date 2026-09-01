@@ -683,6 +683,28 @@ namespace JLib {
 		// promote signal; see MaybeAdjustAwakeFloor.
 		static void NoteWakeMiss() noexcept;
 
+		// ---- DID THE YIELD RE-AIM EVER FIRE? -------------------------------------------------
+		//
+		// WITHOUT THESE, AN A/B ON THE FOURTH STATE IS UNANSWERABLE. "No difference" and "the
+		// mechanism never ran" produce identical output, and this repository has already published
+		// one park-primitive A/B that turned out to be measuring a path taken by under 1% of the
+		// row. So the mechanism has to report its own rate before any number about it is worth
+		// reading.
+		//
+		//   YieldAimCount()    pushes whose chosen candidate read WS_YIELD -- i.e. how often the
+		//                      floor's yield window is actually in the way of a push
+		//   YieldReaimCount()  of those, how many found another awake worker in the same bitmap
+		//                      word and moved. The difference is the pushes that kept a yielding
+		//                      target because there was no alternative -- safe, just late.
+		//
+		// A zero AIM count means the window is never hit and the whole fourth state is costing a
+		// load per push for nothing. A high AIM with a low REAIM means the alternative search is
+		// too narrow (one word, one step) rather than the state being useless. Read both.
+		static unsigned YieldAimCount() noexcept;
+		static unsigned YieldReaimCount() noexcept;
+		static void     ResetYieldCounters() noexcept;
+		static void     NoteYieldAim(bool reaimed) noexcept;
+
 		// ---- LANE OVERFLOW: KEEP hiPri WORK REACHABLE WHEN ITS OWNER CANNOT REACH IT ----------
 		//
 		// Returns the worker a hiPri task should ACTUALLY go to, given the one placement picked.

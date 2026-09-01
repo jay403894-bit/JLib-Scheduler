@@ -3648,11 +3648,21 @@ void Thread::Worker() {
 						// already chosen -- see the re-aim note there.
 						std::this_thread::yield();
 
-						// AFTER: CAS back, NEVER store. A plain store(WS_EMPTY) here wipes a permit
-						// that landed while we were off the core -- and the producer that latched
-						// it already read prev == WS_YIELD and decided it owed no syscall, so
-						// nothing will ever re-announce that work. That is the one control in
-						// yieldstate_model.c that loses a task rather than just delaying it.
+						// AFTER: CAS back, NEVER store.
+						//
+						// A plain store(WS_EMPTY) here wipes a permit that landed while we were off
+						// the core, and the producer that latched it already read prev == WS_YIELD
+						// and decided it owed no syscall.
+						//
+						// WHAT THAT COSTS, STATED HONESTLY, because the model overstates it and the
+						// first version of this comment repeated the overstatement. In
+						// yieldstate_model.c the permit IS the only record of the work, so
+						// -DYIELD_STORE_BACK loses a task. HERE IT LOSES A WAKE: the work is in the
+						// inbox or the deque and hasQueuedWork is set, so this worker's next scan
+						// finds it regardless. It becomes a lost TASK only in the narrow case where
+						// the floor sheds under this worker -- onAwakeFloor is re-read every pass --
+						// and it goes on to the park block having destroyed a wake that was owed.
+						// Narrow, real, and cheaper to close than to reason about again later.
 						int back = WS_YIELD;
 						if (!workerState.compare_exchange_strong(back, WS_EMPTY,
 								std::memory_order_seq_cst, std::memory_order_relaxed)) {

@@ -865,6 +865,20 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		       awake, GetAwakeFloor(), awake ? "CAN" : "CANNOT");
 	}
 
+	// THE YIELD WINDOW, IN THE DUMP RATHER THAN ONLY IN A BENCH, because this is the report someone
+	// reads when a worker looks AWAKE and nothing is happening -- which is the exact symptom the
+	// fourth state exists to explain. `aimed` counts pushes whose chosen candidate was off the core
+	// in its yield window; `re-aimed` counts the ones that found somewhere else to go. aimed == 0
+	// means the window is never in the way and the state is costing a load per push for nothing.
+	{
+		const unsigned aim = YieldAimCount(), re = YieldReaimCount();
+		printf("  yield window: %u push(es) aimed at a YIELDing worker, %u re-aimed"
+		       "  -> %s\n", aim, re,
+		       aim == 0 ? "never hit (the state is buying nothing here)"
+		                : (re == aim ? "always found an alternative"
+		                             : "some kept a yielding target (safe, one quantum late)"));
+	}
+
 	// `phase` is the breadcrumb -- WHERE in Worker() that thread last was. Prints "-" unless the
 	// build has JLIBSCHED_STEAL_STATS. It is the column this dump was missing: "AWAKE with empty
 	// queues" is a protocol state, not a location, and for a multi-millisecond stall the question
@@ -1913,6 +1927,22 @@ size_t TaskScheduler::HiPriSpillTarget(size_t chosen) noexcept {
 
 void TaskScheduler::NoteWakeMiss() noexcept {
 	g_wakeMisses.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Relaxed, and they are diagnostics rather than control inputs -- nothing branches on them, so they
+// buy no ordering and must not pretend to. See the header for why a zero AIM count is the important
+// reading and not a boring one.
+static std::atomic<unsigned> g_yieldAimed{ 0 };    // chosen candidate read WS_YIELD
+static std::atomic<unsigned> g_yieldReaimed{ 0 };  // ...and an alternative was found
+void     TaskScheduler::NoteYieldAim(bool reaimed) noexcept {
+	g_yieldAimed.fetch_add(1, std::memory_order_relaxed);
+	if (reaimed) g_yieldReaimed.fetch_add(1, std::memory_order_relaxed);
+}
+unsigned TaskScheduler::YieldAimCount() noexcept   { return g_yieldAimed.load(std::memory_order_relaxed); }
+unsigned TaskScheduler::YieldReaimCount() noexcept { return g_yieldReaimed.load(std::memory_order_relaxed); }
+void     TaskScheduler::ResetYieldCounters() noexcept {
+	g_yieldAimed.store(0, std::memory_order_relaxed);
+	g_yieldReaimed.store(0, std::memory_order_relaxed);
 }
 
 // The ceiling on push-side growth. A burst wider than this still serialises above the cap, which is
@@ -6056,11 +6086,16 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 				// change the instant after this load either way.
 				if (idx < workers.size()
 				    && workers[idx]->GetWorkerState() == Thread::WS_YIELD) {
+					bool reaimed = false;
 					const unsigned long long rest = word & (word - 1);
 					if (rest) {
 						const size_t alt = w * 64 + platform::CountTrailingZeros64(rest);
-						if (alt < workers.size()) idx = alt;
+						if (alt < workers.size()) { idx = alt; reaimed = true; }
 					}
+					// COUNTED BOTH WAYS -- see YieldAimCount() in the header. A zero AIM count means
+					// the yield window is never in the way of a push and this whole state is a load
+					// per push for nothing; that is the reading worth having before any A/B of it.
+					NoteYieldAim(reaimed);
 				}
 				// NO PER-PUSH SPILL HERE, and both attempts at one are worth recording so they are
 				// not retried. The idea was: prefer an awake worker UNLESS it is already occupied,
