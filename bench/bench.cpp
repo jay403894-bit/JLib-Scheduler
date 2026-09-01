@@ -834,6 +834,15 @@ static bool g_waiterPin = false;   // `waiterpin` -- see the flag note in main()
 
 static std::atomic<unsigned> g_bodyCpu{ ~0u };
 static std::atomic<unsigned> g_bodyTick{ 0u };   // the running worker's idle-pass count at pickup
+// SIGNED, AND A NEGATIVE MEANS THE BODY BEAT THE SAMPLE. tickBefore is read after Push returns, but
+// on a fast dispatch a worker can pick the task up and stamp g_bodyTick before this thread gets
+// there -- so the subtraction can go backwards and, unsigned, wrapped to 4294967143. That case is
+// not an error: it means dispatch was effectively instant, which is the opposite of a stall. Clamp
+// to 0 and let the "not executing / not diagnostic" arms handle it.
+static inline unsigned IdlePassDelta(unsigned after, unsigned before) {
+    const long long d = (long long)(unsigned long long)after - (long long)(unsigned long long)before;
+    return (d <= 0) ? 0u : (unsigned)d;
+}
 
 static std::atomic<long long> g_bodyStartNs{ 0 };
 static std::atomic<long long> g_bodyEndNs{ 0 };
@@ -892,6 +901,12 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     // One exemplar per WHO-class, so the classifier can never name a class whose evidence is
     // missing -- see the gate at the pathological print. Index 1 pool, 2 waiter, 3 pusher.
     bool classDumped[4] = { false, false, false, false };
+    // THE IMPLICATED TRIP MUST NEVER BE SUPPRESSED. Printing first-of-class is not enough: a
+    // NON-implicated trip of the same class can take the slot first, and then the one stall that
+    // actually indicts the scheduler is counted in the headline and never shown. That happened on
+    // the first run that reported SCHEDULER-IMPLICATED: 1 of 2 -- the block printed was the other
+    // one, reading `idle passes: 0`.
+    bool implicatedDumped = false;
     double worstRtUs = 0.0;   // report on each new worst -- see the report site
     // Stall tally by dominant segment. The comparable output of this row; see the classify site.
     unsigned long long stallCount = 0, stallDispatch = 0, stallExecution = 0, stallCompletion = 0;
@@ -1178,6 +1193,9 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // WHICH class this iteration fell into: 0 none, 1 pool, 2 waiter, 3 pusher. Set by the
         // tally below and read by the exemplar gate further down.
         int whoClass = 0;
+        // Set by the tally if this trip is the conjunction that means a real defect. Drives the
+        // exemplar gate: an implicated trip must ALWAYS print, whatever else printed first.
+        bool schedImplicated = false;
         const unsigned wPolls  = JLib::TaskScheduler::LastBareWaitPolls();
         const unsigned wYields = JLib::TaskScheduler::LastBareWaitYields();
         const unsigned wHelped = JLib::TaskScheduler::LastBareWaitHelped();
@@ -1258,13 +1276,33 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                 // Anything else is the OS failing to run one of the three threads involved,
                 // which no scheduler change can fix.
                 {
+                    // FROM pushDoneNs, NOT pushIssuedNs. `dispatch` as printed is issue -> body
+                    // start, which CONTAINS the push call -- so comparing the two is comparing a
+                    // span with a subset of itself and is true almost by construction. A 107 us
+                    // PUSHER-late trip duly reported "the worker was NOT EXECUTING" when the
+                    // worker had nothing to do with it. The worker-attributable span is body-start
+                    // minus push-RETURNED, which is also exactly the window tickBefore samples.
+                    // >= 2, NOT >= 1, AND THE FIRST PASS IS AMBIGUOUS BY CONSTRUCTION. tickBefore
+                    // is sampled after Push returns, so the work is certainly in the queue -- but a
+                    // pass ALREADY IN FLIGHT at that instant read the queue before it landed and
+                    // still counts toward the delta. So one pass is a visibility race, not a miss.
+                    // Two means the worker completed a whole search AFTER the work was there and
+                    // came back for another without taking it.
+                    //
+                    // Seen: 3.5 us trips reporting delta == 1 and being labelled a SCHEDULER
+                    // defect. At a 3 us threshold that is the ordinary dispatch of a task that
+                    // arrived mid-pass, which is exactly what a 0.6 us p50 is made of.
+                    const unsigned kMissedPasses = 2;
+                    const long long workerDispatchNs = sbs - pushDoneNs;
                     const bool dispatchDom =
-                        (sbs - pushIssuedNs) > (returnedNs - sbe) &&
-                        (sbs - pushIssuedNs) > (pushDoneNs - pushIssuedNs);
+                        workerDispatchNs > (returnedNs - sbe) &&
+                        workerDispatchNs > (pushDoneNs - pushIssuedNs);
                     const int bq = g_bodyQ.load(std::memory_order_relaxed);
                     if (dispatchDom && bq >= 0 && (size_t)bq < tickN
-                        && (g_bodyTick.load(std::memory_order_relaxed) - tickBefore[bq]) > 0)
+                        && IdlePassDelta(g_bodyTick.load(std::memory_order_relaxed), tickBefore[bq]) >= kMissedPasses) {
                         ++stallSchedulerImplicated;
+                        schedImplicated = true;
+                    }
                 }
 
                 const double pushUs = (double)(pushDoneNs - pushIssuedNs) / 1000.0;
@@ -1299,18 +1337,23 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // So the first trip of EACH class also prints, whatever its duration. Bounded by three
         // extra blocks per row, and it means the classifier can never name a class whose evidence
         // is missing.
-        const bool firstOfClass = (whoClass > 0 && !classDumped[whoClass]);
-        if (rt > kPathologicalUs && (rt > worstRtUs || firstOfClass)) {
+        const bool firstOfClass  = (whoClass > 0 && !classDumped[whoClass]);
+        const bool firstImplicated = (schedImplicated && !implicatedDumped);
+        if (rt > kPathologicalUs && (rt > worstRtUs || firstOfClass || firstImplicated)) {
             if (rt > worstRtUs) worstRtUs = rt;
             if (whoClass > 0) classDumped[whoClass] = true;
+            if (schedImplicated) implicatedDumped = true;
             dumped = true;
             // Serialise against the watcher's STALL IN PROGRESS block -- see g_reportMx. Held for
             // the whole report, segments included, so the two never splice.
             std::lock_guard<std::mutex> reportLk(g_reportMx);
-            printf("\n  *** PATHOLOGICAL ROUND TRIP [%s]: iteration %d took %.1f us "
+            printf("\n  *** PATHOLOGICAL ROUND TRIP [%s%s]: iteration %d took %.1f us "
                    "(healthy is ~2 us) ***\n",
                    whoClass == 1 ? "POOL late" : whoClass == 2 ? "WAITER late"
                                  : whoClass == 3 ? "PUSHER late" : "unclassified",
+                   // Say it in the HEADING. A reader scanning three blocks for the one that matters
+                   // should not have to find the idle-pass line in each of them.
+                   schedImplicated ? ", SCHEDULER-IMPLICATED" : "",
                    i, rt);
 
             // ---- WHERE THE OUTLIER ACTUALLY LIVES ----------------------------------------
@@ -1479,21 +1522,27 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                 const int      bq = g_bodyQ.load(std::memory_order_relaxed);
                 const unsigned bt = g_bodyTick.load(std::memory_order_relaxed);
                 if (bq >= 0 && (size_t)bq < (int)tickN) {
-                    const unsigned d = bt - tickBefore[bq];
+                    const unsigned d = IdlePassDelta(bt, tickBefore[bq]);
                     // THE CONCLUSION ONLY HOLDS IF DISPATCH IS WHERE THE TIME WENT. On a
                     // PUSHER-late trip the dispatch window contains the PUSHER's stall, so the
                     // worker idles for it legitimately -- a large count there is a worker with
                     // nothing to do, not a worker ignoring its inbox. The first version of this
                     // line shouted SCHEDULER at exactly that case.
+                    // Same span as the counter above -- body start minus push RETURNED. See there.
+                    const long long workerDispatchNs2 = bs - pushDoneNs;
                     const bool dispatchDominates =
-                        (bs - pushIssuedNs) > (returnedNs - be) &&
-                        (bs - pushIssuedNs) > (pushDoneNs - pushIssuedNs);
+                        workerDispatchNs2 > (returnedNs - be) &&
+                        workerDispatchNs2 > (pushDoneNs - pushIssuedNs);
                     printf("      q%d idle passes while the task waited: %u   <- %s\n", bq, d,
                            !dispatchDominates
                                ? "dispatch is not where this trip went; not diagnostic here"
-                               : (d == 0 ? "it was NOT EXECUTING; the OS did not run it"
-                                         : "it WAS scanning and did not take its own inbox:"
-                                           " a SCHEDULER defect"));
+                               : d == 0
+                                   ? "it was NOT EXECUTING; the OS did not run it"
+                                   : d < 2
+                                       ? "one pass, in flight when the work landed -- a visibility"
+                                         " race, not a miss"
+                                       : "it WAS scanning and did not take its own inbox:"
+                                         " a SCHEDULER defect");
                 }
                 else {
                     printf("      (body ran on q%d, outside the sampled floor -- no data)\n", bq);
