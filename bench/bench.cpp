@@ -871,6 +871,8 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     unsigned long long stallCount = 0, stallDispatch = 0, stallExecution = 0, stallCompletion = 0;
     // WHO was late, as opposed to WHERE the time went -- see the classifier at the tally site.
     unsigned long long stallPoolLate = 0, stallWaiterLate = 0, stallUnclassified = 0;
+    // A THIRD PARTY CAN BE LATE: the thread calling Push. Measured directly, not inferred.
+    unsigned long long stallPusherLate = 0;
     unsigned long long stallWithWake = 0;
     double maxDispatchUs = 0.0, maxExecutionUs = 0.0, maxCompletionUs = 0.0;
     // Healthy-iteration poll rate, the yardstick the stall report is read against. See the
@@ -1044,6 +1046,24 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         rtInFlightNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                rtStart.time_since_epoch()).count(),
                            std::memory_order_release);
+        // ---- TWO STAMPS AROUND Push, AND THE ORIGIN IS THE FIRST ONE --------------------------
+        //
+        // DISPATCH USED TO BE MEASURED FROM AFTER Push RETURNED, and that is why the report could
+        // print `dispatch -43.8 us`. The body stamps its own start as soon as a worker picks the
+        // task up -- which can be BEFORE this thread gets the clock back -- so the subtraction ran
+        // backwards. A negative microsecond count in a latency report is not a scheduler hole and
+        // must not be debugged as one; it is the instrument measuring itself.
+        //
+        // FROM ISSUE, NOT FROM RETURN. The body cannot start before the push is issued, so this
+        // origin cannot go negative, and the push's own cost belongs in dispatch anyway -- it is
+        // time the task spent not running.
+        //
+        // AND THE GAP BETWEEN THEM IS A SIGNAL, not overhead to be hidden. Push is a handful of
+        // atomics; if it took tens of microseconds, THIS THREAD was descheduled inside it. That is
+        // the same preemption the `waiter` segment catches on the other side of the trip, and it
+        // was previously indistinguishable from a slow dispatch because it landed in the same
+        // number -- with a minus sign in front of it.
+        const long long pushIssuedNs = NowNs();
         sched.Push(t);
         const long long pushDoneNs = NowNs();
         sched.WaitFor(wg);
@@ -1082,7 +1102,7 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             const long long sbs = g_bodyStartNs.load(std::memory_order_relaxed);
             const long long sbe = g_bodyEndNs.load(std::memory_order_relaxed);
             if (sbs != 0 && sbe != 0) {
-                const double dUs = (double)(sbs - pushDoneNs) / 1000.0;
+                const double dUs = (double)(sbs - pushIssuedNs) / 1000.0;
                 const double eUs = (double)(sbe - sbs)        / 1000.0;
                 const double cUs = (double)(returnedNs - sbe) / 1000.0;
                 if      (dUs >= eUs && dUs >= cUs) { ++stallDispatch;   if (dUs > maxDispatchUs)   maxDispatchUs   = dUs; }
@@ -1110,9 +1130,16 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                 // rt / healthyPollRate polls. Half of that is a generous floor -- anything below
                 // it did not spend the stall spinning. Using the row's own rate means this does
                 // not need retuning per machine, which a hardcoded 125 ns would.
+                // PUSHER FIRST, because it is measured directly and the other two are inferred.
+                // If most of the trip was spent INSIDE Push -- a handful of atomics -- then this
+                // thread was descheduled there and neither the pool nor the waiter was late. A
+                // 182 us trip with push call 182 us was being counted as "pool late" and would
+                // have sent the next week into the scheduler.
                 const double healthyRate = (healthyPollN && healthyPollSum)
                                          ? (double)healthyPollSum / (double)healthyPollN : 0.0;
-                if (healthyRate > 0.0) {
+                const double pushUs = (double)(pushDoneNs - pushIssuedNs) / 1000.0;
+                if (pushUs >= rt * 0.5) { ++stallPusherLate; }
+                else if (healthyRate > 0.0) {
                     const double expectedIfSpinning = rt / (2.0 / healthyRate);   // rt us at ~healthy us/poll
                     if ((double)wPolls >= expectedIfSpinning * 0.5) ++stallPoolLate;
                     else                                            ++stallWaiterLate;
@@ -1144,8 +1171,14 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             const long long bs = g_bodyStartNs.load(std::memory_order_relaxed);
             const long long be = g_bodyEndNs.load(std::memory_order_relaxed);
             if (bs != 0 && be != 0) {
-                printf("      dispatch   (push -> body start)  %8.1f us\n",
-                       (double)(bs - pushDoneNs) / 1000.0);
+                // THE PUSH CALL ITSELF, and it is a preemption detector rather than overhead.
+                // Push is a handful of atomics; tens of microseconds here means the PUSHING thread
+                // was descheduled inside it. That used to be invisible -- it landed inside
+                // `dispatch` and turned it negative, which read as a scheduler hole and is not one.
+                printf("      push call  (issue -> return)     %8.1f us   <- large = the PUSHER preempted\n",
+                       (double)(pushDoneNs - pushIssuedNs) / 1000.0);
+                printf("      dispatch   (issue -> body start) %8.1f us\n",
+                       (double)(bs - pushIssuedNs) / 1000.0);
                 printf("      execution  (body start -> end)   %8.1f us   <- large = worker PREEMPTED\n",
                        (double)(be - bs) / 1000.0);
                 printf("      completion (body end -> return)  %8.1f us   <- large = the WAITER\n",
@@ -1322,10 +1355,13 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                "               ALREADY AWAKE, so no OS wake is in them at all\n", stallWithWake);
         // WHO was late. The line above says where the time went; this says which half of the
         // system to go and look at, and they do not always agree.
-        printf("               WHO was late:  pool %llu | waiter %llu",
-               stallPoolLate, stallWaiterLate);
+        printf("               WHO was late:  pool %llu | waiter %llu | pusher %llu",
+               stallPoolLate, stallWaiterLate, stallPusherLate);
         if (stallUnclassified) printf(" | unclassified %llu", stallUnclassified);
         printf("\n"
+               "                 pusher -> most of the trip was spent INSIDE Push, which is a few\n"
+               "                           atomics. That thread was descheduled there; neither the\n"
+               "                           pool nor the waiter was late. Measured, not inferred.\n"
                "                 pool   -> the waiter spun the whole time and kept seeing n>0.\n"
                "                           Work existed and nobody took it: a SCHEDULER problem.\n"
                "                 waiter -> few polls across a long trip means the calling thread\n"
