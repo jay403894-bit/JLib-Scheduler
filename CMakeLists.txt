@@ -48,6 +48,7 @@ set(JLIBSCHED_VERSION "5.0.0")
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
 option(JLIBSCHED_RETRY_STATS "Record CAS retries per call -- max and buckets, not an average (diagnostic; sits inside CAS loops)" OFF)
+option(JLIBSCHED_REQUEUE_TRACE "Count which of Requeue's three exits each resume takes (diagnostic; sits on the resume path)" OFF)
 # ---- THREAD SANITIZER ------------------------------------------------------------------------
 #
 # Finds data races by watching actual memory accesses and computing happens-before. The reason it is
@@ -421,6 +422,10 @@ endif()
 if(JLIBSCHED_RETRY_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_RETRY_STATS=1)
     message(STATUS "JLib::Scheduler: CAS retry distribution ON (diagnostic build, not for perf numbers)")
+endif()
+if(JLIBSCHED_REQUEUE_TRACE)
+    target_compile_definitions(Scheduler PUBLIC JLIBSCHED_REQUEUE_TRACE=1)
+    message(STATUS "JLib::Scheduler: Requeue branch trace ON (diagnostic build, not for perf numbers)")
 endif()
 if(JLIBSCHED_HOT_OCCUPANCY_STATS)
     target_compile_definitions(Scheduler PUBLIC JLIBSCHED_HOT_OCCUPANCY_STATS=1)

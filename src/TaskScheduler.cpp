@@ -5675,6 +5675,39 @@ bool TaskScheduler::PushResume(size_t worker, Task* task) {
 }
 bool TaskScheduler::MigratableFibers() { return g_migratableFibers.load(std::memory_order_relaxed); }
 
+// ---- REQUEUE BRANCH TRACE -------------------------------------------------------------------
+//
+// See the header. Three exits, counted separately, compiled out unless the option is on.
+#if defined(JLIBSCHED_REQUEUE_TRACE)
+static std::atomic<uint64_t> g_rqLane{ 0 };     // migratable + on a worker -> own deque bottom
+static std::atomic<uint64_t> g_rqPinned{ 0 };   // pinned -> binding worker's resume inbox
+static std::atomic<uint64_t> g_rqPlaced{ 0 };   // ordinary placement -> PickNextWorker
+static std::atomic<uint64_t> g_rqNoFiber{ 0 };  // no assignedFiber: a fresh task, not a resume
+// PLACEMENT IS NOT THE SAME QUESTION AS MIGRATION. `placed` only says Requeue reached
+// PickNextWorker; it does not say the answer DIFFERED from the worker the fiber was bound on.
+// Round-robin can spread perfectly and still hand every task back to its own home if the wake
+// order tracks the submission order, because both passes rotate the same counter.
+static std::atomic<uint64_t> g_rqPlacedHome{ 0 };  // ... and PickNextWorker returned homeWorker
+#define JLIB_RQ_BUMP(c) (c).fetch_add(1, std::memory_order_relaxed)
+void TaskScheduler::RequeueTraceReset() {
+	g_rqLane.store(0); g_rqPinned.store(0); g_rqPlaced.store(0); g_rqNoFiber.store(0);
+	g_rqPlacedHome.store(0);
+}
+void TaskScheduler::RequeueTraceReport(const char* label) {
+	std::printf("  [requeue trace] %-12s lane(own deque)=%llu  pinned(inbox)=%llu  "
+		"placed=%llu (of which chose home=%llu)  no-fiber=%llu\n", label ? label : "",
+		(unsigned long long)g_rqLane.load(), (unsigned long long)g_rqPinned.load(),
+		(unsigned long long)g_rqPlaced.load(), (unsigned long long)g_rqPlacedHome.load(),
+		(unsigned long long)g_rqNoFiber.load());
+}
+#else
+#define JLIB_RQ_BUMP(c) ((void)0)
+void TaskScheduler::RequeueTraceReset() {}
+void TaskScheduler::RequeueTraceReport(const char*) {
+	std::printf("  [requeue trace] not compiled in -- configure with -DJLIBSCHED_REQUEUE_TRACE=ON\n");
+}
+#endif
+
 #if defined(JLIBSCHED_TASK_STATS)
 // Prints the task-size histogram AND the class-boundary arithmetic.
 //
@@ -5963,9 +5996,10 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// NO LANE -> FALL THROUGH. Requeue can be called from a bare thread (Fiber.cpp's resume path,
 	// the redistribute path), which owns no deque. Those take the ordinary placement below rather
 	// than inventing a target.
+	if (!task->assignedFiber) JLIB_RQ_BUMP(g_rqNoFiber);
 	if (MigratableFibers() && task->assignedFiber) {
 		if (TaskDeque* lane = LaneForCurrentThread()) {
-			if (lane->push_bottom(task)) return RequeueResult::Stealable;
+			if (lane->push_bottom(task)) { JLIB_RQ_BUMP(g_rqLane); return RequeueResult::Stealable; }
 			// push_bottom refuses only at the growth ceiling. Falling through to placement is
 			// better than dropping a resumed fiber, which would strand a live 64KB stack.
 		}
@@ -6029,6 +6063,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 			// A departing worker handing its own leftovers to its (stealable) deque has no race in
 			// it, because only that worker can be doing it.
 			if (home < resumedInboxes.size()) {
+				JLIB_RQ_BUMP(g_rqPinned);
 				resumedInboxes[home]->push(task);
 				NoteInboxPush(1);
 				workers[home]->MarkQueuedWork();
@@ -6044,7 +6079,14 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// HiPriLaneActive(), NOT hotN -- see the identical fix above.
 
 	const bool useHi = task->hiPri && HiPriLaneActive();
+	if (task->assignedFiber) JLIB_RQ_BUMP(g_rqPlaced);
 	const uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
+#if defined(JLIBSCHED_REQUEUE_TRACE)
+	if (task->assignedFiber) {
+		if ((size_t)chosen == task->assignedFiber->homeWorker) JLIB_RQ_BUMP(g_rqPlacedHome);
+		task->assignedFiber->lastPlacedOn = (size_t)chosen;
+	}
+#endif
 	if (useHi) {
 		// Same hook as PushLocal, and it has to be here too: a RESUMED completion queueing behind
 		// another is the exact pressure the K controller is meant to see, and on an I/O workload

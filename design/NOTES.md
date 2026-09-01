@@ -1340,3 +1340,83 @@ records WHAT, and no marker means no task.
 chain, one-shot CAS recycle), death hook, registration at pickup, ResetForReuse on acquire.
 NOT built: anything that SETS a kind (no resource wrapper exists), the reverse enumeration above,
 and migratable resume still reports 0 migrations in its own test with the flag confirmed TRUE.
+
+## Migration and thread_local: what is safe, what is enforced, and what was parked
+
+Found while getting `migratable_fiber_test` from RED to GREEN. The test reported **0 migrations**
+while the router reported **186-203 of 256 resumes sent away from home**. The routing was right the
+whole time; the test could not see it.
+
+`CurrentQ()` was inlined, so MSVC loaded the TLS address of `Thread::instance` ONCE and reused it on
+both sides of the wait -- across `WaitOnEventArmed`, an opaque extern call that context-switches. A
+fiber that suspended on worker 1 and resumed on worker 4 read worker 1's TLS block and reported "I
+did not move." Marking `CurrentQ()` `noinline` took it from 0 to 206 with no scheduler change at all.
+
+**The compiler caches TLS across an opaque call.** That is measured here, not assumed.
+
+### The pattern the reclamation code already uses
+
+`CurrentEpochSlot()` (Thread.h) is the precedent, and it is two halves, not one:
+
+- **Storage on the fiber** -- the slot is `&f->localEpoch`, so it travels with the fiber.
+- **Access through TLS** -- it is reached via `Thread::GetCurrent()->currentFiber`, which is exactly
+  the read that can go stale.
+
+Its comment says the fiber branch is "migration-proof." The SLOT is. The LOOKUP is not. What makes
+it safe is a separate, ENFORCED invariant: `JLIB_EPOCH_CHECK_NO_GUARD` fires at all eleven suspend
+points (`Suspend`, `CoYield`, `WaitOnEvent`, `WaitFor`, `WaitOnEventArmed`, `WaitOnEventDirectArmed`,
+both `SchedulerMutex` locks, both `Semaphore` waits, fiber exit). A guard cannot span a switch, so
+the cached TLS cannot go stale inside one.
+
+So the rule for any new fiber-affine state is: **storage on the fiber, access via TLS, correct only
+inside an enforced no-suspend window.** Do not hold a TLS-derived value across a suspend.
+
+### Parked: registry identity (tail-1)
+
+Considered and NOT built. The idea was that registration returns "are you first", and a caller that
+needs the PREVIOUS worker reads tail-1 of a per-fiber pickup list (you register yourself at the tail).
+
+It has no caller. Every candidate is answered by something already built:
+
+- "Which workers do I owe?" -> the creditor bitmask, which dedups by construction.
+- "Run this on that worker" -> the return-sender task. It does not NAME the thread, it STANDS on it:
+  `AdvanceCleanup` takes a creditor out of the mask (already the worker id, and what selects the
+  inbox), mails the work there, and `Thread::GetCurrent()` is correct when it runs.
+
+Naming the previous thread would only be needed to decide something BEFORE dispatch, or to have
+someone other than the owner release the state. Neither exists. Building it now would add a second
+identity source drifting alongside the bitmask.
+
+A stack-pointer anchor was also proposed (`(addr - arenaBase) >> 16`; the arena is one contiguous
+reservation at a uniform 64 KB stride, and the bounds test doubles as `isOnFiber`). It is layout-
+viable and also has no caller, for the same reason -- the enforced window makes the TLS lookup fine.
+Note it does NOT survive the planned third stack size class unchanged: a second arena with a
+different stride turns it into a small sorted `{base, end, log2stride, firstIndex}` table.
+
+### User thread_local: pinned mode, and why a registry does not fix it
+
+No FTL that migrates caches the user's `thread_local`, and we do not either. A
+`vector<std::any>` registry was considered and rejected -- not mainly for type erasure and the
+allocation per entry, but because it does not close the hole. What makes user TLS dangerous is that
+it is IMPLICIT: someone writes `thread_local int depth;` and nothing tells us it exists. A registry
+holds only what was DECLARED, so anything forgotten is still broken and still silent, and "forgot
+one" is indistinguishable from "correct" until it corrupts.
+
+**Pinned mode is sound for all user TLS, including the ones we were never told about.** That is the
+contract, and it is a correctness contract, not a performance note:
+
+> If your task bodies keep thread-affine state across a suspend, run pinned.
+
+The constructive alternative, if one is ever wanted: a typed `FiberLocal<T>` anchored on the fiber,
+so `thread_local X` ports to `FiberLocal<X>` and is correct under migration by construction. Not
+built.
+
+### The diagnostic that settled it
+
+`JLIBSCHED_REQUEUE_TRACE` (CMake option, default OFF) counts Requeue's three exits -- lane / pinned
+/ placed -- plus how many placements chose home, and stamps `Fiber::lastPlacedOn`.
+
+THE STAMP IS THE POINT. Two aggregate counters each counted honestly and disagreed 203-vs-2, and
+neither could check the other because they never counted the same task. Joining them on ONE task --
+the router stamps where it sent the fiber, the fiber reads it back after it wakes -- is what made
+the disagreement legible instead of just puzzling.

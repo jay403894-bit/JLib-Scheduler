@@ -2400,6 +2400,20 @@ namespace JLib {
 		static void SetMigratableFibers(bool on);
 		static bool MigratableFibers();
 
+		// ---- WHICH BRANCH DID A RESUME TAKE? (diagnostic, OFF unless JLIBSCHED_REQUEUE_TRACE) ---
+		//
+		// Requeue has three exits and they are indistinguishable from outside, which is exactly the
+		// blindness that let migratable_fiber_test report "0 migrations" for a reason that had
+		// nothing to do with the routing: the resume did not come from where the test assumed.
+		// A caller ON A WORKER lands in the lane branch and pushes to ITS OWN deque bottom, which
+		// is stealable but is also the owner's LIFO end -- so it is re-popped locally and looks
+		// exactly like pinning. A caller on a BARE THREAD has no lane and falls to placement.
+		//
+		// Counting the exits separates those. Compiled out entirely by default: this sits on the
+		// resume path and the push path is measured.
+		static void RequeueTraceReset();
+		static void RequeueTraceReport(const char* label);
+
 		// ---- PushBatch PLACES Wide: EXPERIMENT, DEFAULT OFF ------------------------------------
 		//
 		// A CALLER HANDING OVER N TASKS AT ONCE HAS DECLARED A BURST, which is the one honest burst

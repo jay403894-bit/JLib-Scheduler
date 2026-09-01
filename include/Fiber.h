@@ -54,6 +54,17 @@ namespace JLib {
 		// SIZE_MAX means "not bound" -- a fiber sitting in a pool cache. It is not a valid target.
 		size_t homeWorker = SIZE_MAX;
 
+#if defined(JLIBSCHED_REQUEUE_TRACE)
+		// WHERE Requeue SENT THIS FIBER on its last resume, stamped by the router and read back by
+		// the fiber once it is running again. Diagnostic only, compiled out by default.
+		//
+		// IT EXISTS BECAUSE TWO SEPARATE INSTRUMENTS DISAGREED and neither could settle it: the
+		// router reported 178 of 256 resumes routed AWAY from home, while the test reported every
+		// fiber waking on the worker it left. Both counted honestly; they just never counted the
+		// SAME task, so nothing could join them. This joins them -- one task, both ends.
+		size_t lastPlacedOn = SIZE_MAX;
+#endif
+
 		// INTRUSIVE LINK for a WaitGroup's direct waiter stack. Owned by whichever
 		// primitive this fiber is parked on, and null whenever it is not parked on one.
 		//
