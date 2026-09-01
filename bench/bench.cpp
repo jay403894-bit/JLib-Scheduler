@@ -2040,10 +2040,15 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
     // arrived and the steal scan is the bug; a slow row with 20 means they did arrive and the cost
     // is per-leaf. From the ratio alone those two are indistinguishable, and they want opposite
     // fixes -- which is how an afternoon goes into fixing the wrong one.
-    printf("             distinct workers that ran a leaf (count, not an index; pool has %zu):",
+    // PRINTED AS A ROW OF THE SAME TABLE, not as a sentence with numbers after it. It used to be a
+    // long inline label followed by " %zu" values -- variable width, starting at a column the size
+    // headers never reach -- so mapping a count back to its N meant counting positions by hand and
+    // getting it wrong. Same prefix and same 7-char cells as the speedup row above, so each count
+    // sits under its own N; the explanation moves to the end of the line where it costs nothing.
+    printf("  %-10s |", "workers");
+    for (size_t i = 0; i < participants.size(); ++i) printf(" %6zu", participants[i]);
+    printf("   | distinct workers that ran a leaf (a count, not an index; pool has %zu)\n",
            JLib::TaskScheduler::Instance().GetWorkerCount());
-    for (size_t i = 0; i < participants.size(); ++i) printf(" %zu", participants[i]);
-    printf("\n");
 }
 
 static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
@@ -2058,7 +2063,11 @@ static void BenchParallelForCrossover(JLib::TaskScheduler& sched) {
     printf("           taken back and run inline (~11 ns). Nothing probe-free can decline a body\n");
     printf("           too cheap to parallelize, so cells below 1.00x are that, not a bug.\n");
     printf("  %-10s |", "body");
-    for (int n : sizes) printf(" %5d", n);
+    // WIDTH MUST MATCH THE CELLS BELOW, WHICH ARE " %5.2fx" -- SEVEN CHARACTERS, NOT SIX. This was
+    // " %5d" (six) while the cells were seven, so every column drifted one character right of its
+    // own header and by the right-hand side a speedup sat under a different N than it belonged to.
+    // The table looked fine at a glance because the drift is invisible until several columns in.
+    for (int n : sizes) printf(" %6d", n);
     printf("   |\n");
     printf("  -----------+------------------------------------------------------+--------------------------------------\n");
 
@@ -2198,7 +2207,9 @@ static void BenchSplitterVsCursorCrossover(JLib::TaskScheduler& sched) {
     printf("  '?' marks a cell whose same-vs-same control moved >5%% on its own -- distrust that cell,\n");
     printf("  not the cursor. See the ParallelFor doc table in README.md for when to reach for this.\n");
     printf("  %-10s |", "body");
-    for (int n : sizes) printf(" %6d", n);
+    // SEVEN vs EIGHT, the same off-by-one as the crossover table above: these cells are
+    // " %5.2fx%s" -- the ratio, the 'x', and the '?' suspect marker -- so the header needs eight.
+    for (int n : sizes) printf(" %7d", n);
     printf("    |\n");
     printf("  -----------+--------------------------------------------------------+------------------\n");
 
