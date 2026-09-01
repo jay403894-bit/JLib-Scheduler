@@ -768,3 +768,51 @@ None of those was a scheduler bug and every one of them cost real time. THE RULE
 THIS KEEPS PRODUCING: a diagnostic whose best result can be mistaken for its worst
 is broken regardless of the number underneath it, and a label that names a
 mechanism the system does not have will send someone looking for it.
+
+## The I/O lane without an MPMC FIFO — Jay's design, 2026-08-31 (NOT BUILT)
+
+Recorded because it dissolves the blocker this session concluded was structural, and because I
+told him the opposite twice.
+
+**WHAT I SAID AND WHY IT WAS WRONG.** First: "you are one well-chosen queue away", which assumed a
+shared ordered MPMC could load-balance completions. Then, correctly, that it could not -- completions
+resume PINNED fibers, so the destination is fixed by fiber ownership and no queue changes that. From
+which I concluded the ~K-worker ceiling was structural. **THAT SECOND CONCLUSION ASSUMED YOU NEED
+MULTIPLE CONSUMERS. You do not.**
+
+**THE DESIGN.** Concurrency on the I/O lane comes from FIBERS ON ONE CONSUMER, not from many
+consumers:
+
+  - the reactor / completion thread ONLY ENQUEUES. It never runs user code.
+  - ONE owner is the only pop -- K=1, or one chosen floor worker. MPSC stays MPSC.
+  - handlers are Fiber/Coroutine. `co_await` suspends the frame and returns the worker to its drain
+    loop, so the consumer is never blocked and the same consumer pops the next completion.
+  - two producers into one inbox is still one consumer. Ordering is per-queue FIFO with a single
+    reader, which is all a completion stream needs.
+
+One thread drives thousands of in-flight operations exactly as a single-threaded async runtime does.
+**The MPMC FIFO requirement disappears because the multi-consumer case was never needed.**
+
+**MOST OF THE MACHINERY ALREADY EXISTS.** `hiPriInboxes[q]` is a TaskMPSCQueue; both pop sites
+(`Worker()`'s HiPri phase and `TryTakeLaneTask`) are owner-only by qIndex; it is drained FIRST on
+every pass, ahead of the deque and stealing; and it is named in all three park predicates. The delta
+is CONTRACT AND POLICY, not plumbing.
+
+**WHAT IS ACTUALLY NEW, and none of it is built or modelled:**
+
+  - **NATIVE ON THIS PATH MUST BE REJECTED, NOT TOLERATED.** A Native handler runs to completion on
+    the consumer thread and IS the stolen consumer. Nothing enforces fiber-only today. This is the
+    [[tolerance-is-not-permission]] shape: code that survives a violation is defending against it,
+    not permitting it.
+  - **BOUNDED + BACKPRESSURE AT THE REACTOR.** The inbox links through Task::next and is unbounded.
+    DO NOT BAIL A SINKING OWNER BY HANDING WORK TO F -- that is the stray-net mistake again. Late
+    packets on one owner beat lost packets on two.
+  - **K=1 AS THE RULE.** K=4 sharing one backlog with hand-off when behind is the shape to stay away
+    from; it is what forced the MPMC question in the first place.
+  - **NOT IN ANY MODEL.** The three verify files cover the permit word and the loPri queue. A
+    fiber-only single-consumer completion queue with backpressure is unmodelled.
+
+**K IS NOT BROKEN BY THIS SESSION'S WORK -- it is better suited to it.** "K never reads loPri"
+(k-never-reads-lopri-invariant) leaves K's queue set as exactly {hiPri, resumed}, which IS the I/O
+lane. The reactor stays off the shipping surface (branch `io-reactor`, tag `io-reactor-preserved`)
+until someone wants to build this.
