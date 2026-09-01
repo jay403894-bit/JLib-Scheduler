@@ -1398,7 +1398,12 @@ static std::atomic<unsigned> g_workerRelax{ TaskScheduler::kWorkerRelaxDefault }
 void     TaskScheduler::SetWorkerRelax(unsigned n) noexcept { g_workerRelax.store(n, std::memory_order_relaxed); }
 unsigned TaskScheduler::GetWorkerRelax() noexcept { return g_workerRelax.load(std::memory_order_relaxed); }
 
+// AN EXPLICIT CALL PINS THE BASE. Without this flag the pool-size default below could not tell an
+// app that asked for floor=2 on a 4-core box from one that never asked at all, and would quietly
+// overrule the first. Policy the caller stated always wins.
+static std::atomic<bool> g_awakeFloorBaseExplicit{ false };
 void TaskScheduler::SetAwakeFloor(size_t k) noexcept {
+	g_awakeFloorBaseExplicit.store(true, std::memory_order_relaxed);
 	// The caller is stating policy, so this moves the BASE as well as the current value. Growth
 	// (NoteFloorCrowding) and shedding (CollapseAwakeFloorToBase) only ever move the current one.
 	BandsSetFb(k);
@@ -2142,10 +2147,24 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// and growth only becomes legal after the owners have drained -- which is far too late to widen
 	// for the burst that is already in flight.
 	//
-	// A CORRECT VERSION HAS TO ASK A PUSH-TIME QUESTION: how many DISTINCT WORKERS have pending
-	// work, which the producer knows and the steal hints do not yet reflect. That is a different
-	// mechanism and it is not built. Until it is, the ceiling below is what bounds the damage --
-	// and it bounds it by width rather than by refusing to grow at all.
+	// THE HINTS ARE STRUCTURALLY THE WRONG INSTRUMENT HERE, not merely early, and that is the part
+	// worth remembering. THE STEAL HINTS ARE A STEAL SCHEDULER: a bit means "a thief may take work
+	// from this deque". F IS A PARK POLICY: it means "this many cores stay off WaitOnAddress".
+	// Those two questions agree most of the time and DIVERGE EXACTLY ON THE BURST THE FLOOR EXISTS
+	// FOR -- 16 heavy tasks is 16 inbox items and ~0 hint bits, because nothing is stealable until
+	// an owner drains and stages. Gating a park policy on a steal signal therefore says "do not
+	// recruit until the wave is already in flight", which is the opposite of what recruitment is.
+	//
+	// GROW EXISTS FOR THE MOMENT BEFORE ANYTHING IS STEALABLE. So a replacement signal has to be
+	// PUSH-VISIBLE (Jay's list): queued / inbox depth, a long body, or the target already being
+	// busy. Not hint bits.
+	//
+	// SHED IS THE OTHER DIRECTION AND MAY USE THEM. By collapse time the wave has either staged or
+	// finished, so hints and inboxes read together are a fair question there -- which is what
+	// CollapseAwakeFloorToBase already does. The asymmetry is the design, not an oversight.
+	//
+	// Until such a signal exists, the ceiling below is what bounds the damage, and it bounds it by
+	// WIDTH rather than by refusing to grow at all.
 
 	// ---- THE CEILING: A BUDGET, NOT A TARGET -------------------------------------------------
 	//
@@ -2169,8 +2188,28 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// teaching every burst to become NoSleep for 6 ms.
 	const size_t structural = (n >= kNow + 2) ? (n - kNow - 2) : 0;
 	if (structural == 0) return;
+	// Fmax = clamp(n - 2, Fbase, 16)
+	//
+	// n/2 WAS THE FIRST ATTEMPT AND IT IS WRONG AT BOTH ENDS, which is the argument for this shape:
+	// it OVER-BINDS exactly where a burst needs cores (8-16 threads -> a cap of 4-8) and does
+	// NOTHING where the behaviour was actually measured (31 threads -> 15, above an observed peak of
+	// 11-13). A rule that only binds on the machines you did not test is not a policy.
+	//
+	// n - 2 keeps one or two logical CPUs outside the live floor so the application thread is not
+	// sharing a packed box with it. THE ABSOLUTE 16 is the other half: without it a 64-thread box
+	// grows a 62-core pause-loop, and "peak is a budget" stops meaning anything at scale. Sixteen
+	// sits above every peak observed here (11-13 on a 31-wide pool) so it does not bind on the
+	// shape that was measured, and caps the shapes that were not.
+	//
+	// Floored at fbase so policy is never undercut, then clamped to the structural limit.
 	const size_t userCap = GetAwakeFloorMax();
-	size_t cap = userCap ? userCap : (fbase > (n / 2) ? fbase : (n / 2));
+	size_t cap;
+	if (userCap) cap = userCap;
+	else {
+		cap = (n >= 2) ? (n - 2) : 0;
+		if (cap < fbase) cap = fbase;
+		if (cap > 16)    cap = 16;
+	}
 	if (cap > structural) cap = structural;
 
 	// THE EARLY-OUT IS THE STEADY-STATE COST: two relaxed loads once the floor has reached the cap.
@@ -4404,6 +4443,23 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// K is clamped against the ACTUAL pool size here -- it may have been set before Init, when there
 	// was nothing to clamp against. Must precede the hot-CPU publish below, which reads it.
 	ClampHotWorkersToPool();
+
+	// ---- THE FLOOR BASE SCALES WITH THE MACHINE ---------------------------------------------
+	//
+	// Fbase = n < 6 ? 1 : 2, and only when the application did not state one.
+	//
+	// ON A 4-CORE LAPTOP A BASE OF 2 IS HALF THE MACHINE, permanently, and the floor's whole
+	// justification is that a push lands on a worker that is already running -- which is not worth
+	// half the box. WIDE IS HOW A SMALL POOL USES EVERYONE: it wakes the crowd once for one wave
+	// and they all park after, which is far cheaper there than keeping cores off WaitOnAddress.
+	// The band word is initialised statically, before the pool size exists, so this is the first
+	// point where the question can even be asked.
+	if (!g_awakeFloorBaseExplicit.load(std::memory_order_relaxed)) {
+		const size_t n = workers.size();
+		const size_t fb = (n < 6) ? 1u : 2u;
+		BandsSetFb(fb);
+		BandsSetF(fb, n);
+	}
 
 	// UNDO Join()'s service-layer shutdown, so Init works a second time. Join stops the reactor and
 	// timer threads (it must -- they push into the pool it is about to clear), and both latch

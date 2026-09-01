@@ -1036,8 +1036,18 @@ namespace JLib {
 		// than wrapping. Settable before Init and honoured live; lowering it does not retroactively
 		// shed a floor that is already wider, it only refuses further growth -- the collapse still
 		// returns the floor to base when the wave drains.
-		// 0 = USE THE DEFAULT POLICY, which is max(Fbase, hw/2) clamped to n - K - 2 -- NOT
-		// unlimited. See the ceiling note in NoteFloorCrowding for why peak is a budget.
+		// 0 = USE THE DEFAULT POLICY: Fmax = clamp(n - 2, Fbase, 16), then clamped to n - K - 2.
+		// NOT unlimited, which is what it was. See the ceiling note in NoteFloorCrowding.
+		//
+		// THE FLOOR BASE SCALES TOO, and is set at pool start unless the app stated one:
+		// Fbase = n < 6 ? 1 : 2. On a 4-core box a base of 2 is half the machine held
+		// permanently off the park path, and Wide -- wake the crowd once, everyone parks after --
+		// is the cheaper way for a small pool to use everyone.
+		//
+		// QUOTE THIS FROM THE POOL SIZE YOU SHIP. A small pool makes a ceiling look like a
+		// regression by construction -- an n/2 rule gave 4 on eight workers and burst/dflt fell to
+		// 2.3x, while on 31 it gave 15, above an observed peak of 11-13, and never bound at all.
+		// Use a small pool to catch index bugs, never to tune this.
 		static void   SetAwakeFloorMax(size_t maxLiveFloorWidth) noexcept;
 		static size_t GetAwakeFloorMax() noexcept;
 
