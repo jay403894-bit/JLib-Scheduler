@@ -1991,7 +1991,26 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             SinkAdd(acc);
 
             // --- parallel ---
-            std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
+            // PER-WORKER SLOTS, PADDED, AND NOW ACTUALLY USED.
+            //
+            // This vector was declared here and referenced NOWHERE ELSE IN THE FILE. The reduction
+            // it was written for had been replaced by a single contended atomic, and the array was
+            // left behind allocated and zero-filled once per rep.
+            //
+            // THE ATOMIC WAS MEASURING THE HARNESS. Every leaf finished with a CAS loop on ONE
+            // shared double. At the cheap end of this sweep that is most of the leaf: grain is
+            // n/(workers*4), so `trivial` at N=256 runs ~2 elements and then contends a single word
+            // against every other worker doing the same. Those sub-1.00x cells were partly the
+            // benchmark's own reduction, attributed to the splitter.
+            //
+            // AND IT IS THE WRONG SHAPE FOR THE QUESTION BEING ASKED. A CAS retry storm shows up in
+            // OUTLIERS, and this row reports a best-of-7 -- so the contention neither shows up
+            // honestly nor stays out of the number. A per-worker slot has no retry to hide.
+            //
+            // +1 SLOT for the non-worker lane: a leaf can run on a thread with no JLib::Thread
+            // (main, spin-helping), and that must not alias worker 0's slot.
+            std::vector<double> partials(((size_t)workers + 1) * 8, 0.0);
+            const size_t kSpillSlot = (size_t)workers;   // the no-JLib::Thread case
 
             // Cleared HERE, per rep, so the bitmap describes this run alone. Before the timer
             // starts: it is a plain relaxed store over 64 bytes and must not land inside the
@@ -1999,7 +2018,6 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
             for (auto& c : g_sweepSeen) c.store(0, std::memory_order_relaxed);
 
             auto t1 = Clock::now();
-            std::atomic<double> pacc{ 0.0 };
             // ParallelFor, not the removed fork-join entry point. There is no gate to dodge any more:
             // the range is split speculatively and steals decide, so this measures dispatch plus
             // whatever the pool chose to take. Cells below ~1.00x mean the splitter parallelized a
@@ -2009,22 +2027,29 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
                 // "the wake fired and the thief found nothing": if a row is slow with 2-3
                 // participants the steal scan is not reaching the non-worker lane; if it is slow
                 // with 20, the thieves arrived and the cost is per-leaf.
+                size_t slot = kSpillSlot;
                 if (JLib::Thread* w = JLib::Thread::Current()) {
                     const int q = w->qIndex;
                     if (q >= 0 && q < 64) g_sweepSeen[q].store(1, std::memory_order_relaxed);
+                    if (q >= 0 && (size_t)q < kSpillSlot) slot = (size_t)q;
                 }
                 double local = 0.0;
                 for (int i = a; i < b; ++i) local += BodyCost<kFlops>(i);
-                // fetch_add on a double isn't available pre-C++20 atomics ops, so accumulate via CAS.
-                double cur = pacc.load(std::memory_order_relaxed);
-                while (!pacc.compare_exchange_weak(cur, cur + local, std::memory_order_relaxed)) {}
+                // A PLAIN STORE TO THIS THREAD'S OWN PADDED SLOT. No atomic, so no retry and no
+                // shared line. A leaf runs to completion on one thread, and two leaves on the same
+                // worker are sequential on that thread, so there is nothing to race.
+                partials[slot * 8] += local;
                 });
             const double parMs = MsBetween(t1, Clock::now());
             // Capture on the rep that WINS, not unconditionally: the reported speedup comes from
             // this rep, so the participant count has to come from it too or the two lines of the
             // table describe different executions.
             if (parMs < bestPar) { bestPar = parMs; bestParParticipants = SweepParticipants(); }
-            SinkAdd(pacc.load());
+            // Reduce AFTER the timer, serially. This is the half of the work the contended CAS was
+            // doing inside the measured region, and out here it is (workers+1) adds.
+            double psum = 0.0;
+            for (size_t s = 0; s <= kSpillSlot; ++s) psum += partials[s * 8];
+            SinkAdd(psum);
         }
 
         const double speedup = bestSerial / std::max(bestPar, 1e-9);
