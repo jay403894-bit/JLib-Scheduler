@@ -2194,7 +2194,7 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// teaching every burst to become NoSleep for 6 ms.
 	const size_t structural = (n >= kNow + 2) ? (n - kNow - 2) : 0;
 	if (structural == 0) return;
-	// Fmax = clamp(n - 2, Fbase, 16)
+	// Fmax = max(n - 2, Fbase), then clamped to the structural limit (n - K - 2).
 	//
 	// n/2 WAS THE FIRST ATTEMPT AND IT IS WRONG AT BOTH ENDS, which is the argument for this shape:
 	// it OVER-BINDS exactly where a burst needs cores (8-16 threads -> a cap of 4-8) and does
@@ -2202,10 +2202,9 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// 11-13). A rule that only binds on the machines you did not test is not a policy.
 	//
 	// n - 2 keeps one or two logical CPUs outside the live floor so the application thread is not
-	// sharing a packed box with it. THE ABSOLUTE 16 is the other half: without it a 64-thread box
-	// grows a 62-core pause-loop, and "peak is a budget" stops meaning anything at scale. Sixteen
-	// sits above every peak observed here (11-13 on a 31-wide pool) so it does not bind on the
-	// shape that was measured, and caps the shapes that were not.
+	// sharing a packed box with it. AN ABSOLUTE 16 USED TO SIT BESIDE IT and was removed once it was
+	// swept -- see the block below for the table and for why the collapse, not a constant, is what
+	// bounds this.
 	//
 	// Floored at fbase so policy is never undercut, then clamped to the structural limit.
 	const size_t userCap = GetAwakeFloorMax();
@@ -2214,7 +2213,32 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	else {
 		cap = (n >= 2) ? (n - 2) : 0;
 		if (cap < fbase) cap = fbase;
-		if (cap > 16)    cap = 16;
+		// THE ABSOLUTE 16 WAS HERE AND IS GONE. MEASURED 2026-09-01 on a 31-worker pool, sweeping
+		// the ceiling with SetAwakeFloorMax and everything else held fixed:
+		//
+		//     cap   ran   blocking(d=0)   round-trip   idle tax
+		//      16    16       9.50 ms       0.533 us       0.5%
+		//      24    24       7.47 ms       0.533 us       1.2%
+		//      29    29       6.27 ms       0.577 us      -0.0%
+		//
+		// Monotonic, and it does not cost the two things the cap existed to protect. THE FEAR WAS
+		// "a 64-thread box grows a 62-core pause-loop, and peak is a budget stops meaning anything
+		// at scale" -- i.e. a pool that STAYS wide. It does not: at cap 29 the idle-tax row reads
+		// `peak 6, live at end 2` and -0.0%, because growth collapses to base when the burst ends.
+		// The collapse is what bounds this, not the constant, and the constant was bounding the
+		// burst instead.
+		//
+		// WHAT THE 16 ACTUALLY DID was pin a 31-worker pool at `peakF 16 / ran 16` -- fifteen
+		// workers that never ran a task in the blocking row -- which is where that row's whole gap
+		// to marl came from.
+		//
+		// STILL BOUNDED, by two things that are not this line: `n - 2` keeps a couple of logical
+		// CPUs outside the live floor for the application thread, and `structural` (n - K - 2)
+		// clamps below. On this box both land on 29, which is why asking for 31 also reports 29.
+		//
+		// NOT MEASURED ABOVE 31 THREADS. If a very wide box ever shows the floor failing to
+		// collapse, the fix is the collapse, not a magic number here -- and SetAwakeFloorMax is
+		// still the per-application override.
 	}
 	if (cap > structural) cap = structural;
 

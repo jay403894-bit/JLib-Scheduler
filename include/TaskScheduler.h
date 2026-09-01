@@ -1036,8 +1036,14 @@ namespace JLib {
 		// than wrapping. Settable before Init and honoured live; lowering it does not retroactively
 		// shed a floor that is already wider, it only refuses further growth -- the collapse still
 		// returns the floor to base when the wave drains.
-		// 0 = USE THE DEFAULT POLICY: Fmax = clamp(n - 2, Fbase, 16), then clamped to n - K - 2.
-		// NOT unlimited, which is what it was. See the ceiling note in NoteFloorCrowding.
+		// 0 = USE THE DEFAULT POLICY: Fmax = max(n - 2, Fbase), then clamped to n - K - 2.
+		//
+		// AN ABSOLUTE 16 WAS PART OF THAT AND WAS REMOVED 2026-09-01 after a sweep. It was pinning a
+		// 31-worker pool at 16 participants -- fifteen workers that never ran a task -- and buying
+		// nothing: at a ceiling of 29 the blocking row went 9.50 -> 6.27 ms while round-trip and
+		// idle tax did not move (0.533 -> 0.577 us, 0.5% -> -0.0%). What bounds a grown floor is the
+		// COLLAPSE back to base, not a constant; the constant was bounding the burst instead.
+		// See the ceiling note in NoteFloorCrowding for the table.
 		//
 		// THE FLOOR BASE SCALES TOO, and is set at pool start unless the app stated one:
 		// Fbase = n <= 8 ? 1 : 2. On an 8-thread box a base of 2 is a QUARTER of the machine held
