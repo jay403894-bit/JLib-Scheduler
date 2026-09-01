@@ -1196,7 +1196,8 @@ void Thread::Worker() {
 	// It describes the request, not the kernel -- POSIX may refuse an elevation, and that is the
 	// unprivileged answer rather than a state to track.
 	WorkerPrio curPrio = WorkerPrio::Normal;
-	unsigned spinTick = 0;   // idle-pass counter, used only to rate-limit the yield below
+	unsigned spinTick = 0;     // FLOOR idle passes -- rate-limits the yield, nothing else
+	unsigned idlePasses = 0;   // ALL idle passes, for Thread::SpinTick(); see the store site
 	// How long a NON-floor worker pauses before handing the core back. Short on purpose: it is
 	// awake on a transient reason, so the pause only has to cover a steal target appearing, not a
 	// policy decision. See the spin path in Worker().
@@ -3704,6 +3705,15 @@ void Thread::Worker() {
 				// Publish the two pass locals the dump cannot otherwise see. Idle path only.
 				dbgOnAwakeFloor.store(onAwakeFloor, std::memory_order_relaxed);
 
+				// EVERY WORKER, NOT JUST THE FLOOR. This was stored inside the floor arm, where it
+				// doubled as the yield rate-limiter, so a guest's `tick` column read 1 forever and
+				// a delta across a stall meant nothing for anyone off the floor. It is now the
+				// general "this thread took an idle pass" counter, which is what makes
+				// Thread::SpinTick() able to separate "the scheduler did not dispatch" from "the OS
+				// did not run the thread". spinTick below stays separate: it is the yield cadence
+				// and must keep counting only floor passes.
+				dbgSpinTick.store(++idlePasses, std::memory_order_relaxed);
+
 				if (onAwakeFloor) {
 					// SAY WHAT THIS THREAD IS ACTUALLY DOING. It reached the park block, found
 					// nothing, and is about to go round because it is on the floor -- it is not
@@ -3712,7 +3722,7 @@ void Thread::Worker() {
 					// every push swaps the word and the floor never consumes it) read as a permit
 					// latched on a worker at the park gate, which is the signature of a stall.
 					JLIBSCHED_PHASE(qIndex, FloorSpin);
-					dbgSpinTick.store(++spinTick, std::memory_order_relaxed);
+
 
 					// ---- A TINY FLOOR DOES NOT YIELD AT ALL ----------------------------------
 					//
@@ -3737,7 +3747,7 @@ void Thread::Worker() {
 						// is still EMPTY. This is orthogonal to the gate above -- the gate removes
 						// the yield below the threshold, the stagger desynchronises it above --
 						// so the two never confound a measurement at any single F.
-						if (((spinTick + (unsigned)qIndex) & TaskScheduler::GetSpinYieldMask()) == 0) {
+						if ((((++spinTick) + (unsigned)qIndex) & TaskScheduler::GetSpinYieldMask()) == 0) {
 							if (yieldWithHandshake()) continue;
 						}
 						else platform::CpuRelax();

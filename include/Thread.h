@@ -413,6 +413,25 @@ namespace JLib {
         // strengthening costs nothing measurable and removes a class of doubt entirely.
         int GetWorkerState() const noexcept { return workerState.load(std::memory_order_seq_cst); }
 
+        // ---- DID THIS WORKER EXECUTE AT ALL DURING SOME INTERVAL? ----------------------------
+        //
+        // THE ONE NUMBER THAT SEPARATES "the scheduler did not dispatch" FROM "the OS did not run
+        // the thread", which every stall analysis so far has had to infer from poll counts and core
+        // numbers. It counts IDLE PASSES of Worker(): a worker that is spinning increments it
+        // thousands of times a millisecond, and a worker that is not on a CPU cannot increment it
+        // at all.
+        //
+        // Sample it either side of an interval and read the delta:
+        //     delta  > 0   the thread WAS running and scanning, and still did not take the work.
+        //                  That is a scheduler defect -- the search missed a reachable queue.
+        //     delta == 0   the thread did not execute. No scheduler change can help; the OS did
+        //                  not schedule it.
+        //
+        // Relaxed, and only meaningful on an IDLE worker -- a worker inside a task body is not
+        // taking idle passes either, so a zero delta there means "busy", not "not running". Read it
+        // next to `busy`.
+        unsigned SpinTick() const noexcept { return dbgSpinTick.load(std::memory_order_relaxed); }
+
         // The OS thread itself, so a caller can join it directly -- `threads[i]->GetThread().join()`
         // -- rather than going through Thread::Join().
         //

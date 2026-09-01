@@ -833,6 +833,7 @@ static std::mutex g_reportMx;
 static bool g_waiterPin = false;   // `waiterpin` -- see the flag note in main()
 
 static std::atomic<unsigned> g_bodyCpu{ ~0u };
+static std::atomic<unsigned> g_bodyTick{ 0u };   // the running worker's idle-pass count at pickup
 
 static std::atomic<long long> g_bodyStartNs{ 0 };
 static std::atomic<long long> g_bodyEndNs{ 0 };
@@ -945,6 +946,10 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
 
     const size_t floorAtLatencyStart = JLib::TaskScheduler::GetAwakeFloor();
     const size_t floorBaseHere       = JLib::TaskScheduler::GetAwakeFloorBase();
+
+    // Hoisted: GetThreads() returns a const ref, and the per-iteration sampler must not pay a
+    // call into the scheduler for something that cannot change during the row.
+    const std::vector<JLib::Thread*>& threadsForTick = sched.GetThreads();
 
     // ---- `waiterpin`: move the BENCH THREAD off the steer set for this row -------------------
     //
@@ -1066,6 +1071,13 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             // core below, this is the witness for "the waiter and the worker were sharing a
             // timeslice" -- see the note at the report. One KUSER_SHARED_DATA read on Windows.
             g_bodyCpu.store(JLib::platform::CurrentCpu(), std::memory_order_relaxed);
+            // THIS WORKER'S IDLE-PASS COUNT AT THE MOMENT IT PICKED THE TASK UP. Subtracting the
+            // sample taken before the push gives idle passes across the DISPATCH WINDOW only --
+            // push issued -> body started. Sampling after WaitFor returns instead measures the
+            // whole trip, which includes every pass the worker took AFTER running the body, and a
+            // large number there says nothing at all. The first version of this did that.
+            g_bodyTick.store(JLib::Thread::Current() ? JLib::Thread::Current()->SpinTick() : 0u,
+                             std::memory_order_relaxed);
             if (JLib::Thread::Current()) {
                 const int q = JLib::Thread::Current()->qIndex;
                 if (q >= 0 && q < 64) g_landedOn[q].fetch_add(1, std::memory_order_relaxed);
@@ -1114,6 +1126,25 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // the same preemption the `waiter` segment catches on the other side of the trip, and it
         // was previously indistinguishable from a slow dispatch because it landed in the same
         // number -- with a minus sign in front of it.
+        // ---- DID THE TARGET WORKER EXECUTE DURING THIS TRIP? ---------------------------------
+        //
+        // THE NUMBER THAT ENDS THE ARGUMENT. Everything so far has inferred "the worker was not on
+        // a CPU" from poll counts and core numbers. This measures it: Thread::SpinTick() counts
+        // IDLE PASSES of Worker(), so a worker that is spinning increments it thousands of times a
+        // millisecond and one that is not executing cannot increment it at all.
+        //
+        //   delta  > 0  the thread WAS running and scanning and still did not take the work.
+        //               A SCHEDULER DEFECT: the search missed a reachable queue.
+        //   delta == 0  the thread did not execute. No scheduler change can help.
+        //
+        // ONLY THE FLOOR, which is two reads at floor=2 and where 100% of this row's pushes land
+        // (`landed on the floor 20000/20000`). Sampling all 31 would cost more than the round trip
+        // it is measuring.
+        unsigned tickBefore[8] = {};
+        const size_t tickN = (floorAtLatencyStart < 8) ? floorAtLatencyStart : 8;
+        for (size_t q = 0; q < tickN && q < threadsForTick.size(); ++q)
+            tickBefore[q] = threadsForTick[q]->SpinTick();
+
         const long long pushIssuedNs = NowNs();
         sched.Push(t);
         const long long pushDoneNs = NowNs();
@@ -1398,6 +1429,42 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                        waiterCpuPre, waiterCpuPost, bcpu,
                        same ? "<-- SAME CORE: the waiter was sitting on the core the target needed"
                             : "(different cores -- core contention is NOT the explanation here)");
+            }
+            // ---- WAS THE TARGET EVEN EXECUTING WHILE THE TASK WAITED? -----------------------
+            //
+            // READ THIS FIRST: the poll count and the cores line INFER, this MEASURES. Idle passes
+            // taken by the worker that ran the body, across the DISPATCH WINDOW only -- push
+            // issued to body started. Not the whole trip: that would count every pass the worker
+            // took after running the body, which is unbounded and says nothing.
+            //
+            //   0        the thread took no idle pass while the task sat in its queue. It was not
+            //            executing. Nothing in placement, the permit word or the search order
+            //            could have been faster -- the OS did not run it.
+            //   nonzero  it WAS scanning, repeatedly, and did not take work in its own inbox.
+            //            THAT is a scheduler defect and the only reading that implicates one.
+            {
+                const int      bq = g_bodyQ.load(std::memory_order_relaxed);
+                const unsigned bt = g_bodyTick.load(std::memory_order_relaxed);
+                if (bq >= 0 && (size_t)bq < (int)tickN) {
+                    const unsigned d = bt - tickBefore[bq];
+                    // THE CONCLUSION ONLY HOLDS IF DISPATCH IS WHERE THE TIME WENT. On a
+                    // PUSHER-late trip the dispatch window contains the PUSHER's stall, so the
+                    // worker idles for it legitimately -- a large count there is a worker with
+                    // nothing to do, not a worker ignoring its inbox. The first version of this
+                    // line shouted SCHEDULER at exactly that case.
+                    const bool dispatchDominates =
+                        (bs - pushIssuedNs) > (returnedNs - be) &&
+                        (bs - pushIssuedNs) > (pushDoneNs - pushIssuedNs);
+                    printf("      q%d idle passes while the task waited: %u   <- %s\n", bq, d,
+                           !dispatchDominates
+                               ? "dispatch is not where this trip went; not diagnostic here"
+                               : (d == 0 ? "it was NOT EXECUTING; the OS did not run it"
+                                         : "it WAS scanning and did not take its own inbox:"
+                                           " a SCHEDULER defect"));
+                }
+                else {
+                    printf("      (body ran on q%d, outside the sampled floor -- no data)\n", bq);
+                }
             }
             printf("      waiter: %u polls, %u yields, %u helped\n", wPolls, wYields, wHelped);
             printf("        polls HIGH -> waiter ran and kept seeing n>0: the pool was late.\n"
