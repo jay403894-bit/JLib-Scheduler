@@ -261,6 +261,66 @@ timer thread), and the reserved band was bought with a measurement on the *old* 
 buys a flat completion tail worth 175x at 400 µs grain. Whether that number survives the lane owning
 its own threads is unknown and untested.
 
+### 3.8 Thread-affine teardown: one optional `home`, and nothing else migrates
+
+Invariant 6 says a handler may resume on a different K thread after every await. Two exits were
+obvious and both are expensive: pin the coroutine (gives up round-robin and drags the fiber path
+back in), or make nothing thread-affine in the first place (write a lock-free allocator). Jay's is
+a third:
+
+- `task->home = qIndex` on **first thread_local touch**; `0xFF` means *any worker*, which is the
+  common case
+- resume still runs anywhere
+- **only the final teardown that genuinely refuses to be remote** — COM uninitialize, a thread-owned
+  handle, a magazine you will not remote-free — is pushed to the home thread's inbox
+- everything else: free-by-address plus the remote-free list
+
+One `uint8_t`. No chain, no affinity list, no per-object table.
+
+**The insight is that migration was never the problem — teardown was.** The frame does not care
+where it resumes; a `HANDLE` opened by `CoInitialize`'s apartment does. Pinning the coroutine to
+protect the last few microseconds of its life pays for the whole life. This pins the teardown only,
+which is the part that is actually affine, and leaves the hot path untouched.
+
+Three things it has to carry.
+
+**(a) IT IS A CONTRACT, NOT A MECHANISM.** Nothing can detect a `thread_local` touch. `home` is set
+by an explicit call, so a handler that touches TLS without declaring it gets no protection *and no
+diagnostic*. Therefore the write must live in the **resource wrapper, at acquisition** — not in the
+handler remembering to call it. Anything that depends on the author remembering is the loPri strand
+again: a rule with no enforcement point, self-healing until it isn't.
+
+**(b) THE TEARDOWN PUSH MUST NOT BE ALLOWED TO FAIL — AND §3.2 SAYS PUSHES FAIL.** This is where
+this decision collides with an earlier one, and it is the "teardown might get complicated" that Jay
+flagged. `IOMPSCQueue::push` returns `false` when full and invariant 3 says overflow drops
+deliberately. **A dropped teardown is not a dropped packet.** It is a leaked apartment, an
+unreleased handle, a magazine that never returns — a loss that never resolves on its own. Three
+ways out, none measured:
+
+- **route to the F inbox**: `loPriInboxes[home]` is unbounded and infallible today. But then `home`
+  is an F index, and this only works if the affine resource was acquired on an F worker.
+- **reserve headroom**: teardown pushes bypass the bound. Cheap, and it makes the bound a lie for
+  exactly one class of item, which is arguably what a bound is for.
+- **retry until it lands**: the reactor must never block, but this is not the reactor.
+
+The third is probably right, and the reason is a frequency argument worth stating explicitly:
+**teardown is O(connections), not O(completions).** A retry loop on the completion path would be
+unacceptable; on a path that runs once per connection close it costs nothing measurable.
+
+**(c) WHICH POOL DOES `home` INDEX?** K threads and F workers are different arrays with different
+queue types, so a bare `uint8_t` is ambiguous between them — and (b) may deliberately want to land
+in the *other* one. It needs a pool bit or a documented rule that homes are always F. Separately:
+`0xFF` as the sentinel caps the home space at **254** while `kMaxHintQueues` is 256
+(`include/TaskScheduler.h:2884`). `uint8_t` is already the convention for worker indices
+(`src/TaskScheduler.cpp:5614`), so this is consistent — but at a 256-worker pool, worker 255 cannot
+be a home and nothing would say so. Cap it and state it, or spend the second byte.
+
+**One correction: "epoch slot on the fiber" is fiber-draft language.** With coroutines the mechanism
+is counted epochs (`include/Epochs.h:474`), which shipped for this exact reason. The invariant
+counted epochs did **not** lift still applies: **nothing may suspend inside an `EpochGuard`**, so a
+handler must not hold a guard across a `co_await`. That is a third thing invariant 6 makes fatal,
+alongside `thread_local` and same-thread assumptions, and it belongs in the same list.
+
 ---
 
 ## 4. Invariants
@@ -289,9 +349,12 @@ its own threads is unknown and untested.
    the one to model first: cancellation on this path already has a sharp edge — `scope.Cancel()`
    alone leaves a parked read parked — and a double resume is a corruption where that is a hang.
 6. **A handler may resume on a different K thread after every await.** Correct for the frame, fatal
-   for any `thread_local` or same-thread assumption inside it. **The fiber path guarantees the
-   opposite**, so the two contracts must be documented as opposites rather than assumed alike — the
-   confusion between those two mechanisms is what produced the pinning error recorded in §3.5.
+   for three things inside it: a `thread_local`, a same-thread assumption, and an `EpochGuard` held
+   across a `co_await` — counted epochs did not lift "nothing may suspend inside a guard". **The
+   fiber path guarantees the opposite**, so the two contracts must be documented as opposites rather
+   than assumed alike — the confusion between those two mechanisms is what produced the pinning error
+   recorded in §3.5. The escape hatch for the first two is §3.8: one optional `home` per task,
+   consulted only for teardown that refuses to be remote. Migration was never the problem.
 7. **No Native handlers on this path.** A Native handler runs to completion on the dispatch thread
    and *is* a stolen consumer. Reject, do not tolerate: code that survives a violation is defending
    against it, not permitting it.
