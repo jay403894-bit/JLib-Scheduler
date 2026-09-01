@@ -2826,18 +2826,45 @@ void Thread::Worker() {
 					// advertised mate, which is the herd the hint exists to break up -- and worse
 					// here than in phase 2, because these are the threads most likely to be
 					// searching simultaneously.
+					// ---- ABANDON THE WALK THE MOMENT OUR OWN WORK ARRIVES --------------------
+					//
+					// THE ORDER WAS ALREADY RIGHT AND THAT WAS NOT ENOUGH. drainOwnInbox() runs
+					// before this walk and again after it, so a push that lands BEFORE the walk is
+					// taken first and one that lands after is taken at the end. Neither covers a
+					// push that lands DURING it: the walk keeps probing foreign deques, up to
+					// probeLimit of them, while the task sits in an inbox nobody else may drain.
+					//
+					// ON A FLOOR WORKER THERE IS NOTHING TO HIDE BEHIND. It does not park, so the
+					// aimed push correctly bought no syscall -- Wake saw != PARKED -- and the whole
+					// delay lands in `dispatch` with kernel wakes at 0. That is the shape of the
+					// 102 us trip: 1985 waiter polls, body 0.1 us, completion 0.1 us. The POOL was
+					// late, not the waiter -- the other trip in the same row is the opposite.
+					//
+					// hasQueuedWork IS THE RIGHT SIGNAL AND ITS EDGE-TRIGGERED WEAKNESS DOES NOT
+					// BITE HERE. A stale SET costs one abandoned walk and a drain that finds
+					// nothing -- a wasted pass, not a wrong answer. A stale CLEAR just leaves the
+					// old behaviour. This only decides WHEN to go and look; the drain immediately
+					// after this block re-reads the queues and does the real work.
+					//
+					// Relaxed: one load against cache lines this walk is already missing on, and
+					// nothing is ordered on it.
+					const auto ownWorkArrived = [&]() -> bool {
+						return hasQueuedWork.load(std::memory_order_relaxed);
+					};
 					const std::vector<int>& mates = scheduler->matesSameClass[qIndex];
 					if (!mates.empty()) {
 						const size_t ms = FastRand() % mates.size();
-						for (size_t i = 0; i < mates.size() && !task_to_run && probed < probeLimit; ++i)
+						for (size_t i = 0; i < mates.size() && !task_to_run && probed < probeLimit
+						                   && !ownWorkArrived(); ++i)
 							probeOnce(mates[(ms + i) % mates.size()]);
 					}
 
 					// PHASE 2 -- every other advertised victim, including the non-worker lane and
 					// anything outside this LLC cluster. Rotating start for the same reason.
-					if (!task_to_run && lim > 0) {
+					if (!task_to_run && lim > 0 && !ownWorkArrived()) {
 						const int start = (int)(FastRand() % (unsigned)lim);
-						for (int i = 0; i < lim && !task_to_run && probed < probeLimit; ++i)
+						for (int i = 0; i < lim && !task_to_run && probed < probeLimit
+						                && !ownWorkArrived(); ++i)
 							probeOnce((start + i) % lim);
 					}
 				}

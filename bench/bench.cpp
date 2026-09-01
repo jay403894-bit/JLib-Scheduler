@@ -869,6 +869,8 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     double worstRtUs = 0.0;   // report on each new worst -- see the report site
     // Stall tally by dominant segment. The comparable output of this row; see the classify site.
     unsigned long long stallCount = 0, stallDispatch = 0, stallExecution = 0, stallCompletion = 0;
+    // WHO was late, as opposed to WHERE the time went -- see the classifier at the tally site.
+    unsigned long long stallPoolLate = 0, stallWaiterLate = 0, stallUnclassified = 0;
     unsigned long long stallWithWake = 0;
     double maxDispatchUs = 0.0, maxExecutionUs = 0.0, maxCompletionUs = 0.0;
     // Healthy-iteration poll rate, the yardstick the stall report is read against. See the
@@ -1087,6 +1089,35 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                 else if (cUs >= dUs && cUs >= eUs) { ++stallCompletion; if (cUs > maxCompletionUs) maxCompletionUs = cUs; }
                 else                               { ++stallExecution;  if (eUs > maxExecutionUs)  maxExecutionUs  = eUs; }
                 if (wakeDelta0) ++stallWithWake;
+
+                // ---- TWO DIFFERENT STALLS, AND POOLING THEM WASTES THE NEXT WEEK -----------
+                //
+                // The segment split says WHERE the time went. It does not say WHO was late, and
+                // those are different questions with different fixes:
+                //
+                //   POOL LATE   the waiter ran the whole time and kept seeing n > 0, so it polled
+                //               at its spin rate. Work existed and nobody picked it up. Fix is in
+                //               the scheduler -- the steal walk not re-checking its own inbox is
+                //               exactly this shape, and it shows up as dispatch with 0 kernel
+                //               wakes on a floor worker.
+                //   WAITER LATE the waiter was NOT ON A CPU. A handful of polls across tens of
+                //               microseconds is a descheduled thread, not a spinning one. Fix is
+                //               priority/affinity of the calling thread -- nothing in the
+                //               scheduler is implicated, and "aim" certainly is not.
+                //
+                // THE THRESHOLD IS THE WAITER'S OWN SPIN RATE, measured on the healthy iterations
+                // of this same row rather than assumed: a spinning waiter does roughly
+                // rt / healthyPollRate polls. Half of that is a generous floor -- anything below
+                // it did not spend the stall spinning. Using the row's own rate means this does
+                // not need retuning per machine, which a hardcoded 125 ns would.
+                const double healthyRate = (healthyPollN && healthyPollSum)
+                                         ? (double)healthyPollSum / (double)healthyPollN : 0.0;
+                if (healthyRate > 0.0) {
+                    const double expectedIfSpinning = rt / (2.0 / healthyRate);   // rt us at ~healthy us/poll
+                    if ((double)wPolls >= expectedIfSpinning * 0.5) ++stallPoolLate;
+                    else                                            ++stallWaiterLate;
+                }
+                else ++stallUnclassified;
             }
         }
 
@@ -1289,6 +1320,19 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                stallCompletion, maxCompletionUs);
         printf("               of those, %llu bought a kernel wake -- the rest hit a target that was\n"
                "               ALREADY AWAKE, so no OS wake is in them at all\n", stallWithWake);
+        // WHO was late. The line above says where the time went; this says which half of the
+        // system to go and look at, and they do not always agree.
+        printf("               WHO was late:  pool %llu | waiter %llu",
+               stallPoolLate, stallWaiterLate);
+        if (stallUnclassified) printf(" | unclassified %llu", stallUnclassified);
+        printf("\n"
+               "                 pool   -> the waiter spun the whole time and kept seeing n>0.\n"
+               "                           Work existed and nobody took it: a SCHEDULER problem.\n"
+               "                 waiter -> few polls across a long trip means the calling thread\n"
+               "                           was NOT ON A CPU. Priority/affinity of the WAITER, and\n"
+               "                           nothing in placement or the permit word is implicated.\n"
+               "                 Split by the waiter's own healthy poll rate on this row, not by a\n"
+               "                 hardcoded constant, so it does not need retuning per machine.\n");
         printf("               ^ COMPARE THESE COUNTS BETWEEN ARMS, NOT max. Five identical runs of\n"
                "                 this row spanned 27.5..197.9 us of max (7.2x) with p50/p99 stable,\n"
                "                 so a max read from one run measures the afternoon, not the config.\n");
