@@ -1059,3 +1059,57 @@ write belongs in the resource wrapper at acquisition, not in the handler remembe
   list is the alternative and needs no home at all.
 - `home` was also described as "owner index **or stream id**" — two namespaces in one byte needs a
   discriminator or a partitioned value space.
+
+---
+
+## The push path writes three fields on the consumer's Thread, and they were on two cache lines
+
+2026-09-01. MEASURED AND FIXED. `PushLocal` writes `inboxDepth`, `hasQueuedWork` (MarkQueuedWork)
+and `workerState` (NotifyWorker) on the worker it selected, once per task, while that worker is
+concurrently reading or RMW-ing all three. Every distinct COHERENCE line among them is a transfer
+the producer pays per task; `PushBatch` pays it once per batch.
+
+```
+before   inboxDepth 2460 (line 38)   hasQueuedWork 2472 (38)   workerState 2520 (39)
+after    inboxDepth 2460 (line 38)   hasQueuedWork 2472 (38)   workerState 2476 (38)
+```
+
+**RESULT, on the rows that hold still:**
+
+| | before (2 runs) | after |
+|---|---|---|
+| latency p50 | 0.60 us | **0.50 us** |
+| latency p99 | 0.90 us | **0.70 us** |
+| latency/cold | 0.55 us | **0.48 us** |
+
+p50 read 0.60 on every run that day at 0-2% spread, so this is well outside noise. ~48 bytes of
+lane and debug counters (`laneWake`, `dbgOnAwakeFloor`, `dbgSpinTick`, `laneCyclesTotal`...) had
+grown between the two halves of a hot triple.
+
+**READ THE 64-BYTE NUMBER, NOT `platform::kCacheLine`.** That constant is 128 -- the adjacent-line
+PREFETCH pair, correct for padding a counter away from unrelated data and NOT the coherence unit.
+At 128 the answer was "1 line, nothing to fix" and this investigation would have closed on it.
+x86 invalidates in 64. `tests/thread_layout_test.cpp` prints both and guards against a future field
+splitting them again.
+
+**DO NOT MEASURE THIS ON THE THROUGHPUT ROW.** The effect is one line transfer -- tens of ns against
+a 422 ns push -- and that column swung 320..662 ns WITHIN a single run. Only the latency row has the
+resolution (p50 stable to 0-2%).
+
+### What is still on that path, and what is NOT the answer
+
+- **CAS retries are not it.** `JLIBSCHED_RETRY_STATS` measured `MAX 0` at both the bands word and
+  the WaitGroup waiter push; the collapse gate's own counter agrees at `casLost=56` of 35,976,149.
+- **`NotePush`/`NoteWakeMiss` were removed** -- two per-push atomics, plus a `GetWorkerState()` load
+  of the target's permit word, feeding counters NOTHING ever loaded. The comment that kept them
+  claimed "the bench reports them"; the bench reports `g_wakeCalls`, a different counter.
+- **`inboxDepth`'s producer-side atomic is the next candidate, and estimating it is the wrong fix.**
+  Its ONLY reader is the worker's own publish-to-stealable gate (`Thread.cpp`, `>= kStealHintDepth`).
+  A push-local counter cannot feed it -- the reader is the WORKER, not the pusher. But since the
+  worker is the sole reader it can observe depth from its own drain ("batch came back full"), which
+  removes the producer's RMW entirely rather than giving it an error bar. Batching the producer
+  instead would UNDERCOUNT between flushes and delay the publish-to-stealable, which is the
+  reachability mechanism the burst rows show matters most.
+- The growth gate already uses the push-local-counter idea, and rejected depth for it explicitly:
+  "it cannot use depth. 200,000 no-ops pile up behind two workers exactly like sixteen 3.3 ms bodies
+  do, and gating on depth grew the floor to 16 on the no-op row: 1p 10.0 -> 5.2 M/s."
