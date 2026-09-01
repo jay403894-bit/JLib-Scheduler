@@ -830,6 +830,8 @@ static std::mutex g_reportMx;
 // after it returns. Either matching the body's core is the collision. This does not prove causation
 // on one sample, but "same core" turns a hypothesis into a number, and "never the same core" kills
 // it outright -- which is the more useful outcome.
+static bool g_waiterPin = false;   // `waiterpin` -- see the flag note in main()
+
 static std::atomic<unsigned> g_bodyCpu{ ~0u };
 
 static std::atomic<long long> g_bodyStartNs{ 0 };
@@ -940,6 +942,26 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
 
     const size_t floorAtLatencyStart = JLib::TaskScheduler::GetAwakeFloor();
     const size_t floorBaseHere       = JLib::TaskScheduler::GetAwakeFloorBase();
+
+    // ---- `waiterpin`: move the BENCH THREAD off the steer set for this row -------------------
+    //
+    // Applied HERE because the floor is only known now -- after the shed above -- and the whole
+    // point is to land outside [0, F), which is where every push in this row is steered.
+    //
+    // A HINT, NOT A HARD BIND. SetThreadIdealProcessor is what the pool itself uses by default,
+    // and hard affinity measured ~45% worse on wake latency for the workers; there is no reason to
+    // expect the waiter to be different. It also means a wrong guess degrades rather than pins the
+    // thread into a corner.
+    if (g_waiterPin) {
+#if defined(_WIN32)
+        const DWORD ideal = (DWORD)((floorAtLatencyStart + 1) % (size_t)std::max(1u, std::thread::hardware_concurrency()));
+        const DWORD prev  = SetThreadIdealProcessor(GetCurrentThread(), ideal);
+        printf("    (waiterpin: bench thread ideal processor %lu -> %lu, outside the floor [0,%zu))\n",
+               (unsigned long)prev, (unsigned long)ideal, floorAtLatencyStart);
+#else
+        printf("    (waiterpin: not implemented on this platform -- ignored)\n");
+#endif
+    }
     if (floorBeforeShed != floorAtLatencyStart)
         printf("    (shed the previous row's floor before measuring: F %zu -> %zu)\n",
                floorBeforeShed, floorAtLatencyStart);
@@ -2948,6 +2970,22 @@ int main(int argc, char** argv) {
         //   The default is now the wide zone; this is the A/B arm, because the narrow steer was
         //   bought with real numbers on the serial row (p50 0.40 -> 0.90 us, 1p 10.0 -> 5.74 M/s
         //   when spread) and giving them back has to be visible.
+        // waiterpin -- give the BENCH THREAD an ideal processor OUTSIDE the steer set [0, F).
+        //
+        //   THE ARM FOR "the waiter is sitting on the core its own target needs". The bare wait is
+        //   a pure spin -- BareWaitBackoff relaxes 512 times then yields, and never parks -- so a
+        //   waiter that logs 4 polls across 100 us was NOT SPINNING TOO LONG, it was off-CPU. If
+        //   the thread that took the core was q0 or q1, moving the waiter away fixes it. If it was
+        //   another process, this makes it WORSE by shrinking where the waiter may run.
+        //
+        //   SO READ THE `cores:` LINE FIRST. This flag is the second step, not the first: run
+        //   unpinned, see whether the waiter and the body shared a core, and only reach for this if
+        //   they did. Ideal processor, not hard affinity -- a hint the OS may ignore under load,
+        //   which is the right strength for a diagnostic and matches the pool's own default.
+        if (JLIB_STRICMP(argv[a], "waiterpin") == 0) {
+            g_waiterPin = true;
+            continue;
+        }
         if (JLIB_STRICMP(argv[a], "narrowsteer") == 0) {
             JLib::TaskScheduler::SetPlacementFollowsGrownFloor(false);
             continue;
