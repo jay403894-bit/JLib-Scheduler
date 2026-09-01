@@ -888,6 +888,9 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     // and 20,000 dumps would be unreadable.
     const double kPathologicalUs = g_stallUs;   // `stall=N` on the command line; 50 us default
     bool dumped = false;
+    // One exemplar per WHO-class, so the classifier can never name a class whose evidence is
+    // missing -- see the gate at the pathological print. Index 1 pool, 2 waiter, 3 pusher.
+    bool classDumped[4] = { false, false, false, false };
     double worstRtUs = 0.0;   // report on each new worst -- see the report site
     // Stall tally by dominant segment. The comparable output of this row; see the classify site.
     unsigned long long stallCount = 0, stallDispatch = 0, stallExecution = 0, stallCompletion = 0;
@@ -1130,6 +1133,9 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // READ IMMEDIATELY, BEFORE ANYTHING ELSE ON THIS THREAD WAITS. They are thread_local and
         // reset by the next bare wait, so a single intervening WaitFor would overwrite them with
         // that wait's numbers and the report would describe the wrong iteration.
+        // WHICH class this iteration fell into: 0 none, 1 pool, 2 waiter, 3 pusher. Set by the
+        // tally below and read by the exemplar gate further down.
+        int whoClass = 0;
         const unsigned wPolls  = JLib::TaskScheduler::LastBareWaitPolls();
         const unsigned wYields = JLib::TaskScheduler::LastBareWaitYields();
         const unsigned wHelped = JLib::TaskScheduler::LastBareWaitHelped();
@@ -1198,11 +1204,11 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                     if (bc != ~0u && (bc == waiterCpuPre || bc == waiterCpuPost)) ++stallSameCore;
                 }
                 const double pushUs = (double)(pushDoneNs - pushIssuedNs) / 1000.0;
-                if (pushUs >= rt * 0.5) { ++stallPusherLate; }
+                if (pushUs >= rt * 0.5) { ++stallPusherLate; whoClass = 3; }
                 else if (healthyRate > 0.0) {
                     const double expectedIfSpinning = rt / (2.0 / healthyRate);   // rt us at ~healthy us/poll
-                    if ((double)wPolls >= expectedIfSpinning * 0.5) ++stallPoolLate;
-                    else                                            ++stallWaiterLate;
+                    if ((double)wPolls >= expectedIfSpinning * 0.5) { ++stallPoolLate;   whoClass = 1; }
+                    else                                           { ++stallWaiterLate; whoClass = 2; }
                 }
                 else ++stallUnclassified;
             }
@@ -1218,14 +1224,30 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // Printing on every new worst means the LAST block printed is the worst one, which is the
         // one to read and the one that matches `max` in the row below. Costs a few extra blocks on a
         // bad run, which is cheaper than a wrong comparison.
-        if (rt > kPathologicalUs && rt > worstRtUs) {
-            worstRtUs = rt;
+        // ---- ONE EXEMPLAR PER CLASS, NOT JUST THE WORST -----------------------------------
+        //
+        // "PRINT ON EVERY NEW WORST" SUPPRESSES THE INTERESTING TRIP. A row that reports
+        // `WHO was late: pool 1 | waiter 1` printed the 73 us WAITER trip and never showed the
+        // POOL one, because the pool trip was smaller and lost the max race -- and the pool trip
+        // is the only one of the two that implicates the scheduler at all. The counts said a
+        // scheduler stall existed and the segments for it were unobtainable.
+        //
+        // So the first trip of EACH class also prints, whatever its duration. Bounded by three
+        // extra blocks per row, and it means the classifier can never name a class whose evidence
+        // is missing.
+        const bool firstOfClass = (whoClass > 0 && !classDumped[whoClass]);
+        if (rt > kPathologicalUs && (rt > worstRtUs || firstOfClass)) {
+            if (rt > worstRtUs) worstRtUs = rt;
+            if (whoClass > 0) classDumped[whoClass] = true;
             dumped = true;
             // Serialise against the watcher's STALL IN PROGRESS block -- see g_reportMx. Held for
             // the whole report, segments included, so the two never splice.
             std::lock_guard<std::mutex> reportLk(g_reportMx);
-            printf("\n  *** PATHOLOGICAL ROUND TRIP: iteration %d took %.1f us "
-                   "(healthy is ~2 us) ***\n", i, rt);
+            printf("\n  *** PATHOLOGICAL ROUND TRIP [%s]: iteration %d took %.1f us "
+                   "(healthy is ~2 us) ***\n",
+                   whoClass == 1 ? "POOL late" : whoClass == 2 ? "WAITER late"
+                                 : whoClass == 3 ? "PUSHER late" : "unclassified",
+                   i, rt);
 
             // ---- WHERE THE OUTLIER ACTUALLY LIVES ----------------------------------------
             const long long bs = g_bodyStartNs.load(std::memory_order_relaxed);

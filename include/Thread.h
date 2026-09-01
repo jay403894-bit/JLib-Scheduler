@@ -96,13 +96,29 @@ namespace JLib {
         InboxDrain,     // own loPri inbox, the bulk drain
         StealScan,      // probing other workers' deques
         ParkGate,       // inside the park block, deciding whether to sleep
+        // A FLOOR WORKER WENT ROUND, AND IT IS NOT A PARK. Without this the idle floor paints
+        // ParkGate: it enters the park block, finds nothing, reads the band word, sees it is on the
+        // floor and `continue`s -- so the breadcrumb says "deciding whether to sleep" for a thread
+        // that is structurally forbidden to sleep.
+        //
+        // AND THAT MADE EVERY IDLE DUMP LOOK LIKE A HANDSHAKE FAILURE. The floor's resting pose is
+        // NOTIFIED + parkGate: every aimed push swaps the word to NOTIFIED, and at F <= the yield
+        // threshold the worker never takes the handshake's consume, so the word STAYS NOTIFIED and
+        // the phase STAYS parkGate for the whole row. Read as "a permit was latched on a worker at
+        // the park gate", that is a stall; read correctly it is an idle floor doing its job -- 0
+        // floor parks completed, 0 yield aims, 20000/20000 landings.
+        //
+        // NOT FIXED BY CONSUMING THE PERMIT ON THIS PATH. That would turn NOTIFIED into EMPTY at
+        // the cost of a CAS on every idle pass, and buys nothing: the next Wake still correctly
+        // performs no syscall either way. The word is right. The NAME was wrong.
+        FloorSpin,      // on the floor, went round rather than parking -- NOT a park attempt
         Parked,         // blocked in WaitOnAddress / futex / condvar
         Running,        // executing a task body
         Count
     };
     inline const char* WorkerPhaseName(unsigned char p) {
         static const char* k[] = { "start", "hiPri", "resumed", "ownDeque", "drain",
-                                   "stealScan", "parkGate", "PARKED", "RUNNING", "?" };
+                                   "stealScan", "parkGate", "floorSpin", "PARKED", "RUNNING", "?" };
         return p < (unsigned char)WorkerPhase::Count ? k[p] : "?";
     }
     struct alignas(platform::kCacheLine) PhaseSlot { std::atomic<unsigned char> phase{ 0 }; };

@@ -3705,6 +3705,13 @@ void Thread::Worker() {
 				dbgOnAwakeFloor.store(onAwakeFloor, std::memory_order_relaxed);
 
 				if (onAwakeFloor) {
+					// SAY WHAT THIS THREAD IS ACTUALLY DOING. It reached the park block, found
+					// nothing, and is about to go round because it is on the floor -- it is not
+					// "deciding whether to sleep", it is forbidden to sleep. Leaving ParkGate
+					// painted here made the floor's normal idle pose (NOTIFIED + parkGate, because
+					// every push swaps the word and the floor never consumes it) read as a permit
+					// latched on a worker at the park gate, which is the signature of a stall.
+					JLIBSCHED_PHASE(qIndex, FloorSpin);
 					dbgSpinTick.store(++spinTick, std::memory_order_relaxed);
 
 					// ---- A TINY FLOOR DOES NOT YIELD AT ALL ----------------------------------
