@@ -146,6 +146,69 @@ word shipped on 2026-08-31:
 No new mechanism. `WS_YIELD` exists precisely because `WS_EMPTY` was claiming "on core, no syscall
 needed" while a thread was off it.
 
+
+### 3.7 The adaptive floor, and what the I/O lane does to it
+
+The compute side is not a fixed set of hot cores. **F is elastic**: it grows under a wave and sheds
+when the wave drains, which is the mechanism the I/O lane sits beside and must not disturb.
+
+```
+  [0, K)          I/O lane          RESERVED   fixed, opt-in, never grows or sheds
+  [K, K+F)        awake floor       ELASTIC    grows under load, collapses on idle
+  [K+F, n)        parkable          the rest
+```
+
+**K is reserved, F is a budget.** That is the whole distinction, and it is why they can share a
+machine without a controller arbitrating between them:
+
+| | K (I/O lane) | F (awake floor) |
+|---|---|---|
+| size | fixed at opt-in, 1–3 | `Fbase` at rest, grows to `Fmax` under load |
+| changes at runtime | no | yes — `NoteFloorCrowding` grows, `CollapseAwakeFloorToBase` sheds |
+| who decides | the application, once | the workload, continuously |
+
+As shipped 2026-08-31:
+
+```
+Fbase = n <= 8 ? 1 : 2
+Fmax  = clamp(n - 2, Fbase, 16)     then clamped to n - K - 2
+```
+
+**The floor already starts after K and already cannot grow into it.** `floorBase = pbands.k`, and the
+growth ceiling is `structural = n - kNow - 2` — live K, re-read every time. So a larger I/O lane
+narrows the compute floor's ceiling automatically. No new accounting, and nothing to keep in step.
+
+The `- 2` is the other half: one or two logical CPUs stay outside the live floor so the application
+thread is not sharing a fully packed box. **Peak is a budget, not a target** — an unbounded peak is
+NoSleep for the length of the grow-hold, and every parkable worker becomes a spinner until the
+collapse wins.
+
+### Wide is the other lever, and the I/O lane does not touch it
+
+`Wide` wakes the crowd once for one wave, keeps F at base, and everyone parks after — measured at 31
+participants with `PEAK 2`. Growth keeps cores hot for the *next* push. They are separate mechanisms
+and the I/O lane interacts with neither: it never grows, never sheds, and is never a steal target.
+
+### An open consequence, stated rather than assumed
+
+**If K threads live OUTSIDE the worker array** — as §2 describes them, subcontractors of the reactor
+rather than pool workers — then `bands.k` is 0 for the compute scheduler and **the reserved band
+disappears from it entirely**:
+
+- `PickNextWorker`'s `kResv` mask has nothing to mask
+- `reservedForHiPri` gates in `Worker()` are dead code
+- `hiPriInboxes` becomes per-K-thread rather than per-worker
+
+That would delete most of the machinery repaired on 2026-08-31 — the placement mask, the drain gates,
+the park-predicate terms — because the invariant they enforce ("ordinary work never reaches a
+reserved worker") becomes true by construction when no worker is reserved.
+
+**This is a consequence to confirm, not a decision recorded.** It is a large deletion, it changes the
+thread budget (K threads become additional cores rather than a slice of the pool, accounted like the
+timer thread), and the reserved band was bought with a measurement on the *old* design — reservation
+buys a flat completion tail worth 175x at 400 µs grain. Whether that number survives the lane owning
+its own threads is unknown and untested.
+
 ---
 
 ## 4. Invariants
