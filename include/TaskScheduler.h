@@ -1025,8 +1025,8 @@ namespace JLib {
 		// floor that grows -- it is a floor that does not SHED.
 		//
 		// THE ARGUMENT IS THE MAXIMUM LIVE FLOOR WIDTH, NOT A NUMBER OF EXTRA WORKERS. It is
-		// compared against live F directly, so with a base of 2, SetFloorGrowthCap(2) forbids
-		// growth entirely (F is already at the ceiling) and SetFloorGrowthCap(6) allows four more.
+		// compared against live F directly, so with a base of 2, SetAwakeFloorMax(2) forbids
+		// growth entirely (F is already at the ceiling) and SetAwakeFloorMax(6) allows four more.
 		// A cap at or below the base is therefore equivalent to SetFloorGrowthEnabled(false), and
 		// `growcap=2 floor=2` duly measured `peak 2` on a fork-join row that reaches `peak 30`
 		// uncapped. Naming it maxExtraWorkers, as the first draft did, would have had every caller
@@ -1036,8 +1036,10 @@ namespace JLib {
 		// than wrapping. Settable before Init and honoured live; lowering it does not retroactively
 		// shed a floor that is already wider, it only refuses further growth -- the collapse still
 		// returns the floor to base when the wave drains.
-		static void   SetFloorGrowthCap(size_t maxLiveFloorWidth) noexcept;
-		static size_t GetFloorGrowthCap() noexcept;
+		// 0 = USE THE DEFAULT POLICY, which is max(Fbase, hw/2) clamped to n - K - 2 -- NOT
+		// unlimited. See the ceiling note in NoteFloorCrowding for why peak is a budget.
+		static void   SetAwakeFloorMax(size_t maxLiveFloorWidth) noexcept;
+		static size_t GetAwakeFloorMax() noexcept;
 
 		// The floor the process ASKED for, as opposed to GetAwakeFloor() which is what it is right
 		// now -- growth may hold it above the base for the length of a wave.

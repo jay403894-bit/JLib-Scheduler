@@ -2018,12 +2018,12 @@ static constexpr bool kWakeOnRangePublish = false;
 // bounding the wrong thing: the danger is a floor that does not SHED, not a floor that grows.
 // WAS A COMPILE-TIME CONSTANT PINNED AT 0. The value and its meaning are unchanged -- 0 is
 // unlimited -- but an application could not reach it, so "grow, but not past N" was inexpressible.
-// See SetFloorGrowthCap in the header for why a CEILING is a different and far cheaper thing than
+// See SetAwakeFloorMax in the header for why a CEILING is a different and far cheaper thing than
 // SetAwakeFloor's permanent base, and for why the old wide-floor objection was the spin rather than
 // the width.
 static std::atomic<size_t> g_floorGrowCap{ 0 };
-void   TaskScheduler::SetFloorGrowthCap(size_t n) noexcept { g_floorGrowCap.store(n, std::memory_order_relaxed); }
-size_t TaskScheduler::GetFloorGrowthCap() noexcept { return g_floorGrowCap.load(std::memory_order_relaxed); }
+void   TaskScheduler::SetAwakeFloorMax(size_t n) noexcept { g_floorGrowCap.store(n, std::memory_order_relaxed); }
+size_t TaskScheduler::GetAwakeFloorMax() noexcept { return g_floorGrowCap.load(std::memory_order_relaxed); }
 
 // How deep a floor worker's inbox must be before queueing behind it is worth waking a core for.
 // 4 sits between the two workloads that have to be told apart: a 6-node frame graph puts ~3 behind
@@ -2128,12 +2128,50 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// Minus one more so a parkable worker always exists -- the pool must retain somewhere to put a
 	// worker that has genuinely run out of work, or "parkable" is a band with no members.
 	if (n <= kNow + 1) return;              // no room for a floor at all: refuse rather than wrap
-	// The app's ceiling if it set one, otherwise the structural limit. Clamped to the structural
-	// limit either way, so a caller passing a number larger than the pool gets the pool and not a
-	// wrap -- the `n <= kNow + 1` guard above is what keeps that subtraction safe.
-	const size_t userCap = GetFloorGrowthCap();
-	size_t cap = userCap ? userCap : (n - kNow - 1);
-	if (cap > n - kNow - 1) cap = n - kNow - 1;
+	// ---- NO "SEVERAL DEQUES MUST HAVE WORK" GATE HERE, AND IT WAS TRIED --------------------
+	//
+	// The idea was Grok's and it is right about the DISEASE: `submitted` counts things pushed, so
+	// one long body in one owner's inbox could slide F over twenty idle cores, which is how
+	// burst/dflt produced `PEAK 11, participants 8`. The proposed cure was to require two or more
+	// steal hints -- "this queue has work a THIEF may take" -- before widening past the base.
+	//
+	// IT COST 2.7x ON THE ROW IT WAS MEANT TO FIX. burst/dflt went 9.93 ms -> 26.54 ms (5.3x ->
+	// 2.0x of 16) with participants collapsing from 8 to 2, because THIS FUNCTION IS CALLED AT PUSH
+	// TIME. The tasks are still in inboxes; nothing has been staged to a deque yet; the steal hints
+	// advertise DEQUE work. So the gate reads "no wave" at exactly the moment a wave is arriving,
+	// and growth only becomes legal after the owners have drained -- which is far too late to widen
+	// for the burst that is already in flight.
+	//
+	// A CORRECT VERSION HAS TO ASK A PUSH-TIME QUESTION: how many DISTINCT WORKERS have pending
+	// work, which the producer knows and the steal hints do not yet reflect. That is a different
+	// mechanism and it is not built. Until it is, the ceiling below is what bounds the damage --
+	// and it bounds it by width rather than by refusing to grow at all.
+
+	// ---- THE CEILING: A BUDGET, NOT A TARGET -------------------------------------------------
+	//
+	// NOT UNLIMITED BY DEFAULT, and that is a deliberate reversal. Max peak is NoSleep for the
+	// length of the grow-hold: every parkable worker becomes a spinner until the collapse wins --
+	// leftover F on the next latency row, N pause loops, the submitter and the waiter fighting
+	// elevated cores, and a collapse that has to walk the whole band back down. Jay: "Base 2 is the
+	// product. Peak is a budget. Max is a stress row, not the policy."
+	//
+	// hw/2 AS THE DEFAULT, floored at fbase so policy is never undercut. Half the machine is what a
+	// burst may spend without handing the box to the pool.
+	//
+	// n - 2, NOT n - 1: leave a logical CPU out so the application thread is not sharing a fully
+	// packed box with the floor. The entire latency argument for a floor is that a push lands on a
+	// worker that is ALREADY RUNNING, and that stops being true if the submitter cannot get a core.
+	//
+	// WIDE IS THE OTHER LEVER AND STAYS SEPARATE. Wide wakes the crowd once for one wave, keeps F
+	// at base, and everyone parks after -- burst/wide reaches 31 participants at PEAK 2. Growth
+	// keeps cores hot for the NEXT push, which is only worth it if another wave is coming and the
+	// work is stealable. Fork-join reaching peak 30 is a case for ASKING for width, not for
+	// teaching every burst to become NoSleep for 6 ms.
+	const size_t structural = (n >= kNow + 2) ? (n - kNow - 2) : 0;
+	if (structural == 0) return;
+	const size_t userCap = GetAwakeFloorMax();
+	size_t cap = userCap ? userCap : (fbase > (n / 2) ? fbase : (n / 2));
+	if (cap > structural) cap = structural;
 
 	// THE EARLY-OUT IS THE STEADY-STATE COST: two relaxed loads once the floor has reached the cap.
 	// That matters because this sits on the push path, and in a throughput workload the floor is

@@ -3194,7 +3194,7 @@ int main(int argc, char** argv) {
         //   NOT SetAwakeFloor: that is a PERMANENT base and costs a 3.3-17 us round trip at 31
         //   against 0.6 at 2. A ceiling on a TRANSIENT burst is a different and far cheaper thing.
         if (JLIB_STRNICMP(argv[a], "growcap=", 8) == 0) {
-            JLib::TaskScheduler::SetFloorGrowthCap((size_t)strtoul(argv[a] + 8, nullptr, 10));
+            JLib::TaskScheduler::SetAwakeFloorMax((size_t)strtoul(argv[a] + 8, nullptr, 10));
             continue;
         }
         //   yield() is politeness aimed at a WIDE spinning set. At F=2 the steer set has two bits,
