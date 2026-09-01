@@ -932,3 +932,41 @@ it in K's own std::queue backlog, which is safe unsynchronised because K is sing
     concurrently, which breaks stream ordering -- and nothing in pushIO can fix that, because by then
     they are on separate threads. It is normally free (the next recv is not issued until the current
     one completes) but it is a CONTRACT the reactor must state, not a property that happens to hold.
+
+### It is TWO SCHEDULERS SHARING ONE PARK MACHINE, and that fixes the naming
+
+Jay's framing, and it resolves a confusion that ran through this whole design conversation: the
+library is an ASYNC I/O SCHEDULER and an FTL AT THE SAME TIME, one opted into from the other. What
+they share is the park machine -- the permit word, YIELD, the wake protocol. What they do NOT share
+is queues, priorities, or placement policy. That is exactly why the verify files kept needing "this
+file is about the loPri queue" as a caveat.
+
+**hiPri NEVER MEANT "MORE IMPORTANT", IT MEANT "THE LANE"**, which is what the labelling argument was
+actually about. F is the priority in the jobs system and it is the only one. Renaming hiPri* to io*
+makes this session's invariant self-describing: "K never reads loPri" has to be held in the head,
+"THE I/O LANE NEVER READS THE TASK INBOX" is obvious on sight. NOT ALL WORKERS ARE EQUAL is a
+deliberate property here, not an accident of implementation.
+
+**IOMPSCQueue IS A SEPARATE TYPE AND THE DUPLICATION IS THE POINT.** A bounded queue whose push can
+FAIL is a different CONTRACT, not a configuration of the same one. Parameterising TaskMPSCQueue would
+put a new failure edge inside the path mpsc_model.c already proves; copying leaves that subject
+untouched. `bool push()` is also what stops the copy being code smell -- it is the reason the type
+exists. CAVEAT: the copy needs ITS OWN MODEL. Full/empty and a failing producer are new states and
+mpsc_model.c says nothing about them.
+
+**REACTOR-OWNED BACKLOG ELIMINATES pushIO ENTIRELY.** The retry-and-spill logic collapses into one
+single-threaded loop instead of a shared helper every caller could get wrong: pop a completion, try
+push into the next kworker's queue round-robin, on false park it in a plain std::queue -- no mutex,
+because the only producer and the only consumer of that backlog are the same thread -- and drain the
+backlog before pulling anything new.
+
+**OPEN, and asked rather than assumed:** is K the reactor's DISPATCH THREAD (pulls completions,
+round-robins, owns the backlog -- collapsing a hop and a wake), or a separate thread the reactor
+feeds? "A K worker is deployed as a subcontractor of the reactor" and "the backlog is handled by the
+reactor itself" read as the former. The two differ in thread count and in how many wakes a cold
+completion pays, so it is worth stating before anyone builds to it.
+
+**UNMEASURED, and stated as such:** the sleep/wake cost of an exclusive sub-scheduler. The claim is
+that a poll-then-park loop is cheap because the kworkers only wake when work exists, and every
+existing check already works. Plausible -- a wake is ~3 us and an I/O completion is not free either
+-- but nobody has run it.
