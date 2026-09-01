@@ -1867,7 +1867,26 @@ namespace JLib {
 		// primitive is the same bug waiting for the next primitive. See design/NOTES.md.
 		WaitResult WaitFor(WaitGroup& wg, CancelToken tok);
 		bool Push(uint8_t cpu_affinity, Task* task);
-		bool Requeue(Task* task);
+		// ---- WHERE A RESUMED TASK WENT, AND WHO MAY TAKE IT ------------------------------------
+		//
+		// NOT A bool, AND THE REASON IS THAT `false` WOULD MEAN TWO THINGS. Today false means "this
+		// task is queued NOWHERE" -- a lost task, and the yield site calls dropping it "the worse of
+		// the two lost-task sites". Under migratable fibers the caller also wants to know whether
+		// the resume became STEALABLE, and answering that with the same bool makes `!Requeue(t)`
+		// unreadable: a leak and a correctly-pinned resume look identical.
+		//
+		// THE AXIS IS HOW MANY WORKERS MAY RUN IT, which is the thing that decides resume latency:
+		//   Failed     queued nowhere. The task is lost unless the caller acts. Only a null task
+		//              today, but it stays distinct so it cannot be confused with the two below.
+		//   Pinned     queued where exactly ONE worker may take it -- a resume inbox, or an
+		//              ordinary inbox before its owner drains it. Resume waits for that worker.
+		//   Stealable  queued on a DEQUE. The owner pops it LIFO (still cache-warm) and any thief
+		//              may take it from the other end, so the resume happens on whoever is free.
+		//
+		// That last one is the whole point of migratable mode: pinned makes a resume wait for one
+		// specific worker, stealable lets the pool answer it.
+		enum class RequeueResult { Failed, Pinned, Stealable };
+		RequeueResult Requeue(Task* task);
 		// minPerSegment: the smallest run this is willing to hand to a single worker. The default of
 		// 64 suits a big fire-and-forget batch, where the alternative is ONE push and the notifies
 		// are pure added cost. A caller replacing N individual Push() calls -- which already notify
@@ -2631,7 +2650,27 @@ namespace JLib {
 			PushLocal(t, cpu_affinity);
 		}
 	private:
-		explicit TaskScheduler(size_t poolSize);
+		// ---- CONSTRUCTION NO LONGER STARTS THE POOL, AND THAT IS A RACE FIX -------------------
+		//
+		// It used to be `TaskScheduler(size_t) { StartPool(poolSize); }`, so `Init`'s
+		// `instance = new TaskScheduler(poolSize)` started worker threads INSIDE the constructor --
+		// and `instance` is not assigned until the constructor returns. Workers reached GetBands(),
+		// read `instance`, and raced main's write of it.
+		//
+		// FOUND BY TSAN, first run:
+		//   Write  main   TaskScheduler::Init()      TaskScheduler.cpp:460
+		//   Read   T1     TaskScheduler::GetBands()  TaskScheduler.cpp:2574 <- Thread::Worker()
+		//
+		// It was not only a data race on a plain pointer. GetBands does
+		// `const size_t nw = instance ? instance->workers.size() : 0;` and then clamps K and F
+		// against nw -- so for the whole startup window nw read ZERO and THE CLAMPS DID NOT APPLY,
+		// while workers were already making band decisions with the result.
+		//
+		// Init now assigns `instance` and THEN calls StartPool, so the pointer is published before
+		// any worker thread exists and the publication happens-before every worker's first read by
+		// thread creation. Nothing else constructed a TaskScheduler or called StartPool -- one
+		// caller each -- so this splits cleanly.
+		TaskScheduler() = default;
 
 		// ---- TEARDOWN IS NOT PUBLIC API. It happens once, at process exit. -------------------
 		//

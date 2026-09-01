@@ -254,9 +254,8 @@ TaskScheduler::AtExitDestroyer::~AtExitDestroyer() {
 thread_local int TaskScheduler::consecutiveHiPriSteals = 0;
 GlobalFiberPool* TaskScheduler::globalPool = nullptr;
 
-TaskScheduler::TaskScheduler(size_t poolSize) {
-	StartPool(poolSize);
-}
+// The constructor no longer starts the pool -- Init publishes `instance` first and then calls
+// StartPool. See the declaration in TaskScheduler.h for the race that forced the split.
 // Init-only, and a plain bool for the same reason as EpochManager's selfReclaim: written once before
 // any thread exists, read while sizing the pool. Nothing races it.
 static bool g_reserveTimerCore = false;
@@ -457,7 +456,16 @@ size_t TaskScheduler::GetSafeTC() {
 void TaskScheduler::Init(size_t poolSize) {
 	if (instance != nullptr)
 		throw std::runtime_error("TaskScheduler already initialized!");
-	instance = new TaskScheduler(poolSize);
+	// PUBLISH BEFORE THE WORKERS EXIST. The pointer must be visible before any thread that could
+	// read it is created; thread creation then gives every worker a happens-before edge to this
+	// store, which is what removes the race rather than papering over it with an atomic.
+	//
+	// TSan found the old ordering on its first run: StartPool ran INSIDE the constructor, so
+	// workers reached GetBands() and read `instance` while this line was still writing it -- and
+	// GetBands' `nw` read 0 for that window, so the K/F clamps did not apply while those workers
+	// were already using the result. See the constructor's declaration for the full report.
+	instance = new TaskScheduler();
+	instance->StartPool(poolSize);
 
 	// ---- TEMP DIAG: JLIB_WATCHDOG=<seconds> --------------------------------------------------
 	//
@@ -5622,7 +5630,12 @@ static std::atomic<bool> g_pushBatchWide{ false };
 void TaskScheduler::SetPushBatchWide(bool on) noexcept { g_pushBatchWide.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::PushBatchWide() noexcept { return g_pushBatchWide.load(std::memory_order_relaxed); }
 
-static bool g_migratableFibers = false;
+// ATOMIC, MATCHING g_pushBatchWide AND g_bareWaitHelp. It was a plain bool on the grounds that the
+// contract is set-before-Init, which is true and is still the contract -- but a relaxed load is a
+// plain mov on x86, so the UB was being accepted for nothing. A flag whose whole selling point is
+// "set once, so the branch predicts perfectly and costs nothing" should not be the one place that
+// relies on a promise instead of the type system.
+static std::atomic<bool> g_migratableFibers{ false };
 void TaskScheduler::SetMigratableFibers(bool on) {
 	// THE CREDITOR MASK MUST COVER EVERY ADDRESSABLE WORKER. If it does not, NoteCreditor refuses a
 	// high-numbered worker -- correctly, since wrapping would bill the wrong one -- and that
@@ -5635,7 +5648,7 @@ void TaskScheduler::SetMigratableFibers(bool on) {
 	// ACCESS it (private). A member function body is both.
 	static_assert(Fiber::kCreditorWords * 64 >= kMaxHintQueues,
 		"Fiber::kCreditorWords is too narrow for kMaxHintQueues workers.");
-	g_migratableFibers = on;
+	g_migratableFibers.store(on, std::memory_order_relaxed);
 }
 
 bool TaskScheduler::PushResume(size_t worker, Task* task) {
@@ -5656,7 +5669,7 @@ bool TaskScheduler::PushResume(size_t worker, Task* task) {
 		s->workers[worker]->NotifyWorker();
 	return true;
 }
-bool TaskScheduler::MigratableFibers() { return g_migratableFibers; }
+bool TaskScheduler::MigratableFibers() { return g_migratableFibers.load(std::memory_order_relaxed); }
 
 #if defined(JLIBSCHED_TASK_STATS)
 // Prints the task-size histogram AND the class-boundary arithmetic.
@@ -5922,8 +5935,37 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 	}
 	return true;
 }
-bool TaskScheduler::Requeue(Task* task) {
-	if (!task) return false;
+TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
+	if (!task) return RequeueResult::Failed;
+
+	// ---- MIGRATABLE RESUME: ONTO A DEQUE, WHERE ANYONE MAY TAKE IT ---------------------------
+	//
+	// THE ONE PLACE THE MODE IS READ. Everything else about migratable fibers -- the creditor set,
+	// the cleanup chain, the recycle -- is the same code in both modes; pinned is that machinery
+	// with the creditor set holding one member. Only the ROUTING of a resume differs, so only this
+	// branch exists, and a second copy is where the two modes would drift apart.
+	//
+	// WHY IT IS FASTER, WHICH IS THE WHOLE ARGUMENT: pinned makes the resume wait for one specific
+	// worker. Stealable lets whichever worker is free answer it. The deque BOTTOM specifically --
+	// the owner pops LIFO so it takes this back first with the stack still warm, while a thief
+	// takes from `top` if the owner does not come back. That is the mailbox's placement benefit
+	// without the mailbox's dead end (see the note at the top of this file).
+	//
+	// AND IT IS SAFE ONLY BECAUSE THE DEBTS ARE RECORDED. A migrating fiber's thread-affine state
+	// is owed to the workers in Fiber::creditors and settled by the cleanup chain at death; that is
+	// what makes resume-anywhere legal rather than the thread_local hazard pinning existed to
+	// remove.
+	//
+	// NO LANE -> FALL THROUGH. Requeue can be called from a bare thread (Fiber.cpp's resume path,
+	// the redistribute path), which owns no deque. Those take the ordinary placement below rather
+	// than inventing a target.
+	if (MigratableFibers() && task->assignedFiber) {
+		if (TaskDeque* lane = LaneForCurrentThread()) {
+			if (lane->push_bottom(task)) return RequeueResult::Stealable;
+			// push_bottom refuses only at the growth ceiling. Falling through to placement is
+			// better than dropping a resumed fiber, which would strand a live 64KB stack.
+		}
+	}
 	// Re-queue a paused task (resumed after Suspend). Unlike PushLocal this does NOT
 	// re-count the task -- it was already accounted for at its original submission and
 	// is only resuming, not newly created. (The yield path does the same, via the
@@ -5945,7 +5987,22 @@ bool TaskScheduler::Requeue(Task* task) {
 	// suspended for. Fresh lane work is unaffected, because a task that has not run holds no fiber
 	// and never reaches this branch.
 	{
-		if (Fiber* f = task->assignedFiber) {
+		// MIGRATABLE MODE NEVER REACHES THE RESUME INBOX, and this gate is why. Without it the
+		// branch above only migrated when the resume was triggered FROM A WORKER -- a bare-thread
+		// signaler (main, an I/O completion, a GPU callback) has no lane, so it fell through to
+		// here and got pinned anyway. tests/migratable_fiber_test.cpp caught exactly that: work
+		// spread over six workers and every one of 256 tasks still resumed on the worker it left.
+		//
+		// AND THAT IS THE CASE MIGRATION MATTERS MOST FOR. An external signaler has no natural home
+		// to pin to; making it wait for the binding worker is the latency this mode exists to
+		// remove. Falling through to ordinary placement puts the task in an inbox its owner drains
+		// INTO ITS DEQUE, so it becomes stealable one hop later -- not as direct as the deque push
+		// above, but reachable by the whole pool, which is the property that matters.
+		//
+		// A BARE THREAD CANNOT DO BETTER THAN THAT. Chase-Lev allows push_bottom from the OWNER
+		// only, so a non-worker physically may not publish onto a worker's deque; the inbox hop is
+		// the legal route.
+		if (!MigratableFibers()) if (Fiber* f = task->assignedFiber) {
 			const size_t home = f->homeWorker;
 			// SIZE_MAX is "not bound", which a task holding a fiber should never be. Falling through
 			// to the ordinary path is the safe answer rather than indexing on it: unpinned routing
@@ -5972,7 +6029,7 @@ bool TaskScheduler::Requeue(Task* task) {
 				NoteInboxPush(1);
 				workers[home]->MarkQueuedWork();
 				workers[home]->NotifyWorker();
-				return true;
+				return RequeueResult::Pinned;   // resume inbox: exactly one legal consumer
 			}
 		}
 	}
@@ -5998,7 +6055,9 @@ bool TaskScheduler::Requeue(Task* task) {
 	NoteInboxPush(1);
 	workers[chosen]->MarkQueuedWork();
 	workers[chosen]->NotifyWorker();
-	return true;
+	// ORDINARY PLACEMENT: an inbox also has exactly one legal consumer until its owner drains it
+	// to a deque, so this is Pinned by the same definition -- how many workers may run it NOW.
+	return RequeueResult::Pinned;
 }
 int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	// THE LANE INVARIANT, ENFORCED AT THE ONE PLACE PLACEMENT IS DECIDED. A hiPri task rotates the
