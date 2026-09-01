@@ -12,34 +12,40 @@
 # is not a dependency of the library and copying someone else's scheduler in would imply otherwise.
 # Point at a clone instead: git clone https://github.com/dougbinks/enkiTS
 
-if(NOT JLIBSCHED_ENKITS_DIR)
+# THE THREE COMPARISONS ARE INDEPENDENTLY OPTIONAL. Set any subset of the three _DIR variables and
+# you get exactly those targets.
+#
+# THIS BLOCK USED TO `return()` WHEN enkiTS WAS ABSENT, which exits the whole file -- so the Taskflow
+# and marl blocks below were never reached, and the only message printed said "skipping the enkiTS
+# comparison target". Configuring with JLIBSCHED_MARL_DIR alone therefore produced no targets at all
+# and told you nothing was wrong. The other two blocks were always if/else; this one is now too.
+if(JLIBSCHED_ENKITS_DIR)
+    if(NOT EXISTS "${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h")
+        message(FATAL_ERROR
+            "compare: no enkiTS at ${JLIBSCHED_ENKITS_DIR} -- expected ${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h. "
+            "Clone it with: git clone https://github.com/dougbinks/enkiTS")
+    endif()
+
+    # BOTH libraries have a header called TaskScheduler.h, and both are on the include path, so a
+    # plain #include picks whichever directory comes first -- silently, and differently per
+    # generator. Alias enkiTS's to an unambiguous name and include that instead.
+    set(_enki_alias "${CMAKE_CURRENT_BINARY_DIR}/enki_include")
+    file(MAKE_DIRECTORY "${_enki_alias}")
+    file(WRITE "${_enki_alias}/TaskScheduler_enki.h"
+         "#pragma once\n#include \"${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h\"\n")
+
+    add_executable(CompareEnkiTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/compare_enkits.cpp"
+        "${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.cpp")
+
+    target_include_directories(CompareEnkiTS PRIVATE "${_enki_alias}")
+    target_link_libraries(CompareEnkiTS PRIVATE Scheduler)
+    target_compile_features(CompareEnkiTS PRIVATE cxx_std_17)
+
+    message(STATUS "compare: enkiTS comparison target enabled (${JLIBSCHED_ENKITS_DIR})")
+else()
     message(STATUS "compare: JLIBSCHED_ENKITS_DIR not set, skipping the enkiTS comparison target")
-    return()
 endif()
-
-if(NOT EXISTS "${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h")
-    message(FATAL_ERROR
-        "compare: no enkiTS at ${JLIBSCHED_ENKITS_DIR} -- expected ${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h. "
-        "Clone it with: git clone https://github.com/dougbinks/enkiTS")
-endif()
-
-# BOTH libraries have a header called TaskScheduler.h, and both are on the include path, so a plain
-# #include picks whichever directory comes first -- silently, and differently per generator. Alias
-# enkiTS's to an unambiguous name and include that instead.
-set(_enki_alias "${CMAKE_CURRENT_BINARY_DIR}/enki_include")
-file(MAKE_DIRECTORY "${_enki_alias}")
-file(WRITE "${_enki_alias}/TaskScheduler_enki.h"
-     "#pragma once\n#include \"${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.h\"\n")
-
-add_executable(CompareEnkiTS
-    "${CMAKE_CURRENT_SOURCE_DIR}/compare_enkits.cpp"
-    "${JLIBSCHED_ENKITS_DIR}/src/TaskScheduler.cpp")
-
-target_include_directories(CompareEnkiTS PRIVATE "${_enki_alias}")
-target_link_libraries(CompareEnkiTS PRIVATE Scheduler)
-target_compile_features(CompareEnkiTS PRIVATE cxx_std_17)
-
-message(STATUS "compare: enkiTS comparison target enabled (${JLIBSCHED_ENKITS_DIR})")
 
 # ---------------------------------------------------------------- Taskflow
 # Separate target and separate BINARY from the enkiTS comparison, deliberately -- see the header of
