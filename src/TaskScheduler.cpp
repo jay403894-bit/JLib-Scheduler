@@ -5472,6 +5472,28 @@ void TaskScheduler::SetFiberBudget(size_t fibersPerWorker) {
 	g_standardFibersPerWorker = fibersPerWorker;
 }
 size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWorker; }
+
+// DEFAULT false -- pinned, which is what every release through 5.0 shipped. Migration is opt-in
+// rather than the new default because it changes a contract users already build against, and a
+// scheduler that silently starts resuming elsewhere would break exactly the code that was relying
+// on it not doing so, with no diagnostic.
+static bool g_migratableFibers = false;
+void TaskScheduler::SetMigratableFibers(bool on) {
+	// THE CREDITOR MASK MUST COVER EVERY ADDRESSABLE WORKER. If it does not, NoteCreditor refuses a
+	// high-numbered worker -- correctly, since wrapping would bill the wrong one -- and that
+	// worker's cleanup is dropped instead. Silent, and only on machines wide enough to reach the
+	// gap, which is the worst combination.
+	//
+	// ASSERTED HERE, INSIDE A MEMBER BODY, and the two failed placements are worth recording: at
+	// class scope it cannot see kMaxHintQueues (declared further down, and a class-scope
+	// static_assert is not a complete-class context), and at namespace scope in this file it cannot
+	// ACCESS it (private). A member function body is both.
+	static_assert(Fiber::kCreditorWords * 64 >= kMaxHintQueues,
+		"Fiber::kCreditorWords is too narrow for kMaxHintQueues workers.");
+	g_migratableFibers = on;
+}
+bool TaskScheduler::MigratableFibers() { return g_migratableFibers; }
+
 #if defined(JLIBSCHED_TASK_STATS)
 // Prints the task-size histogram AND the class-boundary arithmetic.
 //

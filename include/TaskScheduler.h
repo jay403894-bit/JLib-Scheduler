@@ -2331,6 +2331,30 @@ namespace JLib {
 		static void SetFiberBudget(size_t fibersPerWorker);
 		static size_t StandardFibersPerWorker();
 
+		// ---- MIGRATABLE FIBERS: the mode switch, and it is ONE PREDICATE, not two schedulers -----
+		//
+		// false (DEFAULT, and what every release through 5.0 shipped): a fiber resumes only on the
+		// worker it was bound to. marl's contract -- "the fiber must belong to this worker" -- and
+		// the conservative one. TLS is safe because the fiber never moves.
+		//
+		// true: a resumed fiber may continue on ANY worker. This is the position the architecture
+		// header at the top of this file argues for and the one the library already PAID for --
+		// address-routed frees, a global epoch participant list, fiber-indexed hazard cells. What it
+		// costs is that thread-affine cleanup can no longer just happen wherever the fiber ends: it
+		// is settled through Fiber's creditor set, one hop per creditor.
+		//
+		// WHY A SETTING RATHER THAN A CHOICE. The two are not equally right for every host. A game
+		// that owns every job in the process can enforce "do not cache a TLS-derived value across a
+		// suspension point" and take the rebalancing; middleware embedded in a host it cannot audit
+		// cannot. Shipping both is more code. It is not two sets of invariants: PINNED IS THE
+		// MIGRATABLE PATH WITH THE CREDITOR SET FORCED TO ONE MEMBER, so the mechanisms are shared
+		// and this flag is read at the resume-routing decision rather than branched on throughout.
+		//
+		// MUST BE SET BEFORE Init(). Flipping it under a live pool would strand fibers under the
+		// rule they were bound with while new ones follow the other.
+		static void SetMigratableFibers(bool on);
+		static bool MigratableFibers();
+
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
 		// "level_loaded", the handful of names your app knows at compile time. The registry is
@@ -2684,6 +2708,20 @@ namespace JLib {
 		// and the same signature as the loPri-inbox hang already recorded in Worker().
 		std::vector<std::unique_ptr<TaskMPSCQueue>> resumedInboxes;
 
+		// NO PER-HOME FIBER LIST. An earlier pass in this design built one -- a padded Treiber stack
+		// per worker, of the fibers homed to it -- to answer "what does worker H still owe?". It was
+		// removed on the same day it was written, and the reason is worth keeping: THE POOL IS
+		// ALREADY THAT CENSUS. GlobalFiberPool holds one contiguous `std::vector<Fiber>` indexed by
+		// Fiber::poolIndex, reserved and leaked so it never reallocates, so enumerating fibers is a
+		// scan over TotalCount() and filtering by creditor is a mask test. A maintained list would
+		// have been a second copy of that, kept in step by hand, with a CAS on the fiber acquire
+		// path paying for it.
+		//
+		// The remaining question a list could have answered -- who owes what -- is answered on the
+		// fiber instead, by Fiber::creditors. See there for why it is a SET and not one home.
+		// The width tie-in (Fiber::kCreditorWords vs kMaxHintQueues) is asserted in
+		// TaskScheduler.cpp, not here: kMaxHintQueues is declared further down this class, and a
+		// class-scope static_assert is not a complete-class context, so it cannot see it yet.
 
 		static GlobalFiberPool* globalPool;
 		// -----------------------------------------------

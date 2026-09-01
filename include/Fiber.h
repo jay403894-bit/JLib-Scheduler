@@ -67,6 +67,84 @@ namespace JLib {
 		// address meant the next drain walked a recycled slot. Fibers are never freed -- the global
 		// pool reserves and leaks them -- so a link through a fiber cannot dangle that way.
 		Fiber* nextWaiter = nullptr;
+
+		// ---- THE CREDITOR SET: every worker this fiber owes thread-affine cleanup to ------------
+		//
+		// A SET, NOT ONE HOME, AND THAT IS THE WHOLE POINT. `homeWorker` above can name one worker.
+		// Under migration that is not enough: a fiber that allocates on A, migrates, and allocates
+		// again on B owes BOTH, and no single index can say so. An earlier draft of this design
+		// tried one `uint8_t home` and the second creditor is exactly what broke it.
+		//
+		// A SET, NOT A SEQUENCE. Cleanup order does not matter -- each worker releases its own
+		// resources and no creditor's work depends on another's -- so this needs membership, not
+		// ordering. Which makes a bitmask strictly better than the linked list of ids it replaces:
+		//
+		//   * NOTHING TO ALLOCATE on the death path, where an allocation is least welcome.
+		//   * DEDUPLICATED BY CONSTRUCTION. A worker that touches this fiber fifty times sets one
+		//     bit. A list would queue fifty cleanup jobs and need its own dedup pass to avoid it.
+		//   * ONE `fetch_or` to record, no CAS loop, so the debt-incurring path stays cheap.
+		//   * The iteration is CountTrailingZeros64, the same idiom the scheduler already uses for
+		//     the awake bitmap.
+		//
+		// AND IT IS ON THE FIBER, NOT THE TASK, for the reason the nextWaiter comment above gives:
+		// Task is on a hard 64-byte budget and Fiber is not. 32 bytes here is free; on Task it
+		// would push every single-capture lambda out of the 64-byte slab class.
+		//
+		// PINNED MODE IS THIS SET WITH EXACTLY ONE MEMBER. It is not a second mechanism and not a
+		// second code path -- the binding worker is added at bind, nothing else ever is, and the
+		// cleanup chain degenerates to one hop. See TaskScheduler::MigratableFibers.
+		static constexpr size_t kCreditorWords = 4;   // 256 workers; see the static_assert in
+		                                             // TaskScheduler.h that ties this to kHintWords
+		std::atomic<uint64_t> creditors[kCreditorWords] = {};
+
+		// Record that `worker` now owes cleanup for this fiber. Idempotent BY CONSTRUCTION rather
+		// than by checking -- setting a set bit is a no-op, so the caller never has to ask whether
+		// it already registered, and a hot path that fires on every affine allocation costs one
+		// atomic OR with no branch and no retry.
+		void NoteCreditor(size_t worker) {
+			if (worker >= kCreditorWords * 64) return;   // refuse, do not wrap: a wrapped index
+			                                             // would silently bill the wrong worker
+			creditors[worker >> 6].fetch_or(1ull << (worker & 63), std::memory_order_release);
+		}
+
+		// Remove and return the lowest-numbered creditor, or SIZE_MAX when the set is empty.
+		//
+		// THIS IS THE CHAIN STEP. Cleanup pops ONE creditor and queues one job to it; that job does
+		// its work and pops the next; whoever gets SIZE_MAX recycles the fiber. The fan-out shape --
+		// pop them all, queue N jobs, then recycle -- looks equivalent and is not: the jobs would be
+		// QUEUED, not run, so the fiber returns to the pool while cleanup still references it.
+		// Priority changes when those jobs run; it does not change that ordering.
+		size_t TakeCreditor() {
+			for (size_t w = 0; w < kCreditorWords; ++w) {
+				uint64_t cur = creditors[w].load(std::memory_order_acquire);
+				while (cur) {
+					const unsigned b = platform::CountTrailingZeros64(cur);
+					// CAS rather than fetch_and: two threads may drain concurrently during a
+					// teardown sweep, and both must not be handed the same creditor.
+					if (creditors[w].compare_exchange_weak(cur, cur & (cur - 1),
+							std::memory_order_acq_rel, std::memory_order_acquire))
+						return w * 64 + b;
+					// cur was reloaded by the failed CAS; re-examine it rather than restarting.
+				}
+			}
+			return SIZE_MAX;
+		}
+
+		bool HasCreditors() const {
+			for (size_t w = 0; w < kCreditorWords; ++w)
+				if (creditors[w].load(std::memory_order_acquire)) return true;
+			return false;
+		}
+
+		// Drop every creditor without running cleanup. FOR RECYCLE ONLY, and only once the chain has
+		// drained -- a fiber returning to the pool is a NEW fiber and must owe nobody. Calling this
+		// with debts outstanding does not lose a task, it loses a RELEASE: the COM apartment or
+		// handle those creditors were holding is never given back, and nothing reports it.
+		void ClearCreditors() {
+			for (size_t w = 0; w < kCreditorWords; ++w)
+				creditors[w].store(0, std::memory_order_release);
+		}
+
 		std::atomic<FiberStatus>  status;
 		// EBR participation slot. SIZE_MAX == "not in an epoch". The fiber is the unit
 		// that migrates across workers, so the slot lives here (not on the thread).

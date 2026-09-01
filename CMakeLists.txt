@@ -962,3 +962,21 @@ target_compile_features(SchedulerTeardownDestroyTest PRIVATE cxx_std_17)
 add_executable(SchedulerReservedLoPriPlacementTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_lopri_placement_test.cpp")
 target_link_libraries(SchedulerReservedLoPriPlacementTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedLoPriPlacementTest PRIVATE cxx_std_17)
+
+# FIBER REGISTRY, STRUCTURE IN ISOLATION. Drives RegisterFiberHome/TakeFiberHomeList against fibers
+# the test owns, rather than routing tasks through the scheduler to reach them -- see the test
+# header for why, and for the four -D negative controls that must each go RED.
+add_executable(SchedulerFiberRegistryTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_registry_test.cpp")
+target_link_libraries(SchedulerFiberRegistryTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberRegistryTest PRIVATE cxx_std_17)
+# The four negative controls, driven by a CACHE variable so the define actually reaches the compiler
+# and MSBuild sees a changed command line. Passing /D through CL_ADDITIONALOPTIONS does NOT work:
+# with no source change MSBuild skips the compile and silently reruns the OLD binary, so every
+# control reports as passing -- which is indistinguishable from the controls being weak, and is the
+# same stale-binary trap that has produced false results here before.
+#   cmake -S . -B build-src -DJLIB_FIBERREG_CTL=CTL_DROP_ONE
+#   cmake --build build-src --config Release --target SchedulerFiberRegistryTest
+#   ./build-src/bin/Release/SchedulerFiberRegistryTest.exe     # MUST FAIL
+if(JLIB_FIBERREG_CTL)
+  target_compile_definitions(SchedulerFiberRegistryTest PRIVATE ${JLIB_FIBERREG_CTL})
+endif()
