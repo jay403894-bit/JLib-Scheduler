@@ -3096,6 +3096,8 @@ int main(int argc, char** argv) {
     // call below for why a benchmark must not leave this to the controller.
     size_t hotWorkers = 2;
     size_t awakeFloor  = JLib::TaskScheduler::GetAwakeFloor();
+    // floor=auto -- skip SetAwakeFloor entirely so the library's pool-size default applies.
+    bool floorAuto = false;
     bool   floorGrowth = true;   // `nogrow` turns the growth controller off
     bool   neverPark   = false;  // `neverpark` makes [0,K) spin instead of sleeping -- see the flag
     size_t splitCap = 0; bool haveSplitCap = false;   // splitcap=N  // floor=N; default = the shipped one
@@ -3325,6 +3327,23 @@ int main(int argc, char** argv) {
         //   floor=N -> N workers that never park. Changes whether a push has to buy an OS wake.
         // A pool can have a live floor and no lane (floor=2 hot=0), or a lane whose workers all
         // park (hot=2 floor=0). Tying them means a row that moved cannot be attributed to either.
+        // floor=auto -- DO NOT CALL SetAwakeFloor AT ALL, and report what the library chose.
+        //
+        //   THE LIBRARY'S POOL-SIZE DEFAULT IS OTHERWISE UNREACHABLE FROM THIS BENCH. SetAwakeFloor
+        //   is called unconditionally below, which PINS the base explicit on every run -- so
+        //   `Fbase = n <= 8 ? 1 : 2` never fires here, and the population it exists for (apps that
+        //   never touch the knob) is exactly the population the suite could not measure.
+        //
+        //   A THIRD SPELLING RATHER THAN A CHANGED DEFAULT. Making the no-flag case mean `auto`
+        //   would silently move the suite's documented default from "whole pool may park" to
+        //   "library auto", and every historical `floor=0` paste would stop being comparable. So:
+        //     floor=0     unchanged, and still what you get with no flag
+        //     floor=N     pin the base to N
+        //     floor=auto  leave it to the library, and print what it picked
+        if (JLIB_STRICMP(argv[a], "floor=auto") == 0) {
+            floorAuto = true;
+            continue;
+        }
         if (JLIB_STRNICMP(argv[a], "floor=", 6) == 0) {
             awakeFloor = (size_t)strtoul(argv[a] + 6, nullptr, 10);
             continue;
@@ -3457,7 +3476,7 @@ int main(int argc, char** argv) {
     // 0..N-1 never park, so a push steered at one of them is picked up by a thread that is already
     // scheduled -- no WaitOnAddress, no kernel round trip. The floor buys nothing unless placement
     // actually steers there, which is what the latency row's landing histogram exists to check.
-    JLib::TaskScheduler::SetAwakeFloor(awakeFloor);
+    if (!floorAuto) JLib::TaskScheduler::SetAwakeFloor(awakeFloor);
     JLib::TaskScheduler::SetFloorGrowthEnabled(floorGrowth);
     if (haveSplitCap) JLib::TaskScheduler::SetLazySplitCap(splitCap);
 
@@ -3512,6 +3531,28 @@ int main(int argc, char** argv) {
     // ASKED FOR, so that is all this line claims.
     printf("requested: hot=%zu  floorBase=%zu\n",
            hotWorkers, JLib::TaskScheduler::GetAwakeFloorBase());
+    // THE POINT OF floor=auto IS THIS LINE. Every other run pins the base, so the library's
+    // pool-size rule -- Fbase = n <= 8 ? 1 : 2 -- is invisible to the suite. Printed AFTER Init
+    // because the band word is set before the pool size exists, so the rule cannot have run until
+    // the workers do. A 31-wide box will report `auto -> 2`, which only exercises the n > 8 arm;
+    // the n <= 8 arm needs a real 8-thread machine, not a 31-wide process asked for 8 workers.
+    if (floorAuto) {
+        // THE EFFECTIVE CEILING, NOT THE RAW OVERRIDE. GetAwakeFloorMax() returns what the app
+        // SET, and 0 means "use the default policy" -- printing it raw said `Fmax=0`, which reads
+        // as "the ceiling is zero" and is the opposite of unlimited-by-policy. Same failure as the
+        // landing line: a number whose sentinel value reads as its own extreme.
+        const size_t wc  = JLib::TaskScheduler::Instance().GetWorkerCount();
+        const size_t fb  = JLib::TaskScheduler::GetAwakeFloorBase();
+        const size_t ovr = JLib::TaskScheduler::GetAwakeFloorMax();
+        size_t eff = ovr;
+        if (!eff) {                       // mirror NoteFloorCrowding: clamp(n - 2, Fbase, 16)
+            eff = (wc >= 2) ? (wc - 2) : 0;
+            if (eff < fb) eff = fb;
+            if (eff > 16) eff = 16;
+        }
+        printf("           floor=auto -> library chose Fbase=%zu, Fmax=%zu%s (pool %zu)\n",
+               fb, eff, ovr ? " (set by the app)" : " (policy: clamp(n-2, Fbase, 16))", wc);
+    }
     // SAY WHEN THE KNOB IS INERT. GetHotWorkers() returns 0 unconditionally -- the RESERVED LANE is
     // deleted, and the early return is the "provably unreachable" step. `hot=N` is accepted and does
     // nothing, and a banner reading `hot=0` next to a command line reading `hot=5` looks like a parse

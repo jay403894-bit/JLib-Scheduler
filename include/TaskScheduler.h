@@ -1040,9 +1040,12 @@ namespace JLib {
 		// NOT unlimited, which is what it was. See the ceiling note in NoteFloorCrowding.
 		//
 		// THE FLOOR BASE SCALES TOO, and is set at pool start unless the app stated one:
-		// Fbase = n < 6 ? 1 : 2. On a 4-core box a base of 2 is half the machine held
-		// permanently off the park path, and Wide -- wake the crowd once, everyone parks after --
-		// is the cheaper way for a small pool to use everyone.
+		// Fbase = n <= 8 ? 1 : 2. On an 8-thread box a base of 2 is a QUARTER of the machine held
+		// permanently off the park path, often two SMT siblings; on a 4-core it is half. Wide --
+		// wake the crowd once, everyone parks after -- is the cheaper way for a small pool to use
+		// everyone. The F=1 tax is a one-bit steer set: a long body on q0 sends the next aimed push
+		// off the floor to buy a wake. Accepted at 8; the fix if it hurts is a placement fallback
+		// when the single floor worker is busy, NOT a base of 2.
 		//
 		// QUOTE THIS FROM THE POOL SIZE YOU SHIP. A small pool makes a ceiling look like a
 		// regression by construction -- an n/2 rule gave 4 on eight workers and burst/dflt fell to

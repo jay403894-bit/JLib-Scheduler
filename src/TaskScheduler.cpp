@@ -4446,17 +4446,24 @@ void TaskScheduler::StartPool(size_t poolSize) {
 
 	// ---- THE FLOOR BASE SCALES WITH THE MACHINE ---------------------------------------------
 	//
-	// Fbase = n < 6 ? 1 : 2, and only when the application did not state one.
+	// Fbase = n <= 8 ? 1 : 2, and only when the application did not state one.
 	//
-	// ON A 4-CORE LAPTOP A BASE OF 2 IS HALF THE MACHINE, permanently, and the floor's whole
-	// justification is that a push lands on a worker that is already running -- which is not worth
-	// half the box. WIDE IS HOW A SMALL POOL USES EVERYONE: it wakes the crowd once for one wave
+	// EIGHT, NOT SIX. On an 8-thread box a base of 2 is a QUARTER of the machine that never parks,
+	// and on a hyperthreaded one those two are often SMT siblings -- too much reserved heat for a
+	// machine that also has an application thread. On a 4-core laptop a base of 2 is half the box.
+	//
+	// THE COST OF Fbase=1 IS ACCEPTED, NOT OVERLOOKED: the steer set is ONE BIT, so a long body on
+	// q0 makes the next aimed push either wait on that worker or fall off the floor and buy a wake.
+	// That is the F=1 tax and it is the right tax at 8. Note it does NOT interact with the yield
+	// re-aim, which needed two floor cores to have somewhere to go: at F=1 the floor never yields at
+	// all (kYieldFloorMin). IF p50 FALLS APART ON A REAL 8-THREAD BOX THE FIX IS A PLACEMENT
+	// FALLBACK when the single floor worker is busy -- not putting Fbase back to 2. WIDE IS HOW A SMALL POOL USES EVERYONE: it wakes the crowd once for one wave
 	// and they all park after, which is far cheaper there than keeping cores off WaitOnAddress.
 	// The band word is initialised statically, before the pool size exists, so this is the first
 	// point where the question can even be asked.
 	if (!g_awakeFloorBaseExplicit.load(std::memory_order_relaxed)) {
 		const size_t n = workers.size();
-		const size_t fb = (n < 6) ? 1u : 2u;
+		const size_t fb = (n <= 8) ? 1u : 2u;
 		BandsSetFb(fb);
 		BandsSetF(fb, n);
 	}
