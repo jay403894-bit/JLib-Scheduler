@@ -227,6 +227,18 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
     printf("  round-trip latency (%d serial submit-and-wait round-trips)\n", kPings);
 
     std::vector<double> a, b;
+    // WHAT FLOOR IS THIS ROW ACTUALLY RUNNING AT? It inherits whatever the throughput row above
+    // left behind -- 20,000 pushes grow the floor, and this row starts the instant that finishes --
+    // so the configured base is NOT necessarily the base in force here.
+    //
+    // THAT IS WHY THIS ROW AND SchedulerBench's LATENCY ROW DISAGREE. SchedulerBench forces the
+    // floor to base first and prints "floor during this row: 2 -> 2", with the warning that a value
+    // above base means an earlier row grew it and "every number in this row is then a measurement
+    // of THAT floor, not of the configured one". This row had no such report, so 0.516 us here and
+    // p50 0.60 us there were being compared as if they described the same configuration. They did
+    // not, and the floor is exactly the variable this session showed round-trip is sensitive to
+    // (0.533 us at base 2 against 1.707 us at base 16, same peak).
+    const size_t floorBefore = JLib::TaskScheduler::GetAwakeFloor();
     if (g_doJ) {
         for (int r = 0; r < 3; ++r) {
             auto t0 = Clock::now();
@@ -257,6 +269,14 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
     }
     Report("JLib", a, "us");
     Report("marl", b, "us");
+    // Printed AFTER as well as sampled before: the row itself pushes 20,000 tasks, so it can grow
+    // the floor while it runs. Two different numbers here means this row measured a moving target.
+    if (g_doJ) {
+        const size_t floorAfter = JLib::TaskScheduler::GetAwakeFloor();
+        printf("     floor during this row: %zu -> %zu (base %zu)%s\n",
+               floorBefore, floorAfter, JLib::TaskScheduler::GetAwakeFloorBase(),
+               (floorBefore == floorAfter) ? "" : "   <- MOVED; this row is not one configuration");
+    }
     printf("\n");
 }
 
