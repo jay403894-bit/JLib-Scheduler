@@ -816,3 +816,38 @@ is CONTRACT AND POLICY, not plumbing.
 (k-never-reads-lopri-invariant) leaves K's queue set as exactly {hiPri, resumed}, which IS the I/O
 lane. The reactor stays off the shipping surface (branch `io-reactor`, tag `io-reactor-preserved`)
 until someone wants to build this.
+
+### Correction, same evening: the pinning argument was about FIBERS, not the reactor
+
+I concluded twice that the I/O lane had a structural ceiling because "completions resume PINNED
+fibers, so no queue can load-balance them". **THE REACTOR DOES NOT RESUME FIBERS.** IoAsync.h:
+"`co_await` for asynchronous I/O. C++20 -- and the ONLY C++20 in the reactor", with
+`await_suspend(std::coroutine_handle<P>)`. A coroutine frame is a heap allocation and `resume()` may
+be called from ANY thread. `resumedInboxes` is the FIBER path -- pinned, unstealable, per-worker --
+and it is a different mechanism that happens to sit next to this one.
+
+So completions ARE freely routable, round-robin IS valid, and the MPMC FIFO question is closed for
+good rather than merely side-stepped: K single-consumes the reactor queue, each kworker
+single-consumes its own mailbox, and every edge is MPSC.
+
+**JAY'S SHAPE.** K is a boss poll loop that pulls completions and round-robins them into a vector of
+MPSCQueue, one per kworker; kworkers are std::threads with their own ids (kworker0, ...) outside the
+F bands; K and each kworker are accounted into the thread budget the way EnableTimers and
+EnableIoReactor already reserve cores. Handlers are coroutines, so v5 makes the runtime C++20.
+
+**THREE THINGS THAT STILL NEED ANSWERING, none of them the queue:**
+
+  - **A BOSS THAT NEVER PARKS BURNS A CORE.** "K never leaves" means one core in a poll loop with
+    zero I/O in flight, permanently, in every app that enables the reactor -- the NoSleep tax,
+    forever, on one core. K should PARK on an empty reactor queue and be woken by the enqueue. That
+    is the full EMPTY/NOTIFIED/PARKED permit machine, not the YIELD state: YIELD is for a thread
+    leaving the core briefly and still owed no syscall. Same for kworkers on an empty mailbox.
+    Making them Thread objects past the bands -- the `nw` non-worker-lane shape, `deques.size()` is
+    already `num_workers + 1` -- gets the verified handshake for free.
+  - **EXACTLY ONE RESUME MAY BE IN FLIGHT PER FRAME.** Not-pinned is not the same as safe-to-resume-
+    twice. A cancel racing a completion must not put the same handle in two mailboxes. See
+    [[io-cancel-requires-requestcancel]]: scope.Cancel() alone already leaves a parked read parked,
+    so the cancel path here is not hypothetical.
+  - **A HANDLER MAY RESUME ON A DIFFERENT KWORKER AFTER EVERY AWAIT.** Correct for the frame, fatal
+    for any thread_local or same-thread assumption inside it -- and the FIBER path guarantees the
+    opposite, so the two contracts must be documented as opposites rather than assumed alike.
