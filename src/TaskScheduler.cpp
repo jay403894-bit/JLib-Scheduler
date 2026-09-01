@@ -2561,6 +2561,52 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// performance leak rather than a correctness fault, so nothing else would have caught it.
 	const size_t loEnd = (prev < eff) ? prev : eff;
 	const size_t hiEnd = (prev < eff) ? eff  : prev;
+
+	// ---- A PROMOTED WORKER SHEDS ITS ORDINARY WORK BEFORE IT IS A LANE WORKER ----------------
+	//
+	// THE INVARIANT IS THAT K NEVER READS A LOPRI INBOX. Every drain site in Worker() is now
+	// gated on !reservedForHiPri, with no exception -- the stray-pop net that used to rehome an
+	// ordinary task found on a reserved worker is gone, because a lane worker stopping to service
+	// bulk work is the thing the lane exists to prevent. It is already behind; that is why it is
+	// reserved.
+	//
+	// Which makes THIS the one legal way work can end up there, and the only one: the task was
+	// placed while worker i was still compute, and K then grew over an inbox that already held it.
+	// Placement reads LIVE K, so after BandsSetK above no new ordinary push targets [0, eff) --
+	// but what is already sitting there is this function's problem, and nobody else's. Shed it
+	// here, to the first compute worker, before the promotion is allowed to mean anything.
+	//
+	// WITHOUT THIS THE TASK IS LOST, not delayed: loPri inboxes are owner-drain-only, the owner
+	// has just been told never to look, and no thief may. Removing the net without adding this
+	// would trade a papered-over placement bug for a silent strand on a legal path.
+	//
+	// K ONLY, NOT ON A DEMOTE. hiEnd > loEnd in both directions; a worker LEAVING the band keeps
+	// its inbox and starts draining it again on its next pass, which needs nothing from here.
+	if (prev < eff) {
+		const size_t firstCompute = eff;
+		if (firstCompute < instance->workers.size()) {
+			size_t moved = 0;
+			for (size_t i = loEnd; i < hiEnd && i < instance->workers.size(); ++i) {
+				Task* t = nullptr;
+				while (instance->loPriInboxes[i]->pop(t) && t) {
+					instance->loPriInboxes[firstCompute]->push(t);
+					instance->workers[firstCompute]->inboxDepth.fetch_add(
+						1, std::memory_order_relaxed);
+					instance->workers[i]->inboxDepth.fetch_sub(1, std::memory_order_relaxed);
+					++moved;
+					t = nullptr;
+				}
+			}
+			if (moved) {
+				instance->workers[firstCompute]->MarkQueuedWork();
+				instance->workers[firstCompute]->NotifyWorker(/*force*/ true);
+			}
+		}
+		// firstCompute >= size means K covers the pool. BandsSetK clamps to n-1 precisely so that
+		// cannot happen -- see ClampHotWorkersToPool -- so there is no "nowhere to put it" case to
+		// handle here, and inventing one would be inventing a policy for an unreachable state.
+	}
+
 	for (size_t i = loEnd; i < hiEnd && i < instance->workers.size(); ++i) {
 		instance->workers[i]->MarkLaneWake();
 		instance->workers[i]->NotifyWorker(/*force*/ true);

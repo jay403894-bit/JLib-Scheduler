@@ -954,3 +954,11 @@ target_compile_features(SchedulerIoOverlapTest PRIVATE cxx_std_17)
 add_executable(SchedulerTeardownDestroyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/teardown_destroy_test.cpp")
 target_link_libraries(SchedulerTeardownDestroyTest PRIVATE Scheduler)
 target_compile_features(SchedulerTeardownDestroyTest PRIVATE cxx_std_17)
+
+
+# ORDINARY WORK MUST NEVER BE PLACED IN A RESERVED WORKER'S LOPRI INBOX. Two arms -- floor base 0
+# (the configuration the placement bug lived in) and floor base >= K (the path that was already
+# masked). See the header of the test for why it pauses the pool instead of sampling.
+add_executable(SchedulerReservedLoPriPlacementTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_lopri_placement_test.cpp")
+target_link_libraries(SchedulerReservedLoPriPlacementTest PRIVATE Scheduler)
+target_compile_features(SchedulerReservedLoPriPlacementTest PRIVATE cxx_std_17)

@@ -530,7 +530,20 @@ bool Thread::DrainOwnInboxesToDeques() {
 	// queue of its own to fill; the lane belongs to Worker(), where the owner pops one arrival and
 	// runs it. The loPri drain below stays, and that one IS load-bearing: a worker blocked inside a
 	// task stops running Worker(), which makes its own loPri inbox unreachable by the entire pool.
-	drain(scheduler->loPriInboxes[qIndex].get(), scheduler->deques[qIndex].get(), false);
+	//
+	// NOT FOR K, WHICH NEVER READS LOPRI. This was the last unguarded reader of a reserved worker's
+	// loPri inbox and it is the least obviously wrong of them, which is why it is worth naming: the
+	// worker here is BLOCKED inside a task rather than choosing bulk over the lane, so it does not
+	// break the spirit of the reservation. It breaks the letter, and the letter is what makes the
+	// contract checkable -- "K never touches loPri" is worth more as an invariant with no
+	// exceptions than as a rule with one defensible one.
+	//
+	// COSTS NOTHING WHEN THE INVARIANT HOLDS: a reserved worker's loPri inbox is empty, so this is
+	// a no-op for it either way. What the gate buys is that when the invariant is VIOLATED, the
+	// violation is reported by the diagnostic in Worker() instead of being quietly rehomed into a
+	// stealable deque by a path nobody would think to look at.
+	if ((size_t)qIndex >= TaskScheduler::GetHotWorkers())
+		drain(scheduler->loPriInboxes[qIndex].get(), scheduler->deques[qIndex].get(), false);
 	return moved;
 }
 
@@ -2160,70 +2173,41 @@ void Thread::Worker() {
 			// and the only somewhere a worker has is its deque -- which would hand these straight
 			// back to thieves and undo the pinning. Popping one and going round the loop costs an
 			// extra pass and keeps the invariant local to this block.
-			// ---- STRAY ORDINARY WORK ON A RESERVED CORE: HAND IT OFF, NEVER SIT ON IT ----
+			// ---- K NEVER READS A LOPRI INBOX. THAT IS THE INVARIANT, NOT A PREFERENCE. --------
 			//
-			// A reserved worker refuses ordinary work, which makes its loPri inbox a BLACK HOLE if
-			// anything ever lands there: inboxes are not stealable, so no thief can rescue it, and
-			// the owner will not run it. Observed exactly once and it stopped the pool -- the dump
-			// read `1 AWAKE ... inbox 0/1/0`, one loPri task on a reserved core, every other worker
-			// asleep with nothing advertised.
+			// This block used to POP the stray and hand it to the first compute worker -- a
+			// self-healing net, on the argument that "placement is supposed to prevent this and
+			// mostly does, but mostly is not a property a scheduler can rely on".
 			//
-			// PLACEMENT IS SUPPOSED TO PREVENT THIS and mostly does, but "mostly" is not a property
-			// a scheduler can rely on: Requeue, an explicit-affinity push, and any future path can
-			// all name a worker directly and bypass the band logic entirely. So rather than trust
-			// that every site was found, the reserved worker hands strays to the first compute
-			// worker and carries on. Self-healing beats exhaustive, because the failure mode of
-			// missing one site is a silent permanent stall.
-			if (reservedForHiPri && !task_to_run) {
-				Task* stray = nullptr;
-				if (scheduler->loPriInboxes[qIndex]->pop(stray) && stray) {
-					// SAY SO -- but say the RIGHT thing, and which thing is right depends on whether
-					// K can move. Under STATIC K, reaching here means some placement path put
-					// ordinary work on a reserved core: a bug, and the net makes it survivable
-					// rather than correct. Under ADAPTIVE K there is a second, LEGAL way in: the
-					// task was placed while this worker was still compute, and a promote then grew
-					// K over an inbox that already held it. No placement path did anything wrong --
-					// the hand-off below IS the design for that race (the spec's promote rule: the
-					// newly reserved worker sheds the loPri work it was holding). Printing
-					// "placement bug" for that case sends whoever reads it hunting a path that does
-					// not exist.
-					static std::atomic<unsigned> warned{ 0 };
-					if (warned.fetch_add(1, std::memory_order_relaxed) == 0) {
-						if (bandsNow.kmax > bandsNow.kmin) {
-							std::fprintf(stderr,
-								"[JLib::Scheduler] ordinary task found on RESERVED worker %d (K=%zu, adaptive) --"
-								" handing it to the first compute worker. Expected when a promote grows K"
-								" over an inbox that already held work; only a placement bug if it floods.\n",
-								qIndex, bandsNow.k);
-						} else {
-							std::fprintf(stderr,
-								"[JLib::Scheduler] ordinary task placed on RESERVED worker %d (K=%zu) --"
-								" handing it to the first compute worker. This is a placement bug;"
-								" the net keeps the pool alive but the path should be found.\n",
-								qIndex, bandsNow.k);
-						}
-					}
-					// THE SAME K THAT SAID THIS WORKER IS RESERVED. Re-asking would let K move
-					// between the two, and then the "first compute worker" this hands the stray to
-					// could itself be inside the reserved band -- the net re-creating the exact
-					// placement bug it exists to absorb.
-					const size_t firstCompute = bandsNow.k;
-					if (firstCompute < scheduler->workers.size()) {
-						scheduler->loPriInboxes[firstCompute]->push(stray);
-						scheduler->workers[firstCompute]->inboxDepth.fetch_add(
-							1, std::memory_order_relaxed);
-						scheduler->workers[firstCompute]->MarkQueuedWork();
-						scheduler->workers[firstCompute]->NotifyWorker(/*force*/ true);
-					}
-					else {
-						// Nowhere to hand it to (K covers the pool). Run it rather than lose it --
-						// the reservation is not worth stranding a task over.
-						task_to_run = stray;
-						continue;
-					}
-				}
+			// THE NET WAS THE PROBLEM. A lane worker that stops to service bulk work is the exact
+			// thing reservation exists to prevent; it is reserved BECAUSE it is already behind. And
+			// as a reader of loPriInboxes[qIndex] it made the band's contract untestable: the three
+			// drain sites were `!reservedForHiPri`, `!reservedForHiPri` and this one, whose guard is
+			// the complement -- so "K never touches ordinary work" was true of the code everywhere
+			// except the one place that made it false. It also hid the placement bug it absorbed:
+			// PickNextWorker could hand a CorePref::Default task to a reserved index whenever the
+			// awake floor base was 0, and the only symptom was one line on stderr and an extra hop.
+			//
+			// THE ONE LEGAL WAY IN IS HANDLED AT ITS SOURCE. A task placed while this worker was
+			// compute, with K then growing over the inbox that held it, is now shed by the PROMOTE
+			// path -- SetHotWorkersEffective drains [prev, eff) into the first compute worker before
+			// the promotion means anything. That is where the knowledge is: it knows which workers
+			// just changed band, and it runs once per K change instead of once per idle pass.
+			//
+			// SO THIS OBSERVES AND DOES NOT DRAIN. If the inbox is non-empty here, placement or a
+			// direct-named push violated the contract, and the task is lost rather than rehomed --
+			// deliberately. Losing it loudly is worth more than a lane worker quietly doing bulk
+			// work forever, and a net that repairs the symptom guarantees nobody finds the writer.
+			// quiescent(), not empty(): a push mid-commit still counts as an occupant.
+			if (reservedForHiPri && !scheduler->loPriInboxes[qIndex]->quiescent()) {
+				static std::atomic<unsigned> strayWarned{ 0 };
+				if (strayWarned.fetch_add(1, std::memory_order_relaxed) == 0)
+					std::fprintf(stderr,
+						"[JLib::Scheduler] ordinary work in the loPri inbox of RESERVED worker %d"
+						" (K=%zu). K never drains loPri, so this task will not run. This is a"
+						" placement bug -- find the writer; there is no longer a net.\n",
+						qIndex, bandsNow.k);
 			}
-
 			// ---- THE LANE IS THE INBOX: POP ONE, RUN IT ----------------------------------
 			//
 			// Priority is expressed as ORDER, and this is where the order lives: every worker
@@ -2344,7 +2328,14 @@ void Thread::Worker() {
 				yieldedLastPass = false;
 
 				// THE INBOX FIRST -- oldest arrival, and the queue nobody else may drain.
-				if (!scheduler->loPriInboxes[qIndex]->quiescent()) {
+				//
+				// !reservedForHiPri, LIKE EVERY OTHER READER OF THIS QUEUE. This was the FOURTH
+				// reader of loPriInboxes[qIndex] and the second one missing the guard: a reserved
+				// worker that had yielded would pop ordinary work here and run it, which is the
+				// lane stopping to do bulk. The other three sites all carry the gate, so this one
+				// silently made the band's contract conditional on whether the worker had yielded
+				// on its previous pass -- which is not a distinction the contract knows about.
+				if (!reservedForHiPri && !scheduler->loPriInboxes[qIndex]->quiescent()) {
 					Task* fromInbox = nullptr;
 					if (scheduler->loPriInboxes[qIndex]->pop(fromInbox) && fromInbox) {
 						inboxDepth.fetch_sub(1, std::memory_order_relaxed);
@@ -3004,7 +2995,15 @@ void Thread::Worker() {
 					&& (hasQueuedWork.load(std::memory_order_seq_cst)
 						|| laneWake.load(std::memory_order_seq_cst)
 						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
-						|| !scheduler->loPriInboxes[qIndex]->quiescent()
+						// THE SAME GATE THE DRAIN HAS. A predicate may only name a queue this pass
+						// would actually READ -- otherwise it is a hint that cannot be discharged,
+						// and the worker takes the `continue` below, skips the backoff, searches,
+						// declines to look, and arrives back here to be told the same thing. A hot
+						// spin on a queue K is forbidden to touch. The three park predicates and
+						// the drain sites now carry one gate between them, so the set the search
+						// covers and the set the recheck asks about are the same set by
+						// construction. See tests/verify/workerspin_model.c.
+						|| (!reservedForHiPri && !scheduler->loPriInboxes[qIndex]->quiescent())
 						// PINNED RESUMES. Not optional and not merely a latency question: nobody
 						// else is permitted to drain this queue, so parking on a non-empty one is
 						// a permanent hang rather than a delay. Same reasoning as the loPri inbox
@@ -3502,7 +3501,10 @@ void Thread::Worker() {
 							    || hasQueuedWork.load(std::memory_order_seq_cst)
 							    || laneWake.load(std::memory_order_seq_cst)
 							    || !scheduler->hiPriInboxes[qIndex]->quiescent()
-							    || !scheduler->loPriInboxes[qIndex]->quiescent()
+							    // Gated, term for term with the recheck above -- K never reads
+							    // loPri, so K must never WAIT on it either.
+							    || (!reservedForHiPri
+							        && !scheduler->loPriInboxes[qIndex]->quiescent())
 							    || !scheduler->resumedInboxes[qIndex]->quiescent();
 						});
 					}
@@ -3513,7 +3515,9 @@ void Thread::Worker() {
 					       && !hasQueuedWork.load(std::memory_order_seq_cst)
 					       && !laneWake.load(std::memory_order_seq_cst)
 					       && scheduler->hiPriInboxes[qIndex]->quiescent()
-					       && scheduler->loPriInboxes[qIndex]->quiescent()
+					       // Gated, term for term with the recheck and the condvar predicate.
+					       && (reservedForHiPri
+					           || scheduler->loPriInboxes[qIndex]->quiescent())
 					       && scheduler->resumedInboxes[qIndex]->quiescent()) {
 #if defined(JLIB_PLATFORM_WINDOWS)
 						// Address-based: no kernel object to create, own or leak, and no mutex on

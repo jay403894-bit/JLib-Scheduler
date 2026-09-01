@@ -112,6 +112,26 @@ static _Atomic int g_parked;   /* the worker committed to sleep */
   #ifndef SEARCH_MISS
     #define SEARCH_MISS 1
   #endif
+  /* K DOES NOT WAIT ON WHAT K DOES NOT READ. The earlier version of this file left the recheck
+     naming loPri in this build, which made -DPLACE_ON_RESERVED red and was read as "the shipped
+     reserved path spins". IT DID NOT: this model's worker read loPri at all only because K and F
+     were collapsed into one worker here. A real K worker is DEFINED by loPri being in neither set,
+     and the two sets matching is the invariant -- not a coincidence to be asserted around.
+
+     Both halves are now shipped as one gate (Thread.cpp): the drain sites and all three park
+     predicates carry `!reservedForHiPri` together, so this build models a CORRECT K worker --
+     loPri in neither set.
+
+     IT IS STILL RED, AND THE REASON IS THE POINT. A push that violates the invariant does not only
+     write the queue: it calls MarkQueuedWork, and hasQueuedWork is in the recheck for every worker,
+     K included. So K is sent round by a flag it can never discharge. Gating the QUEUE term does not
+     make a misplaced task harmless; it only changes which term lies.
+
+     WHAT THE REAL CODE THEN DOES, and this file cannot see it because it models one pass: the flag
+     is cleared at the top of the next pass, so it is ONE wasted lap and then K parks -- and the
+     task is STRANDED, which is workerpass_model.c's assertion, not this one's. Read this cell as
+     "a violated invariant is a bad state", not as "the shipped K worker spins". */
+  #define RECHECK_HINTS_ONLY 1
 #endif
 
 #ifdef SEARCH_MISS
