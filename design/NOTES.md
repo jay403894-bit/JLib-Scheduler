@@ -851,3 +851,53 @@ EnableIoReactor already reserve cores. Handlers are coroutines, so v5 makes the 
   - **A HANDLER MAY RESUME ON A DIFFERENT KWORKER AFTER EVERY AWAIT.** Correct for the frame, fatal
     for any thread_local or same-thread assumption inside it -- and the FIBER path guarantees the
     opposite, so the two contracts must be documented as opposites rather than assumed alike.
+
+### The shape, as decided (2026-08-31). NOT BUILT.
+
+**K IS A REAL THREAD AND IT PARKS.** Check inbox -> run immediately if there is a task -> otherwise
+WaitOnAddress until there is one. That is the permit machine already built and verified, so K and the
+kworkers inherit it by being Thread objects; there is no NoSleep tax and nothing new to model. My
+"demote K to a function" suggestion does NOT apply here -- it assumed pinned fibers made routing
+static, and Jay's model has a live decision per completion.
+
+**FIBER PER COMPLETION, NOT PER OPERATION**, and this is the part that makes the whole thing cheap.
+K round-robins completions across kworkers, hands each one a fiber, and the kworker returns it to the
+moodycamel free list when the handler finishes.
+
+    fiber per OPERATION      budget = max in-flight ops. 1000 connections x 64 KB = 64 MB, committed
+    fiber per COMPLETION     budget = concurrent handlers, i.e. ~kworker count. Tens of fibers.
+
+The 64 KB x connections problem disappears: the budget is bounded by concurrent HANDLERS rather than
+open connections. The cost is handler style -- a handler needing a second I/O op stores state on the
+connection and returns, rather than awaiting inline. State machine, not linear async. It is also why
+round-robin is legal: no continuation state lives in the fiber across completions.
+
+**TWO FIBER POOLS.** Completions get their own pool shared with K. Jay's call, and explicitly "the
+easiest even if not the best" -- the alternative is one pool with a reservation, which shares
+capacity but needs a policy. Two pools cannot starve each other and an exhausted I/O pool is a local,
+sized, reportable condition instead of a mysterious compute stall.
+
+**WHAT THE TWO-POOL DECISION MUST CARRY, and it is the only sharp edge in it.** GlobalFiberPool is
+not just a free list, it is a SIZING AUTHORITY. Exactly two sites index flat arrays by a fiber's own
+poolIndex:
+
+    Event::EnsureTable()   slots = new std::atomic<Task*>[TotalCount()]
+    Hazard.cpp:129         sizes by TotalCount()
+
+With two pools, IO fiber poolIndex 5 and compute fiber poolIndex 5 write THE SAME Event waiter slot.
+Silent corruption, not an error. The fix is small and must not be skipped: give the I/O pool an index
+range starting at the compute pool's count so indices are globally unique, and size both tables by
+the UNION. `GlobalFiberPool::Create()` is a factory returning a pointer, not a singleton, so a second
+instance is already constructible -- it is the indexing that needs the work, not the plumbing.
+
+**THE RECYCLE POINT IS THE OTHER HAZARD.** A fiber must not return to the free list while the reactor
+could still deliver a completion for it: the next acquire hands out the same Fiber* and a stale
+completion resumes the wrong frame. Same pointer, different owner -- ABA, and this codebase has been
+bitten there once already (ReturnBatch clearing localEpoch = SIZE_MAX). Sequenced after the reactor
+guarantees no further completion, which is what RequestCancel is for -- and cancellation on this path
+already has a sharp edge: scope.Cancel() alone leaves a parked read parked. RECYCLING TURNS THAT FROM
+A HANG INTO A CORRUPTION, which is why this is the piece to model before writing it.
+
+Note the free list is moodycamel and that is CORRECT here even though it was the wrong answer for
+ordered completions: a free list has no ordering requirement, any fiber is as good as any other.
+Same library, opposite verdict, for a real reason.
