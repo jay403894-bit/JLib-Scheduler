@@ -1263,7 +1263,19 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                        (double)(bs - pushIssuedNs) / 1000.0);
                 printf("      execution  (body start -> end)   %8.1f us   <- large = worker PREEMPTED\n",
                        (double)(be - bs) / 1000.0);
-                printf("      completion (body end -> return)  %8.1f us   <- large = the WAITER\n",
+                // NOT "the WAITER", and the old label said exactly that and was wrong. This span
+                // is body-end -> WaitFor returns, and BETWEEN THOSE TWO POINTS THE WORKER IS STILL
+                // WORKING: TaskDAG::OnTaskDiscarded, then the waitGroup fetch_sub, then
+                // CleanupTaskMetadata / DestroyTask / Free. The waiter cannot observe n == 0 until
+                // the middle of that, so a worker preempted during teardown lands here and reads
+                // as a late waiter.
+                //
+                // THE POLL COUNT SEPARATES THEM and is why it is printed right below: a waiter that
+                // spun through this segment WAS running, so the decrement had not happened and the
+                // WORKER was off-CPU. A waiter with a handful of polls across the same span was
+                // itself descheduled. Same number, opposite culprits.
+                printf("      completion (body end -> return)  %8.1f us   <- WORKER teardown + the\n"
+                       "                                                    WAITER; read the polls\n",
                        (double)(returnedNs - be) / 1000.0);
                 printf("      (segments should sum to about the round trip; a large excess means\n"
                        "       the instrument is measuring itself)\n");
