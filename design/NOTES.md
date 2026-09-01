@@ -733,3 +733,38 @@ That removes the shared-counter dependency entirely and would make the 64-byte-c
 instead of tolerant. It needs an allocator API addition, so it was not worth it for one flaky check
 -- but if the slab is being reworked anyway, this is nearly free to add at the same time, and it is
 the only way to assert "this frame came from that class" without a race.
+
+## Deferred — bench report polish, before the repo goes public again (2026-08-31)
+
+Jay's call: these are presentation, not correctness, and they wait for the public
+push. Recorded because "when it goes public" is exactly the horizon items fall off.
+
+**The ParallelFor crossover table has an ordering bug.** Not diagnosed here, and the
+symptom was not written down precisely enough to reconstruct — re-read the table
+against its own column headers before assuming which axis is wrong. The
+`distinct workers that ran a leaf` line under each row is the one that looks
+inconsistent with its columns first.
+
+**One table has no real comparison and should be deleted rather than fixed.** A row
+that reports `NO VERDICT -- every cell's own control moved >5%`, or a ratio with a
+confidence interval like `[0.39 .. 1.33]`, is not a measurement anybody can act on;
+printing it invites someone to read a number out of it anyway. Better to remove the
+section than to keep shipping a table whose honest answer is "this harness cannot
+resolve this".
+
+WHY THESE ARE WORTH THE TRIP AT ALL. Three separate report defects were found in one
+evening while chasing a stall that did not exist:
+
+  - the `completion` segment blamed the WAITER for time the WORKER spent in task
+    teardown (TaskDAG::OnTaskDiscarded, then the waitGroup fetch_sub);
+  - the per-class exemplar suppressed the one SCHEDULER-IMPLICATED trip, because a
+    non-implicated trip of the same class printed first;
+  - `landed on the floor: 20000 of 20000 (100.0%)` — the best possible result on
+    that row — was read as "100% of aim MISSED", because the line named neither the
+    desired direction nor what it counted;
+  - `steal/bt` read as "batch stealing", which cannot exist with a Chase-Lev deque.
+
+None of those was a scheduler bug and every one of them cost real time. THE RULE
+THIS KEEPS PRODUCING: a diagnostic whose best result can be mistaken for its worst
+is broken regardless of the number underneath it, and a label that names a
+mechanism the system does not have will send someone looking for it.
