@@ -472,9 +472,15 @@ static void BenchIdleTax(JLib::TaskScheduler& jl) {
 
 static void BenchBlocking(JLib::TaskScheduler& jl) {
     {
-        char capbuf[32];
-        if (g_floorMax >= 0) snprintf(capbuf, sizeof capbuf, "%ld", g_floorMax);
-        else                 snprintf(capbuf, sizeof capbuf, "16 (default)");
+        // NAME THE POLICY, DO NOT RESTATE ITS VALUE. This printed "16 (default)" as a literal, and
+        // stayed printing it after the absolute 16 was removed from MaybeAdjustAwakeFloor -- so a
+        // run whose floor reached 29 was labelled "cap 16". A banner that hardcodes a number it
+        // does not read is a lie the moment the number moves, and it is worse than no banner
+        // because it gets pasted. peakF on each row is the observation; this only says which knob
+        // was in force.
+        char capbuf[40];
+        if (g_floorMax >= 0) snprintf(capbuf, sizeof capbuf, "%ld (floormax=)", g_floorMax);
+        else                 snprintf(capbuf, sizeof capbuf, "default policy");
         printf("  blocking crossover -- 25%% of tasks wait on an external signal"
                "   [growth: %s, cap %s]\n", g_noGrow ? "OFF" : "on", capbuf);
     }
