@@ -1968,7 +1968,14 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
 
     for (int n : sizes) {
         constexpr int kRuns = 7;
-        double bestSerial = 1e300, bestPar = 1e300;        for (auto& c : g_sweepSeen) c.store(0, std::memory_order_relaxed);
+        double bestSerial = 1e300, bestPar = 1e300;
+        // PARTICIPANTS BELONG TO THE RUN WHOSE TIME IS REPORTED, and that is the best-of-7 par run.
+        // The reset used to happen once here, before all seven reps, so the printed count was the
+        // UNION of every worker that ran a leaf in ANY rep -- which cannot tell "31 workers every
+        // run" apart from "four different workers each run", and those want opposite fixes. It is
+        // now reset per rep and captured on the rep that set bestPar, so the count and the speedup
+        // describe the same execution.
+        size_t bestParParticipants = 0;
 
         // Grain: aim for ~4 chunks per worker, which is the usual load-balancing sweet spot (enough
         // pieces to even out, few enough to keep per-chunk overhead down). Never below 1.
@@ -1985,6 +1992,11 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
 
             // --- parallel ---
             std::vector<double> partials((size_t)workers * 8, 0.0);   // padded, but correctness only
+
+            // Cleared HERE, per rep, so the bitmap describes this run alone. Before the timer
+            // starts: it is a plain relaxed store over 64 bytes and must not land inside the
+            // measured window.
+            for (auto& c : g_sweepSeen) c.store(0, std::memory_order_relaxed);
 
             auto t1 = Clock::now();
             std::atomic<double> pacc{ 0.0 };
@@ -2007,12 +2019,16 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
                 double cur = pacc.load(std::memory_order_relaxed);
                 while (!pacc.compare_exchange_weak(cur, cur + local, std::memory_order_relaxed)) {}
                 });
-            bestPar = std::min(bestPar, MsBetween(t1, Clock::now()));
+            const double parMs = MsBetween(t1, Clock::now());
+            // Capture on the rep that WINS, not unconditionally: the reported speedup comes from
+            // this rep, so the participant count has to come from it too or the two lines of the
+            // table describe different executions.
+            if (parMs < bestPar) { bestPar = parMs; bestParParticipants = SweepParticipants(); }
             SinkAdd(pacc.load());
         }
 
         const double speedup = bestSerial / std::max(bestPar, 1e-9);
-        participants.push_back(SweepParticipants());
+        participants.push_back(bestParParticipants);
         speedups.push_back(speedup);
         serialUs.push_back(bestSerial * 1000.0);
         printf(" %5.2fx", speedup);
@@ -2047,7 +2063,7 @@ static void SweepOne(JLib::TaskScheduler& sched, const char* label, const std::v
     // sits under its own N; the explanation moves to the end of the line where it costs nothing.
     printf("  %-10s |", "workers");
     for (size_t i = 0; i < participants.size(); ++i) printf(" %6zu", participants[i]);
-    printf("   | distinct workers that ran a leaf (a count, not an index; pool has %zu)\n",
+    printf("   | workers that ran a leaf IN THE BEST-OF-7 RUN (a count, not an index; pool has %zu)\n",
            JLib::TaskScheduler::Instance().GetWorkerCount());
 }
 
