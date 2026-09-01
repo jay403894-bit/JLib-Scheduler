@@ -48,6 +48,38 @@ set(JLIBSCHED_VERSION "5.0.0")
 # normal build's.
 option(JLIBSCHED_STEAL_STATS "Count steal probes and hits (diagnostic; perturbs the steal path)" OFF)
 option(JLIBSCHED_RETRY_STATS "Record CAS retries per call -- max and buckets, not an average (diagnostic; sits inside CAS loops)" OFF)
+# ---- THREAD SANITIZER ------------------------------------------------------------------------
+#
+# Finds data races by watching actual memory accesses and computing happens-before. The reason it is
+# worth having is that it shares NO ASSUMPTIONS with this codebase: every other check here was
+# written by the same people who wrote the code, and an instrument built from a misunderstanding
+# agrees with the code for the wrong reason. TSan cannot do that -- it has no model of what this
+# scheduler is supposed to do.
+#
+# ############ IT DOES NOT UNDERSTAND FIBERS. READ THIS BEFORE BELIEVING A RESULT. ############
+#
+# TSan tracks happens-before PER THREAD. A ContextSwitch swaps the stack out from under it, so two
+# fibers running on one worker are attributed to one thread: real races between them are MISSED, and
+# accesses correctly ordered by a fiber handoff can be reported as races that do not exist. It ships
+# an annotation API for this -- __tsan_create_fiber / __tsan_destroy_fiber / __tsan_switch_to_fiber
+# -- and until Context.cpp/FiberInit call it, ANY finding that involves a fiber stack is unproven in
+# both directions.
+#
+# So: trust findings on NATIVE task paths, the push path, the permit machine, the bands word, the
+# inboxes and the deques. Treat anything naming a fiber as needing the annotations first. This is the
+# same trap as ASan-plus-fibers, where "stack-use-after-return" turned out to be shadow leftovers
+# from fiber reuse.
+#
+# LINUX ONLY (WSL is fine). MSVC has no thread sanitizer. Everything must be built with it,
+# including the library, which is why this is a whole-tree option rather than a per-target flag.
+#
+#   wsl -e bash -lc "cmake -S /mnt/c/T_Threads -B ~/tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+#                          -DJLIBSCHED_TSAN=ON && cmake --build ~/tsan -j"
+#
+# Build OUT of /mnt/c -- a Linux-native build dir is far faster and avoids the stale-object trap
+# that a shared Windows path has produced here before.
+option(JLIBSCHED_TSAN "Build with -fsanitize=thread (Linux/WSL only; see the fiber caveat above)" OFF)
+
 option(JLIBSCHED_HOT_OCCUPANCY_STATS "Witness whether an idle hot worker has a backlogged sibling (diagnostic; scans hot deques)" OFF)
 option(JLIBSCHED_LANE_WAKE_STATS "Count lane-hint edges and the wakes they send (diagnostic; two relaxed counters)" OFF)
 
@@ -347,6 +379,23 @@ if(WIN32)
     message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH} (os layer: win32)")
 else()
     message(STATUS "JLib::Scheduler: ${CMAKE_SYSTEM_NAME} / ${JLIBSCHED_ARCH} (os layer: ${JLIBSCHED_OSDIR})")
+endif()
+
+# TSan BEFORE the targets, and as a DIRECTORY property, because every object in the program must be
+# instrumented -- a library compiled without it makes the runtime blind to exactly the code under
+# test, and the result is a clean report that means nothing. Link flags too: the runtime is linked
+# in, not just compiled against.
+if(JLIBSCHED_TSAN)
+    if(MSVC)
+        message(FATAL_ERROR "JLIBSCHED_TSAN: MSVC has no thread sanitizer. Build under WSL/Linux.")
+    endif()
+    # -O1 and frame pointers: TSan slows execution 5-15x and inflates memory ~5-10x, so an
+    # unoptimised build can turn a race window that needs microseconds into one that never opens.
+    # -g so a report names a line rather than an address.
+    add_compile_options(-fsanitize=thread -g -O1 -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+    message(STATUS "JLib::Scheduler: THREAD SANITIZER ON -- findings on FIBER paths are unproven "
+                   "until __tsan_switch_to_fiber annotations exist; see the option's comment")
 endif()
 
 add_library(Scheduler STATIC ${JLIBSCHED_SRC} ${JLIBSCHED_PLAT} ${JLIBSCHED_ASM})
