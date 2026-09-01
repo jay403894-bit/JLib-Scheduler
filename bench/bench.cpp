@@ -2415,11 +2415,27 @@ static void BenchBatchPref(JLib::TaskScheduler& sched) {
            "               unreadable (best +17%%, worst -5%%, spread 1.07x -> 1.32x). '?' marks a\n"
            "               cell whose same-vs-same control moved more than the arms did.\n");
 
-    struct Case { const char* name; int n; int chunk; int work; };
+    // minPerSegment IS THE OTHER AXIS, AND THE FIRST VERSION OF THIS ROW MISSED IT.
+    //
+    // PushBatch computes `segments = count / minPerSegment` (default 64) and places ONE segment per
+    // worker. So a batch of <= 64 tasks is ONE segment on ONE worker whatever CorePref says -- and
+    // the original `burst N=64 chunk=64` case therefore measured Wide choosing a different single
+    // worker, not Wide spreading. It read 0.82x: a kernel wake bought, no parallelism gained. That
+    // is a correct number about the wrong question.
+    //
+    // A SMALL BURST CANNOT BE SPREAD BY CorePref AT ALL. The lever is minPerSegment. The `seg=N`
+    // cases below vary it so the row measures spreading rather than re-aiming.
+    struct Case { const char* name; int n; int chunk; int work; size_t minPerSeg; };
     const Case cases[] = {
-        { "stream N=200000 chunk=64", 200000, 64,   0 },   // the throughput/bt shape
-        { "chunky N=20000  chunk=64",  20000, 64,  64 },   // real bodies, still a stream
-        { "burst  N=64     chunk=64",     64, 64, 4096 },  // one batch of heavy tasks: the burst shape
+        { "stream N=200000 chunk=64 seg=64", 200000, 64,   0,  64 },  // the throughput/bt shape
+        { "chunky N=20000  chunk=64 seg=64",  20000, 64,  64,  64 },  // real bodies, still a stream
+        // ONE SEGMENT BY CONSTRUCTION -- kept deliberately as the control that shows what Wide costs
+        // when it cannot spread: a wake, and nothing back.
+        { "burst  N=64     chunk=64 seg=64",     64, 64, 4096,  64 },
+        // THE SAME BURST, ACTUALLY SPREAD. 64 tasks / 4 per segment = 16 segments, so placement has
+        // something to distribute. This is the case the flag was proposed for.
+        { "burst  N=64     chunk=64 seg=4",      64, 64, 4096,   4 },
+        { "burst  N=16     chunk=16 seg=1",      16, 16, 4096,   1 },  // the burst-row shape exactly
     };
 
     for (const Case& c : cases) {
@@ -2447,9 +2463,9 @@ static void BenchBatchPref(JLib::TaskScheduler& sched) {
                 if (!t) return -1.0;
                 t->waitGroup = &wg;
                 chunk[(size_t)made++] = t;
-                if (made == c.chunk) { sched.PushBatch(chunk.data(), (size_t)made, 0); made = 0; }
+                if (made == c.chunk) { sched.PushBatch(chunk.data(), (size_t)made, 0, c.minPerSeg); made = 0; }
             }
-            if (made) sched.PushBatch(chunk.data(), (size_t)made, 0);
+            if (made) sched.PushBatch(chunk.data(), (size_t)made, 0, c.minPerSeg);
             sched.WaitFor(wg);
             return MsBetween(t0, Clock::now());
         };
@@ -2483,7 +2499,7 @@ static void BenchBatchPref(JLib::TaskScheduler& sched) {
         // SUSPECT WHEN THE CONTROL MOVED AS MUCH AS THE ARMS DID. Distance from 1.00 on each side.
         const bool suspect = ratio.empty() || control.empty()
                           || std::fabs(cMid - 1.0) >= std::fabs(rMid - 1.0);
-        printf("               %-26s  %.2fx%s  (control %.2fx)  wakes dflt=%llu wide=%llu\n",
+        printf("               %-32s  %.2fx%s  (control %.2fx)  wakes dflt=%llu wide=%llu\n",
                c.name, rMid, suspect ? "?" : " ", cMid,
                wakesD, wakesW);
     }
