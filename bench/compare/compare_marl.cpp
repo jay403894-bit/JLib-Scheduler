@@ -107,6 +107,7 @@ static bool g_doM = true;
 // harness differ only by a command-line word, and a pasted table that does not name its arm is the
 // single easiest way to compare two numbers that were never comparable.
 static bool g_noGrow = false;
+static bool g_noHelp = false;
 
 // THE TASK TYPE EVERY UNTAGGED JLib ROW SUBMITS, switched by the `fiberonly` flag.
 //
@@ -140,6 +141,7 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
     std::vector<JLib::Task*> batch;
     for (int n : counts) {
         std::vector<double> a, ab, pa, m;
+        double helped = 0.0;   // tasks main ran itself, summed over the Push arm's kRuns reps
 
         if (g_doJ) {
             for (int r = 0; r < kRuns; ++r) {
@@ -153,6 +155,10 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
                     t->waitGroup = &wg; jl.Push(t);
                 }
                 jl.WaitFor(wg);
+                // HOW MANY OF THESE n TASKS main RAN ITSELF. Read immediately after the wait, since
+                // the counter is per-wait and the next one resets it. Without this, main's
+                // contribution and the pool's speed are the same number.
+                helped += (double)JLib::TaskScheduler::LastBareWaitHelped();
                 a.push_back(Ms(t0, Clock::now()) * 1e6 / n);
             }
             batch.resize(n);
@@ -204,6 +210,10 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
 
         printf("     %8d", n);
         Cell(MedOr(a), 11); Cell(MedOr(ab), 11); Cell(MedOr(pa), 12); Cell(MedOr(m), 11);
+        // MAIN'S OWN SHARE OF THE Push ARM, as a percentage of the tasks submitted. If this is a
+        // few percent, main is a rounding error and the Push column is the pool's cost. If it is
+        // 30%, the pool is slower than the column says and main has been hiding it.
+        if (g_doJ) printf("   main ran %.0f%%", 100.0 * helped / ((double)n * kRuns));
         printf("\n");
     }
     printf("\n");
@@ -817,6 +827,21 @@ int main(int argc, char** argv) {
         //
         // AND IT IS AN A/B, NOT AN ESTIMATE, which is the point: a timer says "slow" and a wake
         // counter cannot see a CAS retry storm at all. This either moves the number or it does not.
+        // `nohelp` -- a bare thread's WaitFor stops running stolen Native tasks while it waits.
+        //
+        // WHAT IT ANSWERS: how much of JLib's throughput is the CALLING thread rather than the
+        // pool. No timing row separates those on its own -- main's contribution looks exactly like
+        // the pool being fast.
+        //
+        // NOT A FAIRNESS ARM. marl's bound thread also runs tasks when it blocks on a WaitGroup
+        // (see the worker accounting at the top of this file: both libraries are N spawned plus a
+        // participating main). Turning this off makes it N against N+1, so the marl column stops
+        // being a comparison and starts being a different question.
+        if (strcmp(argv[i], "nohelp") == 0) {
+            JLib::TaskScheduler::SetBareWaitHelp(false);
+            g_noHelp = true;
+            continue;
+        }
         if (strcmp(argv[i], "nogrow") == 0) {
             JLib::TaskScheduler::SetFloorGrowthEnabled(false);
             g_noGrow = true;

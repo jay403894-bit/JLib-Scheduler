@@ -2355,6 +2355,29 @@ namespace JLib {
 		static void SetMigratableFibers(bool on);
 		static bool MigratableFibers();
 
+		// ---- SPIN-HELP ON A BARE THREAD'S WaitFor: DIAGNOSTIC OFF SWITCH -----------------------
+		//
+		// Default TRUE, which is the shipped behaviour: a bare thread inside WaitFor runs one
+		// stolen NATIVE task per poll instead of only waiting. That is work-conserving and it is
+		// why `main` counts as a participant rather than a spectator.
+		//
+		// WHAT TURNING IT OFF IS FOR. It answers "how much of this pool's throughput is actually
+		// the CALLING thread?" -- which no timing row can separate on its own, because main's
+		// contribution is indistinguishable from the pool being fast. LastBareWaitHelped() counts
+		// it; this removes it.
+		//
+		// IT IS NOT A FAIRNESS KNOB, AND MUST NOT BE USED AS ONE. marl's bound thread also runs
+		// tasks when it blocks on a WaitGroup, so both libraries are N workers plus a participating
+		// main. Disabling this here makes the comparison N against N+1 -- a different question, and
+		// a worse one if it gets quoted as a like-for-like.
+		//
+		// SCOPE: WaitFor only. The SchedulerMutex acquisition path helps too and is deliberately
+		// NOT covered -- helping there is entangled with the reentrancy guards (t_spinHelpDepth,
+		// t_heldMutexes) that exist to stop it self-deadlocking, and switching it off is a
+		// different experiment with a different blast radius.
+		static void SetBareWaitHelp(bool on) noexcept;
+		static bool BareWaitHelp() noexcept;
+
 		// ---- PUSH TO ONE WORKER'S RESUME INBOX -------------------------------------------------
 		//
 		// The resume inbox is the only per-worker queue with the contract this needs: exactly one

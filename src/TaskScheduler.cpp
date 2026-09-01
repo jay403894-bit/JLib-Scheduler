@@ -53,6 +53,12 @@ namespace {
 	thread_local uint32_t t_spinHelpDepth = 0;   // >0 -> we are executing inside a helped task
 	thread_local uint32_t t_heldMutexes   = 0;   // >0 -> this BARE THREAD owns a SchedulerMutex
 
+	// DIAGNOSTIC ONLY, default = shipped behaviour. See TaskScheduler::SetBareWaitHelp for what
+	// turning it off answers and why it must not be quoted as a fairness knob. Declared HERE rather
+	// than beside its setter because WaitFor reads it a few thousand lines earlier in this file.
+	// Atomic for the reader in the wait loop; relaxed, since a late flip costs one helped task.
+	std::atomic<bool> g_bareWaitHelp{ true };
+
 	constexpr uint32_t kIdleSpinsBeforeYield = 1000;
 
 	// Thread-local rather than a parameter so it survives across calls. The condition variable calls
@@ -4746,7 +4752,10 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		while (wg.n.load(std::memory_order_acquire) > 0) {
 			++t_bareWaitPolls;
 			bool ranSomething = false;
-			if (t_heldMutexes == 0) {
+			// g_bareWaitHelp is a DIAGNOSTIC off switch, default on -- see SetBareWaitHelp. The
+			// t_heldMutexes guard beside it is not: that one is the inversion deadlock and is not
+			// optional.
+			if (t_heldMutexes == 0 && g_bareWaitHelp.load(std::memory_order_relaxed)) {
 				++t_spinHelpDepth;
 				ranSomething = TryRunStolenNativeTask();
 				--t_spinHelpDepth;
@@ -5477,6 +5486,9 @@ size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWork
 // rather than the new default because it changes a contract users already build against, and a
 // scheduler that silently starts resuming elsewhere would break exactly the code that was relying
 // on it not doing so, with no diagnostic.
+void TaskScheduler::SetBareWaitHelp(bool on) noexcept { g_bareWaitHelp.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::BareWaitHelp() noexcept { return g_bareWaitHelp.load(std::memory_order_relaxed); }
+
 static bool g_migratableFibers = false;
 void TaskScheduler::SetMigratableFibers(bool on) {
 	// THE CREDITOR MASK MUST COVER EVERY ADDRESSABLE WORKER. If it does not, NoteCreditor refuses a
