@@ -989,3 +989,73 @@ Superseded by that document, and NOT to be re-derived from the sections above:
     structure allocates NOTHING; a std::queue is std::deque-backed and allocates in chunks, on the
     one path whose entire job is absorbing a burst. Reverse into the out-stack ONLY when it is empty
     -- reversing early puts newer arrivals ahead of older ones and inverts the ordering silently.
+
+---
+
+## Global task registry for migratable fibers: the fields go on the FIBER, and one already exists
+
+2026-09-01. Design sketched: a global registry plus two links per task, so a fiber can migrate while
+its thread-affine debt stays payable at one home.
+
+```
+Task { Task* next; Task* homeNext; uint8_t home; }
+```
+
+**THE STRUCTURE IS RIGHT AND THE PLACEMENT IS ALREADY DECIDED — ON Fiber, NOT Task.** `Fiber.h` was
+written against this exact question and answers all three parts of it.
+
+**1. `home` ALREADY EXISTS.** `Fiber::homeWorker` (`include/Fiber.h:54`) is a `size_t`, `SIZE_MAX`
+means unbound, it is "set once, where the fiber is bound to a task, and read by every resume path to
+decide where the fiber goes back", and it has 9 call sites. That is the proposed `home` field,
+already shipped and already wired.
+
+**2. `homeNext` ON Task RE-ADDS A RETIRED BUG.** From the `nextWaiter` comment
+(`include/Fiber.h:56-68`), verbatim:
+
+> AN EARLIER DESIGN THREADED THE WAITER LIST THROUGH Task AND WAS RETIRED FOR A REAL BUG: the links
+> WERE the tasks, so a task freed back to the slab while a list still held its address meant the next
+> drain walked a recycled slot. Fibers are never freed -- the global pool reserves and leaks them --
+> so a link through a fiber cannot dangle that way.
+
+A per-home list is a list that outlives a single queue transit by construction — the whole point is
+durable membership — so it is *more* exposed to that recycled-slot walk than the waiter list was, not
+less.
+
+**3. Task HAS NO ROOM ANYWAY, and the 8 free bytes are the expensive ones.** `sizeof(Task) == 64` is
+a static_assert. `uint8_t home` is genuinely free (byte 51, in the padding the 2.9.0 flag packing
+opened). `Task* homeNext` is not: it claims the 8 bytes of deliberate tail padding, and the site says
+what that costs —
+
+> LambdaTask<F> stores F as a member after this base, and BOTH MSVC and GCC reuse the base tail
+> padding -- measured [...] Claim these bytes and every single-capture lambda jumps 64 -> 80, which
+> moves it out of the 64-byte class into the 128-byte one. That is a 2x memory regression on the most
+> common task in the system, paid for one field.
+
+`Fiber` has **no size assert and is not size-classed**, so `Fiber* homeNext` beside `nextWaiter` is
+free, dangle-proof, and argued for by a comment already in the file.
+
+**The registry is then a flat array of heads indexed by worker**, not a map — same shape as Event's
+fiber-indexed waiter table, which `Fiber.h` cites as the precedent for exactly this reasoning. And
+there is no per-pickup lookup: membership is a link on the fiber you already hold, reachable from
+`Task::assignedFiber` in the same cache line.
+
+### What is actually being traded, stated plainly
+
+`homeWorker`'s comment ends: "Pinning removes the class of bug rather than asking every future call
+site to remember the rule." **The registry replaces a structural guarantee with a bookkeeping one.**
+Pinning makes TLS misuse impossible; a registry makes the debt *payable* but leaves every future call
+site that touches `thread_local` obliged to know it. That is a real cost and it should be chosen
+knowingly, not discovered later. The mitigation is the same one §3.8 of IO_LANE landed on: the home
+write belongs in the resource wrapper at acquisition, not in the handler remembering.
+
+### Open, not answered here
+
+- **Unlink.** Push-at-head is one CAS; removing one entry mid-list is the hard half. Owner-only
+  unlink (H owns its own list) plus CAS at the head is workable; drain-and-relink-live avoids the
+  problem entirely at O(live) per drain.
+- **One creditor or many.** A fiber that runs on A, migrates, and allocates on B owes both. One
+  `home` is sufficient only if affine allocation is *bound* to `home` rather than to the current
+  thread — which puts cross-thread traffic on the allocation path. Free-by-address plus a remote-free
+  list is the alternative and needs no home at all.
+- `home` was also described as "owner index **or stream id**" — two namespaces in one byte needs a
+  discriminator or a partitioned value space.
