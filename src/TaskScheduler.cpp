@@ -883,7 +883,12 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 	// build has JLIBSCHED_STEAL_STATS. It is the column this dump was missing: "AWAKE with empty
 	// queues" is a protocol state, not a location, and for a multi-millisecond stall the question
 	// is whether the pool was scanning, parked, or not executing at all.
-	printf("  q  state           queued busy run   inbox(hi/lo/rs)  deque(hi/lo)  phase\n");
+	// lane / flr / tick EARN THEIR WIDTH. A row reading NOTIFIED with every queue empty, no kernel
+	// wake and busy=0 looks like a healthy idle pool, and it is the exact signature of a core that
+	// is in its yield window or walking back into parkGate after a grow-wake. Without `flr` there
+	// is no way to see that this worker entered the pass as a guest while the floor was growing
+	// underneath it, and without `tick` no way to see whether this pass took the yield arm at all.
+	printf("  q  state           queued lane flr tick busy run   inbox(hi/lo/rs)  deque(hi/lo)  phase\n");
 	for (size_t i = 0; i < workers.size(); ++i) {
 		const auto s = workers[i]->GetDebugState();
 		// THESE MUST TRACK Thread::WorkerState. They did not: after the permit machine landed, slot
@@ -895,14 +900,24 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		// three-state rename, and the dump then printed the name of a state that no longer existed
 		// to the person evaluating the change that removed it.
 		static const char* kNames[] = { "EMPTY", "NOTIFIED", "PARKED", "YIELD" };
-		const char* st = (s.workerState >= 0 && s.workerState <= 2) ? kNames[s.workerState] : "?";
+		// <= 3, AND IT WAS <= 2. "YIELD" was added to kNames above and this bound was not widened
+		// with it, so the one state the fourth value exists to make visible printed as "?" and
+		// could never appear in this table -- directly under the comment telling the next person to
+		// keep the two in step. Count the names, not the states you remember.
+		const char* st = (s.workerState >= 0
+		                  && s.workerState < (int)(sizeof(kNames) / sizeof(kNames[0])))
+		               ? kNames[s.workerState] : "?";
 		// ELEVEN specifiers for ELEVEN arguments. It once had one too many: an extra %d ahead of the
 		// inbox pair desynchronised everything after it -- the deque sizes (size_t) were read
 		// through %d, the marker string through %zu, and the trailing %s consumed an argument that
 		// was never passed. That is UB in the one dump you only ever run when something has already
 		// gone wrong. Count them against the argument list before changing this line.
-		printf(" %2d  %-14s   %d      %d    %d       %d/%d/%d           %zu/%zu  %-9s%s\n",
-			s.qIndex, st, (int)s.hasQueuedWork, (int)s.busy, (int)s.running,
+		// FOURTEEN specifiers for FOURTEEN arguments -- see the note below; it desynchronised once
+		// and read a size_t through %d in the one dump you only run when something is wrong.
+		printf(" %2d  %-14s   %d      %d    %d   %4u %d    %d       %d/%d/%d           %zu/%zu  %-9s%s\n",
+			s.qIndex, st, (int)s.hasQueuedWork,
+			(int)s.laneWake, (int)s.onAwakeFloor, s.spinTick,
+			(int)s.busy, (int)s.running,
 			(int)!hiPriInboxes[i]->empty(), (int)!loPriInboxes[i]->empty(),
 			(int)!resumedInboxes[i]->empty(),
 			(size_t)(hiPriInboxes[i]->empty() ? 0 : 1), deques[i]->size(),

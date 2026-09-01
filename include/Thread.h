@@ -539,8 +539,16 @@ namespace JLib {
         // holding work only it can drain, which is the lost-wakeup signature.
         struct DebugState {
             int  qIndex;
-            int  workerState;      // 0 AWAKE, 1 GOING_TO_SLEEP, 2 SLEEPING
+            // RAW, NEVER COLLAPSED TO "awake". EMPTY and YIELD are both "not parked" and they
+            // mean opposite things to a pusher -- EMPTY says "on core, I will find it myself",
+            // YIELD says "I am off the core, aim elsewhere". A dump that folds them together
+            // cannot show the difference between a healthy idle pool and one whose cores are all
+            // in a yield window.
+            int  workerState;      // WS_EMPTY / WS_NOTIFIED / WS_PARKED / WS_YIELD
             bool hasQueuedWork;
+            bool laneWake;         // the OTHER edge-triggered hint; cleared at the top of a pass
+            bool onAwakeFloor;     // as THIS PASS saw it -- a snapshot, and the floor grows
+            unsigned spinTick;     // did this pass take the yield arm? (tick & mask) == 0
             bool busy;
             bool running;
         };
@@ -549,6 +557,9 @@ namespace JLib {
                 qIndex,
                 workerState.load(std::memory_order_relaxed),
                 hasQueuedWork.load(std::memory_order_relaxed),
+                laneWake.load(std::memory_order_relaxed),
+                dbgOnAwakeFloor.load(std::memory_order_relaxed),
+                dbgSpinTick.load(std::memory_order_relaxed),
                 busy.load(std::memory_order_relaxed),
                 running.load(std::memory_order_relaxed)
             };
@@ -645,6 +656,13 @@ namespace JLib {
         // arrived at by accident and with none of NoSleep's bounds. A flag the worker consumes
         // cannot do that.
         std::atomic<bool> laneWake{ false };
+
+        // PUBLISHED FOR THE DUMP ONLY. onAwakeFloor and spinTick are pass locals, and without them
+        // the snapshot cannot answer "was this worker in the yield arm when the push landed" --
+        // which is the question a row of NOTIFIED-with-empty-queues actually raises. Relaxed, and
+        // written on the IDLE path only, so they cost nothing on a pass that found work.
+        std::atomic<bool>     dbgOnAwakeFloor{ false };
+        std::atomic<unsigned> dbgSpinTick{ 0 };
 
         // "The last thing I re-queued was a YIELD, not a genuine resume."
         //

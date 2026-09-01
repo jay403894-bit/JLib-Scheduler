@@ -3612,71 +3612,82 @@ void Thread::Worker() {
 				//
 				// This is what makes the yield interval safe to leave coarse for the floor: the
 				// worker holding the core the longest is the one that was ASKED to.
-				if (onAwakeFloor) {
-					if ((++spinTick & TaskScheduler::GetSpinYieldMask()) == 0) {
-						// ---- THE YIELD HANDSHAKE. See Thread::WS_YIELD and the model. --------
-						//
-						// CpuRelax() below stays on the core and needs none of this. yield() does
-						// not: it asks the OS to run somebody else and this thread stops existing
-						// for a scheduling quantum. Leaving the word at EMPTY across that window
-						// tells every producer "on core, scanning, no syscall needed", which is
-						// false, and the dump reports AWAKE while the task waits.
-						//
-						// BEFORE: publish YIELD, and only then leave. If the CAS fails the word is
-						// NOTIFIED -- a permit landed while we were deciding -- so consume it and
-						// do not yield at all; there is work to find.
-						int e = WS_EMPTY;
-						if (!workerState.compare_exchange_strong(e, WS_YIELD,
-								std::memory_order_seq_cst, std::memory_order_relaxed)) {
-							if (e == WS_NOTIFIED) {
-								int e2 = WS_NOTIFIED;
-								workerState.compare_exchange_strong(e2, WS_EMPTY,
-									std::memory_order_seq_cst, std::memory_order_relaxed);
-							}
-							continue;                       // go round; something is there
-						}
-
-						// THE AWAKE BIT STAYS SET ACROSS THE YIELD, and clearing it here was the
-						// first attempt. It is wrong twice over. A bit says awake or not-awake,
-						// and YIELD is neither -- this worker owes NO syscall, so advertising it
-						// as not-awake collapses YIELD into PARKED for placement and throws away
-						// the one distinction the fourth state exists to make. It is also a second
-						// source of truth for a question the word already answers, which is the
-						// shape that keeps drifting in this file's history.
-						//
-						// PickNextWorker reads the WORD instead, of the one candidate it has
-						// already chosen -- see the re-aim note there.
-						std::this_thread::yield();
-
-						// AFTER: CAS back, NEVER store.
-						//
-						// A plain store(WS_EMPTY) here wipes a permit that landed while we were off
-						// the core, and the producer that latched it already read prev == WS_YIELD
-						// and decided it owed no syscall.
-						//
-						// WHAT THAT COSTS, STATED HONESTLY, because the model overstates it and the
-						// first version of this comment repeated the overstatement. In
-						// yieldstate_model.c the permit IS the only record of the work, so
-						// -DYIELD_STORE_BACK loses a task. HERE IT LOSES A WAKE: the work is in the
-						// inbox or the deque and hasQueuedWork is set, so this worker's next scan
-						// finds it regardless. It becomes a lost TASK only in the narrow case where
-						// the floor sheds under this worker -- onAwakeFloor is re-read every pass --
-						// and it goes on to the park block having destroyed a wake that was owed.
-						// Narrow, real, and cheaper to close than to reason about again later.
-						int back = WS_YIELD;
-						if (!workerState.compare_exchange_strong(back, WS_EMPTY,
-								std::memory_order_seq_cst, std::memory_order_relaxed)) {
-							int e3 = WS_NOTIFIED;
-							workerState.compare_exchange_strong(e3, WS_EMPTY,
+				// ---- LEAVING THE CORE IS A PUBLISHED TRANSITION, ON BOTH ARMS ---------------
+				//
+				// ONE DEFINITION, TWO CALL SITES, and that is the point rather than tidiness. The
+				// first version of this put the handshake on the FLOOR arm only and left the guest
+				// arm calling std::this_thread::yield() with the word at WS_EMPTY -- which is
+				// literally yieldstate_model.c's -DNO_YIELD_HANDSHAKE control, shipped, for every
+				// worker the snapshot called a guest.
+				//
+				// AND `onAwakeFloor` IS A PASS-START SNAPSHOT, so the two arms are not a stable
+				// partition of the pool. The floor GROWS: a worker that entered this pass as a
+				// guest can reach the yield below after growth has already made it a legal aimed
+				// target. It then leaves the core advertising EMPTY -- "on core, scanning, no
+				// syscall needed" -- and a push aimed at it buys nothing and waits a quantum. The
+				// dump reads NOTIFIED (a grow-wake latched a permit) with an empty queue and no
+				// kernel wake, which looks like a healthy pool.
+				//
+				// So the handshake belongs to yield(), not to a band. Returns true if a permit was
+				// consumed instead of yielding, meaning the caller should go round and look again.
+				auto yieldWithHandshake = [&]() -> bool {
+					// BEFORE: publish YIELD, and only then leave. If the CAS fails the word is
+					// NOTIFIED -- a permit landed while we were deciding -- so consume it and do
+					// not yield at all; there is work to find.
+					int e = WS_EMPTY;
+					if (!workerState.compare_exchange_strong(e, WS_YIELD,
+							std::memory_order_seq_cst, std::memory_order_relaxed)) {
+						if (e == WS_NOTIFIED) {
+							int e2 = WS_NOTIFIED;
+							workerState.compare_exchange_strong(e2, WS_EMPTY,
 								std::memory_order_seq_cst, std::memory_order_relaxed);
 						}
+						return true;
+					}
+
+					// THE AWAKE BIT STAYS SET ACROSS THE YIELD, and clearing it was the first
+					// attempt. Wrong twice: a bit says awake or not-awake and YIELD is neither --
+					// this worker owes NO syscall, so advertising it as not-awake collapses YIELD
+					// into PARKED for placement and discards the one distinction the state exists
+					// to make. It is also a second source of truth for a question the word already
+					// answers. PickNextWorker reads the WORD, of the one candidate it chose.
+					std::this_thread::yield();
+
+					// AFTER: CAS back, NEVER store.
+					//
+					// A plain store(WS_EMPTY) wipes a permit that landed while we were off the
+					// core, and the producer that latched it already read prev == WS_YIELD and
+					// decided it owed no syscall. IN THE MODEL that loses a task, because there the
+					// permit is the only record of the work. HERE IT LOSES A WAKE: the work is in
+					// the inbox or deque with hasQueuedWork set, so the next scan finds it. It
+					// becomes a lost task only where the floor sheds under this worker and it
+					// reaches the park block having destroyed a wake that was owed.
+					int back = WS_YIELD;
+					if (!workerState.compare_exchange_strong(back, WS_EMPTY,
+							std::memory_order_seq_cst, std::memory_order_relaxed)) {
+						int e3 = WS_NOTIFIED;
+						workerState.compare_exchange_strong(e3, WS_EMPTY,
+							std::memory_order_seq_cst, std::memory_order_relaxed);
+					}
+					return false;
+				};
+
+				// Publish the two pass locals the dump cannot otherwise see. Idle path only.
+				dbgOnAwakeFloor.store(onAwakeFloor, std::memory_order_relaxed);
+
+				if (onAwakeFloor) {
+					dbgSpinTick.store(++spinTick, std::memory_order_relaxed);
+					if ((spinTick & TaskScheduler::GetSpinYieldMask()) == 0) {
+						if (yieldWithHandshake()) continue;
 					}
 					else platform::CpuRelax();
 					continue;
 				}
-				// A GUEST: brief pause, then hand the core back unconditionally.
+				// A GUEST: brief pause, then hand the core back unconditionally -- through the
+				// SAME handshake. A guest is about to park anyway, so the window here is short,
+				// but "short" is not "absent" and growth can make it a targeted core mid-pass.
 				for (unsigned i = 0; i < kGuestSpin; ++i) platform::CpuRelax();
-				std::this_thread::yield();
+				(void)yieldWithHandshake();
 			}
 		}
 	}
