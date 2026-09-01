@@ -877,7 +877,10 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 		// is a worker that is running or about to consume it, the opposite of one drifting toward
 		// sleep. The dump kept printing the old word and read as evidence of the very state the
 		// change had removed.
-		static const char* kNames[] = { "EMPTY", "NOTIFIED", "PARKED" };
+		// KEEP THIS IN STEP WITH Thread::WorkerState. It was left stale once already, after the
+		// three-state rename, and the dump then printed the name of a state that no longer existed
+		// to the person evaluating the change that removed it.
+		static const char* kNames[] = { "EMPTY", "NOTIFIED", "PARKED", "YIELD" };
 		const char* st = (s.workerState >= 0 && s.workerState <= 2) ? kNames[s.workerState] : "?";
 		// ELEVEN specifiers for ELEVEN arguments. It once had one too many: an extra %d ahead of the
 		// inbox pair desynchronised everything after it -- the deque sizes (size_t) were read

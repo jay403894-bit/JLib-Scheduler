@@ -750,7 +750,33 @@ namespace JLib {
         // the control that removes BOTH the swap-wake and the post-commit recheck is a safety
         // violation. Each mechanism alone is sufficient -- do not "simplify" either without
         // reproducing that control.
-        enum WorkerState : int { WS_EMPTY = 0, WS_NOTIFIED = 1, WS_PARKED = 2 };
+        // WS_YIELD IS THE FOURTH STATE AND IT IS NOT A KIND OF PARKED. A floor worker never parks,
+        // so its word reads EMPTY for its whole life -- and EMPTY is a CLAIM: "on the core,
+        // scanning, a push needs no syscall because I will find it myself". The floor yields every
+        // 8th idle pass (Worker(), the onAwakeFloor arm) to avoid burning a core, and
+        // std::this_thread::yield() is not a small pause -- the thread LEAVES THE CORE. For that
+        // window EMPTY is a lie, the push skips its wake, and the dump says AWAKE while the task
+        // waits for the OS to reschedule the thread: a quantum under oversubscription.
+        //
+        //   EMPTY     on core, scanning. No syscall needed; the scan will find it.
+        //   NOTIFIED  a permit is latched.
+        //   PARKED    committed sleep. A push owes a syscall.
+        //   YIELD     about to leave, or off, the core. Do not aim here. NO SYSCALL IS OWED --
+        //             the thread is RUNNABLE and comes back on its own, so a futex wake would be
+        //             aimed at a thread that is not waiting.
+        //
+        // WHY 3, AND WHY PARKED KEEPS 2. Every reader outside the park machine asks "is it asleep"
+        // and spells it `== 2`, so a fourth value is invisible to all of them -- which is the whole
+        // reason it is safe to add. The shapes that WOULD break are `!= 0` meaning "needs a
+        // syscall" (would futex a runnable thread) and `== 0` meaning "aim here" (would aim at a
+        // core that is gone). Neither exists today; both compile, so do not introduce one.
+        // Parked() stays `== WS_PARKED`. DO NOT FOLD YIELD INTO IT.
+        //
+        // Modelled in tests/verify/yieldstate_model.c, which also says which half is load-bearing:
+        // the HANDSHAKE is mandatory (-DYIELD_STORE_BACK is a genuine lost task), while placement
+        // skipping YIELD is a LATENCY win only -- -DTARGET_YIELDED is green, because the swap
+        // still latches and the return CAS sees NOTIFIED and rescans.
+        enum WorkerState : int { WS_EMPTY = 0, WS_NOTIFIED = 1, WS_PARKED = 2, WS_YIELD = 3 };
         std::atomic<int> workerState{ WS_EMPTY };
 
         std::atomic<bool> running{ false };

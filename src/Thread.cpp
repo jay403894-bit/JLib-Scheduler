@@ -3613,8 +3613,53 @@ void Thread::Worker() {
 				// This is what makes the yield interval safe to leave coarse for the floor: the
 				// worker holding the core the longest is the one that was ASKED to.
 				if (onAwakeFloor) {
-					if ((++spinTick & TaskScheduler::GetSpinYieldMask()) == 0) std::this_thread::yield();
-					else                                                       platform::CpuRelax();
+					if ((++spinTick & TaskScheduler::GetSpinYieldMask()) == 0) {
+						// ---- THE YIELD HANDSHAKE. See Thread::WS_YIELD and the model. --------
+						//
+						// CpuRelax() below stays on the core and needs none of this. yield() does
+						// not: it asks the OS to run somebody else and this thread stops existing
+						// for a scheduling quantum. Leaving the word at EMPTY across that window
+						// tells every producer "on core, scanning, no syscall needed", which is
+						// false, and the dump reports AWAKE while the task waits.
+						//
+						// BEFORE: publish YIELD, and only then leave. If the CAS fails the word is
+						// NOTIFIED -- a permit landed while we were deciding -- so consume it and
+						// do not yield at all; there is work to find.
+						int e = WS_EMPTY;
+						if (!workerState.compare_exchange_strong(e, WS_YIELD,
+								std::memory_order_seq_cst, std::memory_order_relaxed)) {
+							if (e == WS_NOTIFIED) {
+								int e2 = WS_NOTIFIED;
+								workerState.compare_exchange_strong(e2, WS_EMPTY,
+									std::memory_order_seq_cst, std::memory_order_relaxed);
+							}
+							continue;                       // go round; something is there
+						}
+
+						// THE BITMAP TOO, because PLACEMENT READS THE BITMAP AND NOT THIS WORD.
+						// The fourth state exists so there is ONE source of truth, and that only
+						// holds if the bit is derived from the same transition rather than
+						// maintained separately. Two relaxed RMWs on one idle pass in eight.
+						scheduler->SetAwake((size_t)qIndex, false);
+
+						std::this_thread::yield();
+
+						scheduler->SetAwake((size_t)qIndex, true);
+
+						// AFTER: CAS back, NEVER store. A plain store(WS_EMPTY) here wipes a permit
+						// that landed while we were off the core -- and the producer that latched
+						// it already read prev == WS_YIELD and decided it owed no syscall, so
+						// nothing will ever re-announce that work. That is the one control in
+						// yieldstate_model.c that loses a task rather than just delaying it.
+						int back = WS_YIELD;
+						if (!workerState.compare_exchange_strong(back, WS_EMPTY,
+								std::memory_order_seq_cst, std::memory_order_relaxed)) {
+							int e3 = WS_NOTIFIED;
+							workerState.compare_exchange_strong(e3, WS_EMPTY,
+								std::memory_order_seq_cst, std::memory_order_relaxed);
+						}
+					}
+					else platform::CpuRelax();
 					continue;
 				}
 				// A GUEST: brief pause, then hand the core back unconditionally.
