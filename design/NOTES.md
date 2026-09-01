@@ -1198,3 +1198,64 @@ choosing to walk a list: a bounded deadline after which it wakes and re-checks. 
 the timer in the primitives rewrite, and it is a different thing from the timed worker sleep that was
 rejected: a worker's park is signal-driven BY CONTRACT, so a timeout there masks a lost wakeup, while
 a cancellable wait's release depends on an external decision that may never arrive.
+
+### FTL migratable fibers: the complete protocol (Jay's design, 2026-09-01)
+
+Recorded whole because the pieces arrived across a long session and only make sense together.
+
+**PICKUP REGISTERS.** Any worker that picks up a `TaskType::Fiber` -- a fresh bind OR a resume of an
+existing context -- registers itself on that fiber. Both branches converge at one point in
+`Thread::Worker()` and that is where it goes. It is the RETURN ADDRESS: the worker is about to
+context-switch in and run whatever the fiber does next, which may incur state only that thread can
+release. Registering only at bind would record the first worker and miss every one a migrating fiber
+afterwards ran on -- exactly the set whose cleanup would then be orphaned. One `fetch_or`, idempotent,
+so a fiber bouncing between two workers a hundred times records two creditors.
+
+**DEATH WALKS THE REGISTRATIONS.** For each one carrying a marker, create the deletion task and mail
+it to that worker's inbox; the last hop recycles the fiber. Chain, not fan-out -- see the note above
+on why queueing N tasks and then recycling is wrong.
+
+**THE MARKER GATES THE TASK, THE REGISTRATION DOES NOT.** `creditors` records WHO ran it; the marker
+records WHAT is owed (slab / epoch / hazard). A fiber that never incurred affine state has creditors
+and no markers, so the chain walks and dispatches nothing. That is what lets registration sit on the
+pickup path at all.
+
+**AND IN MIGRATABLE MODE, RECLAMATION STOPS BEING SELF-DRIVEN.** Auto-scan and the epoch tick are
+DISABLED; `SetSelfReclaim` is false on both (hazards need that). Everyone frees their own memory
+instead: whatever tick a worker would have done is NOTED IN ITS REGISTRY ENTRY, and the chain settles
+it at fiber death. Jay: "their registry entry has their id and anything they owe, like a real little
+computer city."
+
+**WHY THE THREE KINDS ARE slab / epoch / hazard, and why this is bigger than COM handles.** Those are
+exactly the three costs `TaskScheduler.h`'s architecture header says migration already paid:
+`SlabPool::Free` routes by ADDRESS rather than by the freeing thread owning the block; epochs use a
+GLOBAL participant list with CAS because sharding "is UNSOUND under migration"; hazard cells are
+indexed by the FIBER, not the thread. The header says "pick one branch and follow it; the expensive
+mistake is taking the cost of migration and the constraints of pinning at the same time." THIS IS A
+THIRD BRANCH IT DOES NOT CONSIDER: take the CHEAP per-thread structures AND migrate, and settle up at
+the end. That is the real prize, not apartment teardown.
+
+**BOTH MODES SHIP.** Pinned is marl's contract, for middleware that cannot audit its host. Migratable
+is for a process that owns every job and can enforce "do not cache a TLS-derived value across a
+suspension point". Pinned is NOT a second code path -- it is this machinery with the creditor set
+holding one member, so the cleanup walk is identical and only RESUME ROUTING reads the flag. Set once
+before Init, so the branch predicts perfectly.
+
+### STATE: what is built, and what is still not working
+
+BUILT AND GREEN: `Fiber::creditors` + Note/Take/Has/Clear; `Fiber::ResetForReuse` called on ACQUIRE
+(closes a real hole -- `ReleaseFiber` is `localCache.Push`, which scrubbed nothing; only the spill
+path reached `ReturnBatch`); `FiberRegistry` with the address table, the chain, and a one-shot
+CAS-claimed `ReturnToPool`; the death hook in `OnFiberReturned`; registration at pickup;
+`RequeueResult` {Failed, Pinned, Stealable}; the migratable branch in `Requeue` plus a gate keeping
+migratable mode out of `resumedInboxes` entirely.
+
+NOT WORKING: `tests/migratable_fiber_test.cpp` reports ZERO migrations with the flag confirmed TRUE.
+Its PINNED CONTROL IS SOUND -- 256/256 completed across 6 workers, 0 resumed elsewhere, which is what
+pinning means and proves the test discriminates. The migratable arm shows every one of 256 tasks
+resuming on the worker it left, which is a perfect correlation and therefore still pinning somewhere.
+Candidates NOT yet eliminated: `ResumeQueueless` returns FALSE when the fiber is in WANTS_SUSPEND and
+the WORKER then wakes it locally (`Thread.cpp`'s own-inbox push) without ever reaching `Requeue`;
+and the Event path generally, which was a poor choice of instrument -- the property under test is
+just "mailbox a task with a fiber attached and switch into it", and an Event drags in the waiter
+table, SignalAll enumeration and batch resume, none of which was verified first.
