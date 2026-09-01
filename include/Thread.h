@@ -387,6 +387,22 @@ namespace JLib {
         friend class TaskScheduler;
 
     public:
+        // ---- WHAT ONE PUSH TOUCHES ON THIS OBJECT ------------------------------------------
+        //
+        // PushLocal writes three fields on the worker it selected -- inboxDepth, hasQueuedWork and
+        // workerState -- while that worker is concurrently reading or RMW-ing all three. Every
+        // DISTINCT CACHE LINE among them is a coherence transfer the producer pays PER TASK, and
+        // PushBatch pays once per batch. That difference is most of why Push measures ~422 ns/task
+        // against PushBatch's ~61.
+        //
+        // REPORTED FROM INSIDE THE CLASS because the fields are private and because the layout is
+        // the library's own business. Reasoning about it from declaration order does not work --
+        // the compiler decides, and these three are declared ~160 lines apart with no alignas
+        // between them, which SUGGESTS separate lines. Suggests is not measures.
+        static void PushPathFieldOffsets(size_t& inboxDepthOff,
+                                         size_t& hasQueuedWorkOff,
+                                         size_t& workerStateOff) noexcept;
+
         static thread_local Thread* self;
 
         // THE WORKER RUNNING ON THIS THREAD, or nullptr on a non-worker (the app's main thread, an

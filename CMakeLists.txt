@@ -998,3 +998,9 @@ target_compile_features(SchedulerFiberCleanupChainTest PRIVATE cxx_std_17)
 if(JLIB_FIBERCHAIN_CTL)
   target_compile_definitions(SchedulerFiberCleanupChainTest PRIVATE ${JLIB_FIBERCHAIN_CTL})
 endif()
+
+# THREAD LAYOUT: how many cache lines one Push touches on the consumer's Thread. Prints the offsets
+# rather than reasoning about them from source order -- see the test header.
+add_executable(SchedulerThreadLayoutTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/thread_layout_test.cpp")
+target_link_libraries(SchedulerThreadLayoutTest PRIVATE Scheduler)
+target_compile_features(SchedulerThreadLayoutTest PRIVATE cxx_std_17)

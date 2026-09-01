@@ -3771,3 +3771,16 @@ void Thread::Worker() {
 	running.store(false, std::memory_order_release);
 }
 
+
+namespace JLib {
+// See the declaration in Thread.h for why this lives inside the class.
+void Thread::PushPathFieldOffsets(size_t& inboxDepthOff,
+                                  size_t& hasQueuedWorkOff,
+                                  size_t& workerStateOff) noexcept {
+	// offsetof on a non-standard-layout type is conditionally supported; MSVC, GCC and Clang all
+	// accept it, and it is the only way to ask this without hand-computing the layout.
+	inboxDepthOff    = offsetof(Thread, inboxDepth);
+	hasQueuedWorkOff = offsetof(Thread, hasQueuedWork);
+	workerStateOff   = offsetof(Thread, workerState);
+}
+}
