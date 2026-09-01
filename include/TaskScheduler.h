@@ -2360,6 +2360,30 @@ namespace JLib {
 		static void SetMigratableFibers(bool on);
 		static bool MigratableFibers();
 
+		// ---- PushBatch PLACES Wide: EXPERIMENT, DEFAULT OFF ------------------------------------
+		//
+		// A CALLER HANDING OVER N TASKS AT ONCE HAS DECLARED A BURST, which is the one honest burst
+		// signal the scheduler has. It cannot infer one from the push path: the only push-time
+		// signal is floor crowding, and that fires all through throughput/1p -- 200,000 no-op tasks
+		// where Wide would pay a kernel wake per push against ~900 today.
+		//
+		// WHAT Wide BUYS, already measured on the burst row: `burst/dflt` grew the floor to 13,
+		// got 12 participants and took 9.92 ms; `burst/wide` kept the floor at 2, got 31
+		// participants and took 5.07 ms. Twice as fast with NO growth at all, because Wide skips
+		// the steer-at-the-awake-floor block and pays the wakes to have every worker running
+		// immediately -- see the `Wide DELIBERATELY DOES NOT ENTER HERE` note in PickNextWorker.
+		//
+		// SO THE BENEFIT IS NOT IN QUESTION; THE COST IS. This flag exists to price it on
+		// throughput/bt (16.47 M/s at 64-task chunks) and throughput/mp, where the same wakes buy
+		// nothing because the work is short and already stealable.
+		//
+		// UPGRADES CorePref::Default ONLY. A caller that asked for something specific keeps it --
+		// a flag that overrides an explicit choice is a different and worse thing.
+		//
+		// NOTE it will NOT move the burst rows: those push tasks individually, not as a batch.
+		static void SetPushBatchWide(bool on) noexcept;
+		static bool PushBatchWide() noexcept;
+
 		// ---- SPIN-HELP ON A BARE THREAD'S WaitFor: DIAGNOSTIC OFF SWITCH -----------------------
 		//
 		// Default TRUE, which is the shipped behaviour: a bare thread inside WaitFor runs one

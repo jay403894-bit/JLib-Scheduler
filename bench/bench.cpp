@@ -3163,6 +3163,7 @@ int main(int argc, char** argv) {
     // floor=auto -- skip SetAwakeFloor entirely so the library's pool-size default applies.
     bool floorAuto = false;
     bool   floorGrowth = true;   // `nogrow` turns the growth controller off
+    bool   pushBatchWide = false;   // `batchwide` -- PushBatch places Wide; see the flag parse below
     bool   neverPark   = false;  // `neverpark` makes [0,K) spin instead of sleeping -- see the flag
     size_t splitCap = 0; bool haveSplitCap = false;   // splitcap=N  // floor=N; default = the shipped one
     for (int a = firstOpt; a < argc; ++a) {
@@ -3172,6 +3173,17 @@ int main(int argc, char** argv) {
         // no redistribute. The A/B for the whole growth controller, in ONE binary, so the machine
         // that holds the baseline can run both arms in one session instead of across two builds.
         if (JLIB_STRICMP(argv[a], "nogrow") == 0) { floorGrowth = false; continue; }
+        // batchwide -- PushBatch places CorePref::Wide instead of Default.
+        //
+        // A BATCH IS A DECLARED BURST: the caller handed over N tasks at once, which is the only
+        // burst signal the scheduler gets without inferring one. Wide's BENEFIT is already measured
+        // on the burst rows below (dflt 9.92 ms / 12 participants vs wide 5.07 ms / 31, at floor 2
+        // -- twice as fast with no growth at all). This flag prices the COST, on throughput/bt
+        // (64-task chunks) and throughput/mp, where the wakes Wide pays buy nothing because the
+        // work is short and already stealable.
+        //
+        // IT WILL NOT MOVE THE BURST ROWS. They push tasks individually, not as a batch.
+        if (JLIB_STRICMP(argv[a], "batchwide") == 0) { pushBatchWide = true; continue; }
         // norecruit -- the A/B arm for range recruitment. ON by default, because what it replaces
         //   is a single wake per published range plus discovery-by-luck. The ceiling for it is the
         //   floor=31 run, where every worker is already awake: heavy N=2000 was 7.05x at the
@@ -3542,6 +3554,7 @@ int main(int argc, char** argv) {
     // actually steers there, which is what the latency row's landing histogram exists to check.
     if (!floorAuto) JLib::TaskScheduler::SetAwakeFloor(awakeFloor);
     JLib::TaskScheduler::SetFloorGrowthEnabled(floorGrowth);
+    JLib::TaskScheduler::SetPushBatchWide(pushBatchWide);
     if (haveSplitCap) JLib::TaskScheduler::SetLazySplitCap(splitCap);
 
     // PRESIZE THE SLAB, because a growth allocation is MEASUREMENT NOISE HERE and nowhere else.
@@ -3577,10 +3590,14 @@ int main(int argc, char** argv) {
     const size_t bannerK = JLib::TaskScheduler::GetHotWorkers();
     // "PINNED" is not decoration: it says the dynamic-K controller cannot move this mid-run, so the
     // number in the banner is the number every row below was measured under.
-    printf("config: workers=%zu  affinity=%s  idle=%s  events=%s  park=%s\n",
+    printf("config: workers=%zu  affinity=%s  idle=%s  events=%s  park=%s%s\n",
            sched.GetWorkerCount(), policyName, idleName, runEvents ? "on" : "off",
            JLib::TaskScheduler::GetParkPrimitive() == JLib::TaskScheduler::ParkPrimitive::CondVar
-               ? "cv" : "wait");
+               ? "cv" : "wait",
+           // STAMPED, so a pasted run says which arm produced it. Two runs of this binary differ by
+           // one command-line word, and a table that does not name its arm is the easiest way to
+           // compare two numbers that were never comparable.
+           JLib::TaskScheduler::PushBatchWide() ? "  batchwide=ON" : "");
     // NO RESET HERE. It used to zero the park counters so the verdict "covered the measured run"
     // -- and it hid the fact that reserved workers park ONCE at startup and then sleep through
     // everything, reporting them as never parking at all. Lifetime totals are the honest number:

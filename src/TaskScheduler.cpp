@@ -4871,6 +4871,15 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	// per-push path only moves the floor one step at a time. Growing here means the placement that
 	// follows already has the wider awake set to spread across, instead of discovering it one task
 	// too late and piling the whole wave onto the two workers that were awake when it started.
+	// A BATCH IS THE ONE HONEST BURST SIGNAL -- the caller HANDED OVER N tasks at once rather than
+	// the scheduler inferring a burst from a push-time hint it does not have. Off by default; see
+	// SetPushBatchWide for what Wide buys (burst 9.92 -> 5.07 ms, 12 -> 31 participants) and why
+	// only the COST is still unmeasured.
+	//
+	// UPGRADES Default ONLY. A caller that asked for a specific class keeps it -- a flag that
+	// overrides an explicit choice is a different and worse thing than one that fills in a default.
+	if (pref == CorePref::Default && PushBatchWide()) pref = CorePref::Wide;
+
 	NoteFloorCrowding(count);
 
 	// NOTE (corePref): `pref` places the WHOLE batch as one class -- still assumed homogeneous, but
@@ -5600,6 +5609,12 @@ namespace JLib {
 
 void TaskScheduler::SetBareWaitHelp(bool on) noexcept { g_bareWaitHelp.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::BareWaitHelp() noexcept { return g_bareWaitHelp.load(std::memory_order_relaxed); }
+
+// Default FALSE = shipped behaviour. See SetPushBatchWide for what it is for and why the benefit is
+// already measured but the cost is not.
+static std::atomic<bool> g_pushBatchWide{ false };
+void TaskScheduler::SetPushBatchWide(bool on) noexcept { g_pushBatchWide.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::PushBatchWide() noexcept { return g_pushBatchWide.load(std::memory_order_relaxed); }
 
 static bool g_migratableFibers = false;
 void TaskScheduler::SetMigratableFibers(bool on) {
