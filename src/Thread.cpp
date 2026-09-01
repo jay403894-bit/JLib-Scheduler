@@ -1221,6 +1221,12 @@ static thread_local int consecutiveMisses = 0;
 static constexpr int kBackoffMissThreshold = 8;
 
 void Thread::Worker() {
+	// TSAN: WHICH FIBER IS THIS WORKER'S OWN CONTEXT? Asked, not created -- the context already
+	// exists and TSan is already running on it. Every switch BACK from a task fiber names this
+	// handle, so it has to be captured before the first one can happen. No-op without the
+	// sanitizer; see TsanFiber.h.
+	tsanSchedulerFiber = tsan::CurrentFiber();
+
 	// Is THIS worker reserved for hiPri? Workers [0, R) run hiPri ONLY -- ordinary placement skips
 	// "Am I in the reserved band [0, K)?" USED TO BE CACHED HERE, for the whole life of the thread,
 	// on the grounds that K is static. It is now read once per pass at the top of the loop below --
@@ -2091,12 +2097,38 @@ void Thread::Worker() {
 				f->Init(GlobalFiberPool::FiberEntryWrapper);
 			}
 
+			// ---- REGISTER WITH THE FIBER REGISTRY, ON EVERY PICKUP ---------------------------
+			//
+			// THE RETURN ADDRESS. This worker is about to context-switch into `f` and run whatever
+			// the fiber does next, which may incur thread-affine state that only THIS thread can
+			// release. Recording it here is what lets the cleanup chain mail the deletion task back
+			// when the fiber eventually dies -- see FiberRegistry::AdvanceCleanup.
+			//
+			// BOTH BRANCHES ABOVE CONVERGE HERE, and that is the point: a FRESH BIND
+			// (AcquireFiber) and a RESUME of an existing context are equally a pickup. Registering
+			// only at bind would record the first worker and miss every one a migrating fiber
+			// afterwards ran on -- which is exactly the set whose cleanup would then be orphaned.
+			//
+			// IDEMPOTENT AND ONE ATOMIC OR. Setting a bit that is already set is a no-op, so a
+			// fiber that bounces between two workers a hundred times records two creditors, not a
+			// hundred entries. That is why this can sit on the pickup path at all.
+			//
+			// COSTS NOTHING WHEN NOTHING IS OWED. Registering says only WHO ran it. Whether any
+			// deletion task is actually created is gated separately by what that worker was owed;
+			// a fiber that never touched affine state walks a creditor list and dispatches nothing.
+			f->NoteCreditor((size_t)qIndex);
+
 			f->status.store(FiberStatus::RUNNING, std::memory_order_release);
 			f->homeCtx = &this->schedulerCtx;   // where the fiber returns to: THIS worker
 			currentRunningTask = task_to_run;
 			currentFiber = f;
 			busy.store(true, std::memory_order_relaxed);
 			{
+				// TSAN: ANNOUNCE THE SWITCH BEFORE IT HAPPENS. This is the ONE place a worker
+				// enters a fiber; the eleven switches back out are the other direction. Announcing
+				// after would leave a window where TSan attributes the fiber's first accesses to
+				// the worker's own context, which is the misattribution this exists to prevent.
+				tsan::SwitchTo(f->tsanFiber);
 				ContextSwitch(&this->schedulerCtx, &f->ctx);
 	
 			}

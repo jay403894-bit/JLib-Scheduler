@@ -393,6 +393,9 @@ if(JLIBSCHED_TSAN)
     # unoptimised build can turn a race window that needs microseconds into one that never opens.
     # -g so a report names a line rather than an address.
     add_compile_options(-fsanitize=thread -g -O1 -fno-omit-frame-pointer)
+    # Drives include/TsanFiber.h. Defined by CMake rather than sniffing __SANITIZE_THREAD__ or
+    # __has_feature, so GCC and Clang behave identically and the switch lives in one place.
+    add_compile_definitions(JLIB_TSAN=1)
     add_link_options(-fsanitize=thread)
     message(STATUS "JLib::Scheduler: THREAD SANITIZER ON -- findings on FIBER paths are unproven "
                    "until __tsan_switch_to_fiber annotations exist; see the option's comment")

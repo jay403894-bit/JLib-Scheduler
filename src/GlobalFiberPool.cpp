@@ -22,6 +22,12 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount)
 		f.stackSize = kStandardStackSize;
 		f.poolIndex = i;                        // one dense range, [0, standardCount)
 
+		// TSAN: ONE HANDLE PER FIBER, MADE HERE AND NEVER DESTROYED -- which matches the fibers
+		// themselves, since the pool reserves and leaks them. Without this every switch into this
+		// stack is invisible to the sanitizer and it attributes two fibers on one worker to a single
+		// thread, which misses real races and invents false ones. No-op without the sanitizer.
+		f.tsanFiber = tsan::CreateFiber();
+
 		// Register this fiber's EBR slot ONCE. Fibers live for the whole program (the
 		// pool is leaked, the vector is reserve()'d so it never reallocates), so the
 		// slot address is stable and never needs unregistering -- no lifetime trap.
@@ -100,6 +106,7 @@ void GlobalFiberPool::FiberEntryWrapper()
 	// guard that outlives its traversal is a bug wherever it happens.
 	JLIB_EPOCH_CHECK_NO_GUARD("fiber exit (task returned)");
 
+	Thread::TsanSwitchToScheduler();
 	ContextSwitch(&self->ctx, self->homeCtx);
 }
 

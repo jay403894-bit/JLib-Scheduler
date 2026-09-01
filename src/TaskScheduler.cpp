@@ -4648,6 +4648,7 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 	// Return via the fiber's homeCtx (the worker stamps it before each switch-in),
 	// not thread_local schedulerCtx -- the waiter resumes on whatever worker the
 	// event signal lands on, which may differ from this one.
+	Thread::TsanSwitchToScheduler();
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 }
 
@@ -4771,6 +4772,7 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		}
 
 		JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitFor");
+		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);
 		return;
 	}
@@ -5020,6 +5022,7 @@ void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& 
 	if (arm) arm();
 
 	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEventArmed");
+	Thread::TsanSwitchToScheduler();
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 }
 
@@ -5051,6 +5054,7 @@ void TaskScheduler::WaitOnEventDirectArmed(const std::function<void(DirectEvent*
 	if (arm) arm(e);
 
 	JLIB_EPOCH_CHECK_NO_GUARD("TaskScheduler::WaitOnEventDirectArmed");
+	Thread::TsanSwitchToScheduler();
 	ContextSwitch(&myFiber->ctx, myFiber->homeCtx);
 
 	// Resumed: WE own release. Signal() already exchanged waiter->null and will not touch e again.
@@ -6929,6 +6933,7 @@ void SchedulerMutex::Lock() {
 		// in above -- reintroducing the exact lost wakeup this ordering just closed. WaitOnEvent
 		// switches directly for the same reason.
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerMutex::Lock");
+		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);
 		// Resumed: we have the lock
 		{
@@ -7152,6 +7157,7 @@ WaitResult SchedulerMutex::LockCancellable() {
 			spinLock.clear(std::memory_order_release);
 		}
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerMutex::LockCancellable");
+		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);
 
 		// Resumed. `result` says whether that came with the lock or with a cancellation.
@@ -7256,6 +7262,7 @@ void SchedulerSemaphore::Wait() {
 			spinLock.clear(std::memory_order_release);
 		}
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerSemaphore::Wait");
+		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);
 	}
 	else {
@@ -7331,6 +7338,7 @@ WaitResult SchedulerSemaphore::WaitCancellable() {
 			spinLock.clear(std::memory_order_release);
 		}
 		JLIB_EPOCH_CHECK_NO_GUARD("SchedulerSemaphore::WaitCancellable");
+		Thread::TsanSwitchToScheduler();
 		ContextSwitch(&current->ctx, current->homeCtx);
 
 		// Signal() wrote through `result` before resuming us, so it is settled by the time we run.

@@ -14,6 +14,7 @@
 #include "Fiber.h"
 #include "Epochs.h"
 #include "ThreadLocalCache.h"
+#include "TsanFiber.h"   // fiber annotations for ThreadSanitizer; no-ops without it
 #include "GlobalFiberPool.h"
 namespace JLib {
 	class TaskScheduler;
@@ -415,6 +416,27 @@ namespace JLib {
         static Thread* Current() noexcept { return instance; }
 
         Context schedulerCtx;
+
+        // TSAN'S HANDLE FOR schedulerCtx, or null without the sanitizer. The worker's own context is
+        // a FIBER from TSan's point of view even though nothing here calls it one, so switching back
+        // to it has to be announced exactly like switching into a task fiber.
+        //
+        // Obtained with __tsan_get_current_fiber() at the top of Worker() rather than created: this
+        // context already exists and TSan is already on it, so asking which one it is on is right
+        // and creating a second handle for the same stack would be wrong.
+        void* tsanSchedulerFiber = nullptr;
+
+        // TSAN: "I am switching back to my worker's own context." Called before every
+        // ContextSwitch(&X->ctx, X->homeCtx) -- eleven sites across Fiber.cpp, GlobalFiberPool.cpp
+        // and TaskScheduler.cpp, all the same direction, so they share one call rather than eleven
+        // spellings that could drift.
+        //
+        // NULL-TOLERANT AT BOTH LEVELS: no current Thread (a fiber running somewhere that is not a
+        // worker) and no handle yet both skip silently. Losing one edge costs fidelity; passing
+        // null into the runtime is undefined.
+        static void TsanSwitchToScheduler() noexcept {
+            if (Thread* t = GetCurrent()) tsan::SwitchTo(t->tsanSchedulerFiber);
+        }
         Fiber* currentFiber = nullptr;
         Task* currentRunningTask = nullptr;
         int qIndex = 0;

@@ -3,6 +3,7 @@
 
 #pragma once
 #include "Context.h"
+#include "TsanFiber.h"   // tsanFiber below; no-ops without the sanitizer
 #include "platform.h"
 #include "Task.h"
 #include <atomic>
@@ -67,6 +68,15 @@ namespace JLib {
 		// address meant the next drain walked a recycled slot. Fibers are never freed -- the global
 		// pool reserves and leaks them -- so a link through a fiber cannot dangle that way.
 		Fiber* nextWaiter = nullptr;
+
+		// TSan's handle for this fiber, or null in any build without the sanitizer. Made once with
+		// the pool and never destroyed, because fibers are never destroyed -- the pool reserves and
+		// leaks them. See TsanFiber.h for why an unannotated fiber scheduler produces meaningless
+		// TSan output in BOTH directions.
+		//
+		// NOT CLEARED BY ResetForReuse: like poolIndex, it describes the SLOT, not the occupant. A
+		// recycled fiber is the same fiber to TSan, which is correct -- the stack is the same stack.
+		void* tsanFiber = nullptr;
 
 		// ---- THE CREDITOR SET: every worker this fiber owes thread-affine cleanup to ------------
 		//
