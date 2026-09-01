@@ -108,6 +108,8 @@ static bool g_doM = true;
 // single easiest way to compare two numbers that were never comparable.
 static bool g_noGrow = false;
 static bool g_noHelp = false;
+// -1 = default ceiling (16, from MaybeAdjustAwakeFloor). Stamped into the blocking row header.
+static long g_floorMax = -1;
 
 // THE TASK TYPE EVERY UNTAGGED JLib ROW SUBMITS, switched by the `fiberonly` flag.
 //
@@ -469,8 +471,13 @@ static void BenchIdleTax(JLib::TaskScheduler& jl) {
 }
 
 static void BenchBlocking(JLib::TaskScheduler& jl) {
-    printf("  blocking crossover -- 25%% of tasks wait on an external signal   [floor growth: %s]\n",
-           g_noGrow ? "OFF (nogrow)" : "on");
+    {
+        char capbuf[32];
+        if (g_floorMax >= 0) snprintf(capbuf, sizeof capbuf, "%ld", g_floorMax);
+        else                 snprintf(capbuf, sizeof capbuf, "16 (default)");
+        printf("  blocking crossover -- 25%% of tasks wait on an external signal"
+               "   [growth: %s, cap %s]\n", g_noGrow ? "OFF" : "on", capbuf);
+    }
     printf("     %d batches of %d; ms for all %d tasks, lower is better\n\n",
            kBatches, kBatch, kBatches * kBatch);
     printf("     %8s %11s %11s %9s\n", "block us", "JLib", "marl", "ratio");
@@ -770,6 +777,7 @@ int main(int argc, char** argv) {
     size_t hot = 0;
     // -1 == not given. Applied AFTER Init -- see the floor= case below for why.
     long floorArg = -1;
+    long floorMaxArg = -1;   // growth CEILING; see the floormax= case. Applied after Init with floorArg.
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "hot=", 4) == 0)     { hot = (size_t)strtoul(argv[i] + 4, nullptr, 10); continue; }
         // floor=N -- THE LAST ASYMMETRY WITH marl THAT IS NOT WORKER COUNT.
@@ -811,6 +819,25 @@ int main(int argc, char** argv) {
         // the instance.
         if (strncmp(argv[i], "floor=", 6) == 0) {
             floorArg = (long)strtol(argv[i] + 6, nullptr, 10);
+            continue;
+        }
+        // `floormax=N` -- the GROWTH CEILING, which is a different knob from `floor=` and the
+        // distinction is the whole point.
+        //
+        // `floor=` sets the BASE: that many workers stay awake permanently. Measured cost of doing
+        // it -- floor=16 against a default that GROWS to 16, same peakF, same `ran 16`:
+        // round-trip 1.707 us vs 0.533 us, and idle tax 3.8% vs 0.5%. Three times the latency and
+        // eight times the tax, for identical width during the burst.
+        //
+        // `floormax=` raises only how far growth may go. The floor still collapses to base when the
+        // burst ends, so the width is paid for while it is being used and not otherwise.
+        //
+        // THE DEFAULT CEILING IS 16 (see MaybeAdjustAwakeFloor: `if (cap > 16) cap = 16`), which is
+        // what pins a 31-worker pool at `peakF 16 / ran 16` -- fifteen workers that never run a
+        // task. This sweeps past it without editing that constant, so the number can be chosen from
+        // a curve instead of picked.
+        if (strncmp(argv[i], "floormax=", 9) == 0) {
+            floorMaxArg = (long)strtol(argv[i] + 9, nullptr, 10);
             continue;
         }
         // `nogrow` -- KEEP THE BASE, DISABLE THE GROWTH CONTROLLER. Same spelling as bench.cpp.
@@ -882,6 +909,13 @@ int main(int argc, char** argv) {
     if (fiberOnly) g_jlType = JLib::TaskType::Fiber;
     // NOW the instance exists, so SetAwakeFloor can size against a real worker count and can wake
     // the workers it promotes. See the floor= parse above.
+    // CEILING BEFORE BASE. SetAwakeFloor may promote immediately, and a promotion that runs while
+    // the old 16-cap is still in force would be clamped by the value we are in the middle of
+    // replacing.
+    if (floorMaxArg >= 0) {
+        JLib::TaskScheduler::SetAwakeFloorMax((size_t)floorMaxArg);
+        g_floorMax = floorMaxArg;
+    }
     if (floorArg >= 0) {
         JLib::TaskScheduler::SetAwakeFloor((size_t)floorArg);
         if (floorArg == 0) JLib::TaskScheduler::SetFloorGrowthEnabled(false);
