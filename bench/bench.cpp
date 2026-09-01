@@ -496,6 +496,19 @@ static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
     Spread spread;
     JLib::Task* chunk[kChunk];
     JLib::StealStatsReset();
+    // WAKES ON THIS ROW, WHICH IT NEVER REPORTED. The 1p row has always printed them; bt did not,
+    // and that gap hides which of two explanations a `batchwide` win comes from.
+    //
+    // Wide skips the whole awake-map block in PickNextWorker (it is gated on
+    // `pref == CorePref::Default`) and falls through to the full-pool rotation. So Wide is a
+    // CHEAPER push as well as a wider one, and on a row where `drain-after-submit` is ~0.02 ms --
+    // the producer is the bottleneck, not the pool -- the cheaper push alone could be the whole
+    // effect, with the extra parallelism buying nothing.
+    //
+    // THE TWO SEPARATE ON THIS COUNTER. Wakes roughly unchanged means the win is the skipped
+    // placement work. Wakes up sharply AND still faster means it is paying for parallelism and
+    // getting it. Wakes up with no gain means it is paying for nothing.
+    JLib::TaskScheduler::ResetWakeCount();
     for (int run = 0; run < kThroughputRuns; ++run) {
         JLib::WaitGroup wg;
         wg.n.store(kThroughputTasks, std::memory_order_relaxed);
@@ -520,6 +533,11 @@ static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
         kThroughputTasks, best, kThroughputRuns, kThroughputTasks / best / 1000.0, kChunk);
     printf("               submit %.2f ms (%.2f M/s), drain-after-submit %.2f ms\n",
         bestPush, kThroughputTasks / bestPush / 1000.0, bestDrain);
+    printf("               kernel wakes: %llu over %d runs (%.2f per 1k tasks)  <- compare ACROSS\n"
+           "               arms: `batchwide` places Wide, which skips the awake-map steer entirely.\n"
+           "               Unchanged here means a win came from the CHEAPER push, not from width.\n",
+           (unsigned long long)JLib::TaskScheduler::GetWakeCount(), kThroughputRuns,
+           JLib::TaskScheduler::GetWakeCount() * 1000.0 / (double)kThroughputTasks / kThroughputRuns);
     PrintSpread(nullptr, spread, kThroughputTasks);
     ReportStealStats("bt");
 }
