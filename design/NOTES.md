@@ -970,3 +970,17 @@ completion pays, so it is worth stating before anyone builds to it.
 that a poll-then-park loop is cheap because the kworkers only wake when work exists, and every
 existing check already works. Plausible -- a wake is ~3 us and an I/O completion is not free either
 -- but nobody has run it.
+
+### The I/O lane design has moved to design/IO_LANE.md
+
+The sections above are the conversation that produced it, kept for the reasoning and the two
+corrections in it. THE DESIGN ITSELF IS IN design/IO_LANE.md and that is the one to read: NOTES.md
+grew eight appended sections in one evening and the decisions were no longer findable.
+
+Superseded by that document, and NOT to be re-derived from the sections above:
+  - "two fiber pools" -- it is ONE pool BISECTED, which is what removes the Event/Hazard poolIndex
+    collision rather than requiring it to be managed.
+  - "the backlog eliminates pushIO" -- PushIO IS needed, and private with the reactor a friend,
+    because the scheduler's PLACEMENT path is not thread-safe even though the queue is. A reactor
+    retrying inside the shared push would obstruct an application thread pushing to F.
+  - "K may be demoted to a function" -- K stays 1-3 real dispatch threads.
