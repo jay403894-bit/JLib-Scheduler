@@ -714,9 +714,9 @@ namespace JLib {
 		// the correct answer, not blindness -- one awake worker is all that workload can use.
 		static void MaybeAdjustAwakeFloor() noexcept;
 
-		// Called from NotifyWorker when it actually had to bring a parked worker back. This is the
-		// promote signal; see MaybeAdjustAwakeFloor.
-		static void NoteWakeMiss() noexcept;
+		// NoteWakeMiss REMOVED. It was the promote signal for a miss-ratio promotion that no longer
+		// exists -- growth is the push path's job (NoteFloorCrowding) -- and after that went, both
+		// it and its denominator were incremented on every push and loaded by nothing.
 
 		// ---- DID THE YIELD RE-AIM EVER FIRE? -------------------------------------------------
 		//
@@ -1147,8 +1147,7 @@ namespace JLib {
 
 		void RedistributeToOverflow(size_t ownerIdx, size_t count);
 
-		// Every placement-chosen push. The denominator for the promote ratio -- see NotePush.
-		static void NotePush() noexcept;
+		// NotePush REMOVED with NoteWakeMiss -- it was the denominator of the same retired ratio.
 
 		// Counts actual kernel wakes (WakeByAddress). The diagnostic for "is the floor receiving the
 		// work, or is placement still routing to sleepers?" -- see NoteWakeCall.

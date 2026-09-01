@@ -1687,8 +1687,8 @@ bool TaskScheduler::CollapseAwakeFloorToBase() noexcept {
 
 // ---- AWAKE-FLOOR CONTROLLER STATE ------------------------------------------------------------
 // Rates are asymmetric by design -- see MaybeAdjustAwakeFloor in the header for why.
-static std::atomic<unsigned>  g_wakeMisses{ 0 };      // pushes that landed on a SLEEPING worker
-static std::atomic<unsigned>  g_floorPushes{ 0 };     // placement-chosen pushes -- the denominator
+// g_wakeMisses / g_floorPushes REMOVED -- the promote ratio they fed was retired and nothing ever
+// loaded either one. See the note above NoteFloorCrowding's demote section.
 static std::atomic<long long> g_floorMissWindowNs{ 0 };
 static std::atomic<long long> g_floorWindowNs{ 0 };   // demote observation window
 static std::atomic<long long> g_lastFloorUpNs{ 0 };
@@ -1973,9 +1973,6 @@ size_t TaskScheduler::HiPriSpillTarget(size_t chosen) noexcept {
 	return chosen;
 }
 
-void TaskScheduler::NoteWakeMiss() noexcept {
-	g_wakeMisses.fetch_add(1, std::memory_order_relaxed);
-}
 
 // Relaxed, and they are diagnostics rather than control inputs -- nothing branches on them, so they
 // buy no ordering and must not pretend to. See the header for why a zero AIM count is the important
@@ -2255,8 +2252,9 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 	// crowded on nearly every push -- the gate has to be cheap when it is saying no.
 	if (k >= cap) return;
 
-	// NOT GATED ON WAKE MISSES, and that was tried. NoteWakeMiss fires whenever a push lands on a
-	// sleeping worker, which sounds like "the floor was too small" but is not: the PARKABLE band is
+	// NOT GATED ON WAKE MISSES, and that was tried. (The miss counter itself is now gone -- see the
+	// note above the demote section.) A wake miss was "a push landed on a
+	// sleeping worker", which sounds like "the floor was too small" but is not: the PARKABLE band is
 	// supposed to be asleep and woken on demand, so a healthy pool misses constantly. Gating growth
 	// on it changed nothing measurable. If a crowding signal is wanted here it has to describe the
 	// COMPUTE backlog -- deque depth, long bodies on q >= K -- not the idle policy working.
@@ -2327,20 +2325,22 @@ void TaskScheduler::NoteFloorCrowding(size_t submitted) noexcept {
 		if (Thread* w = inst->workers[i]) w->NotifyWorker(/*force*/ true);
 }
 
-// Every placement-chosen push, whether it hit a sleeping worker or not. The DENOMINATOR.
+// NotePush AND ITS DENOMINATOR ARE GONE, and the reasoning that produced them is kept because it is
+// still correct about the thing it was arguing:
 //
-// WHY A RATIO AND NOT A COUNT. The rule inherited from the K-hot controller was "one miss in a 1 ms
-// window promotes", and that was sane there because its miss signal was a LANE miss -- a hiPri task
-// arriving with no hot worker free, which on a 60 Hz frame loop happens a handful of times a
-// second. The same rule against THIS signal is not: a placement-chosen push is a candidate event
-// millions of times a second in throughput/1p, so "one miss in 1 ms" is essentially always true and
-// the floor ratchets to whatever the run length allows.
+//   A FRACTION IS SCALE-FREE. "More than 1 in 20 pushes hit a sleeping worker" means the same at
+//   60 Hz and at 10 M/s; "one miss" does not. The K-hot controller's "one miss in a 1 ms window
+//   promotes" was sane against a LANE miss (a handful per second on a frame loop) and is not
+//   against a placement-chosen push, which is a candidate event millions of times a second.
 //
-// A FRACTION IS SCALE-FREE. "More than 1 in 20 pushes hit a sleeping worker" means the same thing at
-// 60 Hz and at 10 M/s; "one miss" does not.
-void TaskScheduler::NotePush() noexcept {
-	g_floorPushes.fetch_add(1, std::memory_order_relaxed);
-}
+// WHAT WAS WRONG WAS BUILDING THE RATIO ANYWAY. The promote it was for was removed (see below --
+// growth is the push path's job now), and NOTHING EVER LOADED EITHER COUNTER. They were incremented
+// on every push, reset on a window roll, and never read, in any file.
+//
+// A COUNTER EARNS ITS PLACE BY CHANGING A DECISION. Once nothing reads it, the choice is remove it
+// or invent a policy to consume it -- and inventing one to justify a counter is backwards. This is
+// the third instance of the shape here: NoteLaneMiss had no callers, which is why adaptive K
+// "never ramps" was PROVEN rather than suspected, and it was removed rather than wired.
 
 static std::atomic<unsigned long long> g_wakeCalls{ 0 };
 void TaskScheduler::NoteWakeCall() noexcept { g_wakeCalls.fetch_add(1, std::memory_order_relaxed); }
@@ -2382,8 +2382,8 @@ void TaskScheduler::MaybeAdjustAwakeFloor() noexcept {
 	const long long missWs = g_floorMissWindowNs.load(std::memory_order_relaxed);
 	if (missWs == 0 || now - missWs >= kFloorMissWindowNs) {
 		g_floorMissWindowNs.store(now, std::memory_order_relaxed);
-		g_wakeMisses.store(0, std::memory_order_relaxed);
-		g_floorPushes.store(0, std::memory_order_relaxed);
+		// The two counters this window used to roll are gone -- see the NotePush note above. The
+		// window itself stays: the demote path below still uses it.
 	}
 	// ---- NO PROMOTION HERE. GROWTH IS THE PUSH PATH'S JOB -- see NoteFloorCrowding ------------
 	//
@@ -2394,9 +2394,14 @@ void TaskScheduler::MaybeAdjustAwakeFloor() noexcept {
 	// is blind to the case -- a push onto an AWAKE floor worker records no miss, so sixteen tasks
 	// piling onto two live workers produce a miss ratio of zero while the queue builds.
 	//
-	// The miss counters are still maintained (NoteWakeMiss/NotePush) because they are the honest
-	// measure of "pushes that had to buy a kernel wake", which the bench reports and which is the
-	// floor's headline number. They just no longer steer anything.
+	// THE MISS COUNTERS ARE GONE, AND THE LINE THAT KEPT THEM WAS WRONG. It read: "still maintained
+	// because they are the honest measure of pushes that had to buy a kernel wake, WHICH THE BENCH
+	// REPORTS". The bench reports GetWakeCount() -> g_wakeCalls, which is a DIFFERENT counter,
+	// incremented at the syscall itself. These two were never read by anything, so they cost an
+	// atomic RMW per push -- and NoteWakeMiss cost a GetWorkerState() load of the target's permit
+	// word with it -- to maintain a number no reader existed for.
+	//
+	// Two counters that sound like the one the bench prints is exactly how that survives review.
 	(void)hi;
 
 	// ---- DEMOTE: the MARGINAL floor worker has had nothing to do -----------------------------
@@ -5841,7 +5846,6 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// one, and it would show up as a floor controller promoting against wakes nobody paid.
 		if (useHi) chosen = (uint8_t)HiPriSpillTarget((size_t)chosen);
 
-		NotePush();
 		// ---- REMEMBER WHERE THIS PUSH WENT, SO A STALL DUMP CAN POINT AT IT ------------------
 		//
 		// Mid-stall the watcher cannot tell WHICH worker the outstanding task is waiting on: the
@@ -5849,17 +5853,18 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// correlating against thirty-one interleaved rows by hand -- and the row that mattered was
 		// the one the paste happened to cut.
 		//
-		// AFTER the spill redirect, for the same reason NotePush sits here. Recording before it
-		// would name a worker the task was moved off, which is the counters-describe-one-worker,
-		// task-sits-on-another bug the comment above warns about.
+		// AFTER the spill redirect. Recording before it would name a worker the task was moved off,
+		// which is the counters-describe-one-worker, task-sits-on-another bug the comment above
+		// warns about. (NotePush used to sit here for the same reason and has been removed.)
 		//
 		// Relaxed, last-writer-wins: the serial latency row has one push in flight, which is the
 		// only case this is read in. Under concurrent producers it names whichever pushed last, and
 		// the dump labels it so rather than implying more than it knows.
 		g_lastPushTarget.store((int)chosen, std::memory_order_relaxed);
-		if (chosen < workers.size() && workers[chosen]
-		    && workers[chosen]->GetWorkerState() == 2 /* WS_SLEEPING */)
-			NoteWakeMiss();
+		// A `GetWorkerState()` LOAD WENT WITH NoteWakeMiss. It read the target's permit word on
+		// every push purely to decide whether to bump a counter nothing read -- an extra touch of a
+		// line (Thread.h:833) that the worker is concurrently RMW-ing, on the hottest path in the
+		// scheduler. NotifyWorker below reaches the same word for a reason; this read had none.
 
 		if (useHi) {
 			// ---- A LANE MISS IS "THIS COMPLETION WILL QUEUE BEHIND ONE ALREADY LINKED" -------
@@ -6427,8 +6432,6 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 					// worker side either. The pusher is the only party awake and the only one that
 					// can see the queue building.
 					if (workers[idx]->hasQueuedWork.load(std::memory_order_relaxed)) {
-						NoteWakeMiss();
-
 						// GROW ON DEPTH, NOT ON "ANYTHING IS QUEUED". This gate was
 						// hasQueuedWork alone, and a bool is too coarse: a 6-node frame graph
 						// briefly queues behind two workers exactly like a 16-task wave does, so

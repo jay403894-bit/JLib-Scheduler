@@ -402,8 +402,10 @@ namespace JLib {
         Fiber* currentFiber = nullptr;
         Task* currentRunningTask = nullptr;
         int qIndex = 0;
-        // WS_AWAKE(0) / WS_GOING_TO_SLEEP(1) / WS_SLEEPING(2). Read by the placement path to decide
-        // whether a push it just routed will have to buy an OS wake -- see NoteWakeMiss.
+        // WS_AWAKE(0) / WS_GOING_TO_SLEEP(1) / WS_SLEEPING(2). NO LONGER READ BY THE PLACEMENT PATH:
+        // that read existed only to decide whether to bump NoteWakeMiss, a counter nothing loaded,
+        // and it touched this line on every push while the owning worker was RMW-ing it. NotifyWorker
+        // still reaches this word, for a reason.
         // seq_cst, NOT relaxed, and it was relaxed. Every caller compares this against WS_PARKED to
         // decide whether somebody needs waking or may be targeted -- which makes it one half of a
         // Dekker pair with MarkQueuedWork, and a Dekker pair is only sound when BOTH sides are
