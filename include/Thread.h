@@ -697,6 +697,20 @@ namespace JLib {
 
         std::atomic<bool> hasQueuedWork{ false };
 
+        // ---- THE THIRD FIELD EVERY PUSH WRITES, MOVED HERE FOR THE CACHE LINE ----------------
+        //
+        // Declared next to inboxDepth and hasQueuedWork because PushLocal writes all three on the
+        // target worker, once per task. Measured at 64-byte granularity they used to straddle two
+        // coherence lines (2460/2472 on line 38, 2520 on line 39), so a producer paid two transfers
+        // per push against a worker concurrently RMW-ing the same words. Now one.
+        //
+        // NOT FREE IN BOTH DIRECTIONS, which is why this is a measurement and not a rule: sharing a
+        // line means the worker's RMW on workerState now invalidates the line holding the two
+        // fields the producer writes, and vice versa. It wins if producer writes outnumber worker
+        // RMWs on this object, and the throughput row is exactly that shape. The semantics and the
+        // WS_* enum are documented at the enum's declaration further down; this is storage only.
+        std::atomic<int> workerState{ 0 /* WS_EMPTY -- enum is declared below, see there */ };
+
         // EDGE-TRIGGERED, and that is the whole safety argument for it. Cleared once per Worker()
         // loop iteration in the same place as hasQueuedWork, so ONE wake buys ONE search pass and
         // the worker parks again unless it actually found something.
@@ -848,7 +862,15 @@ namespace JLib {
         // skipping YIELD is a LATENCY win only -- -DTARGET_YIELDED is green, because the swap
         // still latches and the return CAS sees NOTIFIED and rescans.
         enum WorkerState : int { WS_EMPTY = 0, WS_NOTIFIED = 1, WS_PARKED = 2, WS_YIELD = 3 };
-        std::atomic<int> workerState{ WS_EMPTY };
+        // THE MEMBER ITSELF MOVED UP, next to inboxDepth and hasQueuedWork. The enum stays here
+        // with the reasoning above; only the storage was relocated, and only for layout.
+        //
+        // WHY: PushLocal writes all three of those fields on the target worker, and measured at
+        // 64-byte granularity they occupied TWO coherence lines -- inboxDepth 2460 and
+        // hasQueuedWork 2472 on line 38, workerState 2520 on line 39, with ~48 bytes of lane and
+        // debug counters between them. Two lines is two transfers per push from a producer that
+        // the owning worker is concurrently RMW-ing. See tests/thread_layout_test.cpp, which
+        // reports the offsets and fails if a future field splits them again.
 
         std::atomic<bool> running{ false };
         std::atomic<bool> ready{ false };
