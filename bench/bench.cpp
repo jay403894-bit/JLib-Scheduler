@@ -2787,6 +2787,23 @@ int main(int argc, char** argv) {
             JLib::TaskScheduler::SetSpinYieldMask((unsigned)strtoul(argv[a] + 10, nullptr, 10));
             continue;
         }
+        // yieldfloor=N -- a floor of N or fewer NEVER yields; it stays in CpuRelax. Default 4.
+        //   yield() is politeness aimed at a WIDE spinning set. At F=2 the steer set has two bits,
+        //   so a yield on either is a coin flip that a push lands on the core that just stepped off
+        //   -- and the re-aim cannot invent a third floor worker. Set 0 to restore the old
+        //   always-yield behaviour, which is the A/B arm for this gate.
+        if (JLIB_STRNICMP(argv[a], "yieldfloor=", 11) == 0) {
+            JLib::TaskScheduler::SetYieldFloorMin((size_t)strtoul(argv[a] + 11, nullptr, 10));
+            continue;
+        }
+        // relax=N -- CpuRelax iterations per idle pass. Default 32, and SHORT ON PURPOSE: this sits
+        //   between two consecutive looks at the queues, so it is dispatch latency for anything
+        //   that arrives during it. Raising it is a cheap way to make a worker look asleep while it
+        //   is still burning a core; a worker that wants a real backoff should be parking.
+        if (JLIB_STRNICMP(argv[a], "relax=", 6) == 0) {
+            JLib::TaskScheduler::SetWorkerRelax((unsigned)strtoul(argv[a] + 6, nullptr, 10));
+            continue;
+        }
         // narrowsteer -- ordinary pushes aim at the BASE floor instead of the live one (pre-5.0.0).
         //   The default is now the wide zone; this is the A/B arm, because the narrow steer was
         //   bought with real numbers on the serial row (p50 0.40 -> 0.90 us, 1p 10.0 -> 5.74 M/s

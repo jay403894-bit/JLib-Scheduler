@@ -1200,7 +1200,9 @@ void Thread::Worker() {
 	// How long a NON-floor worker pauses before handing the core back. Short on purpose: it is
 	// awake on a transient reason, so the pause only has to cover a steal target appearing, not a
 	// policy decision. See the spin path in Worker().
-	constexpr unsigned kGuestSpin = 32;
+	// The relax count is a runtime knob now -- see TaskScheduler::SetWorkerRelax. Read ONCE per
+	// pass rather than per iteration: it is policy, not a hot value, and a load inside the pause
+	// loop would be measuring the knob instead of pausing.
 	unsigned floorCtlTick = 0;   // subsamples the awake-floor controller; see MaybeAdjustAwakeFloor
 	unsigned laneCtlTick  = 0;   // subsamples the K controller from a reserved worker; see below
 	running.store(true, std::memory_order_release);
@@ -3694,7 +3696,7 @@ void Thread::Worker() {
 					// be polite to a problem a small floor does not have. Gate the yield on the
 					// floor being big enough for politeness to matter.
 					const size_t liveF = TaskScheduler::GetAwakeFloor();
-					if (liveF > TaskScheduler::kYieldFloorMin) {
+					if (liveF > TaskScheduler::GetYieldFloorMin()) {
 						// PHASE-STAGGERED BY qIndex, so a large floor cannot enter YIELD in
 						// lockstep. Same mask, different phase per worker: q and q+1 cannot take
 						// the yield arm on the same pass, so the re-aim always has a sibling that
@@ -3712,7 +3714,12 @@ void Thread::Worker() {
 				// A GUEST: brief pause, then hand the core back unconditionally -- through the
 				// SAME handshake. A guest is about to park anyway, so the window here is short,
 				// but "short" is not "absent" and growth can make it a targeted core mid-pass.
-				for (unsigned i = 0; i < kGuestSpin; ++i) platform::CpuRelax();
+				// Read ONCE per pass, not per iteration: this is policy, not a hot value, and a
+				// load inside the pause loop would be measuring the knob instead of pausing.
+				{
+					const unsigned relaxN = TaskScheduler::GetWorkerRelax();
+					for (unsigned i = 0; i < relaxN; ++i) platform::CpuRelax();
+				}
 				(void)yieldWithHandshake();
 			}
 		}

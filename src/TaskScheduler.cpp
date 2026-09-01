@@ -1384,6 +1384,20 @@ void TaskScheduler::SetSpinYieldMask(unsigned mask) noexcept {
 }
 unsigned TaskScheduler::GetSpinYieldMask() noexcept { return g_spinYieldMask.load(std::memory_order_relaxed); }
 
+// THE FLOOR SIZE BELOW WHICH A FLOOR WORKER NEVER YIELDS. See the header for why it exists; the
+// short version is that yield() is politeness aimed at a WIDE spinning set, and on a two-bit steer
+// set it is a coin flip that a push lands on the core that just stepped off.
+static std::atomic<size_t> g_yieldFloorMin{ TaskScheduler::kYieldFloorMinDefault };
+void   TaskScheduler::SetYieldFloorMin(size_t f) noexcept { g_yieldFloorMin.store(f, std::memory_order_relaxed); }
+size_t TaskScheduler::GetYieldFloorMin() noexcept { return g_yieldFloorMin.load(std::memory_order_relaxed); }
+
+// CpuRelax iterations per idle pass. Kept SHORT deliberately -- it sits between two consecutive
+// looks at the queues, so it is dispatch latency for anything that arrives during it. A worker that
+// wants to back off further should be parking, not relaxing longer.
+static std::atomic<unsigned> g_workerRelax{ TaskScheduler::kWorkerRelaxDefault };
+void     TaskScheduler::SetWorkerRelax(unsigned n) noexcept { g_workerRelax.store(n, std::memory_order_relaxed); }
+unsigned TaskScheduler::GetWorkerRelax() noexcept { return g_workerRelax.load(std::memory_order_relaxed); }
+
 void TaskScheduler::SetAwakeFloor(size_t k) noexcept {
 	// The caller is stating policy, so this moves the BASE as well as the current value. Growth
 	// (NoteFloorCrowding) and shedding (CollapseAwakeFloorToBase) only ever move the current one.

@@ -655,7 +655,28 @@ namespace JLib {
 		//
 		// 4 is a judgement, not a measurement. It is above the F=2 and F=3 configurations the
 		// latency rows actually use and well below the grown floors the politeness was written for.
-		static constexpr size_t kYieldFloorMin = 4;
+		//
+		// A DEFAULT, NOT A CONSTANT. This is policy, and policy an application can be wrong about
+		// belongs behind a setter with a defensible default rather than baked into a header -- the
+		// same shape as SetSpinYieldMask beside it. An app that runs a permanently wide floor may
+		// want it lower; one that pins two cores for latency and nothing else may want it higher.
+		static constexpr size_t kYieldFloorMinDefault = 4;
+		static void   SetYieldFloorMin(size_t f) noexcept;
+		static size_t GetYieldFloorMin() noexcept;
+
+		// ---- HOW LONG AN IDLE WORKER PAUSES BEFORE IT LOOKS AGAIN ----------------------------
+		//
+		// CpuRelax iterations per idle pass. This is the POLITE half of the idle loop: a pause hint
+		// keeps the core, costs power rather than a context switch, and lets a hyperthread sibling
+		// make progress. Only the yield gives the core away.
+		//
+		// SHORT BY DEFAULT AND IT SHOULD STAY SHORT. This runs between two consecutive looks at the
+		// queues, so it is dispatch latency for anything that arrives during it -- a long relax is
+		// a cheap way to make a worker look asleep while it is burning a core. 32 is a pause, not a
+		// backoff; anything that wants a real backoff should be parking instead.
+		static constexpr unsigned kWorkerRelaxDefault = 32;
+		static void     SetWorkerRelax(unsigned iterations) noexcept;
+		static unsigned GetWorkerRelax() noexcept;
 
 		static size_t GetAwakeFloor() noexcept;
 
