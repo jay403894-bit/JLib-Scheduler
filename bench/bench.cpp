@@ -356,7 +356,13 @@ static void ReportStealStats(const char* label) {
     //
     // A probe IS a steal attempt and claims at most one task, so hits <= probes and hits <= tasks.
     // With the window stated, both are checkable at a glance.
-    printf("  steal/%s   : %lld probes, %lld hits (%.1f%% hit rate, %.3g probes per task)\n"
+    // "steal/bt" READ AS "BATCH STEALING", WHICH DOES NOT EXIST. The tag is the ROW -- 1p, bt, mp
+    // -- and bt is the batch-PUSH row, so this is "steal counters measured during that row". There
+    // is no batch steal in this scheduler and there cannot be one with a Chase-Lev deque: the owner
+    // works at `bottom` and thieves CAS `top`, so a thief can claim exactly one task per successful
+    // CAS. Naming the row explicitly costs six characters and removes a standing invitation to look
+    // for a mechanism that is structurally impossible.
+    printf("  steal during %s: %lld probes, %lld hits (%.1f%% hit rate, %.3g probes per task)\n"
            "               over %d runs = %lld tasks (the row header is ONE run, best-of-%d)\n",
         label, probes, hits,
         probes ? 100.0 * (double)hits / (double)probes : 0.0,
