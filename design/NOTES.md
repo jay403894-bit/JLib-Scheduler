@@ -1134,3 +1134,20 @@ Two other shapes were already tried and are recorded at the gate:
 
 So the push path's remaining atomics are all load-bearing, and after the colocation they share one
 coherence line. Closing the rest of the gap to marl needs a profiler, not more reading.
+
+### KNOWN FLAKY: SchedulerWaitGroupCancelTest, ~2%, PRE-EXISTING
+
+Measured 2026-09-01 while landing the fiber-death cleanup hook, because an intermittent failure on a
+WaitGroup test immediately after touching the fiber ACQUIRE path is exactly the thing not to wave
+through. Baseline first, on a stashed tree:
+
+    without the change   1 / 60 failed
+    with the change      2 / 40 failed
+
+Too close and both samples too small to distinguish; the point is that it fails WITHOUT the change.
+It prints "ALL CHECKS PASSED" and then exits non-zero, so the failure is after the assertions -- on
+the teardown path, not in what the test checks. Jay: "i was thinking of testing that and i knew it
+would break."
+
+**RECORDED SO THE BASELINE DOES NOT HAVE TO BE MEASURED AGAIN.** A ~2% flake is invisible in a single
+run and looks like a regression the first time a change happens to hit it.

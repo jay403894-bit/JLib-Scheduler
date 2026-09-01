@@ -7,6 +7,7 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
+#include "../include/FiberRegistry.h"   // registry table is built with the fiber pool
 #include "../include/IoReactor.h" // Join() stops the completion threads before clearing the pool
 #include <cstdlib>            // getenv / _dupenv_s -- JLIB_PARK selects the park primitive
 #include <cstring>            // strncpy -- the POSIX arm of the JLIB_WATCHDOG env read. MSVC pulls
@@ -4388,6 +4389,11 @@ void TaskScheduler::StartPool(size_t poolSize) {
 
 	// GlobalFiberPool now owns all fibers and stack allocation
 	globalPool = GlobalFiberPool::Create(standardFiberCount);
+	// THE REGISTRY'S ADDRESS TABLE, BUILT ONCE THE POOL EXISTS. Without it the cleanup chain's
+	// final hop has no pool to return the fiber to and would drop it -- a leaked fiber rather than
+	// a visible failure. Built here rather than lazily so the failure cannot be first observed at
+	// the moment a fiber dies owing something.
+	FiberRegistry::Instance().Build(globalPool);
 	// Raw Thread*: delete before clearing. Normally empty here -- StartPool runs before any worker
 	// exists -- but an Init after a Join finds the leftovers of the previous pool.
 	for (Thread* w : workers) delete w;

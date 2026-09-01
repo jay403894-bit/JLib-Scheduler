@@ -6,6 +6,7 @@
 #include "../include/platform.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Timer.h"   // MonotonicNs -- lane occupancy stamps
+#include "../include/FiberRegistry.h"   // the fiber-death cleanup chain -- see OnFiberReturned
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -845,10 +846,27 @@ bool Thread::Ready(){
 }
        
 Fiber* Thread::AcquireFiber(Task* task) {
+	// SCRUB ON ACQUIRE, NOT ON RELEASE, AND THAT CLOSES A PRE-EXISTING HOLE.
+	//
+	// Fiber::ResetForReuse is called by GlobalFiberPool::ReturnBatch -- but ReleaseFiber does not
+	// go through ReturnBatch. It is `localCache.Push(f)`, and ThreadLocalCache::Push scrubs
+	// NOTHING; only the SPILL path (the top half, when the cache overflows) reaches ReturnBatch.
+	// So a fiber pushed and popped from the local cache without that cache ever overflowing was
+	// never reset -- including the localEpoch scrub whose own comment says it exists because "a
+	// fiber once went back to the pool still announced at an old epoch, which is an ABA on the
+	// reclaimer".
+	//
+	// ACQUIRE IS THE ONE POINT BOTH PATHS PASS THROUGH. Release has two (local cache, global
+	// batch) and only one of them scrubbed. Here the rule states simply: a fiber handed out is
+	// clean, whatever it came from.
+	//
+	// AND IT IS WHAT MAKES Fiber::creditors SAFE. A recycled fiber carrying a stale creditor bit
+	// would bill its next occupant's cleanup to a worker that never touched it.
 	Fiber* f = localCache.Pop();
-	if (f) return f;
+	if (f) { f->ResetForReuse(); return f; }
 
 	f = localCache.Pop();
+	if (f) f->ResetForReuse();
 
 	if (!f) {
 		// ONCE PER PROCESS, not once per failure. Exhaustion is not a single event: the caller
@@ -986,7 +1004,25 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 				task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
 		}
 		task_to_run->assignedFiber = nullptr;
-		ReleaseFiber(f);
+		// ---- THE FIBER IS DEAD: DOES IT OWE ANYONE? ------------------------------------------
+		//
+		// A fiber that incurred thread-affine state -- a COM apartment, a thread-owned handle, a
+		// magazine that refuses to be remote-freed -- recorded each worker it owes in
+		// Fiber::creditors. Those releases have to run ON those workers, so the fiber cannot simply
+		// go back to this worker's cache: FiberRegistry walks the creditors one hop at a time and
+		// the LAST hop recycles it. See FiberRegistry::AdvanceCleanup.
+		//
+		// THE COMMON PATH IS UNCHANGED, and that is deliberate. HasCreditors() is four relaxed
+		// loads of a word this thread just finished running on, and it is false for every fiber
+		// that never touched affine state -- which today is all of them, since nothing sets a
+		// creditor yet. So this is inert until the resource wrappers exist, and when they do it
+		// costs the ordinary fiber nothing.
+		//
+		// NOT ReleaseFiber IN THE OWING CASE: that pushes to this worker's LOCAL cache, and the
+		// fiber must not be handed out again until its debts are paid. The chain's final hop
+		// returns it to the global pool instead.
+		if (f->HasCreditors()) FiberRegistry::Instance().AdvanceCleanup(f);
+		else                   ReleaseFiber(f);
 
 		scheduler->CleanupTaskMetadata(task_to_run);
 		DestroyTask(task_to_run);
