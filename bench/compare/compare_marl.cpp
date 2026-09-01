@@ -238,6 +238,13 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
     // p50 0.60 us there were being compared as if they described the same configuration. They did
     // not, and the floor is exactly the variable this session showed round-trip is sensitive to
     // (0.533 us at base 2 against 1.707 us at base 16, same peak).
+    //
+    // FORCED, NOT JUST REPORTED. Reporting told you the row was contaminated; it did not stop it.
+    // SchedulerBench has always shed to base before its latency row for exactly this reason, and
+    // this row -- which starts the instant a 20,000-task throughput row finishes growing the floor
+    // -- had neither. Now it sheds first and prints the before/after, so the row measures the
+    // CONFIGURED floor and says so.
+    if (g_doJ) JLib::TaskScheduler::ForceAwakeFloorToBase();
     const size_t floorBefore = JLib::TaskScheduler::GetAwakeFloor();
     if (g_doJ) {
         for (int r = 0; r < 3; ++r) {
