@@ -901,6 +901,8 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     unsigned long long stallPusherLate = 0;
     // How many stalls had the waiter on the same core the body ended up running on.
     unsigned long long stallSameCore = 0;
+    // The one number: stalls where dispatch dominated AND the target was demonstrably running.
+    unsigned long long stallSchedulerImplicated = 0;
     unsigned long long stallWithWake = 0;
     double maxDispatchUs = 0.0, maxExecutionUs = 0.0, maxCompletionUs = 0.0;
     // Healthy-iteration poll rate, the yardstick the stall report is read against. See the
@@ -1142,12 +1144,21 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // it is measuring.
         unsigned tickBefore[8] = {};
         const size_t tickN = (floorAtLatencyStart < 8) ? floorAtLatencyStart : 8;
-        for (size_t q = 0; q < tickN && q < threadsForTick.size(); ++q)
-            tickBefore[q] = threadsForTick[q]->SpinTick();
 
         const long long pushIssuedNs = NowNs();
         sched.Push(t);
         const long long pushDoneNs = NowNs();
+
+        // SAMPLED AFTER Push RETURNS, NOT BEFORE IT IS ISSUED, and the difference is the whole
+        // validity of this number. Taken before the issue, the delta also counts every idle pass
+        // the worker took while the work DID NOT YET EXIST -- passes that could not possibly have
+        // found it. At a 3 us threshold that is most of the window, and the counter duly reported
+        // 6 of 19 trips as scheduler-implicated when the true answer was far lower. After the push
+        // returns, the task is definitely in the queue, so any pass counted here is a pass that
+        // could have taken it and did not.
+        for (size_t q = 0; q < tickN && q < threadsForTick.size(); ++q)
+            tickBefore[q] = threadsForTick[q]->SpinTick();
+
         // The waiter's core on both sides of the wait -- see g_bodyCpu. It can migrate mid-wait, so
         // one sample would be weak evidence and two are cheap.
         const unsigned waiterCpuPre = JLib::platform::CurrentCpu();
@@ -1234,6 +1245,28 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                     const unsigned bc = g_bodyCpu.load(std::memory_order_relaxed);
                     if (bc != ~0u && (bc == waiterCpuPre || bc == waiterCpuPost)) ++stallSameCore;
                 }
+                // ---- THE ONLY QUESTION THAT MATTERS, AS ONE COUNTER ----------------------
+                //
+                // A stall is a SCHEDULER defect if and only if the target worker was EXECUTING
+                // while the task sat in its queue and still did not take it. Both halves are
+                // needed, and until now reading them meant assembling five lines by hand --
+                // segment shape, poll count, cores, idle passes, and the class label -- for
+                // every trip. This is that conjunction, counted:
+                //
+                //     dispatch is where the time went   AND   the worker took idle passes
+                //
+                // Anything else is the OS failing to run one of the three threads involved,
+                // which no scheduler change can fix.
+                {
+                    const bool dispatchDom =
+                        (sbs - pushIssuedNs) > (returnedNs - sbe) &&
+                        (sbs - pushIssuedNs) > (pushDoneNs - pushIssuedNs);
+                    const int bq = g_bodyQ.load(std::memory_order_relaxed);
+                    if (dispatchDom && bq >= 0 && (size_t)bq < tickN
+                        && (g_bodyTick.load(std::memory_order_relaxed) - tickBefore[bq]) > 0)
+                        ++stallSchedulerImplicated;
+                }
+
                 const double pushUs = (double)(pushDoneNs - pushIssuedNs) / 1000.0;
                 if (pushUs >= rt * 0.5) { ++stallPusherLate; whoClass = 3; }
                 else if (healthyRate > 0.0) {
@@ -1531,6 +1564,17 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
                "               ALREADY AWAKE, so no OS wake is in them at all\n", stallWithWake);
         // WHO was late. The line above says where the time went; this says which half of the
         // system to go and look at, and they do not always agree.
+        // THE HEADLINE, ABOVE THE BREAKDOWN, because it is the only line that answers "is this an
+        // actual stall". Everything below it is the working-out.
+        printf("               SCHEDULER-IMPLICATED: %llu of %llu   <- %s\n",
+               stallSchedulerImplicated, stallCount,
+               stallSchedulerImplicated == 0
+                   ? "NONE. Every stall was a thread the OS did not run --\n"
+                     "                     the pusher, the waiter, or the target. No scheduler\n"
+                     "                     change can move these."
+                   : "the target worker WAS executing and did not take work\n"
+                     "                     from its own queue. This is a real defect: read the\n"
+                     "                     [POOL late] block and the phase it was in.");
         printf("               WHO was late:  pool %llu | waiter %llu | pusher %llu",
                stallPoolLate, stallWaiterLate, stallPusherLate);
         if (stallUnclassified) printf(" | unclassified %llu", stallUnclassified);
