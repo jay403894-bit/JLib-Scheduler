@@ -23,9 +23,12 @@
 //                       design the header warns about, and claim 2 must catch it.
 //   CTL_SWALLOW_FAILED  drop the creditor on a failed dispatch instead of restoring it. Claim 5.
 //   CTL_SKIP_ONE        skip one creditor's hop. Claim 1.
+//   CTL_NO_ONESHOT      return the same fiber to the pool twice. Proves the DEAD-&gt;READY CAS claim
+//                       in ReturnToPool is what prevents one stack being handed to two tasks.
 
 #include "../include/FiberRegistry.h"
 #include "../include/Fiber.h"
+#include "../include/GlobalFiberPool.h"
 #include <cstdio>
 #include <vector>
 #include <set>
@@ -171,6 +174,45 @@ int main() {
 		ResetSeams();
 		Check(!reg.AdvanceCleanup(nullptr), "a null fiber is refused");
 		Check(g_recycles == 0, "and nothing is recycled for it");
+	}
+
+	// ---- 7. ReturnToPool is ONE-SHOT --------------------------------------------------------
+	// The real recycler, against a real pool. This is the one place in the chain where getting it
+	// wrong is corruption rather than a stall: a fiber returned twice sits twice in the available
+	// queue and is handed to two tasks, which then share a stack.
+	{
+		reg.SetRecycle(nullptr);                 // the REAL recycler for this section
+		GlobalFiberPool* pool = GlobalFiberPool::Create(8);
+		reg.Build(pool);
+		Check(reg.Count() == 8, "the address table covers the pool");
+		Check(reg.Get(0) != nullptr && reg.Get(8) == nullptr, "and is bounded by it");
+
+		Fiber* f = nullptr;
+		Check(pool->StealInto(&f, 1) == 1 && f, "took a fiber from the pool");
+		const size_t availAfterTake = pool->AvailableCount();
+
+		// A fiber that has not finished is not the registry's to return.
+		f->status.store(FiberStatus::RUNNING, std::memory_order_release);
+		Check(!reg.ReturnToPool(f), "a fiber that is not DEAD is refused");
+		Check(pool->AvailableCount() == availAfterTake, "and nothing was returned for it");
+
+		f->status.store(FiberStatus::DEAD, std::memory_order_release);
+#ifdef CTL_NO_ONESHOT
+		// CONTROL: return it twice by re-arming DEAD in between, which is what losing the CAS
+		// claim would let two callers do.
+		Check(reg.ReturnToPool(f), "first return succeeds");
+		f->status.store(FiberStatus::DEAD, std::memory_order_release);
+		Check(reg.ReturnToPool(f), "CONTROL: second return also succeeds");
+#else
+		Check(reg.ReturnToPool(f), "first return succeeds");
+		Check(!reg.ReturnToPool(f), "the SECOND return is refused -- the claim is one-shot");
+#endif
+		std::printf("pool available: %zu of 8 (one fiber taken, then returned)\n",
+			pool->AvailableCount());
+		Check(pool->AvailableCount() == availAfterTake + 1,
+			"the fiber is in the pool exactly ONCE after being returned");
+
+		reg.Reset();
 	}
 
 	reg.SetDispatch(nullptr);

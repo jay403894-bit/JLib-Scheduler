@@ -876,8 +876,8 @@ Fiber* Thread::AcquireFiber(Task* task) {
 			             "progresses again. A DAG whose concurrently-suspended nodes outnumber the "
 			             "budget above is the shape to look for.\n"
 			             "  Either block fewer tasks concurrently, or call "
-			             "TaskScheduler::SetFiberBudget(standardPerWorker, heavyPerWorker) BEFORE "
-			             "Init() to raise it. This warning prints once.\n";
+			             "TaskScheduler::SetFiberBudget(standardPerWorker) BEFORE Init() to raise "
+			             "it. This warning prints once.\n";
 		}
 	}
 	return f;

@@ -73,7 +73,12 @@ void GlobalFiberPool::ReturnBatch(Fiber** fibers, size_t count) {
 
 	// Direct enqueueing of the pointer batch
 	for (size_t i = 0; i < count; ++i) {
-		fibers[i]->localEpoch.store(SIZE_MAX, std::memory_order_release);  // Defensive: clear epoch state
+		// A RECYCLED FIBER IS A NEW FIBER. This used to scrub localEpoch here and nothing else --
+		// and that scrub exists because a fiber once went back announced at a dead epoch. A list of
+		// inline field clears is correct until someone adds a field, and whoever adds it is not
+		// reading this loop. Fiber::ResetForReuse keeps the scrub next to the members instead; the
+		// full list, and what is deliberately NOT reset, is documented there.
+		fibers[i]->ResetForReuse();
 		availableFibers.enqueue(fibers[i]);
 	}
 }

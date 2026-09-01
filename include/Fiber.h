@@ -145,6 +145,38 @@ namespace JLib {
 				creditors[w].store(0, std::memory_order_release);
 		}
 
+		// ---- EVERYTHING A RECYCLED FIBER MUST NOT CARRY, IN ONE PLACE --------------------------
+		//
+		// A recycled fiber IS a new fiber. Anything left over from its last life is state the next
+		// task inherits without asking for it.
+		//
+		// ONE FUNCTION, NEXT TO THE FIELDS, RATHER THAN SCRUBS AT THE RETURN SITE. GlobalFiberPool::
+		// ReturnBatch used to clear localEpoch inline and nothing else -- and that line exists
+		// BECAUSE a fiber once went back to the pool still announced at an old epoch, which is an
+		// ABA on the reclaimer. A per-field list at the call site is correct exactly until someone
+		// adds a field, and the person adding the field is not looking at the return path. Here,
+		// adding a member and forgetting to reset it means the two are adjacent on screen.
+		//
+		// WHAT IS DELIBERATELY *NOT* RESET: poolIndex (dense, stable, and the identity every table
+		// in the system is keyed by -- see Event's perfect hash), id, stackBase, stackSize, ctx and
+		// the arena pointers. Those describe the SLOT, not the occupant, and clearing them would
+		// unmake the fiber rather than free it.
+		void ResetForReuse() {
+			ClearCreditors();
+			// SIZE_MAX is "not in an epoch". The original inline scrub, kept for its original
+			// reason: a slot still announced pins the reclaimer at a dead epoch.
+			localEpoch.store(SIZE_MAX, std::memory_order_release);
+			// SIZE_MAX is "not bound". A stale value here names a worker the next occupant never
+			// ran on, which under pinning is a resume aimed at the wrong thread.
+			homeWorker = SIZE_MAX;
+			owningTask = nullptr;
+			homeCtx    = nullptr;
+			// Owned by whichever primitive the fiber was parked on. A survivor means the next
+			// occupant appears to be queued on a wait list it never joined.
+			nextWaiter = nullptr;
+			status.store(FiberStatus::READY, std::memory_order_release);
+		}
+
 		std::atomic<FiberStatus>  status;
 		// EBR participation slot. SIZE_MAX == "not in an epoch". The fiber is the unit
 		// that migrates across workers, so the slot lives here (not on the thread).

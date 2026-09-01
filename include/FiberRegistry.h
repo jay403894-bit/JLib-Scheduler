@@ -91,9 +91,21 @@ namespace JLib {
 		// the next hop. Public because the default dispatch installs it as a Task function.
 		static void CleanupHop(void* fiber);
 
+		// Return `f` to the pool it was built from. ONE-SHOT: claims the fiber by CAS-ing its status
+		// out of DEAD, so exactly one caller can hand it back however many reach here. A fiber
+		// returned twice sits twice in the pool's available queue and is handed to two tasks --
+		// two stacks that are the same stack, which is not a stall.
+		//
+		// Returns false if the claim was lost or there is no pool to return to.
+		bool ReturnToPool(Fiber* f);
+
 	private:
 		FiberRegistry() = default;
 		std::vector<Fiber*> table;
+		// Kept from Build. The registry returns fibers to the pool it enumerated, rather than
+		// reaching TaskScheduler::globalPool -- one source, and it cannot go stale against the
+		// table it is indexing.
+		GlobalFiberPool* pool = nullptr;
 		DispatchFn dispatch = nullptr;
 		RecycleFn  recycle  = nullptr;
 	};

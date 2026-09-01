@@ -18,8 +18,9 @@ namespace JLib {
 		return r;
 	}
 
-	void FiberRegistry::Build(GlobalFiberPool* pool) {
+	void FiberRegistry::Build(GlobalFiberPool* p) {
 		table.clear();
+		pool = p;
 		if (!pool) return;
 		const size_t n = pool->TotalCount();
 		table.reserve(n);
@@ -29,7 +30,24 @@ namespace JLib {
 		for (size_t i = 0; i < n; ++i) table.push_back(pool->At(i));
 	}
 
-	void FiberRegistry::Reset() { table.clear(); }
+	void FiberRegistry::Reset() { table.clear(); pool = nullptr; }
+
+	bool FiberRegistry::ReturnToPool(Fiber* f) {
+		if (!f || !pool) return false;
+		// CLAIM IT. DEAD is precisely "finished, pending cleanup/reclamation", so it is the state a
+		// fiber is in for exactly the window this runs in, and CAS-ing out of it is a one-shot that
+		// costs nothing on the winning path. Anything not in DEAD is either still running or was
+		// already claimed, and both mean: not mine to return.
+		FiberStatus expected = FiberStatus::DEAD;
+		if (!f->status.compare_exchange_strong(expected, FiberStatus::READY,
+				std::memory_order_acq_rel, std::memory_order_acquire))
+			return false;
+		// ReturnBatch calls Fiber::ResetForReuse, so the scrub happens on exactly one path whether
+		// a fiber comes back from here or from a worker's batch return. Doing it here as well
+		// would be a second place to forget a field.
+		pool->ReturnBatch(&f, 1);
+		return true;
+	}
 
 	void FiberRegistry::SetDispatch(DispatchFn fn) { dispatch = fn; }
 	void FiberRegistry::SetRecycle(RecycleFn fn)   { recycle  = fn; }
@@ -51,14 +69,15 @@ namespace JLib {
 	}
 
 	static void DefaultRecycle(Fiber* f) {
-		// The chain has drained. Clearing here rather than trusting the drain to have emptied the
-		// set is not redundant: TakeCreditor may have raced a late NoteCreditor, and a fiber going
-		// back to the pool must owe nobody. Cheap, and the failure it prevents is silent.
-		if (f) f->ClearCreditors();
-		// RETURNING THE FIBER TO THE POOL IS NOT DONE HERE YET. The death-path hook that would call
-		// AdvanceCleanup in the first place does not exist, so there is no live caller to hand a
-		// fiber back for -- and a ReturnBatch from a path nothing drives would be a lending
-		// operation with no lender. Wired when the hook lands.
+		// THE CHAIN HAS DRAINED, SO THE FIBER OWES NOBODY AND GOES BACK. Everything a recycled
+		// fiber must not carry -- creditors included -- is scrubbed by Fiber::ResetForReuse, which
+		// ReturnBatch calls; this path deliberately does not scrub anything itself, so there is one
+		// list of fields to keep current rather than two.
+		//
+		// A LOST CLAIM IS NOT AN ERROR. ReturnToPool returns false when the fiber was not in DEAD --
+		// already returned, or never finished -- and both mean somebody else owns it. Nothing to
+		// report and nothing to retry.
+		FiberRegistry::Instance().ReturnToPool(f);
 	}
 
 	bool FiberRegistry::AdvanceCleanup(Fiber* f) {
