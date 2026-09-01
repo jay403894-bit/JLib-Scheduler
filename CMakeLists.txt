@@ -1004,3 +1004,18 @@ endif()
 add_executable(SchedulerThreadLayoutTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/thread_layout_test.cpp")
 target_link_libraries(SchedulerThreadLayoutTest PRIVATE Scheduler)
 target_compile_features(SchedulerThreadLayoutTest PRIVATE cxx_std_17)
+
+# DO FIBERS ACTUALLY MIGRATE? Runs both modes in one process: pinned is the control and must report
+# ZERO resumes on another worker, migratable must report some. See the test header for why a
+# migratable-only run could not tell "broken" from "never given the chance".
+add_executable(SchedulerMigratableFiberTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/migratable_fiber_test.cpp")
+target_link_libraries(SchedulerMigratableFiberTest PRIVATE Scheduler)
+target_compile_features(SchedulerMigratableFiberTest PRIVATE cxx_std_17)
+
+# QUIESCE: push, STOP, and check nothing was left behind. The only test that can distinguish a lost
+# wakeup (TERMINAL) from a stall (RESOLVES) -- every timing row runs under continuous load, where a
+# lost wake is covered by the next push. Assertion is completed == pushed; no classifier, and it
+# deliberately never uses WaitFor, which would spin-help and run the work under test itself.
+add_executable(SchedulerQuiesceTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/quiesce_test.cpp")
+target_link_libraries(SchedulerQuiesceTest PRIVATE Scheduler)
+target_compile_features(SchedulerQuiesceTest PRIVATE cxx_std_17)
