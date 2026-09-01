@@ -140,6 +140,38 @@ namespace JLib {
 			return SIZE_MAX;
 		}
 
+		// ---- WHAT IS OWED, AS OPPOSED TO WHO IS OWED IT ----------------------------------------
+		//
+		// `creditors` records WHO ran this fiber; this records WHAT it incurred. They are separate
+		// because they are set at different times by different parties: registration happens on
+		// EVERY pickup (cheap, unconditional, one fetch_or), while a kind is set only when a
+		// resource is actually acquired.
+		//
+		// AND THE SPLIT IS WHAT MAKES REGISTRATION AFFORDABLE. Without it, wiring registration made
+		// every fiber death dispatch a cleanup task per worker it had run on -- to run an empty
+		// routine, and to recycle through the GLOBAL pool instead of the thread-local cache. Real
+		// work for nothing. With it, a fiber that never touched affine state has creditors, no
+		// kinds, and takes the same path it always did.
+		//
+		// KINDS ARE THE THREE RECLAMATION SYSTEMS, and that is not a coincidence: they are exactly
+		// the three costs the architecture header says migration already paid (address-routed slab
+		// frees, a global epoch participant list, fiber-indexed hazard cells). Recording the debt is
+		// what would let those go back to their cheap per-thread forms.
+		enum OwedKind : uint32_t {
+			kOwesNothing = 0,
+			kOwesSlab    = 1u << 0,
+			kOwesEpoch   = 1u << 1,
+			kOwesHazard  = 1u << 2,
+		};
+		std::atomic<uint32_t> owedKinds{ kOwesNothing };
+
+		void NoteOwed(uint32_t kinds) { owedKinds.fetch_or(kinds, std::memory_order_release); }
+		uint32_t Owed() const { return owedKinds.load(std::memory_order_acquire); }
+
+		// THE GATE ON THE WHOLE CLEANUP CHAIN. Creditors alone are not a reason to run it -- being
+		// picked up is not a debt.
+		bool OwesCleanup() const { return Owed() != kOwesNothing; }
+
 		bool HasCreditors() const {
 			for (size_t w = 0; w < kCreditorWords; ++w)
 				if (creditors[w].load(std::memory_order_acquire)) return true;
@@ -173,6 +205,11 @@ namespace JLib {
 		// unmake the fiber rather than free it.
 		void ResetForReuse() {
 			ClearCreditors();
+			// AND THE KINDS WITH THEM. A recycled fiber carrying a stale kind would send its next
+			// occupant's death down the cleanup chain to release something it never acquired. This
+			// is the exact field the "one reset list, next to the members" note below exists for --
+			// it was added after that rule, and the rule is why it is here rather than forgotten.
+			owedKinds.store(kOwesNothing, std::memory_order_release);
 			// SIZE_MAX is "not in an epoch". The original inline scrub, kept for its original
 			// reason: a slot still announced pins the reclaimer at a dead epoch.
 			localEpoch.store(SIZE_MAX, std::memory_order_release);

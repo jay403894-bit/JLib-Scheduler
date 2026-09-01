@@ -1308,3 +1308,35 @@ and parking -- none of which touches the four things above.
 
 That split is why "fork it and try variants" is a real plan rather than a rewrite. The expensive,
 provable parts are done once.
+
+### FTL: corrections to the blueprint, and what is NOT built yet
+
+**REGISTRATION IS NOT A DEBT, AND THE GATE MUST BE THE MARKER.** Wiring `NoteCreditor` at pickup
+made `HasCreditors()` true for EVERY fiber, so every death dispatched a cleanup task per worker it
+had run on -- to run an empty routine -- and recycled through the GLOBAL pool instead of the
+thread-local cache. The death hook now gates on `Fiber::OwesCleanup()` (any kind set), not on having
+creditors. Jay's rule, which the first wiring did not honour: registration records WHO, the marker
+records WHAT, and no marker means no task.
+
+**JAY'S TWO CORRECTIONS TO THE BLUEPRINT, both still OPEN:**
+
+1. **The list needs a `RegisteredFiber` struct as its next pointer, not just a number.** What is
+   built is a per-fiber BITMASK of creditor worker ids -- that answers "who does THIS FIBER owe?"
+   in O(1) and is right for the cleanup chain. It does NOT answer the reverse question, "which
+   fibers owe ME?", except by scanning every fiber in the pool and testing one bit. A struct with a
+   next pointer gives a per-worker list and makes that enumeration O(owed).
+
+2. **Dynamically joining/leaving threads need an early-collect-and-unlink.** A worker that is about
+   to go away must settle its debts BEFORE it disappears, which means finding every fiber that owes
+   it and unlinking itself -- a function taking the fiber as an argument. That is the reverse
+   enumeration from (1), which is why (1) is its prerequisite.
+
+   NOT NEEDED TODAY: the pool builds its workers once in StartPool and destroys them once in Join,
+   and the floor sheds by PARKING a worker rather than retiring it. So no worker currently
+   disappears while fibers are alive. This is a requirement of a FUTURE dynamic-pool variant, and
+   worth recording now because the bitmask silently cannot serve it.
+
+**STATE.** Built and green: creditor set, kinds/marker with the gate, FiberRegistry (address table,
+chain, one-shot CAS recycle), death hook, registration at pickup, ResetForReuse on acquire.
+NOT built: anything that SETS a kind (no resource wrapper exists), the reverse enumeration above,
+and migratable resume still reports 0 migrations in its own test with the flag confirmed TRUE.

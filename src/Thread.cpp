@@ -1021,8 +1021,15 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 		// NOT ReleaseFiber IN THE OWING CASE: that pushes to this worker's LOCAL cache, and the
 		// fiber must not be handed out again until its debts are paid. The chain's final hop
 		// returns it to the global pool instead.
-		if (f->HasCreditors()) FiberRegistry::Instance().AdvanceCleanup(f);
-		else                   ReleaseFiber(f);
+		// GATED ON WHAT IS OWED, NOT ON WHO RAN IT. This said HasCreditors() until registration at
+		// pickup was wired -- at which point every fiber had a creditor, so every death dispatched
+		// a cleanup task per worker to run an empty routine, and recycled through the global pool
+		// instead of this worker's local cache. Being picked up is not a debt.
+		//
+		// So the common path is unchanged and stays unchanged: one relaxed load of a word this
+		// thread just finished running on, then ReleaseFiber exactly as before.
+		if (f->OwesCleanup()) FiberRegistry::Instance().AdvanceCleanup(f);
+		else                  ReleaseFiber(f);
 
 		scheduler->CleanupTaskMetadata(task_to_run);
 		DestroyTask(task_to_run);
