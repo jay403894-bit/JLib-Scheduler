@@ -980,3 +980,13 @@ target_compile_features(SchedulerFiberRegistryTest PRIVATE cxx_std_17)
 if(JLIB_FIBERREG_CTL)
   target_compile_definitions(SchedulerFiberRegistryTest PRIVATE ${JLIB_FIBERREG_CTL})
 endif()
+
+# THE CLEANUP CHAIN, IN ISOLATION. Drives FiberRegistry::AdvanceCleanup through its test seams so
+# the assertion is about the chain rather than about whether a pool came up -- see the test header,
+# and the three -D negative controls that must each go RED.
+add_executable(SchedulerFiberCleanupChainTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_cleanup_chain_test.cpp")
+target_link_libraries(SchedulerFiberCleanupChainTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberCleanupChainTest PRIVATE cxx_std_17)
+if(JLIB_FIBERCHAIN_CTL)
+  target_compile_definitions(SchedulerFiberCleanupChainTest PRIVATE ${JLIB_FIBERCHAIN_CTL})
+endif()

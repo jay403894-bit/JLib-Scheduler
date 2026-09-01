@@ -63,5 +63,21 @@ namespace JLib {
         // TOTAL fibers. The exact upper bound on tasks that can be parked anywhere at once, since a
         // parked task holds a fiber -- Event sizes its waiter index by it.
         size_t TotalCount() const { return size; }
+
+        // THE FIBER AT A GIVEN poolIndex, or null if out of range.
+        //
+        // SUPPLY, NOT ACCOUNTING. This exists so FiberRegistry can build its address table; the
+        // pool deliberately does NOT grow an ownership or cleanup role to go with it. If the pool
+        // drove cleanup it would have to push tasks, which means this header would need
+        // TaskScheduler -- and TaskScheduler.h already includes THIS header. That is a cycle, and
+        // it is why the registry is a third party rather than a method here.
+        //
+        // AND IT IS THE ONE PLACE A SECOND STACK CLASS TOUCHES. Heavy was deleted (see above) but
+        // poolIndex was designed for its return: "standard fibers occupy [0, standardCount), heavy
+        // fibers follow." When heavy comes back, this function gains the branch and every caller
+        // indexing by poolIndex keeps working unchanged.
+        Fiber* At(size_t poolIndex) {
+            return poolIndex < standardFibers.size() ? &standardFibers[poolIndex] : nullptr;
+        }
     };
 }

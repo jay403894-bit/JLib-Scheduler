@@ -5492,6 +5492,25 @@ void TaskScheduler::SetMigratableFibers(bool on) {
 		"Fiber::kCreditorWords is too narrow for kMaxHintQueues workers.");
 	g_migratableFibers = on;
 }
+
+bool TaskScheduler::PushResume(size_t worker, Task* task) {
+	if (!task) return false;
+	TaskScheduler* s = instance;
+	// NOT Instance(): that throws, and a cleanup push racing teardown is an ordinary outcome, not
+	// an exceptional one. The caller gets false and decides.
+	if (!s || !s->poolActive) return false;
+	if (worker >= s->resumedInboxes.size()) return false;
+	s->resumedInboxes[worker]->push(task);
+	// WAKE THE OWNER. Nothing else will: this queue has exactly one legal consumer, so a parked
+	// worker with a cleanup job in its inbox and no notification stays parked and the resource is
+	// never given back. Same lost-wake shape as the band-skip fix.
+	//
+	// PUSH FIRST, NOTIFY SECOND. The reverse loses the wake outright -- the target can observe an
+	// empty inbox, eat the permit, and park with the task arriving just behind it.
+	if (worker < s->workers.size() && s->workers[worker])
+		s->workers[worker]->NotifyWorker();
+	return true;
+}
 bool TaskScheduler::MigratableFibers() { return g_migratableFibers; }
 
 #if defined(JLIBSCHED_TASK_STATS)

@@ -2355,6 +2355,23 @@ namespace JLib {
 		static void SetMigratableFibers(bool on);
 		static bool MigratableFibers();
 
+		// ---- PUSH TO ONE WORKER'S RESUME INBOX -------------------------------------------------
+		//
+		// The resume inbox is the only per-worker queue with the contract this needs: exactly one
+		// legal consumer and NO path into a deque, so what is pushed here runs on `worker` and
+		// cannot be stolen onto another thread. That is not a preference for cleanup work, it is
+		// the entire requirement -- a cleanup job that gets stolen releases thread-affine state on
+		// the wrong thread, which is the bug the whole mechanism exists to prevent.
+		//
+		// EXISTS BECAUSE THE REGISTRY IS A SEPARATE TRANSLATION UNIT. Thread.cpp reaches
+		// `resumedInboxes[q]->push(t)` as a field; FiberRegistry cannot, and should not become a
+		// friend of everything to do it. One named method is the smaller surface.
+		//
+		// Returns false if the pool is down or `worker` is out of range. CHECK IT: a dropped
+		// cleanup is not a dropped task, it is a resource that is never given back, and the caller
+		// is the only one positioned to retry or report.
+		static bool PushResume(size_t worker, Task* task);
+
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
 		// "level_loaded", the handful of names your app knows at compile time. The registry is
