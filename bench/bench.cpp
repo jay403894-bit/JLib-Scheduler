@@ -1713,10 +1713,23 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             const unsigned missed = total - onFloor;
             const double   pct    = total ? (double)onFloor * 100.0 / (double)total : 0.0;
             const double   shown  = (missed == 0) ? 100.0 : (double)((long long)(pct * 10.0)) / 10.0;
-            printf("               landed on the floor [%zu,%zu): %u of %u (%.1f%%)",
-                   kResv, kResv + floorN, onFloor, total, shown);
-            if (missed == 0) printf("  -- every push, no wake paid\n");
-            else             printf("  -- %u MISSED and paid a wake\n", missed);
+            // SAY WHICH DIRECTION IS GOOD, IN THE LINE. "landed on the floor: 20000 of 20000
+            // (100.0%)" was read as "100% of aim MISSED" -- and nothing in the sentence rules that
+            // out, because it names neither the desired outcome nor what the number counts. The old
+            // suffix `-- the rest paid a wake` made it worse: it implies "the rest" is nonzero even
+            // when it is not. A report whose best possible result can be mistaken for its worst is
+            // a broken report, whatever the number underneath is.
+            printf("               placement HIT the floor [%zu,%zu): %u of %u (%.1f%%)  <- HIGHER IS\n"
+                   "               BETTER; a hit is a push onto an already-running worker, which\n"
+                   "               costs no OS wake. %s\n",
+                   kResv, kResv + floorN, onFloor, total, shown,
+                   missed == 0
+                       ? "0 missed."
+                       : "See the miss count below.");
+            if (missed != 0)
+                printf("               MISSED: %u of %u -- each landed on a parked worker and paid a\n"
+                       "               kernel wake. Cross-check against `kernel wakes this row`.\n",
+                       missed, total);
         }
         if (onResv)
             printf("               landed in the RESERVED band [0,%zu): %u  <- ordinary work is masked\n"
