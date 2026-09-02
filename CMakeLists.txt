@@ -40,7 +40,7 @@ cmake_minimum_required(VERSION 3.21)
 # What forces the major is Join() leaving the public surface. It advertised a teardown that could be
 # followed by a restart, and no such restart ever existed (Init() throws on a non-null instance,
 # StartPool is private). Removing an API that never worked is still removing an API.
-set(JLIBSCHED_VERSION "5.0.1")
+set(JLIBSCHED_VERSION "5.0.2")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
