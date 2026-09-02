@@ -456,9 +456,23 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
     for (int r = 0; r < reps; ++r) {
         // ARMS ALTERNATE AND THE FLOOR IS SET IMMEDIATELY BEFORE EACH, so a drift in the machine
         // lands on all three. Setting it once and running ten of each is how this row lies.
+        // ---- THE TRANSITION IS NOT THE TAX, AND THE FIRST VERSION CHARGED IT AS ONE. ---------
+        //
+        // SetAwakeFloor(29) PROMOTES AND WAKES 29 PARKED WORKERS. At the ~5 us this project has
+        // measured for a wake, that is up to ~145 us of kernel work -- inside a ~400 us sample,
+        // against a measured delta of ~79 us. The transition was the same order of magnitude as the
+        // entire effect being attributed to spinning, and it landed ASYMMETRICALLY: floor=0
+        // collapses and wakes nobody, floor=2 wakes at most two, floor=29 wakes twenty-nine. So the
+        // arm that showed the tax was the only arm paying for its own setup.
+        //
+        // A DISCARDED PASS ABSORBS IT. One full workload after the change, thrown away, then the
+        // recorded one -- by which point the promoted workers are spinning steadily and what is
+        // measured is the OCCUPANCY, which is the thing the row claims. This is cheaper and more
+        // honest than a fixed sleep, which would have to guess how long 29 wakes take.
         auto sample = [&](size_t f, Samples& out) {
             JLib::TaskScheduler::SetAwakeFloor(f);
-            out.add(workload());
+            (void)workload();          // absorbs the promote/park transition
+            out.add(workload());       // steady state
         };
         if (r % 3 == 0)      { sample(0, parked); sample(baseFloor, shipped); sample(wideFloor, wide); }
         else if (r % 3 == 1) { sample(baseFloor, shipped); sample(wideFloor, wide); sample(0, parked); }
