@@ -3,7 +3,7 @@
 Correctness fixes are marked **[CRITICAL]** with a note on what breaks without them -
 downstream users (forks/ports) should treat those as must-pull.
 
-## 5.0.0 - unreleased
+## 5.0.0 - 2026-09-02
 
 **Two controllers, one packed word.** 4.0.1 shipped adaptive K and the awake floor as two mechanisms
 that each kept their own idea of where the bands were. This makes them share one 64-bit word, gives
