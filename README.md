@@ -1,5 +1,4 @@
 # JLib::Scheduler
-[![CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/ci.yml)
 
 > **Development note.** This runtime was developed iteratively, using AI-assisted tooling for rapid
 > prototyping and code generation under strict human specification and verification. Lots of work was done by hand,
