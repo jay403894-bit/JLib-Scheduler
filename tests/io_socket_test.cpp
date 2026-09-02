@@ -65,11 +65,31 @@ static std::atomic<int> g_acceptStatus{ -1 }, g_connectStatus{ -1 };
 static std::atomic<int> g_recvStatus{ -1 }, g_recvBytes{ -1 }, g_sendBytes{ -1 };
 static char g_rxbuf[256];
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     WSADATA wsa{};
     const int wsaRc = ::WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    // ---- `pin` RUNS THE WHOLE SUITE UNDER FiberMode::Pin, AND IT IS A REGRESSION TEST --------
+    //
+    // A pinned fiber resumes ONLY on its home worker, which makes this the configuration where a
+    // reserved worker stealing suspendable work would strand it -- if a pinned resume went to a
+    // deque. It does not: Requeue sends it to resumedInboxes[home] with MarkQueuedWork and
+    // NotifyWorker, and every worker drains its OWN resume inbox regardless of band. A reserved
+    // worker reads it exactly like any other.
+    //
+    // A steal gate on the fiber mode was added here on the opposite theory and then removed once
+    // the mechanism was actually checked. This arm is what keeps that decision honest: if a pinned
+    // resume ever DOES start landing somewhere K cannot read, this hangs, and the watchdog below
+    // dumps the band that is holding it.
+    bool pinned = false;
+    for (int a = 1; a < argc; ++a)
+        if (std::strcmp(argv[a], "pin") == 0) pinned = true;
+    if (pinned) {
+        JLib::TaskScheduler::SetFiberMode(JLib::FiberMode::Pin);
+        std::printf("FiberMode::Pin -- pinned resumes go to the home worker's resume inbox\n");
+    }
 
     JLib::TaskScheduler::EnableTimers(true);
     JLib::TaskScheduler::EnableIoReactor(true);

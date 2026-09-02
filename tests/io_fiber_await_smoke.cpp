@@ -8,11 +8,13 @@
 
 #include "TaskScheduler.h"
 #include "IoReactor.h"
+#include "Thread.h"          // Thread::Current()->qIndex -- arm 4 asks WHICH worker resumed it
 #include "io_fiber_await.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 // socket_compat.h, NOT a bare <windows.h>: it gets winsock2.h in FIRST. windows.h pulls the ancient
 // winsock.h, and a winsock2.h after that is the classic redefinition wall -- the same ordering rule
@@ -29,8 +31,14 @@ static void Check(bool c, const char* what) {
 
 static std::atomic<int> g_status{ -1 }, g_bytes{ -1 }, g_ran{ 0 };
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // `pin` runs everything under FiberMode::Pin and enables arm 4, which is the only arm that
+    // asks whether a RESERVED worker actually drains its own resume inbox. Must precede Init().
+    for (int a = 1; a < argc; ++a)
+        if (std::strcmp(argv[a], "pin") == 0) JLib::TaskScheduler::SetFiberMode(JLib::FiberMode::Pin);
+
     std::printf("=== a fiber suspends on I/O and is woken by the completion ===\n");
 
     // TIMERS ON, matching io_socket_test. It is the one setup difference left between this file
@@ -212,6 +220,89 @@ int main() {
         Check(con3.load() == (int)JLib::IoStatus::Completed, "the connect completed");
         Check(acc3.load() == (int)JLib::IoStatus::Completed, "the accept completed");
         ::closesocket(cli); ::closesocket(acc); ::closesocket(lis);
+    }
+
+    // ---- ARM 4: A RESERVED WORKER RESUMES A PINNED FIBER FROM ITS OWN INBOX ------------------
+    //
+    // THE SUITE PASSING ONLY PROVES NOTHING HUNG. This asserts the mechanism that makes it safe for
+    // a reserved worker to steal in pinned mode: a pinned fiber resumes ONLY on its home worker, and
+    // if that home is reserved the resumption goes to resumedInboxes[home] -- which every worker
+    // drains regardless of band. A steal gate was added on the opposite theory and removed once the
+    // drain was actually read; this is what keeps that decision from being re-litigated from memory.
+    //
+    // HOW A FIBER COMES TO BE HOMED ON K AT ALL: ordinary work is never PLACED there, so the only
+    // route is a reserved worker STEALING it. So this arm is precisely "K steals a fiber, the fiber
+    // suspends on I/O, and K resumes it" -- the sequence the gate was meant to prevent.
+    if (JLib::TaskScheduler::GetFiberMode() == JLib::FiberMode::Pin) {
+        std::printf("\na RESERVED worker resumes a pinned fiber from its own inbox\n");
+        const size_t K = JLib::TaskScheduler::GetHotWorkers();
+        if (K == 0) {
+            std::printf("  K=0 -- no reserved band, so this arm is vacuous\n");
+        } else {
+            constexpr int kJobs = 96;
+            static std::atomic<int> ranOnReserved{ 0 }, ranTotal{ 0 }, resumedOnReserved{ 0 };
+            static std::atomic<int> parked4{ 0 };
+            JLib::WaitGroup wg4;
+
+            // ---- THE FIBERS SUSPEND ON AN EVENT, NOT ON I/O, AND THAT IS THE POINT ----------
+            //
+            // The first version of this arm did I/O, and its vacuity guard immediately caught the
+            // problem: 0 of 96 jobs ever ran on a reserved worker. RESERVED STEALING IS GATED ON
+            // THE LANE BEING QUIET -- a worker in the band will not take ordinary work while
+            // completions are arriving, which is exactly the protection that makes the band worth
+            // having. So an arm that generates I/O can never observe K stealing, by design.
+            //
+            // Suspending on an Event instead leaves the lane idle while ordinary suspendable work
+            // is available, which is the configuration where K steals. The quiet window is dropped
+            // to 1ms and waited out first, so the test does not depend on the default.
+            JLib::TaskScheduler::SetIoQuietWindowUs(1000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+            JLib::Event& gate4 = sched.GetEvent("pin_arm4_gate");
+
+            for (int i = 0; i < kJobs; ++i) {
+                Fib::SpawnFiber(sched, wg4, [&sched, &gate4, K] {
+                    JLib::Thread* pre = JLib::Thread::Current();
+                    if (pre && (size_t)pre->qIndex < K)
+                        ranOnReserved.fetch_add(1, std::memory_order_relaxed);
+
+                    parked4.fetch_add(1, std::memory_order_release);
+                    sched.WaitOnEvent(gate4);
+
+                    // AFTER the suspension. In pinned mode this MUST be the same worker it started
+                    // on -- that is what pinning means -- so a reserved start implies a reserved
+                    // resume, and observing one is observing K draining its own resume inbox.
+                    JLib::Thread* post = JLib::Thread::Current();
+                    if (post && (size_t)post->qIndex < K)
+                        resumedOnReserved.fetch_add(1, std::memory_order_relaxed);
+                    ranTotal.fetch_add(1, std::memory_order_relaxed);
+                });
+            }
+
+            // Let them all park before releasing, so the resumes are a storm the band participates
+            // in rather than a trickle it never sees.
+            const auto d4 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (parked4.load(std::memory_order_acquire) < kJobs
+                   && std::chrono::steady_clock::now() < d4)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            gate4.SignalAll();
+            sched.WaitFor(wg4);
+
+            std::printf("  %d jobs: %d started on a reserved worker, %d RESUMED on one\n",
+                        ranTotal.load(), ranOnReserved.load(), resumedOnReserved.load());
+            Check(ranTotal.load() == kJobs, "every pinned job finished (a stranded resume hangs here)");
+
+            // THE VACUITY GUARD. If K never stole one, nothing here exercised the path and a green
+            // arm would mean only that reserved stealing did not happen this run.
+            if (ranOnReserved.load() == 0)
+                std::printf("  VACUOUS: no job ever ran on a reserved worker, so K never stole one\n"
+                            "           and this arm proves nothing. Reserved stealing is gated on\n"
+                            "           the lane being QUIET -- re-run, or raise the I/O quiet window.\n");
+            else
+                Check(resumedOnReserved.load() > 0,
+                      "a RESERVED worker resumed a pinned fiber -- it drains its own resume inbox");
+
+        }
     }
 
     std::printf("\n%s\n", g_fail ? "FAILED" : "PASSED");
