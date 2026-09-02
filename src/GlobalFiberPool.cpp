@@ -46,47 +46,52 @@ GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount)
 }
 
 
+// ---- REFILL: ONE BULK DEQUEUE, NO ALLOCATION -------------------------------------------------
+//
+// StealInto is the REFILL path -- ThreadLocalCache::Pop calls it whenever a worker's cache runs
+// dry -- so it runs whenever a worker needs a fiber and has none. It used to go through the
+// vector-returning StealBatch and paid for it three times over:
+//
+//   * A HEAP ALLOCATION PER REFILL. StealBatch built a std::vector, StealInto copied it into the
+//     caller's array and destroyed it. A malloc and a copy to move pointers we already had.
+//   * size_approx() AS THE LOOP CONDITION. It is a sum across producer blocks, not a load, and it
+//     was re-evaluated every iteration.
+//   * ONE try_dequeue PER FIBER, each its own trip through the queue's block machinery.
+//
+// try_dequeue_bulk does the whole thing in one call with no allocation. The queue always had the
+// entry point; we were just not using it.
+size_t GlobalFiberPool::StealInto(Fiber** dest, size_t maxCount) {
+	if (maxCount == 0) return 0;
+	return availableFibers.try_dequeue_bulk(dest, maxCount);
+}
+
+// KEPT, AND NOW A WRAPPER RATHER THAN THE IMPLEMENTATION. It is public on GlobalFiberPool, so it
+// stays; but having the allocating version be the one that does the work meant the hot path
+// inherited the allocation. One implementation now, and it is the one without the vector.
 std::vector<Fiber*> GlobalFiberPool::StealBatch(size_t count)
 {
-	std::vector<Fiber*> batch;
-	batch.reserve(count); // Optional: reserve space for efficiency
-
-	Fiber* fiber = nullptr;
-	// Loop until we have filled the requested batch or the queue is empty
-	while (batch.size() < count && availableFibers.size_approx() > 0) {
-		if(availableFibers.try_dequeue(fiber))
-			batch.push_back(fiber);
-	}
-
+	std::vector<Fiber*> batch(count);
+	const size_t got = StealInto(batch.data(), count);
+	batch.resize(got);
 	return batch;
-}
-size_t GlobalFiberPool::StealInto(Fiber** dest, size_t maxCount) {
-	// 1. Call your existing vector-based logic
-	std::vector<Fiber*> stolen = StealBatch(maxCount);
-
-	// 2. Copy it into the provided array (stack/buffer)
-	size_t count = stolen.size();
-	for (size_t i = 0; i < count; ++i) {
-		dest[i] = stolen[i];
-	}
-
-	return count;
 }
 
 
 void GlobalFiberPool::ReturnBatch(Fiber** fibers, size_t count) {
 	if (count == 0) return;
 
-	// Direct enqueueing of the pointer batch
-	for (size_t i = 0; i < count; ++i) {
-		// A RECYCLED FIBER IS A NEW FIBER. This used to scrub localEpoch here and nothing else --
-		// and that scrub exists because a fiber once went back announced at a dead epoch. A list of
-		// inline field clears is correct until someone adds a field, and whoever adds it is not
-		// reading this loop. Fiber::ResetForReuse keeps the scrub next to the members instead; the
-		// full list, and what is deliberately NOT reset, is documented there.
-		fibers[i]->ResetForReuse();
-		availableFibers.enqueue(fibers[i]);
-	}
+	// A RECYCLED FIBER IS A NEW FIBER. This used to scrub localEpoch here and nothing else -- and
+	// that scrub exists because a fiber once went back announced at a dead epoch. A list of inline
+	// field clears is correct until someone adds a field, and whoever adds it is not reading this
+	// loop. Fiber::ResetForReuse keeps the scrub next to the members instead; the full list, and
+	// what is deliberately NOT reset, is documented there.
+	//
+	// SCRUB ALL, THEN PUBLISH ONCE. The scrub must finish before a fiber is visible to another
+	// worker, so the two cannot be interleaved into one enqueue-per-fiber loop and still be one
+	// bulk call -- but they do not need to be: every fiber here is already ours. Same reasoning as
+	// the refill above, and the same saving.
+	for (size_t i = 0; i < count; ++i) fibers[i]->ResetForReuse();
+	availableFibers.enqueue_bulk(fibers, count);
 }
 
 void GlobalFiberPool::FiberEntryWrapper()

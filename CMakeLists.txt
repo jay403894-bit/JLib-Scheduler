@@ -1056,6 +1056,26 @@ if(JLIB_FIBERCHAIN_CTL)
   target_compile_definitions(SchedulerFiberCleanupChainTest PRIVATE ${JLIB_FIBERCHAIN_CTL})
 endif()
 
+# THE TOKEN REGISTRY, IN ISOLATION. The generic reader-space index that replaces the fiber-only
+# registry: fibers as a prefix, then workers, then lazily-claimed external ids, so main and Native
+# tasks stop being special cases. No pool and no scheduler -- the seams exist so the assertion is
+# about the structure. Four -D negative controls, each of which must go RED:
+#   cmake -S . -B build-ctl -DJLIBSCHED_TOKENREG_CTL=FANOUT
+#   cmake --build build-ctl --config Release --target SchedulerTokenRegistryTest
+#   ./build-ctl/bin/Release/SchedulerTokenRegistryTest.exe      # MUST FAIL
+# A CACHE variable, not CL_ADDITIONALOPTIONS: with no source change MSBuild skips the compile and
+# reruns the OLD binary, so every control reports as passing -- indistinguishable from the controls
+# being weak, and the same stale-binary trap that has produced false results here before.
+add_executable(SchedulerTokenRegistryTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/token_registry_test.cpp")
+target_link_libraries(SchedulerTokenRegistryTest PRIVATE Scheduler)
+target_compile_features(SchedulerTokenRegistryTest PRIVATE cxx_std_17)
+if(JLIBSCHED_TOKENREG_CTL)
+  # OVERLAP changes a header the LIBRARY compiles too, so the define has to reach both or the test
+  # links against a registry built without it and the control silently passes.
+  target_compile_definitions(Scheduler PUBLIC JLIB_TOKENREG_CTL_${JLIBSCHED_TOKENREG_CTL}=1)
+  message(STATUS "JLib::Scheduler: token registry NEGATIVE CONTROL ${JLIBSCHED_TOKENREG_CTL} -- the test MUST fail")
+endif()
+
 # THREAD LAYOUT: how many cache lines one Push touches on the consumer's Thread. Prints the offsets
 # rather than reasoning about them from source order -- see the test header.
 add_executable(SchedulerThreadLayoutTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/thread_layout_test.cpp")
