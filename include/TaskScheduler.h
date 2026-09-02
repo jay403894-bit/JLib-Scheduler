@@ -1692,18 +1692,6 @@ namespace JLib {
 		// has profiled its own workload knows better. Set it enormous (1e12) to force every ParallelFor
 		// serial, which is the fastest way to answer "is ParallelFor causing this?" without a rebuild.
 		// Set once at startup; read-only thereafter.
-		// Hand epoch reclamation to the caller: workers stop self-triggering, and you call
-		// EpochManager::Instance().Tick() from your own idle point instead. MUST be called before
-		// StartPool. See EpochManager::SetSelfReclaim in Epochs.h for the full contract, the
-		// measured numbers, and the warning about what happens if you disable it and never Tick().
-		//
-		// A FORWARDER, and it exists because the real function was unfindable. Every other knob in
-		// this library is a static on TaskScheduler, so that is where people look -- the first
-		// person to go looking for this one searched for TaskScheduler::SetSelfReclaim, did not
-		// find it, and reasonably concluded the feature did not exist. An implementation detail
-		// being the only entry point to a tuning option is an API bug, not a naming preference.
-		static void SetSelfReclaim(bool on);
-		static bool SelfReclaimEnabled();
 
 		// Force every ParallelFor to run its whole range inline, on the calling thread.
 		//
@@ -2586,6 +2574,27 @@ namespace JLib {
 		// fiber to attach the debt to, so the caller still owns the object and needs to know.
 		static bool ReleaseOnFiberDeath(FiberDebt& node, void* obj,
 		                                void (*release)(void*) noexcept) noexcept;
+
+		// ---- AN AFFINE DEBT: released ON `holder`, not on whoever recycles --------------------
+		//
+		// The form above is for MEMORY, which is fungible -- it runs wherever the fiber is recycled
+		// because that is harmless. This one is for state only ONE WORKER may retract: a slot in
+		// participants[q], a worker-owned hazard cell, a thread-owned handle. Releasing those from
+		// the wrong thread is not slow, it is wrong -- clearing an epoch slot on a thread that never
+		// set it un-announces a live traversal and frees nodes underneath it.
+		//
+		// So this tags the fiber with `kind`, which is what routes its death down the creditor chain
+		// instead of straight back to the pool, and the chain visits `holder` exactly once. That one
+		// visit discharges everything this worker is owed -- which is why the debts are a list.
+		//
+		// NOTHING IN THE LIBRARY CALLS THIS YET, and that is deliberate rather than incomplete. The
+		// two obvious candidates do not need it: epochs are thread-keyed and their guard cannot span
+		// a suspend, and the retire bags are thread_local with their own orphan stores. The wiring
+		// is here so that a debt which DOES need it is one call away, and so the path is tested
+		// rather than discovered later on the death path.
+		static bool ReleaseOnWorker(FiberDebt& node, void* obj,
+		                            void (*release)(void*) noexcept,
+		                            size_t holder, uint32_t kind) noexcept;
 
 		// Release every debt `f` owes to THIS holder, and leave the rest linked for theirs. The
 		// creditor chain reaches each worker exactly once, so that visit must discharge all of the

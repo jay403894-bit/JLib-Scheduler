@@ -976,16 +976,15 @@ static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
 
 int main(int argc, char** argv) {
     const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
-    // "noreclaim" runs the WHOLE suite with worker self-triggered reclamation disabled, the way an
-    // application that ticks EpochManager from its own idle path would run.
+    // The "noreclaim" arm is gone with the flag it set. It ran the whole suite with worker
+    // self-triggered reclamation disabled -- which is now the ONLY way the pool runs, so the arm has
+    // become the default and there is nothing left to contrast it against. Every retire path in
+    // every test below already exercises what that arm existed to cover.
     //
-    // Set here, BEFORE Init, rather than flipped inside a test -- because SetSelfReclaim's contract
-    // is init-only (it is a plain bool read by every worker). A test that flipped it on a live pool
-    // would be racing the very readers it is meant to exercise, and would be testing something the
-    // API does not promise. Reusing the whole suite is also better coverage than one bespoke case:
-    // every retire path in every test runs with the counter disabled.
-    const bool noReclaim = (argc > 1) && std::strcmp(argv[1], "noreclaim") == 0;
-    if (noReclaim) JLib::EpochManager::Instance().SetSelfReclaim(false);
+    // The argument is still accepted and ignored, so an existing invocation does not fail; it just
+    // no longer selects anything.
+    if (argc > 1 && std::strcmp(argv[1], "noreclaim") == 0)
+        std::printf("note: 'noreclaim' is now the only mode -- argument ignored\n");
     std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
     // 30s default, overridable via JLIB_TEST_WATCHDOG_SECS. Raising it is what lets a high-iteration
     // reproducer distinguish SLOW from STUCK: if the run completes in 60s it was merely slow, and if
@@ -1012,18 +1011,29 @@ int main(int argc, char** argv) {
     // Only meaningful in the "noreclaim" run; a no-op otherwise. Placed AFTER the tests above so
     // real retire traffic has already happened -- asserting the counter is zero before anything has
     // retired would pass for the wrong reason.
-    if (noReclaim) {
+    // ---- MANUAL Tick IS THE ONLY Tick NOW ----------------------------------------------------
+    //
+    // The `noreclaim` arm tested a FLAG that no longer exists. Workers do not self-trigger
+    // reclamation at all -- the sweep walks every participant, and a worker doing that has stopped
+    // being available for work that lands a microsecond later, which showed as tail latency and not
+    // in any mean. Reclamation is the application's to schedule.
+    //
+    // WHAT IS STILL WORTH ASSERTING is the half that used to be the flag's edge case and is now the
+    // ONLY path: a manual Tick after a suite's worth of retirements must reclaim without underflowing
+    // the counter. That decrement was guarded symmetrically with an increment the flag could switch
+    // off; with the flag gone the guard is gone, so this is the test that the arithmetic still
+    // balances rather than wrapping size_t.
+    {
         auto& em = JLib::EpochManager::Instance();
-        std::printf("self-reclaim disabled (noreclaim)\n");
-        Check(!em.SelfReclaimEnabled(), "flag actually took");
-        Check(!em.ShouldSelfReclaim(), "workers will not self-trigger");
-        // The point of the flag: RetirePtr skips its fetch_add entirely, so the counter must still
-        // read zero after a suite's worth of retirements.
-        Check(em.RetiredCount() == 0, "no counter traffic while disabled");
-        // And a MANUAL tick must be safe. The decrement in TryReclaim is guarded symmetrically with
-        // the increment; unguarded it would wrap size_t here, since nothing ever incremented.
+        const size_t before = em.RetiredCount();
         em.Tick();
-        Check(em.RetiredCount() == 0, "manual Tick did not underflow the counter");
+        const size_t after = em.RetiredCount();
+        std::printf("manual Tick: retired %zu -> %zu\n", before, after);
+        Check(after <= before, "a manual Tick did not INCREASE the retired count");
+        // The wrap this guards against is enormous, not off-by-one -- an underflowed size_t reads as
+        // ~1.8e19, so a generous bound catches it while tolerating concurrent retires from workers
+        // still finishing the suite's tail.
+        Check(after < (size_t)1 << 40, "and did not underflow the counter (a wrap reads astronomically)");
     }
 
     TestRangeCoverage(sched);

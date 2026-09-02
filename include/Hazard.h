@@ -250,14 +250,14 @@ namespace JLib {
 
         // Frees everything in this thread's batch that no live cell names. Called automatically
         // when a batch grows past its threshold; public so a test can force it, and so an app that
-        // turns the worker-side scan off can drive it itself -- see SetSelfScan.
+        // drives reclamation calls Scan() itself, at an idle point of its own choosing.
         void Scan();
 
         // ---- WHO PAYS FOR THE SWEEP ---------------------------------------------------------
         //
         // Workers scan on the way into idle. That is the right default -- the cost lands on a
         // thread with nothing else to do -- but it is a LATENCY decision, not a correctness one,
-        // and the same argument that produced EpochManager::SetSelfReclaim applies here: the
+        // and the same argument that removed the epoch worker-tick applies here: the
         // sweep walks every hazard cell, and a worker that takes it has stopped being available
         // for the completion that arrives one microsecond later.
         //
@@ -271,8 +271,22 @@ namespace JLib {
         // becomes an orphaned retire (see OrphanedRetired below, which is how you would notice).
         // The threshold-triggered scan inside Retire still runs -- this governs only the
         // worker-idle sweep, so forgetting to call it degrades to "reclaims late", not "leaks".
-        void SetSelfScan(bool on) noexcept { selfScan.store(on, std::memory_order_relaxed); }
-        bool SelfScanEnabled() const noexcept { return selfScan.load(std::memory_order_relaxed); }
+        // ---- SetSelfScan IS GONE. THE WORKER-IDLE SWEEP IS NOT COMING BACK. --------------------
+        //
+        // It walked every hazard cell on a worker's idle transition, and a worker doing that has
+        // stopped being available for the work that lands a microsecond later. That cost does not
+        // appear in a mean and does appear in a tail, which is the worst possible shape for
+        // something that defaulted to ON -- so it was a p99 killer sitting behind a knob almost
+        // nobody knew to turn.
+        //
+        // CALL Scan() YOURSELF, at a natural idle point where a pause costs nothing -- a frame
+        // boundary is the obvious one. The same rule now applies to EpochManager::Tick(), and for
+        // the same reason; reclamation is the application's to schedule, not the pool's to
+        // interrupt itself with.
+        //
+        // THIS IS NOT A LEAK IF YOU FORGET, unlike the epoch case: the threshold-triggered scan
+        // inside Retire() still runs, so forgetting degrades to "reclaims late" rather than "grows
+        // without bound".
 
         // Diagnostics only.
         // Builds the table if needed -- reporting 0 because nobody has taken a guard yet reads as
@@ -344,7 +358,6 @@ namespace JLib {
         // explicit trade the app makes. Atomic and relaxed because it is read on the idle path of
         // every worker and written approximately never -- a stale read costs one extra scan or one
         // skipped one, and the next idle pass corrects it.
-        std::atomic<bool> selfScan{ true };
     };
 
     // RAII over one reader's cells. Construct inside the traversal, destroy when the last protected

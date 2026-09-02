@@ -136,16 +136,6 @@ namespace JLib {
 		// exit correctly and has been in service.
 		std::atomic<size_t> retiredCount{ 0 };     // approx live retired count; DIAGNOSTIC ONLY now
 
-		// Whether workers self-trigger reclamation. See SetSelfReclaim() for the contract.
-		//
-		// A PLAIN bool, NOT atomic, and that is a deliberate difference from
-		// TaskScheduler::SetIdlePolicy -- which is atomic precisely BECAUSE it is documented as
-		// changeable on a running pool. This one is documented as settable only before StartPool,
-		// so a worker hoisting the read out of its loop is not a bug here, it is the point: the
-		// branch folds away and the disabled build pays nothing at all. Make this atomic only if
-		// the contract ever changes to allow runtime flips, and change the contract first.
-		bool selfReclaim = true;
-
 		// Bookkeeping for the "disabled and never ticked" warning in RetirePtr. Only the CODE that
 		// touches these is conditional; the MEMBERS are unconditional and deliberately so.
 		//
@@ -310,11 +300,11 @@ namespace JLib {
 				freed += detail::SweepEpochOrphans(safeEpoch);
 			// Guarded symmetrically with the increment in RetirePtr. With self-reclaim off nothing
 			// ever increments this, so an unguarded subtract would wrap size_t to a huge value on
-			// the first manual Tick(). Harmless while disabled -- ShouldSelfReclaim() short-circuits
+			// the first manual Tick(). Harmless while disabled -- Tick() is now the app's call
 			// on the flag before ever reading the count -- but it would poison any diagnostic read
 			// of RetiredCount(), which is exactly the sort of quietly-wrong number that wastes an
 			// afternoon later.
-			if (selfReclaim && freed) retiredCount.fetch_sub(freed, std::memory_order_relaxed);
+			if (freed) retiredCount.fetch_sub(freed, std::memory_order_relaxed);
 		}
 		// Approximate count of pointers awaiting reclamation. Workers poll this to
 		// self-trigger Tick() under load, so reclamation no longer depends solely on an
@@ -330,61 +320,6 @@ namespace JLib {
 		//
 		// A plain .size() on a vector this thread owns: no atomic, and no shared line to touch on a
 		// predicate that runs on every task completion.
-		bool ShouldSelfReclaim() const {
-			return selfReclaim && detail::t_epochBag.items.size() > ReclaimThreshold();
-		}
-
-		// Turn OFF worker self-triggered reclamation, making Tick() the caller's job.
-		//
-		// MUST be called before StartPool, and never again. It is a plain bool read from every
-		// worker; flipping it on a live pool is a data race, and a worker may have hoisted the read
-		// out of its loop and never see it anyway. That is not a defect -- see the member's comment.
-		//
-		// WHY YOU MIGHT -- and it is NOT the atomic, which was the original guess and measured
-		// nothing. The real win is TAIL LATENCY, and it is large. Frame-shaped DAG loop, 32 nodes
-		// per frame, 4000 frames after 400 warm-up, three interleaved rounds, per-frame us:
-		//
-		//     self-reclaim  p50 58.1/58.9/60.2   p90 67.7/66.8/69.0   p99 331/331/336
-		//     tick on main  p50 60.5/58.7/58.5   p90 69.3/67.8/66.3   p99 125/111/104
-		//
-		// Median and p90 are a wash -- the fetch_add really is free, exactly as the comparable
-		// nextWorker experiment predicted. But p99 improves ~3x, and the reason is WHERE the work
-		// happens, not how much of it there is: TryReclaim calls MinActiveEpoch(), which scans EVERY
-		// participant slot (~2280 in that run, and it scales with the pool -- see ReclaimThreshold).
-		// Under self-reclaim a WORKER stops to do that scan in the middle of a frame, stalling work
-		// on the critical path at an unpredictable moment. Ticking from an idle main thread moves
-		// the identical scan into the gap between frames.
-		//
-		// So this is for an application that cares about frame-time CONSISTENCY and has a natural
-		// idle point. It buys nothing for throughput, and a batch job with no idle point should
-		// leave it alone.
-		//
-		// WHY THE DEFAULT IS ON. Not because a library may not require an explicit pump -- plenty do,
-		// legitimately, and "tick me from your loop" is a perfectly reasonable contract. It is on
-		// because it is the SAFE FAILURE MODE: an embedder with no loop to tick from (a headless
-		// server, a batch job, a plugin inside someone else's engine, a Join()-and-exit tool) gets
-		// working reclamation without having read this comment, whereas the reverse default gets
-		// unbounded growth without having read this comment.
-		//
-		// Both modes are supported and neither is a fallback. If your application has an idle point,
-		// turning this off is a real choice with a measured benefit (below), not a workaround.
-		//
-		// The genuine hazard in the OFF mode is that forgetting Tick() used to fail SILENTLY. It no
-		// longer does: Development and debug builds keep counting retirements even while disabled,
-		// purely so the "disabled and never ticked" case can say so once. See the warning in
-		// RetirePtr. Release pays nothing for that.
-		//
-		// AND MEASURE BEFORE ASSUMING IT BUYS ANYTHING. The `fetch_add` sits immediately after a
-		// lock-free MPSC enqueue that is itself at least one atomic RMW plus a node link, so it is
-		// the cheaper half of an operation you cannot remove. The directly comparable experiment --
-		// making PickNextWorker's `nextWorker` relaxed, a locked xchg removed from the hotter PUSH
-		// path, codegen-verified -- measured EXACTLY ZERO, because the neighbouring notify mutex
-		// dominated. Expect the same here unless a profile says otherwise.
-		//
-		// If you turn this off, call EpochManager::Instance().Tick() from your idle path. It is
-		// already public and needs no other change.
-		void SetSelfReclaim(bool on) { selfReclaim = on; }
-		bool SelfReclaimEnabled() const { return selfReclaim; }
 
 		// How many retirements should accumulate before a self-triggered Tick() is worth paying for.
 		//
@@ -451,7 +386,7 @@ namespace JLib {
 			// DIAGNOSTIC ONLY NOW. The self-reclaim DECISION is thread-local (see
 			// ShouldSelfReclaim); this keeps RetiredCount() meaning what it used to mean for anyone
 			// reading it, and stays gated so the disabled path pays nothing.
-			if (selfReclaim) retiredCount.fetch_add(1, std::memory_order_relaxed);
+			retiredCount.fetch_add(1, std::memory_order_relaxed);
 #if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
 			// DEV-ONLY: make "disabled and never ticked" loud instead of silent.
 			//
@@ -464,10 +399,15 @@ namespace JLib {
 				const size_t n = devRetiredWhileDisabled.fetch_add(1, std::memory_order_relaxed) + 1;
 				if (n > 100000 && !devNoTickWarned.exchange(true, std::memory_order_relaxed)) {
 					std::fprintf(stderr,
-						"[JLib::Scheduler] %zu pointers retired with self-reclaim DISABLED and Tick() "
-						"never called. Memory will grow without bound. Call "
-						"EpochManager::Instance().Tick() from your idle path, or re-enable "
-						"SetSelfReclaim(true). This warning prints once.\n", n);
+						"[JLib::Scheduler] %zu pointers retired and Tick() was NEVER CALLED. Memory "
+						"will grow without bound.\n"
+						"  RECLAMATION IS THE APPLICATION'S JOB. Workers no longer self-trigger it:\n"
+						"  the sweep walks every participant and a worker doing that has stopped\n"
+						"  being available for the work that lands a microsecond later, which showed\n"
+						"  up as tail latency and not in any mean.\n"
+						"  Call EpochManager::Instance().Tick() at a natural idle point -- a frame\n"
+						"  boundary is the obvious one -- where a pause costs nothing.\n"
+						"  This warning prints once.\n", n);
 					std::fflush(stderr);
 				}
 			}

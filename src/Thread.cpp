@@ -1303,7 +1303,6 @@ void Thread::Worker() {
 	// demotion never fires.
 	// Latch for the hazard-bag drain below: set when this worker scans on going idle, cleared the
 	// moment it actually runs something again. Without it the scan runs every spin iteration.
-	bool scannedSinceWork = false;
 	// EXCLUSIVE MODE: an ORDINARY worker gets off the hot cores. The hot workers themselves are
 	// already pinned to them by StartWorker.
 	//
@@ -1738,7 +1737,6 @@ void Thread::Worker() {
 		laneWake.store(false, std::memory_order_seq_cst);
 		// --- 1. Execute task if found ---
 		if (task_to_run) {
-			scannedSinceWork = false;   // we are about to run something: the latch re-arms
 
 			// ---- CONTROLLER INPUTS, and only a floor worker pays for them ----------------------
 			// tasksRun feeds the demote test (did the marginal floor worker do anything?), busyNs
@@ -1977,7 +1975,6 @@ void Thread::Worker() {
 			// and this is the third time a copy of it has drifted.
 			if (scheduler->DiscardIfCancelled(task_to_run)) {
 				task_to_run = nullptr;
-				if (EpochManager::Instance().ShouldSelfReclaim()) EpochManager::Instance().Tick();
 				ready.store(true, std::memory_order_release);
 				continue;
 			}
@@ -2118,9 +2115,6 @@ void Thread::Worker() {
 				// so the gate always said yes and looked like it was working.
 				taskStartNs.store(0, std::memory_order_relaxed);
 
-				if (EpochManager::Instance().ShouldSelfReclaim()) {
-					EpochManager::Instance().Tick();
-				}
 				task_to_run = nullptr;
 				ready.store(true, std::memory_order_release);
 				continue;
@@ -2219,10 +2213,6 @@ void Thread::Worker() {
 			// EVERYTHING AFTER THE SWITCH LIVES IN ONE PLACE -- see Thread::OnFiberReturned. It was
 			// inline here until a bound main thread needed to run the same three-state machine.
 			OnFiberReturned(f, task_to_run);
-
-			if (EpochManager::Instance().ShouldSelfReclaim()) {
-				EpochManager::Instance().Tick();
-			}
 
 			// CLOSE THE LANE STAMP WHERE THE TASK ENDS, which is the only place the interval is
 			// actually over. Closing it at the top of the next pass instead banks everything between
@@ -3143,7 +3133,7 @@ void Thread::Worker() {
 			// original comment cares about is intact: a worker that retired nodes and then went
 			// idle still drains them once, promptly, on the way in.
 			// GATED, so the app can move the sweep off the workers -- see
-			// HazardDomain::SetSelfScan. Same trade EpochManager::SetSelfReclaim offers: the sweep
+			// the note below. Both the sweep and the epoch Tick were removed from the worker: the sweep
 			// walks every hazard cell, and a worker doing that has stopped being available for the
 			// completion that lands a microsecond later. An app with a natural idle point (a frame
 			// boundary) can call Scan() there instead and keep its workers on work.
@@ -3152,11 +3142,19 @@ void Thread::Worker() {
 			// ran something", which is true whether the sweep happened or was declined -- leaving it
 			// clear would make a worker with self-scan off re-enter this branch on every idle pass
 			// for the life of the process, which is the per-pass cost the latch exists to remove.
-			if (!scannedSinceWork) {
-				if (HazardDomain::Instance().SelfScanEnabled())
-					HazardDomain::Instance().Scan();
-				scannedSinceWork = true;
-			}
+			// THE WORKER NO LONGER SWEEPS, and neither does it Tick the epoch manager. Both were
+			// p99 killers by construction: the sweep walks every hazard cell, and a worker doing
+			// that has stopped being available for the completion that lands a microsecond later.
+			// The cost did not show in a mean and did show in a tail, which is the worst shape for
+			// something enabled by default.
+			//
+			// RECLAMATION IS THE APPLICATION'S NOW. Call EpochManager::Tick() and
+			// HazardDomain::Scan() at a natural idle point -- a frame boundary is the obvious one --
+			// where a pause costs nothing because nothing is waiting. Retire without ever doing so
+			// and memory accumulates; the dev-build warning in RetirePtr says so.
+			//
+			// `scannedSinceWork` and the latch around it went with the sweep. There is nothing left
+			// on this path to do once per idle transition.
 
 			JLIBSCHED_PHASE(qIndex, ParkGate);
 			// ---- NO EARLY ADVERTISE. THE COMMITMENT IS THE CAS TO WS_PARKED, FURTHER DOWN. ----

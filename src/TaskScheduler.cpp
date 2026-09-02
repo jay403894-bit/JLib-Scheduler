@@ -3194,8 +3194,6 @@ namespace JLib { namespace detail {
 
 // Forwarders. The state lives on EpochManager (it is the thing that reclaims); these exist so the
 // option is discoverable beside every other tuning knob. See the header for why that mattered.
-void TaskScheduler::SetSelfReclaim(bool on) { EpochManager::Instance().SetSelfReclaim(on); }
-bool TaskScheduler::SelfReclaimEnabled()    { return EpochManager::Instance().SelfReclaimEnabled(); }
 
 // The debugging kill switch that outlived the gate. Plain bool, not atomic, for the same reason
 // the idle and affinity policies are: it is set once at startup (or from a debugger) and read on a
@@ -5732,9 +5730,6 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 		taskAllocator.Free(task);
 	}
 
-	if (EpochManager::Instance().ShouldSelfReclaim()) {
-		EpochManager::Instance().Tick();
-	}
 	return true;
 }
 
@@ -6042,6 +6037,29 @@ bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
 	// it inline and the shared pool rebalances. A slab-cleanup kind would only be needed if a block
 	// ever carried an owner stamp and had to be remote-pushed to that owner's cache, which nothing
 	// here does and nothing here should.
+	return true;
+}
+
+bool TaskScheduler::ReleaseOnWorker(FiberDebt& node, void* obj,
+                                    void (*release)(void*) noexcept,
+                                    size_t holder, uint32_t kind) noexcept {
+	if (!obj || !release || kind == Fiber::kOwesNothing) return false;
+	Fiber* f = CurrentFiberOrNull();
+	if (!f) return false;
+
+	node.obj     = obj;
+	node.release = release;
+	node.holder  = holder;
+
+	node.next = f->debts;
+	f->debts  = &node;
+
+	// THE TAG IS WHAT MAKES THE CHAIN RUN. OwesCleanup() routes the fiber's death through
+	// AdvanceCleanup instead of straight back to the pool, and NoteCreditor puts `holder` on the
+	// set the chain walks. Both are needed: the kind decides that a chain happens at all, the
+	// creditor bit decides who it visits. Setting one without the other is a debt nobody collects.
+	f->NoteOwed(kind);
+	f->NoteCreditor(holder);
 	return true;
 }
 

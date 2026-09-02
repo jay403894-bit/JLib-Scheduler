@@ -1174,22 +1174,21 @@ never diverted into it, or a completion would leave the lane it was routed to.
 worker, nothing ever enters it. It shows up in `DumpPoolState` alongside the away map if you want
 to see whether your workload reaches it.
 
-### You can take garbage collection off the workers
+### Garbage collection is yours to schedule
 
-There are two reclamation schemes and each has its own switch -- `EpochManager::SetSelfReclaim` for
-epochs, `HazardDomain::SetSelfScan` for hazard pointers. Both default to on, both move work off your
-workers when turned off, and they are independent: turning one off leaves the other on the workers.
+**Workers do not reclaim. You must call `Tick()`.** There is no switch and no default that does it
+for you — `SetSelfReclaim` and `SetSelfScan` are gone.
 
-Reclamation is epoch-based, and by default a **worker** performs it: once enough pointers are
-retired, whichever worker notices next stops and runs a reclaim pass. That pass scans every epoch
-participant, and the participant set scales with the pool -- roughly 2,300 slots on a 31-worker
-machine. It is not much total work, but it lands on a thread that was supposed to be running your
-frame, at a moment you do not choose.
+They existed because a worker used to perform reclamation itself: once enough pointers were retired,
+whichever worker noticed next stopped and ran a reclaim pass over every epoch participant — roughly
+2,300 slots on a 31-worker machine. Not much total work, but it landed on a thread that was supposed
+to be running your frame, at a moment you did not choose. That cost never showed in a mean and always
+showed in a tail, which is the worst possible shape for something enabled by default.
 
-If your application has a natural idle point, hand it over:
+So it was removed rather than turned off. Call it at a natural idle point, where a pause costs
+nothing:
 
 ```cpp
-JLib::EpochManager::Instance().SetSelfReclaim(false);   // BEFORE StartPool
 JLib::TaskScheduler::Init(workerCount);
 
 while (running) {
@@ -1203,29 +1202,30 @@ while (running) {
 
 | | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| default (workers reclaim) | 58.1 / 58.9 / 60.2 | 67.7 / 66.8 / 69.0 | **331 / 331 / 336** |
+| when workers reclaimed | 58.1 / 58.9 / 60.2 | 67.7 / 66.8 / 69.0 | **331 / 331 / 336** |
 | `Tick()` on your thread | 60.5 / 58.7 / 58.5 | 69.3 / 67.8 / 66.3 | **125 / 111 / 104** |
 
-**Throughput does not change.** Median and p90 are a wash, and if that is what you care about there
-is nothing here for you. What changes is the tail: **p99 improves about 3x**, because the same scan
-now happens between frames instead of stalling a worker inside one. It is a frame-time *consistency*
-feature.
+**Throughput does not change.** Median and p90 are a wash. What changes is the tail: **p99 improves
+about 3x**, because the same scan happens between frames instead of stalling a worker inside one.
+That 3x is why this stopped being an option and became the rule — a default that costs a third of
+your p99 is not a default, it is a trap with a knob next to it.
 
-Two things to know before you flip it. It must be set **before `StartPool`** and never again -- it
-is a plain `bool` read by every worker, so changing it on a live pool is a data race and a worker may
-have hoisted the read out of its loop anyway. And **if you disable it and then never call `Tick()`,
-retired memory grows without bound and nothing warns you.** The default is on precisely because a
-library cannot assume its embedder has a loop to tick from.
+**If you never call `Tick()`, retired memory grows without bound.** A development build prints a
+one-time warning after 100,000 retirements to say so; a release build will not tell you. This is the
+one real obligation the scheduler places on its embedder, and it is deliberate: a library cannot
+choose a good moment inside your frame, and it should not pretend it can.
 
-#### The hazard sweep has the same switch
+#### Hazard pointers, same rule
 
 Epochs are not the only reclamation here. Structures that must stay readable across a *suspend* use
 hazard pointers instead -- epochs cannot, because no fiber or coroutine may suspend inside an
-`EpochGuard`. That sweep also lands on a worker: on the way into idle, whichever worker gets there
-walks every hazard cell.
+`EpochGuard`. That sweep used to land on a worker too, on the way into idle, and was removed for the
+same reason.
+
+**Forgetting `Scan()` is less severe than forgetting `Tick()`**: the threshold-triggered scan inside
+`Retire()` still runs, so it degrades to *reclaims late* rather than *grows without bound*.
 
 ```cpp
-JLib::HazardDomain::Instance().SetSelfScan(false);
 
 while (running) {
     RunFrame();
@@ -1234,22 +1234,21 @@ while (running) {
 }
 ```
 
-**Three differences from `SetSelfReclaim`, and they all matter:**
+**The two differ in what forgetting costs you:**
 
-| | `SetSelfReclaim` | `SetSelfScan` |
+| | `Tick()` (epochs) | `Scan()` (hazards) |
 |---|---|---|
-| When you may set it | before `StartPool`, once | **any time** -- it is a relaxed atomic |
-| If you disable it and never drive it | unbounded growth, silent | **reclaims late, does not leak** |
+| If you never call it | **unbounded growth**; dev build warns once, release does not | **reclaims late, does not leak** |
 | Measured | p99 331 → 113 µs | **not measured** |
 
-The second row is the useful one: `Retire` still runs its own threshold-triggered scan, so this
-governs only the *worker-idle* sweep. Forgetting to call `Scan()` costs you timeliness, not memory,
-and `HazardDomain::Instance().OrphanedRetired()` is how you would notice if a thread exited holding
-a bag.
+The first row is the one to act on. `Retire` still runs its own threshold-triggered scan, so
+forgetting `Scan()` costs you timeliness rather than memory, and
+`HazardDomain::Instance().OrphanedRetired()` is how you would notice if a thread exited holding a
+bag. Forgetting `Tick()` is the one that actually leaks.
 
-The third row is a caveat rather than a recommendation. **The 3x p99 figure above is the epoch
+The second row is a caveat rather than a recommendation. **The 3x p99 figure above is the epoch
 result and has not been reproduced for hazards** -- the hazard bag is smaller and sweeps less often,
-so it is a reason to try the switch on your own workload, not a number to expect. Measure both
+so it is a reason to measure your own workload, not a number to expect. Measure both
 halves before assuming either pays.
 
 ### `CorePref` is about breadth, not core class

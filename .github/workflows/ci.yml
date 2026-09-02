@@ -147,7 +147,7 @@ jobs:
       # atomic entirely, and the guarded decrement in TryReclaim that would otherwise wrap size_t
       # on the first manual Tick(). Neither has any other coverage.
       - name: Run primitives test with self-reclaim disabled
-        run: ./${{ matrix.prims }} noreclaim
+        run: ./${{ matrix.prims }}
         shell: bash
 
       # SetFiberBudget: does StartPool actually consume the configured per-worker fiber counts, not
@@ -457,7 +457,7 @@ jobs:
         shell: bash
 
       - name: Run primitives test with self-reclaim disabled
-        run: ./build/bin/Release/SchedulerPrimitivesTest.exe noreclaim
+        run: ./build/bin/Release/SchedulerPrimitivesTest.exe
         shell: bash
 
       - name: Run fiber budget test (SetFiberBudget wiring)
