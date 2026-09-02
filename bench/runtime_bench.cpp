@@ -440,10 +440,28 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
     static std::vector<float> buf;
     buf.assign(kWorking, 1.0f);
 
-    auto workload = [&] {
+    // ---- THE WORKLOAD IS SWEPT BY LENGTH, AND THAT IS THE POINT OF THIS SECTION ------------
+    //
+    // A SINGLE LENGTH CANNOT ANSWER THE QUESTION IT WAS BEING ASKED. This row measured ~+20% for a
+    // pool-wide floor against a historical +3.5% for the same worker count -- six times apart, same
+    // machine class, same configuration. The likeliest explanation is not the scheduler: it is that
+    // the historical measurement used a ~14.65 ms frame and this one used ~400 us.
+    //
+    // WHY LENGTH WOULD MATTER THAT MUCH. A short pass on an otherwise idle machine runs at full
+    // boost; the instant N cores start spinning, all-core limits bite and the clock drops. Over a
+    // full frame both arms settle toward the same sustained clock and the gap compresses. So a
+    // 400 us sample sits inside the boost TRANSIENT, where spinning hurts most, and a 15 ms one
+    // mostly does not.
+    //
+    // If the tax falls toward 3.5% as the workload lengthens, the two figures are ONE PHENOMENON AT
+    // TWO TIMESCALES and both are correct about different things. If it stays near 20%, they are
+    // different measurements and the historical number is the one to re-examine. Either answer is
+    // worth having; a single length can produce neither.
+    auto workload = [&](int passes) {
         const auto t0 = Clock::now();
         float acc = 0.0f;
-        for (size_t i = 0; i < kWorking; ++i) { buf[i] = buf[i] * 1.000001f + 0.5f; acc += buf[i]; }
+        for (int p = 0; p < passes; ++p)
+            for (size_t i = 0; i < kWorking; ++i) { buf[i] = buf[i] * 1.000001f + 0.5f; acc += buf[i]; }
         if (acc == 12345.678f) std::printf("");   // keep it observable
         return UsSince(t0);
     };
@@ -461,56 +479,80 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
     // measures the transition, not the state.
     JLib::TaskScheduler::SetAwakeFloor(baseFloor);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    workload();   // warm-up
+    (void)workload(1);   // warm-up
 
-    for (int r = 0; r < reps; ++r) {
-        // ARMS ALTERNATE AND THE FLOOR IS SET IMMEDIATELY BEFORE EACH, so a drift in the machine
-        // lands on all three. Setting it once and running ten of each is how this row lies.
-        // ---- THE TRANSITION IS NOT THE TAX, AND THE FIRST VERSION CHARGED IT AS ONE. ---------
-        //
-        // SetAwakeFloor(29) PROMOTES AND WAKES 29 PARKED WORKERS. At the ~5 us this project has
-        // measured for a wake, that is up to ~145 us of kernel work -- inside a ~400 us sample,
-        // against a measured delta of ~79 us. The transition was the same order of magnitude as the
-        // entire effect being attributed to spinning, and it landed ASYMMETRICALLY: floor=0
-        // collapses and wakes nobody, floor=2 wakes at most two, floor=29 wakes twenty-nine. So the
-        // arm that showed the tax was the only arm paying for its own setup.
-        //
-        // A DISCARDED PASS ABSORBS IT. One full workload after the change, thrown away, then the
-        // recorded one -- by which point the promoted workers are spinning steadily and what is
-        // measured is the OCCUPANCY, which is the thing the row claims. This is cheaper and more
-        // honest than a fixed sleep, which would have to guess how long 29 wakes take.
+    // ---- THREE LENGTHS, SO THE TAX CAN BE READ AS A FUNCTION OF ONE ------------------------
+    //
+    // ~400 us is a burst, ~4 ms is a heavy chunk of a frame, ~15 ms is a whole 60 Hz frame and is
+    // chosen to match the historical measurement this row is being reconciled against.
+    struct Len { int passes; const char* name; };
+    const Len lengths[] = { { 1, "~0.4 ms (burst)" }, { 10, "~4 ms" }, { 37, "~15 ms (a frame)" } };
+
+    std::printf("  workload length is SWEPT -- see the note above for why one length cannot answer\n"
+                "  the question. Each row is floor=0 against a pool-wide floor at that length.\n\n");
+    std::printf("  %-20s %12s %12s %10s\n", "length", "parked", "pool-wide", "tax");
+
+    double taxAtShortest = 0.0, taxAtLongest = 0.0;
+
+    for (const Len& L : lengths) {
+        Samples p, w;
+        auto sample = [&](size_t f, Samples& out) {
+            // THE TRANSITION IS NOT THE TAX. SetAwakeFloor(N) promotes and WAKES N parked workers,
+            // which at ~5 us a wake is real work landing inside the sample -- and asymmetrically,
+            // since floor=0 wakes nobody. A discarded pass absorbs it, leaving the recorded one
+            // measuring steady-state OCCUPANCY, which is what the row claims.
+            JLib::TaskScheduler::SetAwakeFloor(f);
+            (void)workload(L.passes);
+            out.add(workload(L.passes));
+        };
+        for (int r = 0; r < reps; ++r) {
+            if (r & 1) { sample(0, p); sample(wideFloor, w); }
+            else       { sample(wideFloor, w); sample(0, p); }
+        }
+        const double tax = p.median() > 0.0
+                         ? 100.0 * (w.median() - p.median()) / p.median() : 0.0;
+        std::printf("  %-20s %10.2f us %10.2f us %+9.2f %%\n",
+                    L.name, p.median(), w.median(), tax);
+        if (&L == &lengths[0]) taxAtShortest = tax;
+        taxAtLongest = tax;
+    }
+
+    // ---- AND THE SHIPPED FLOOR, WHICH IS THE ONLY ROW THAT IS A CLAIM ABOUT THE DEFAULT ----
+    {
+        Samples p, s;
         auto sample = [&](size_t f, Samples& out) {
             JLib::TaskScheduler::SetAwakeFloor(f);
-            (void)workload();          // absorbs the promote/park transition
-            out.add(workload());       // steady state
+            (void)workload(1);
+            out.add(workload(1));
         };
-        if (r % 3 == 0)      { sample(0, parked); sample(baseFloor, shipped); sample(wideFloor, wide); }
-        else if (r % 3 == 1) { sample(baseFloor, shipped); sample(wideFloor, wide); sample(0, parked); }
-        else                 { sample(wideFloor, wide); sample(0, parked); sample(baseFloor, shipped); }
+        for (int r = 0; r < reps; ++r) {
+            if (r & 1) { sample(0, p); sample(baseFloor, s); }
+            else       { sample(baseFloor, s); sample(0, p); }
+        }
+        const double tax = p.median() > 0.0
+                         ? 100.0 * (s.median() - p.median()) / p.median() : 0.0;
+        std::printf("\n  %-20s %10.2f us %10.2f us %+9.2f %%   <- floor=%zu, the DEFAULT\n",
+                    "~0.4 ms, shipped", p.median(), s.median(), tax, baseFloor);
+        if (Overlaps(p, s))
+            std::printf("  INDISTINGUISHABLE, which is the expected answer for a small floor on a\n"
+                        "  machine with cores to spare -- and it is the resting cost of the library.\n");
     }
     JLib::TaskScheduler::SetAwakeFloor(baseFloor);   // restore, always
 
-    char l1[64], l2[64];
-    std::snprintf(l1, sizeof l1, "floor=%zu   (as shipped)", baseFloor);
-    std::snprintf(l2, sizeof l2, "floor=%zu  (whole pool awake)", wideFloor);
-    Row("floor=0    (pool fully parked)", parked, "us");
-    Row(l1, shipped, "us");
-    Row(l2, wide, "us");
-
-    if (parked.median() > 0.0) {
-        std::printf("  %-34s %+9.2f %%\n", "tax of the shipped floor",
-                    100.0 * (shipped.median() - parked.median()) / parked.median());
-        std::printf("  %-34s %+9.2f %%\n", "tax of a pool-wide floor",
-                    100.0 * (wide.median()    - parked.median()) / parked.median());
-    }
-
-    std::printf("\n  THE THIRD ROW IS WHAT NoSleep USED TO COST -- every worker held awake for the whole\n"
-                "  run. It is here as the reference the shipped floor is cheap AGAINST, not as a\n"
-                "  configuration to choose. Read the two taxes together: the second is the price of\n"
-                "  the wake path the floor buys, the third is the price of buying it for everyone.\n");
-    if (Overlaps(parked, shipped))
-        std::printf("\n  Rows 1 and 2 are INDISTINGUISHABLE, which is the expected answer for a small\n"
-                    "  floor on a machine with cores to spare. Row 3 is where the cost becomes visible.\n");
+    // ---- THE RECONCILIATION, STATED RATHER THAN LEFT TO THE READER -------------------------
+    std::printf("\n  RECONCILIATION. A pool-wide floor is what IdlePolicy::NoSleep used to be, and it\n"
+                "  was historically measured at +3.5%% against a ~14.65 ms frame. This run:\n"
+                "      burst (~0.4 ms) %+.2f%%      frame (~15 ms) %+.2f%%\n",
+                taxAtShortest, taxAtLongest);
+    if (taxAtLongest < taxAtShortest * 0.5)
+        std::printf("  The tax FALLS with workload length, which supports the boost-transient\n"
+                    "  explanation: a short pass runs at full clock until the spinners take it away,\n"
+                    "  while a whole frame settles toward the same sustained clock either way. The\n"
+                    "  two figures are one phenomenon at two timescales.\n");
+    else
+        std::printf("  The tax does NOT fall materially with length, so the boost-transient\n"
+                    "  explanation does not hold and the historical +3.5%% is measuring something\n"
+                    "  else. Do not average them -- find out which is asking the right question.\n");
 }
 
 // ---------------------------------------------------------------------------------------------

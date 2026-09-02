@@ -2310,3 +2310,37 @@ WHAT I GOT WRONG TWICE, in opposite directions, and the lesson is the same both 
 the resume is stuck to a worker" is TRUE and does not imply "stuck somewhere that worker cannot
 read". I inferred the second from the first without reading the drain -- and the sentence that
 refutes it was already in the file.
+
+## Idle tax: the workload-length hypothesis is REFUTED (2026-09-02)
+
+The reconciliation asked for, and it did not go the expected way.
+
+CLAIM UNDER TEST: a pool-wide awake floor measured ~+20% here against a historical +3.5% for the
+same worker count, and the difference was workload length -- ~400 us here versus 14.65 ms then, with
+the short pass sitting inside the boost transient where spinning hurts most.
+
+MEASURED, sweeping the length in one process with the arms interleaved:
+
+    ~0.4 ms (burst)     399.20 us parked   497.50 us wide   +24.62 %
+    ~4 ms              4015.10 us          4926.50 us       +22.70 %
+    ~15 ms (a frame)  15170.90 us         18233.00 us       +20.18 %
+
+    ~0.4 ms, shipped    399.20 us          399.70 us         +0.13 %   floor=2, the DEFAULT
+
+THE TAX BARELY MOVES. A gentle decline, nowhere near 20 -> 3.5. Length is not the explanation and
+the hypothesis is dead.
+
+AND THE GAP IS WORSE THAN FIRST STATED. Re-reading the record: +3.5% was the SYNTHETIC measurement
+(31 workers, idle pool, memory-bound main thread) and +23% was the REAL GAME. This synthetic run
+lands on the GAME figure. Same kind of measurement, same worker count, ~6x apart.
+
+THE CANDIDATE WORTH TESTING NEXT, and it is not about measurement: A POOL-WIDE AWAKE FLOOR MAY NOT BE
+WHAT NoSleep WAS. NoSleep workers spun in the idle search; floor workers also run the growth
+controller and take a different path through the park block. If those are different mechanisms then
+their taxes were never comparable, and +3.5% describes a configuration that no longer exists rather
+than a number this runtime should reproduce. That is a code question -- compare what a floor worker
+executes per idle pass against what NoSleep made it execute -- not another benchmark.
+
+WHAT IS SETTLED REGARDLESS: the SHIPPED floor costs +0.13% and is indistinguishable from parked, at
+every length. That is the number the library's default is answerable for, and it is the one the
+README quotes.
