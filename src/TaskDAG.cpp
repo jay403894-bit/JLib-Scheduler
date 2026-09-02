@@ -77,15 +77,23 @@ TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
     // Coroutines are refused one level down, in CreateNode, for a different reason -- see there.
     //
     // If the work needs to suspend, it does not belong on a main node. Use a pool node
-    // (CreateNode with TaskType::Fiber) and, if the result must land on the main thread, make a
-    // main node that DEPENDS on it.
+    // (CreateNode, which now gets a fiber by default) and, if the result must land on the main
+    // thread, make a main node that DEPENDS on it.
+    //
+    // THIS GUARD BECAME MUCH EASIER TO TRIP when CreateTask's default changed from Native to Fiber:
+    // it used to fire only for someone who asked for a fiber explicitly, and now it fires for
+    // anyone who did not ask for anything. That makes the message's job different -- it has to say
+    // how to COMPLY, not just what went wrong -- so it names the call.
     if (t && t->type == TaskType::Fiber) {
         std::fprintf(stderr,
             "[JLib::Scheduler] FATAL: TaskDAG::CreateMainNode was given a TaskType::Fiber task.\n"
             "  Main-thread nodes run on the main thread, which is not a fiber -- there is nothing to\n"
             "  switch away to, so any suspension inside one fail-fasts with no message.\n"
-            "  Put suspending work on a pool node (CreateNode, TaskType::Fiber) and give the main\n"
-            "  node a dependency on it.\n");
+            "  A public job is a fiber by DEFAULT, so this is what you get from a plain CreateTask.\n"
+            "  For a main node, ask for the non-suspending type explicitly:\n"
+            "      CreateTask(fn, data, /*hipri*/0, TaskType::Native)\n"
+            "  Or put the suspending work on a pool node (CreateNode) and give the main node a\n"
+            "  dependency on it.\n");
         std::fflush(stderr);
         std::abort();
     }

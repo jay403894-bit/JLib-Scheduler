@@ -3168,14 +3168,14 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 	wg.n.store(lanes, std::memory_order_relaxed);
 
 	for (int w = 0; w < lanes; ++w) {
-		Task* t = CreateTask([cur = &cursor, f = &func, end, grain]() {
+		Task* t = CreateInternalTask([cur = &cursor, f = &func, end, grain]() {
 			for (;;) {
 				const int lo = cur->fetch_add(grain, std::memory_order_relaxed);
 				if (lo >= end) return;
 				const int hi = (lo + grain > end) ? end : lo + grain;
 				(*f)(lo, hi);
 			}
-			}, false, TaskType::Native, CorePref::Wide);
+			}, false, CorePref::Wide);
 		// Wide: a cursor LANE is a worker's worth of participation in one range. Steering these at
 		// the floor is self-defeating -- every lane lands on the same couple of threads and the
 		// cursor they share has nobody else pulling on it, which is the fan-out failure this whole
@@ -3581,9 +3581,9 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		//
 		// Default therefore stays, on the cheaper-push argument rather than on Wide being worse:
 		// when two options measure the same, take the one that does not pay a kernel wake.
-		Task* t = CreateTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); },
-		                     false, TaskType::Native,
-		                     ParallelSplitWide() ? CorePref::Wide : CorePref::Default);
+		Task* t = CreateInternalTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); },
+		                             false,
+		                             ParallelSplitWide() ? CorePref::Wide : CorePref::Default);
 		if (!t) break;                      // slab exhausted: run the remainder inline, no error
 		t->waitGroup = st->wg;
 

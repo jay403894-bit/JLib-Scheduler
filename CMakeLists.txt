@@ -1090,6 +1090,13 @@ if(JLIBSCHED_TOKENDRAIN_CTL)
   message(STATUS "JLib::Scheduler: token drain NEGATIVE CONTROL ${JLIBSCHED_TOKENDRAIN_CTL} -- the test MUST fail")
 endif()
 
+# THE PUBLIC JOB IS A FIBER. Asserts the BEHAVIOUR, not the type tag: a plain CreateTask must be
+# able to suspend and resume (illegal under the old Native default), and ParallelFor grains must
+# still take no fiber, or grain concurrency silently becomes bounded by the fiber pool.
+add_executable(SchedulerEverythingIsAFiberTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/everything_is_a_fiber_test.cpp")
+target_link_libraries(SchedulerEverythingIsAFiberTest PRIVATE Scheduler)
+target_compile_features(SchedulerEverythingIsAFiberTest PRIVATE cxx_std_17)
+
 # THREAD LAYOUT: how many cache lines one Push touches on the consumer's Thread. Prints the offsets
 # rather than reasoning about them from source order -- see the test header.
 add_executable(SchedulerThreadLayoutTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/thread_layout_test.cpp")

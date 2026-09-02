@@ -62,8 +62,8 @@ namespace JLib {
 		// TaskType::Native, deliberately. A cleanup hop must run to completion on the worker it was
 		// sent to; giving it a fiber would let it suspend, and a suspended cleanup on a migratable
 		// pool can resume somewhere else -- which is precisely the thing being cleaned up after.
-		Task* t = TaskScheduler::Instance().CreateTask(&FiberRegistry::CleanupHop, f,
-			/*hipri*/ 0, TaskType::Native);
+		Task* t = TaskScheduler::Instance().CreateInternalTask(&FiberRegistry::CleanupHop, f,
+			/*hipri*/ 0);
 		if (!t) return false;
 		return TaskScheduler::PushResume(worker, t);
 	}

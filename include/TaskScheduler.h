@@ -1957,8 +1957,8 @@ namespace JLib {
 				const size_t hi = (lo + chunkSize > end) ? end : lo + chunkSize;
 				// Wide: these are chunks of one range, split precisely so other workers run them.
 				// See the splitter and cursor paths -- same argument, same currency.
-				Task* t = CreateTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); },
-				                     hiPri, TaskType::Native, CorePref::Wide);
+				Task* t = CreateInternalTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); },
+				                             hiPri, CorePref::Wide);
 				if (!t) {                                   // arena exhausted: run it here
 					for (size_t i = lo; i < hi; ++i) fn(i);
 					continue;
@@ -2617,16 +2617,66 @@ namespace JLib {
 		// macro reads the CALLER's TU, which is the thing actually being asked about.
 		Task* CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, TaskType type, CorePref corePref);
 
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
+		// ---- THE PUBLIC JOB IS A FIBER --------------------------------------------------------
+		//
+		// DEFAULT CHANGED FROM Native TO Fiber. A public job may suspend -- that is what a job system
+		// in this family is FOR -- and a Native task may not, so defaulting to Native handed every
+		// caller the one type that cannot wait on anything. The old default was a performance choice
+		// that quietly narrowed the API.
+		//
+		// AND IT IS WHAT MAKES MEMORY RECLAMATION ONE STORY INSTEAD OF THREE. Only a context that can
+		// suspend and RESUME ON ANOTHER THREAD needs to be tracked for cleanup, because only it can
+		// leave thread-affine state behind on a worker it has since left. A fiber can; a Native task
+		// cannot (it runs to completion where it started). So if every public job is a fiber, the
+		// fiber registry covers the whole public surface and nothing else needs a death hook.
+		//
+		// THE COST IS A CONTEXT SWITCH, and it is 9.2 ns since the AVX-transition fix (85.8 ns
+		// before it). A fiber that never suspends still runs to completion exactly like a Native
+		// task; it just paid for the option.
+		//
+		// Native has NOT gone away -- see CreateInternalTask. It is no longer the thing a caller
+		// gets by accident.
+		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
 #if !defined(__cpp_impl_coroutine) || __cpp_impl_coroutine < 201902L
 			assert(type != TaskType::Coroutine && "coroutines require a C++20 build");
 #endif
 			return CreateTaskImpl(fn, data, hipri, type, corePref);
 		}
 
+		// ---- INTERNAL JOBS: NATIVE ON PURPOSE, AND THE REASONS ARE NOT INTERCHANGEABLE ----------
+		//
+		// Two kinds of caller belong here and they want Native for different reasons:
+		//
+		//   PARALLELFOR LEAVES -- a grain is a slice of one range with no wait in it. Giving each a
+		//   fiber would bound grain concurrency by the fiber pool (coreCount * StandardFibersPerWorker,
+		//   64 KB of stack apiece) and put grain acquisition on the path that already deadlocked once
+		//   under nested ParallelFor: AcquireFiber fails, Requeue, spin. Grains are the one workload
+		//   where the count is unbounded and the body provably never waits.
+		//
+		//   CLEANUP HOPS -- these must run to completion ON THE WORKER THEY WERE SENT TO. A fiber
+		//   could suspend mid-release and resume elsewhere, which is precisely the migration the
+		//   cleanup exists to repair. Here "cannot suspend" is the REQUIREMENT, not a concession.
+		//
+		//   MAIN-AFFINITY DAG NODES -- and this one is PUBLIC, which is why Native stays selectable
+		//   rather than becoming private. ProcessMainThread runs a task with `t->Execute()` on the
+		//   main thread's own stack: no fiber is bound, so there is nothing to switch away to and a
+		//   suspension inside one fail-fasts with no message. TaskDAG::CreateMainNode rejects a
+		//   Fiber task outright for exactly this reason, and that guard got much easier to trip the
+		//   moment Fiber became the default.
+		//
+		// SO NATIVE IS NOT PRIVATE -- it is no longer the thing a caller gets by ACCIDENT. Asking
+		// for it explicitly is asking for "this may never wait on anything", which is a real and
+		// occasionally correct thing to want. This overload exists so the library's own internal
+		// jobs say so at the call site instead of passing an enum whose meaning is a footnote.
+		Task* CreateInternalTask(void(*fn)(void*), void* data, uint8_t hipri = false,
+		                         CorePref corePref = CorePref::Default) {
+			return CreateTaskImpl(fn, data, hipri, TaskType::Native, corePref);
+		}
 
+
+		// Fiber by default, for the reasons on the raw overload above.
 		template<typename F>
-		auto CreateTask(F&& f, uint8_t hipri = false, TaskType type = TaskType::Native, CorePref corePref = CorePref::Default) {
+		auto CreateTask(F&& f, uint8_t hipri = false, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			// NO SIZE CEILING, as of 4.0.1. A capture larger than the biggest slot used to be a
 			// COMPILE ERROR, which made the task path stricter than the coroutine path for no reason
@@ -2670,6 +2720,15 @@ namespace JLib {
 			t->trivialDtor = std::is_trivially_destructible_v<std::decay_t<F>> ? 1 : 0;
 			return t;
 		}
+
+		// Lambda form of CreateInternalTask -- see the raw overload for why these stay Native.
+		// ParallelFor's three leaf paths (flat chunks, cursor lanes, the lazy splitter) are the
+		// callers, and their bodies provably never wait.
+		template<typename F>
+		auto CreateInternalTask(F&& f, uint8_t hipri = false, CorePref corePref = CorePref::Default) {
+			return CreateTask(std::forward<F>(f), hipri, TaskType::Native, corePref);
+		}
+
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
 		void Push(F&& f) {
 			auto* t = CreateTask(std::forward<F>(f));
