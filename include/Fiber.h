@@ -278,9 +278,23 @@ namespace JLib {
 		// the three costs the architecture header says migration already paid (address-routed slab
 		// frees, a global epoch participant list, fiber-indexed hazard cells). Recording the debt is
 		// what would let those go back to their cheap per-thread forms.
+		// ---- WHAT THE CREDITOR CHAIN IS FOR, AND WHAT IT IS NOT -------------------------------
+		//
+		// A SLOT ON A WORKER, NOT AN ADDRESS IN A POOL. The chain exists for "worker q still
+		// advertises an epoch" and "worker q still holds a hazard cell" -- a position in
+		// participants[q], which only that worker may retract. That is why the release has to run
+		// ON that worker, and why the chain visits each creditor exactly once.
+		//
+		// MEMORY IS NOT ONE OF THESE AND MUST NOT BE TAGGED AS ONE. Slab blocks are fungible --
+		// SlabPool.h has the argument -- so the thread that kills the fiber frees them inline and
+		// the shared pool rebalances. kOwesSlab is retained only as a reserved bit: setting it would
+		// route every fiber holding memory through a per-worker hop on the death path to release
+		// something no particular worker owns. It would become real ONLY if a block ever carried an
+		// owner stamp that had to be remote-pushed to that owner's cache, and nothing here does
+		// that. FiberDebt/ReleaseOnFiberDeath is the memory path, and it deliberately sets no kind.
 		enum OwedKind : uint32_t {
 			kOwesNothing = 0,
-			kOwesSlab    = 1u << 0,
+			kOwesSlab    = 1u << 0,   // RESERVED, unused -- see above. Do not set it for memory.
 			kOwesEpoch   = 1u << 1,
 			kOwesHazard  = 1u << 2,
 		};
