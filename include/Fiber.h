@@ -18,6 +18,50 @@ namespace JLib {
 		SUSPENDED,     // Parked, not queued; only now may Resume() make it READY + re-queue
 		DEAD           // Finished, pending cleanup/reclamation
 	};
+	// ---- A DEBT A FIBER OWES: one object, one way to release it -----------------------------
+	//
+	// The eight fixed slots answer "a few well-known per-fiber values". This answers the other
+	// shape: an ARBITRARY NUMBER of objects, each allocated a DIFFERENT way -- one from `new`, one
+	// from a custom arena, one from a pool -- all owed by the same fiber and all released when it
+	// dies. `owedKinds` already says WHICH KINDS are outstanding; this is where the payloads live.
+	//
+	// INTRUSIVE, AND THAT IS FORCED RATHER THAN PREFERRED. FiberRegistry's dispatch note is explicit
+	// that the death path must not allocate -- "an allocation here is least welcome and most likely
+	// to be the thing that fails", and a dropped cleanup is a resource never given back. A list of
+	// heap nodes would put a malloc on exactly that path. So the node lives inside whatever the
+	// caller is registering, or in storage the caller already owns, and linking is two stores.
+	//
+	// RELEASED ON WHOEVER RECYCLES THE FIBER, which is safe for MEMORY and unsafe for AFFINITY. The
+	// slab note in SlabPool.h draws that line: memory is fungible, so freeing it on another thread
+	// costs cache migration and nothing else. An epoch slot or a hazard cell is NOT fungible --
+	// clearing one from the wrong thread un-announces a slot that was never set there -- so those
+	// belong on the creditor chain, which runs the release ON THE OWING WORKER. Do not register
+	// them here.
+	struct FiberDebt {
+		FiberDebt* next = nullptr;
+		void*      obj  = nullptr;
+		void     (*release)(void*) noexcept = nullptr;
+
+		// WHICH WORKER MUST RUN THIS, or kAnyHolder when nobody in particular must.
+		//
+		// THE REAPER VISITS EACH CREDITOR EXACTLY ONCE -- `creditors` is a bitmask and TakeCreditor
+		// clears the bit before dispatching, which is precisely what makes a double release
+		// impossible. That single visit therefore has to discharge EVERYTHING that worker is owed,
+		// of every kind, which is the whole reason this is a list with a loop rather than one
+		// pointer and one deleter.
+		//
+		// kAnyHolder is the fungible case -- memory. SlabPool.h has the argument: an arena slot
+		// freed on another thread costs cache migration and nothing else, so it can simply go on the
+		// recycle path and never involve a creditor at all.
+		//
+		// A REAL WORKER INDEX IS THE AFFINE CASE -- an epoch slot, a hazard cell, a thread-owned
+		// handle. Those must run ON that worker: clearing an epoch slot from the wrong thread
+		// un-announces a slot that was never set there and frees nodes under a live traversal. The
+		// index is what lets one visit release its own subset and leave the rest for their owners.
+		static constexpr size_t kAnyHolder = (size_t)-1;
+		size_t holder = kAnyHolder;
+	};
+
 	namespace detail {
 		// The seam ResetForReuse calls to release owning fiber-local slots. Declared here and
 		// DEFINED IN FiberRegistry.cpp so Fiber.h does not have to include the registry -- Fiber is
@@ -94,6 +138,12 @@ namespace JLib {
 		// static_assert it against kLocalSlots -- see FiberLocal() in TaskScheduler.h.
 		static constexpr size_t kLocalSlots = 8;
 		void* local[kLocalSlots] = {};
+
+		// Head of this fiber's debt list. Plain, not atomic: a fiber runs on exactly one worker at a
+		// time -- that is what a fiber IS -- so its own debts have a single mutator for their whole
+		// life. What changes under migration is which thread that mutator is, and the list travels
+		// with the fiber, which is the same reason the slots above are safe.
+		FiberDebt* debts = nullptr;
 
 #if defined(JLIBSCHED_REQUEUE_TRACE)
 		// WHERE Requeue SENT THIS FIBER on its last resume, stamped by the router and read back by
@@ -308,6 +358,32 @@ namespace JLib {
 			// every program that does not use the feature.
 			detail::ReleaseFiberSlots(local, kLocalSlots);
 			for (size_t i = 0; i < kLocalSlots; ++i) local[i] = nullptr;
+
+			// DEBTS BEFORE THE SLOTS ARE FORGOTTEN, and the head is cleared BEFORE the walk: a
+			// release that somehow registers another debt on this fiber must not link onto a list
+			// that is mid-walk. Everything registered after this point belongs to the next
+			// occupant, which is the correct place for it to go.
+			//
+			// EVERY REMAINING DEBT IS DISCHARGED HERE, holder or not. By the time a fiber is being
+			// recycled its creditor chain has drained -- AdvanceCleanup only recycles when
+			// TakeCreditor returns SIZE_MAX -- so an affine debt still on this list is one nobody
+			// claimed, and dropping it silently would leak the resource it names. Running it late on
+			// the wrong thread is the lesser wrong of the two, and it is loud in a debugger; leaking
+			// is neither.
+			{
+				FiberDebt* d = debts;
+				debts = nullptr;
+				while (d) {
+					// READ next BEFORE releasing. The node usually lives INSIDE the object being
+					// released, so `release` is free to destroy the node along with it -- reading
+					// the link afterwards is a use-after-free, and an intrusive list is exactly
+					// where that mistake is easy to make.
+					FiberDebt* nxt = d->next;
+					d->next = nullptr;
+					if (d->release && d->obj) d->release(d->obj);
+					d = nxt;
+				}
+			}
 			status.store(FiberStatus::READY, std::memory_order_release);
 		}
 

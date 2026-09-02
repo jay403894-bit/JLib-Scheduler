@@ -6010,6 +6010,56 @@ static Fiber* CurrentFiberOrNull() noexcept {
 
 bool TaskScheduler::HasFiberLocal() noexcept { return CurrentFiberOrNull() != nullptr; }
 
+bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
+                                        void (*release)(void*) noexcept) noexcept {
+	if (!obj || !release) return false;
+	Fiber* f = CurrentFiberOrNull();
+	// REFUSED OFF A FIBER, and refused LOUDLY by returning false rather than quietly by doing
+	// nothing. There is no fiber to attach the debt to, so the caller still owns the object -- and a
+	// caller that assumed otherwise has just leaked it. A Native task and a bare thread both land
+	// here legitimately, which is why this is a return value and not an assert.
+	if (!f) return false;
+
+	node.obj     = obj;
+	node.release = release;
+	node.holder  = FiberDebt::kAnyHolder;   // memory: fungible, see the note on the field
+
+	// PUSH FRONT, single mutator. A fiber runs on one worker at a time, so its own debt list needs
+	// no synchronisation -- the same argument the local slots rest on.
+	node.next = f->debts;
+	f->debts  = &node;
+	f->NoteOwed(Fiber::kOwesSlab);
+	return true;
+}
+
+// ---- DISCHARGE WHAT ONE CREDITOR OWES, AND ONLY THAT ------------------------------------------
+//
+// THE ONE-VISIT RULE IS WHY THIS EXISTS. The reaper reaches each creditor exactly once -- creditors
+// is a bitmask and TakeCreditor clears the bit before dispatching, which is what makes a double
+// release impossible -- so that single visit has to discharge everything this worker is owed, of
+// every kind. One pointer and one deleter could not; a list and a loop can.
+//
+// FILTERED BY HOLDER, so a visit takes its own subset and leaves the rest linked for their owners.
+// Unlinking in place rather than draining the whole list is the difference between "worker 3 paid
+// its debts" and "worker 3 paid everyone's debts on the wrong thread".
+//
+// Returns how many it released, so a caller can tell "nothing was owed" from "nothing ran".
+size_t TaskScheduler::DischargeFiberDebts(Fiber* f, size_t holder) noexcept {
+	if (!f) return 0;
+	size_t n = 0;
+	FiberDebt** link = &f->debts;
+	while (FiberDebt* d = *link) {
+		if (d->holder != holder) { link = &d->next; continue; }
+		// UNLINK BEFORE RELEASING. The node usually lives inside the object being released, so the
+		// release is free to destroy it -- touching *link afterwards would be a use-after-free.
+		*link = d->next;
+		d->next = nullptr;
+		if (d->release && d->obj) d->release(d->obj);
+		++n;
+	}
+	return n;
+}
+
 void*& TaskScheduler::FiberLocal(size_t slot) noexcept {
 	// PER-THREAD FALLBACK RATHER THAN AN ASSERT. Off a fiber -- a Native task, a bare thread, main
 	// -- there is nowhere fiber-local to put anything, but returning a reference is the contract, so

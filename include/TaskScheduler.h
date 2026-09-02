@@ -2554,6 +2554,52 @@ namespace JLib {
 			return static_cast<T*>(FiberLocal(slot));
 		}
 
+		// ---- OWE A RELEASE UNTIL THIS FIBER DIES ----------------------------------------------
+		//
+		// The slots above hold a FIXED, SMALL set of well-known values. This holds an arbitrary
+		// number of objects, each allocated a DIFFERENT way -- one from `new`, one from an arena,
+		// one from a pool -- all owed by the same fiber and all released when it is recycled. That
+		// combination is the point: `owedKinds` already records which KINDS are outstanding, and
+		// this is where the payloads live.
+		//
+		// THE CALLER SUPPLIES THE NODE, and that is forced rather than chosen. FiberRegistry's
+		// dispatch path must not allocate -- a malloc on a death path is the allocation most likely
+		// to fail and a dropped cleanup is a resource never given back -- so there is nowhere to put
+		// a node the caller did not already own. Put the FiberDebt inside the object being
+		// registered and it costs two stores and no memory at all.
+		//
+		//     struct Buf { JLib::FiberDebt debt; char data[4096]; };
+		//     auto* b = new Buf();
+		//     TaskScheduler::DeleteOnFiberDeath(b->debt, b);      // `delete b` when the fiber dies
+		//
+		//     auto* p = MyArena::Alloc(n);                        // any allocator, via the raw form
+		//     TaskScheduler::ReleaseOnFiberDeath(node, p, &MyArena::Free);
+		//
+		// MEMORY ONLY. NOT EPOCHS, NOT HAZARDS. These run on whichever thread recycles the fiber,
+		// which is safe for memory -- SlabPool.h documents why freeing on another thread costs cache
+		// migration and nothing else -- and WRONG for anything thread-affine. Clearing an epoch slot
+		// from the wrong thread un-announces a slot that was never set there and frees nodes under a
+		// live traversal. Affine debts belong on FiberRegistry's creditor chain, which runs the
+		// release on the owing worker; that is the whole reason that chain exists.
+		//
+		// OFF A FIBER IT IS REFUSED, and returns false rather than leaking silently: there is no
+		// fiber to attach the debt to, so the caller still owns the object and needs to know.
+		static bool ReleaseOnFiberDeath(FiberDebt& node, void* obj,
+		                                void (*release)(void*) noexcept) noexcept;
+
+		// Release every debt `f` owes to THIS holder, and leave the rest linked for theirs. The
+		// creditor chain reaches each worker exactly once, so that visit must discharge all of the
+		// kinds it owes -- which is what the list is for. Returns how many ran, so "nothing owed"
+		// is distinguishable from "nothing happened".
+		static size_t DischargeFiberDebts(Fiber* f, size_t holder) noexcept;
+
+		template <typename T>
+		static bool DeleteOnFiberDeath(FiberDebt& node, T* p) noexcept {
+			if (!p) return false;
+			return ReleaseOnFiberDeath(node, p,
+				[](void* q) noexcept { delete static_cast<T*>(q); });
+		}
+
 		// ---- WHICH BRANCH DID A RESUME TAKE? (diagnostic, OFF unless JLIBSCHED_REQUEUE_TRACE) ---
 		//
 		// Requeue has three exits and they are indistinguishable from outside, which is exactly the
