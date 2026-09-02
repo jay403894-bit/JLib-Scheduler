@@ -1624,3 +1624,51 @@ suspend sites still abort, where the answer is unambiguous.
 the outer guard spans a migration and the ambiguity stops being benign -- it becomes the exact
 use-after-free the suspend check exists to prevent. Either dependents must not be fired inside the
 guard, or the walk must copy the edges first and drop the guard before firing. Not decided here.
+
+## Thread-local epoch bags: four structures became one
+
+    BEFORE                                   AFTER
+    moodycamel MPMC `incoming`               -
+    `pending` staging vector                 each thread's own carry-over, private
+    `reclaiming` CAS gate                    - (nothing shared to arbitrate)
+    retire = implicit-producer enqueue       vector::push_back
+
+**THE GATE EXISTED BECAUSE `pending` WAS SHARED.** One global staging vector means exactly one thread
+may drain into it. Per-thread bags give every reclaimer a private slice, so the gate is not optimised
+away -- it is unnecessary. All three go together; one shape, not three fixes.
+
+The retire path loses its atomic entirely. It was a moodycamel implicit-producer enqueue -- hash the
+thread, maybe allocate a block, copy 24 bytes -- and is now a `push_back` into a vector only the
+owner touches.
+
+`ShouldSelfReclaim()` asks **this thread's** bag rather than a global counter. With private bags a
+worker that retired nothing has nothing to reclaim however busy the pool has been; the global count
+would send it scanning every participant to free none of its own.
+
+Shape copied from `HazardDomain`'s `thread_local RetireBatch` -- orphan store, dead-bag flag and all
+-- rather than invented. That one already handles thread exit correctly and has been in service.
+
+### The behaviour change, and why it needed a test
+
+Only the OWNER drains its own bag. The old global queue meant ANY reclaimer freed EVERY retirement,
+so "the suite is green" used to imply memory came back. It no longer does, and **nothing in the suite
+asserted reclamation at all** -- survivable before, not now.
+
+`epoch_reclaim_test` covers four claims, and the middle two are the ones this rework introduced:
+
+    1. retire + tick  -> freed
+    2. NEGATIVE CONTROL: no tick -> NOTHING freed (else claim 1 passes on a build that frees eagerly)
+    3. another thread's tick does NOT drain a LIVE thread's bag  <- the documented change
+    4. a thread that retires and EXITS hands its bag off        <- the safety net for 3
+
+Without 4, private bags would make a short-lived thread an unconditional leak. Without 3 asserted,
+the change gets rediscovered later as a bug.
+
+**The skew cost is real and unmeasured:** a worker doing most of the removes accumulates on itself
+between its own ticks, where the global queue would have let an idle thread do the work. That is a
+tail cost, invisible to a throughput mean, and it is the price of deleting the gate.
+
+### Measured on a 31-worker box
+
+    MinActiveEpoch   0.629 us / 2016 slots   ->   0.015 us / 32 slots
+    guards/sec       1.65e9                  ->   3.60e9

@@ -26,6 +26,86 @@ namespace JLib {
 	struct PeriodicTask;
 	extern thread_local size_t thread_id;
 	inline std::atomic<size_t>  thread_counter;
+
+	// ---- PER-THREAD RETIRE BAGS -----------------------------------------------------------------
+	//
+	// Retiring is a POINT OPERATION that cannot suspend, so a thread-affine bag is sound where a
+	// thread-affine PROTECT cell would not be -- the same argument HazardDomain writes down for its
+	// own bag, and this shape is copied from there rather than invented.
+	//
+	// ONLY THE OWNER PUSHES AND ONLY THE OWNER DRAINS, so the vector needs no synchronisation at all.
+	// That is the entire win: retire was a moodycamel enqueue and is now a push_back.
+	//
+	// The garbage itself is NOT thread-affine -- a retired pointer's deleter is `delete` or a slab
+	// free, and SlabPool::Free routes by ADDRESS. The bag is affine because the CONTAINER is, which
+	// is why thread exit needs a handoff and nothing else does.
+	namespace detail {
+		struct EpochRetired {
+			void*  ptr;
+			size_t epoch;
+			void (*deleter)(void*);
+		};
+
+		// LEAKED ON PURPOSE. A thread_local destructor may run during process teardown, and a
+		// function-local static with a destructor could already be gone by then -- handing entries
+		// to a destroyed vector is a worse bug than the one being fixed. Same choice, same reason, as
+		// HazardDomain's orphan store and the registries.
+		struct EpochOrphanStore {
+			std::mutex mtx;
+			std::vector<EpochRetired> items;
+		};
+		inline EpochOrphanStore* const g_epochOrphans = new EpochOrphanStore();
+
+		// THE GATE, and why TryReclaim does not pay a mutex. Reclaim runs on a threshold and on every
+		// Tick, so it is warm; the orphan sweep is for a case that never happens in a healthy run.
+		// One relaxed load of a line that stays 0 keeps the cost at zero until something is stranded.
+		inline std::atomic<size_t> g_epochOrphanCount{ 0 };
+
+		struct EpochRetireBatch {
+			std::vector<EpochRetired> items;
+			~EpochRetireBatch();
+		};
+		inline thread_local EpochRetireBatch t_epochBag;
+
+		// SET BY ~EpochRetireBatch, and it must OUTLIVE the batch. A bool with constant
+		// initialization has no destructor, so it is still readable while other thread_locals are
+		// being destroyed -- and one of those may itself retire, which would otherwise touch a dead
+		// vector. After the flag is up, retire goes straight to the orphan store.
+		inline thread_local bool t_epochBagDead = false;
+
+		inline EpochRetireBatch& EpochBag() { return t_epochBag; }
+
+		inline void OrphanEpochEntries(std::vector<EpochRetired>& v) {
+			if (v.empty()) return;
+			std::lock_guard<std::mutex> lk(g_epochOrphans->mtx);
+			for (auto& e : v) g_epochOrphans->items.push_back(e);
+			g_epochOrphanCount.store(g_epochOrphans->items.size(), std::memory_order_release);
+			v.clear();
+		}
+
+		// A BAG ABANDONED AT THREAD EXIT IS NOT DELAYED RECLAMATION, IT IS A LEAK -- the deleter
+		// simply never runs. Handing the leftovers to a global store any later reclaim sweeps is
+		// what makes a short-lived thread safe to retire from.
+		inline EpochRetireBatch::~EpochRetireBatch() {
+			t_epochBagDead = true;
+			OrphanEpochEntries(items);
+		}
+
+		// Returns how many were freed. Takes the mutex, which is why it is gated.
+		inline size_t SweepEpochOrphans(size_t safeEpoch) {
+			std::lock_guard<std::mutex> lk(g_epochOrphans->mtx);
+			auto& v = g_epochOrphans->items;
+			size_t kept = 0, freed = 0;
+			for (size_t i = 0; i < v.size(); ++i) {
+				if (v[i].epoch < safeEpoch) { v[i].deleter(v[i].ptr); ++freed; }
+				else                        { v[kept++] = v[i]; }
+			}
+			v.resize(kept);
+			g_epochOrphanCount.store(v.size(), std::memory_order_release);
+			return freed;
+		}
+	}
+
 	class EpochManager {
 	private:
 		std::vector<std::atomic<size_t>*> participants;
@@ -35,13 +115,26 @@ namespace JLib {
 			size_t epoch;     // epoch at which it was retired
 			void (*deleter)(void*);
 		};
-		// Producers (RetirePtr, i.e. a list remove) enqueue here LOCK-FREE.
-		moodycamel::ConcurrentQueue<GlobalRetired> incoming;
-		// Owned exclusively by the single active reclaimer (gated by `reclaiming`): holds
-		// drained entries not yet safe to free. No lock needed -- only one thread touches it.
-		std::vector<GlobalRetired> pending;
-		std::atomic<bool>   reclaiming{ false };   // only one reclaimer at a time
-		std::atomic<size_t> retiredCount{ 0 };     // approx live retired count; drives self-reclaim
+		// ---- THE GLOBAL RETIRE QUEUE IS GONE. THREE STRUCTURES BECAME ONE. ----------------------
+		//
+		// It was: a moodycamel MPMC `incoming` that every retire enqueued into, a `pending` staging
+		// vector holding drained-but-not-yet-safe entries, and a `reclaiming` CAS so exactly one
+		// thread could own `pending`.
+		//
+		// THE GATE EXISTED **BECAUSE** `pending` WAS SHARED. One global staging vector means exactly
+		// one thread may be draining into it. Per-thread bags give every reclaimer a private slice,
+		// so there is nothing left to arbitrate -- the gate is not optimised away, it is
+		// unnecessary. All three go together; it is one shape, not three fixes.
+		//
+		// AND THE RETIRE PATH LOSES ITS ATOMIC ENTIRELY. It was a moodycamel implicit-producer
+		// enqueue -- a thread-hash lookup, possibly a block allocation, and a 24-byte copy. It is
+		// now a push_back into a vector only this thread ever touches. The carry-over of entries
+		// that are not yet safe IS `pending`, except private instead of contended.
+		//
+		// See EpochRetireBatch below. The shape is copied from HazardDomain's thread_local
+		// RetireBatch, orphan store and all, rather than invented -- that one already handles thread
+		// exit correctly and has been in service.
+		std::atomic<size_t> retiredCount{ 0 };     // approx live retired count; DIAGNOSTIC ONLY now
 
 		// Whether workers self-trigger reclamation. See SetSelfReclaim() for the contract.
 		//
@@ -182,32 +275,39 @@ namespace JLib {
 #endif
 			return &threadEpochs[tid]->localEpoch;
 		}
+		// EACH THREAD RECLAIMS ITS OWN BAG. No gate, because there is nothing shared to arbitrate --
+		// see the note where `incoming`/`pending`/`reclaiming` used to be.
+		//
+		// ONE MinActiveEpoch CALL FOR THE WHOLE PASS, not one per entry: it is a scan over every
+		// participant and the answer cannot change in a way that makes MORE things unsafe partway
+		// through (the minimum only rises). Hoisting it is correct, not merely faster.
 		void TryReclaim() {
-			// One reclaimer at a time. Others bail -- reclaim is cold and idempotent. This
-			// makes the reclaimer effectively single-threaded, so `pending` needs no lock
-			// even though RetirePtr runs concurrently (it only touches `incoming`).
-			bool expected = false;
-			if (!reclaiming.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			auto& bag = detail::EpochBag();
+			if (bag.items.empty() && detail::g_epochOrphanCount.load(std::memory_order_relaxed) == 0)
 				return;
 
-			// 1. Drain what producers enqueued into our private list.
-			GlobalRetired item;
-			while (incoming.try_dequeue(item))
-				pending.push_back(item);
+			const size_t safeEpoch = MinActiveEpoch();
+			size_t freed = 0;
 
-			// 2. Free what's now safe; compact survivors to the front. EBR keeps entries
-			//    whose epoch >= safeEpoch -- a reader may still be able to reach them.
-			size_t safeEpoch = MinActiveEpoch();
-			size_t kept = 0, freed = 0;
-			for (size_t i = 0; i < pending.size(); ++i) {
-				if (pending[i].epoch < safeEpoch) {
-					pending[i].deleter(pending[i].ptr);
+			// Free what is now safe; compact survivors to the front. EBR keeps entries whose epoch
+			// >= safeEpoch -- a reader may still be able to reach them.
+			size_t kept = 0;
+			for (size_t i = 0; i < bag.items.size(); ++i) {
+				if (bag.items[i].epoch < safeEpoch) {
+					bag.items[i].deleter(bag.items[i].ptr);
 					++freed;
 				} else {
-					pending[kept++] = pending[i];
+					bag.items[kept++] = bag.items[i];
 				}
 			}
-			pending.resize(kept);
+			bag.items.resize(kept);
+
+			// AND SWEEP WHAT ABANDONED THREADS LEFT. Gated on a relaxed counter that stays 0 in a
+			// healthy process, so this costs one load on the common path -- the same arrangement
+			// HazardDomain uses, and for the same reason: the orphan case never happens until it
+			// does, and then nothing else would ever free those entries.
+			if (detail::g_epochOrphanCount.load(std::memory_order_acquire) != 0)
+				freed += detail::SweepEpochOrphans(safeEpoch);
 			// Guarded symmetrically with the increment in RetirePtr. With self-reclaim off nothing
 			// ever increments this, so an unguarded subtract would wrap size_t to a huge value on
 			// the first manual Tick(). Harmless while disabled -- ShouldSelfReclaim() short-circuits
@@ -215,8 +315,6 @@ namespace JLib {
 			// of RetiredCount(), which is exactly the sort of quietly-wrong number that wastes an
 			// afternoon later.
 			if (selfReclaim && freed) retiredCount.fetch_sub(freed, std::memory_order_relaxed);
-
-			reclaiming.store(false, std::memory_order_release);
 		}
 		// Approximate count of pointers awaiting reclamation. Workers poll this to
 		// self-trigger Tick() under load, so reclamation no longer depends solely on an
@@ -226,8 +324,14 @@ namespace JLib {
 		// THE ONE PLACE that decides whether a worker should stop and reclaim. The four call sites
 		// (three in Worker(), one in TaskScheduler) previously each spelled the comparison out, so
 		// this also removes four copies of a predicate that must agree.
+		// ASKS **THIS THREAD'S** BAG, not the global count. With per-thread bags a worker that has
+		// retired nothing has nothing to reclaim, however busy the rest of the pool has been -- the
+		// global counter would send it scanning every participant to free none of its own.
+		//
+		// A plain .size() on a vector this thread owns: no atomic, and no shared line to touch on a
+		// predicate that runs on every task completion.
 		bool ShouldSelfReclaim() const {
-			return selfReclaim && RetiredCount() > ReclaimThreshold();
+			return selfReclaim && detail::t_epochBag.items.size() > ReclaimThreshold();
 		}
 
 		// Turn OFF worker self-triggered reclamation, making Tick() the caller's job.
@@ -330,10 +434,23 @@ namespace JLib {
 	
 		template<typename T>
 		void RetirePtr(T* p, size_t epoch, DeleterFunc d) {
-			incoming.enqueue(GlobalRetired{ (void*)p, epoch, d });   // lock-free
-			// The ONLY atomic in this path, and the only reason it exists is to let workers
-			// self-trigger. With self-reclaim off the counter has no reader, so skip it entirely --
-			// that is the whole saving SetSelfReclaim(false) offers.
+			// A PUSH INTO A VECTOR ONLY THIS THREAD TOUCHES. No queue, no atomic, no producer
+			// lookup -- this was a moodycamel implicit-producer enqueue, which hashes the thread,
+			// may allocate a block, and copies 24 bytes.
+			//
+			// THE DEAD-BAG CHECK IS NOT PARANOIA. thread_locals are destroyed in an order nobody
+			// controls, and one destroyed later than this bag may itself retire -- pushing into a
+			// vector whose storage is already gone. After the flag is up, entries go straight to the
+			// orphan store, which is leaked and therefore always valid.
+			if (detail::t_epochBagDead) {
+				std::vector<detail::EpochRetired> one{ detail::EpochRetired{ (void*)p, epoch, d } };
+				detail::OrphanEpochEntries(one);
+			} else {
+				detail::EpochBag().items.push_back(detail::EpochRetired{ (void*)p, epoch, d });
+			}
+			// DIAGNOSTIC ONLY NOW. The self-reclaim DECISION is thread-local (see
+			// ShouldSelfReclaim); this keeps RetiredCount() meaning what it used to mean for anyone
+			// reading it, and stays gated so the disabled path pays nothing.
 			if (selfReclaim) retiredCount.fetch_add(1, std::memory_order_relaxed);
 #if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
 			// DEV-ONLY: make "disabled and never ticked" loud instead of silent.

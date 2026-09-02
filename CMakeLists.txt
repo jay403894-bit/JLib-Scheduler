@@ -1101,6 +1101,16 @@ endif()
 # THE PUBLIC JOB IS A FIBER. Asserts the BEHAVIOUR, not the type tag: a plain CreateTask must be
 # able to suspend and resume (illegal under the old Native default), and ParallelFor grains must
 # still take no fiber, or grain concurrency silently becomes bounded by the fiber pool.
+# EPOCH RECLAMATION ACTUALLY FREES. Nothing asserted this before, which was survivable while a
+# global queue meant any reclaimer drained every retirement. Per-thread bags mean only the OWNER
+# drains its own, so a green suite no longer implies memory comes back. Carries its own negative
+# control (no tick -> nothing freed) and asserts the behaviour change explicitly: another thread's
+# tick does not drain a live thread's bag, and a thread that exits hands its bag off rather than
+# stranding it.
+add_executable(SchedulerEpochReclaimTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/epoch_reclaim_test.cpp")
+target_link_libraries(SchedulerEpochReclaimTest PRIVATE Scheduler)
+target_compile_features(SchedulerEpochReclaimTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerEverythingIsAFiberTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/everything_is_a_fiber_test.cpp")
 target_link_libraries(SchedulerEverythingIsAFiberTest PRIVATE Scheduler)
 target_compile_features(SchedulerEverythingIsAFiberTest PRIVATE cxx_std_17)
