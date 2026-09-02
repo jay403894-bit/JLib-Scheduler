@@ -52,7 +52,10 @@ that reports get acted on -- not as a response time. During a work week the same
 have taken weeks, and a report may sit for a while before anyone looks at it. Nothing here is
 staffed.
 
-Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · macOS Apple Silicon · C++17 (C++20 for optional coroutines) · BSD
+Windows x64 & ARM64 (MSVC) · Linux x86-64 · Linux/Android AArch64 · C++17 (C++20 for optional coroutines) · BSD
+
+macOS Apple Silicon builds and runs the **scheduler only** -- see [Build](#build) for what that
+excludes and why it is stated that narrowly.
 
 
 I built this scheduler to solve the problem of scheduling for my custom 2d/3d engine  -- it was built to be the backbone of multithreaded simulation engines.
@@ -640,7 +643,7 @@ exhaustive rather than lucky. Models live in `tests/verify/`.
   `immediate` protocol that lets a push skip the mutex+notify when the target is already awake.
   32 executions clean as shipped. Its own history is the cautionary tale for this whole section: an
   earlier, single-flag version of this same model passed clean, the protocol was built from it, and
-  1.2.0 shipped a lost wakeup that hung macOS arm64 in CI about one run in three -- the model was not
+  1.2.0 shipped a lost wakeup that hung macOS arm64 about one run in three -- the model was not
   wrong about what it modelled, it just modelled a decision with two fewer inputs than the real one.
 - **Fiber wait/resume handshake** (`fiberwait_model.c`) - `SchedulerMutex`/`Semaphore`/`CondVar`'s
   queue-then-mark-parkable ordering. This is the exact handshake that shipped broken in 1.3.4: publish
@@ -708,20 +711,27 @@ and shared with the POSIX AArch64 build rather than duplicated.
 Never two of the same kind -- they define the same symbols, and a static library will not diagnose
 that. It silently links whichever one it reaches first.
 
-Every platform below runs the full test suite in CI on every push:
+The platforms below build and run the test suite:
 
 > **The Linux tree did not build end to end until 5.0.0.** Two benches included `<windows.h>`
 > unconditionally, and as unconditional CMake targets they aborted `cmake --build` partway through --
 > so every target after them in build order was silently never produced. That is worth knowing when
 > reading any historical claim about Linux coverage: the suite ran, but not all of it existed.
 
-| OS | Arch | Toolchain |
-| --- | --- | --- |
-| Windows | x86-64 | MSVC |
-| Windows | ARM64 | MSVC (`armasm64`) |
-| Linux | x86-64 | GCC |
-| Linux / Android | AArch64 | GCC / Clang |
-| macOS | arm64 | AppleClang |
+| OS | Arch | Toolchain | Scope |
+| --- | --- | --- | --- |
+| Windows | x86-64 | MSVC | Everything, including the I/O reactor. Primary development target. |
+| Windows | ARM64 | MSVC (`armasm64`) | Everything. |
+| Linux | x86-64 | GCC | Scheduler, plus the io_uring reactor (sockets). |
+| Linux / Android | AArch64 | GCC / Clang | Scheduler. Android has no reactor -- io_uring is refused by policy. |
+| macOS | arm64 | AppleClang | **Scheduler only.** See below. |
+
+**macOS is the scheduler and nothing beyond it.** The context switch, the `src/darwin/` layer and the
+job system are there and were written to work; the I/O reactor is not, and will not be claimed until
+somebody can actually run it. `IsAvailable()` returns false, there is no kqueue backend, and I have
+no Apple hardware to write or verify one on -- so anything I shipped there would be untested code
+wearing a support claim. Treat macOS as: it runs tasks, fibers and the parallel algorithms; it does
+no I/O.
 
 ### CPU features on x86-64
 
@@ -764,8 +774,8 @@ caller-saved, so that routine has no vector block and executes no legacy-SSE ins
 ### iOS
 
 **Untested, not supported.** iOS, tvOS, watchOS and visionOS are arm64 Darwin, so they use the same
-context switch and `src/darwin/` layer that macOS arm64 uses and that CI verifies -- but nobody has
-run the result, and I have no Apple hardware to do it. Opt in with:
+context switch and `src/darwin/` layer that macOS arm64 uses -- but nobody has run the result, and I
+have no Apple hardware to do it. Opt in with:
 
 ```
 cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -824,7 +834,7 @@ or the `io_uring_disabled` sysctl reports false on a binary that supports it.
 | Linux x86-64 / AArch64 | io_uring | **Live as of 5.0.0.** Sockets pass end to end. |
 | Linux without io_uring | — | **Not implemented.** `IsAvailable()` is false. |
 | Android | — | Same: io_uring is usually refused by policy, so no reactor. |
-| macOS | — | `IsAvailable()` is false; no reactor. |
+| macOS | — | `IsAvailable()` is false; no reactor, and no kqueue backend until there is hardware to verify one on. |
 
 **What "sockets pass end to end" covers**, so it is not read as more than it is: accept, connect,
 send, recv, vectored send, a peer close as a zero-byte completion, the acceptor pool, `Stop` drain,
@@ -1232,7 +1242,7 @@ cgroups own thread placement, so the affinity calls either fail for an unprivile
 and are immediately overridden. `Hard` and `Ideal` are effectively `None`, and topology-aware
 stealing is correspondingly approximate. Read nothing into timings there -- unconstrained thermal
 throttling and heterogeneous cores mean a phone benchmark describes the phone. Verified by hand on
-Termux rather than in CI, which covers Linux AArch64 on glibc but not bionic.
+Termux, which covers Linux AArch64 on glibc but not bionic.
 
 **Above 64 logical CPUs**, binding goes through `SetThreadGroupAffinity`/`SetThreadIdealProcessorEx`,
 which take the processor group as data -- `SetThreadAffinityMask` takes it from the calling thread
