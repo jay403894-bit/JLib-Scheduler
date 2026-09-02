@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
                 g_entered.fetch_add(1, std::memory_order_relaxed);
                 sched.WaitOnEvent(name);
                 g_resumed.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             if (!t) { printf("FAIL: CreateTask returned null (round %d)\n", round); return 1; }
             t->waitGroup = &wg;
             sched.Push(t);

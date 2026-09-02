@@ -572,7 +572,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                                       if (g_released.load(std::memory_order_acquire))
                                           g_ioEvent->SignalAll();
                                   });
-                              }, nullptr, false, JLib::TaskType::Fiber)
+                              }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber)
                             : jl.CreateTask(+[](void* p) {
                                   NoteBlkWorker();
                                   g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
@@ -699,7 +699,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
         JLib::WaitGroup wg; wg.n.store(N, std::memory_order_relaxed);
         auto t0 = Clock::now();
         for (int i = 0; i < N; ++i) {
-            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr, false, JLib::TaskType::Fiber);
+            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &wg; jl.Push(t);
         }
         jl.WaitFor(wg);
@@ -713,7 +713,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
             JLib::Task* t = jl.CreateTask(+[](void*) {
                 JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
                 s.WaitOnEventArmed(*g_ioEvent, [] { g_ioEvent->SignalAll(); });
-            }, nullptr, false, JLib::TaskType::Fiber);
+            }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &wg; jl.Push(t);
         }
         jl.WaitFor(wg);
@@ -755,7 +755,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
             auto t0 = Clock::now();
             for (int i = 0; i < N; ++i) {
                 JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr,
-                                              false, JLib::TaskType::Fiber);
+                                              JLib::Lane::Normal, JLib::TaskType::Fiber);
                 t->waitGroup = &wg; jl.Push(t);
             }
             jl.WaitFor(wg);
@@ -769,7 +769,7 @@ static void BenchFiberBreakdown(JLib::TaskScheduler& jl) {
                 JLib::Task* t = jl.CreateTask(+[](void*) {
                     JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
                     s.WaitOnEventArmed(*g_ioEvent, [] { g_ioEvent->SignalAll(); });
-                }, nullptr, false, JLib::TaskType::Fiber);
+                }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
                 t->waitGroup = &wg; jl.Push(t);
             }
             jl.WaitFor(wg);
@@ -1009,7 +1009,7 @@ int main(int argc, char** argv) {
     if (g_doJ) {
         JLib::WaitGroup wg; wg.n.store(4096, std::memory_order_relaxed);
         for (int i = 0; i < 4096; ++i) {
-            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr, false,
+            JLib::Task* t = jl.CreateTask(+[](void*) {}, nullptr, JLib::Lane::Normal,
                                           g_jlType);
             t->waitGroup = &wg; jl.Push(t);
         }

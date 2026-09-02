@@ -88,9 +88,9 @@ static void Arm(const char* name, size_t floor) {
 
     int created = 0;
     for (int i = 0; i < kTasks; ++i) {
-        // ORDINARY: loPri, Native, CorePref::Default. hiPri is routed INTO the reserved band on
+        // ORDINARY: loPri, Native, CorePref::Default. lane is routed INTO the reserved band on
         // purpose and would be a different question entirely.
-        JLib::Task* t = sched.CreateTask(Payload, nullptr, /*hiPri*/ false,
+        JLib::Task* t = sched.CreateTask(Payload, nullptr, /*lane*/ JLib::Lane::Normal,
                                          JLib::TaskType::Native, JLib::CorePref::Default);
         if (!t) break;
         sched.Push(t);

@@ -476,7 +476,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl, enki::TaskScheduler& enki_) {
                                       s.GetEvent("compare_io").SignalAll();
                               });
                               g_blockersLeft.fetch_sub(1, std::memory_order_acq_rel);
-                          }, nullptr, false, JLib::TaskType::Fiber)
+                          }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber)
                         : jl.CreateTask(+[](void* p) {
                               g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                std::memory_order_relaxed);

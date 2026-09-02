@@ -330,7 +330,7 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
                 if (released.load(std::memory_order_acquire)) evp->SignalAll();
             });
             finished.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::TaskType::Fiber);
+        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null under fiber pressure"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -552,7 +552,7 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
         wg.n.store(kPerRound, std::memory_order_relaxed);
         for (int i = 0; i < kPerRound; ++i) {
             JLib::Task* t = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); },
-                                             false, JLib::TaskType::Native);
+                                             JLib::Lane::Normal, JLib::TaskType::Native);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -625,7 +625,7 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                     inside.fetch_sub(1, std::memory_order_acq_rel);
                     if (useLock) m->Unlock();
                 }
-                }, false, JLib::TaskType::Fiber);
+                }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             if (!task) return std::pair<int, int>{ -1, -1 };
             task->waitGroup = &wg;
             sched.Push(task);
@@ -689,7 +689,7 @@ static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
     wg.n.store(1, std::memory_order_relaxed);
     // `body` passed directly, as an lvalue. This did not compile until LambdaTask gained a const&
     // constructor -- see TestCreateTaskAcceptsNamedCallable below, which guards it.
-    JLib::Task* t = sched.CreateTask(body, false, JLib::TaskType::Fiber);
+    JLib::Task* t = sched.CreateTask(body, JLib::Lane::Normal, JLib::TaskType::Fiber);
     if (!t) { Check(false, "CreateTask returned null"); return; }
     t->waitGroup = &wg;
     sched.Push(t);
@@ -730,7 +730,7 @@ static void TestConditionVariableFiber(JLib::TaskScheduler& sched) {
         heldAfterWake.store(!m.Try_Lock(), std::memory_order_release);
         m.Unlock();
         finished.store(true, std::memory_order_release);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
     if (!waiter) { Check(false, "CreateTask returned null"); return; }
     waiter->waitGroup = &wg;
     sched.Push(waiter);
@@ -771,7 +771,7 @@ static void TestConditionVariableNotifyAll(JLib::TaskScheduler& sched) {
             while (!ready) cv.Wait(m);
             m.Unlock();
             woke.fetch_add(1, std::memory_order_release);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -897,7 +897,7 @@ static void TestEventSignalOne(JLib::TaskScheduler& sched) {
             parked.fetch_add(1, std::memory_order_relaxed);
             s.WaitOnEvent(*evp);
             woke.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::TaskType::Fiber);
+        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -947,7 +947,7 @@ static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
             parked2.fetch_add(1, std::memory_order_relaxed);
             s.WaitOnEvent(*evp2);
             woke2.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, false, JLib::TaskType::Fiber);
+        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);

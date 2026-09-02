@@ -543,7 +543,7 @@ namespace JLib {
 		// ---- THE AWAKE FLOOR: how many workers are never allowed to park ----------------------
 		//
 		// THE ONE LOAD-BEARING IDEA LEFT FROM K-HOT, with everything incidental stripped off: no
-		// lane, no hiPri queues, no priority tag on Task, no controller. Just a count.
+		// lane, no lane queues, no priority tag on Task, no controller. Just a count.
 		//
 		// WHY IT IS NEEDED, measured rather than assumed. Letting every worker park fixed the idle
 		// tax and every bimodal row in the bench -- throughput/mp had been 1.7-2.0x bimodal in every
@@ -741,9 +741,9 @@ namespace JLib {
 		static void     ResetYieldCounters() noexcept;
 		static void     NoteYieldAim(bool reaimed) noexcept;
 
-		// ---- LANE OVERFLOW: KEEP hiPri WORK REACHABLE WHEN ITS OWNER CANNOT REACH IT ----------
+		// ---- LANE OVERFLOW: KEEP lane WORK REACHABLE WHEN ITS OWNER CANNOT REACH IT ----------
 		//
-		// Returns the worker a hiPri task should ACTUALLY go to, given the one placement picked.
+		// Returns the worker a lane task should ACTUALLY go to, given the one placement picked.
 		// Normally that is `chosen` unchanged; it differs only when `chosen` already has a lane
 		// task queued AND is inside a task body, which is the one state in which the queued task
 		// is reachable by nobody.
@@ -758,11 +758,11 @@ namespace JLib {
 		// NOT A DEQUE, AND THAT IS THE POINT. The lane was deliberately reduced to an inbox because
 		// staging latency work into a bulk structure is an O(depth) unload -- exactly the cost the
 		// lane exists to avoid, measured at roughly half the io p99. This adds no structure: the
-		// overflow goes to another worker's hiPri INBOX, which every worker drains before its own
-		// deque, so it keeps hiPri priority instead of being demoted into bulk work.
+		// overflow goes to another worker's lane INBOX, which every worker drains before its own
+		// deque, so it keeps lane priority instead of being demoted into bulk work.
 		static size_t HiPriSpillTarget(size_t chosen) noexcept;
 
-		// How many hiPri pushes were redirected by HiPriSpillTarget. Zero on a healthy lane; a
+		// How many lane pushes were redirected by HiPriSpillTarget. Zero on a healthy lane; a
 		// rising count means completions are arriving faster than the reserved band retires them,
 		// which is the K controller's promote case, not an error.
 		static unsigned long long GetHiPriSpillCount() noexcept;
@@ -801,7 +801,7 @@ namespace JLib {
 		static unsigned long long GetLaneStrandIdleWideCount() noexcept;
 
 		// NoteHiPriStaged / GetHiPriStagedCount WERE HERE and are gone with the lane deque. They
-		// counted lane tasks a worker unloaded into hiPri[qIndex] at dispatch. With no deque there
+		// counted lane tasks a worker unloaded into lane[qIndex] at dispatch. With no deque there
 		// is no unload, so the counter had no writer -- and a diagnostic that can only ever report
 		// zero is worse than an absent one, because a reader takes the zero for a measurement.
 		// Lane reachability is now one number, the spill above.
@@ -820,7 +820,7 @@ namespace JLib {
 		// that certainly cannot help.
 		//
 		// THE OLD LANE WAKE WAS REMOVED FOR A REASON THAT NO LONGER HOLDS. UpdateLaneHint records
-		// it: "with the hiPri deque gone there is nothing for a woken worker to steal" -- waking a
+		// it: "with the lane deque gone there is nothing for a woken worker to steal" -- waking a
 		// worker to look at an MPSC it may not touch is pure cost, and the measurements that killed
 		// it were taken in exactly that world. With the deque back the woken worker has something
 		// it is allowed to take, which is the entire difference.
@@ -1063,7 +1063,7 @@ namespace JLib {
 
 		// The floor the process ASKED for, as opposed to GetAwakeFloor() which is what it is right
 		// now -- growth may hold it above the base for the length of a wave.
-		// Workers [0, R) take hiPri work only; ordinary placement skips them. R must be <= the awake
+		// Workers [0, R) take lane work only; ordinary placement skips them. R must be <= the awake
 		// floor, or a reserved worker parks and a completion pays the wake this exists to avoid.
 		// Does a reserved worker refuse to park? Default FALSE: reservation already guarantees it is
 		// not stuck inside a compute leaf, which is the property I/O needs. Never sleeping is a
@@ -1232,7 +1232,7 @@ namespace JLib {
 		// step with the bounds.
 		//
 		// minK is forced to >= 1 only when the range can actually move. At K=0 the lane does not
-		// exist at all -- hiPri routes to the ordinary lane and no worker serves it -- so a
+		// exist at all -- lane routes to the ordinary lane and no worker serves it -- so a
 		// controller starting there has nothing to observe and could never ramp up. Absorbing under
 		// scaling; perfectly fine as a fixed point, which is what (0,0) means.
 		//
@@ -1394,22 +1394,22 @@ namespace JLib {
 
 		// THE TWO PREDICATES THAT DEFINE THE LOW-LATENCY LANE. Everything -- push routing, inbox
 		// draining, deque popping, steal probes, the sleep predicate -- asks one of these rather than
-		// open-coding the condition. Nine sites read the hiPri lane; a copy of the rule at each is
+		// open-coding the condition. Nine sites read the lane lane; a copy of the rule at each is
 		// how the pickup-discard invariant drifted three times, so there are no copies.
 		//
-		// THE LANE ONLY EXISTS WHEN SOMEONE SERVES IT. At K=0 a hiPri task routes to the ordinary
-		// lane and NOBODY probes hiPri -- which makes the default pool's worker loop CHEAPER than it
+		// THE LANE ONLY EXISTS WHEN SOMEONE SERVES IT. At K=0 a lane task routes to the ordinary
+		// lane and NOBODY probes lane -- which makes the default pool's worker loop CHEAPER than it
 		// was before any of this: one inbox, one deque, one steal probe per victim.
 		//
-		// hiPri was never a real priority queue -- per-worker queues plus stealing gave no global
+		// lane was never a real priority queue -- per-worker queues plus stealing gave no global
 		// ordering, so "picked up first" cost every worker a second inbox, a second deque and a
 		// second probe per victim to buy something close to a coin flip. It has a job now, and only
 		// where it has one.
 		// ---- HIPRI IS A ROUTE, NOT A RESERVED LANE (4.0.2) ------------------------------------
 		//
-		// This used to be `GetHotWorkers() > 0`, so with K stubbed to 0 every hiPri push collapsed to
-		// loPri and the reactor.s steering became a no-op. Priority now works WITHOUT K: a hiPri push
-		// goes to a worker.s hiPri INBOX, every worker drains hiPri before its own deque, and the
+		// This used to be `GetHotWorkers() > 0`, so with K stubbed to 0 every lane push collapsed to
+		// loPri and the reactor.s steering became a no-op. Priority now works WITHOUT K: a lane push
+		// goes to a worker.s lane INBOX, every worker drains lane before its own deque, and the
 		// AWAKE FLOOR is what makes that fast -- the push is steered at a worker that never parks, so
 		// an I/O completion lands on a running thread without buying a wake.
 		//
@@ -1419,14 +1419,14 @@ namespace JLib {
 		// worker it was steered to -- ordering wins the race, not isolation.
 		// ---- THE FLOOR-LANE VARIANT: A LANE WITHOUT A RESERVATION -----------------------------
 		//
-		// EXPERIMENT, DEFAULT OFF. Routes hiPri at the awake floor [K, K+F) instead of the reserved
+		// EXPERIMENT, DEFAULT OFF. Routes lane at the awake floor [K, K+F) instead of the reserved
 		// band, so completions land on a worker that is guaranteed AWAKE but is also running bulk.
-		// It is the configuration behind PickNextWorker's recorded "hiPri was briefly steered at the
+		// It is the configuration behind PickNextWorker's recorded "lane was briefly steered at the
 		// unreserved floor, and it lost" -- whose harness no longer existed when the question came
 		// back, so the claim could neither be reproduced nor re-run at a different grain.
 		//
 		// NOTHING ON THE CONSUMER SIDE CHANGES, and that is why this is a routing flag rather than a
-		// design. Every worker already pops its own hiPri inbox before its own deque, reserved or
+		// design. Every worker already pops its own lane inbox before its own deque, reserved or
 		// not (see Worker()'s lane block, gated only on `!task_to_run`). The inbox is per worker, it
 		// is FIFO, and ordering within it is preserved -- which is the property a strand needs and
 		// the reason a shared MPMC cannot serve this.
@@ -1463,28 +1463,28 @@ namespace JLib {
 		//
 		// K > 0: only the hot ones, so N-K workers halve their search -- half the inbox checks, half
 		// the deque checks, half the steal probes. That is the structural win, and it is why
-		// ordinary workers must NOT steal hiPri: letting them means they have to probe it.
+		// ordinary workers must NOT steal lane: letting them means they have to probe it.
 		//
 		// K == 0: EVERY worker serves it, exactly as before any of this existed. Without that clause
-		// nobody drains a hiPri lane at the default setting, and anything that reaches one -- a task
+		// nobody drains a lane lane at the default setting, and anything that reaches one -- a task
 		// queued before K changed, the shutdown drain, any push site the collapse missed -- strands
 		// forever while the pool spins looking for work it refuses to take. Making correctness
 		// depend on catching every push site was the fragile half of this design; this makes the
 		// safe case the DEFAULT case and leaves the optimisation to the configuration that asked
 		// for it.
 		// K == 0 RETURNS FALSE FOR EVERYONE, and that is the dead-lane elimination: PickNextWorker
-		// routes hiPri to the hot set only, so at K=0 nothing can enter a hiPri lane and scanning
+		// routes lane to the hot set only, so at K=0 nothing can enter a lane lane and scanning
 		// one is provably wasted work at the DEFAULT setting.
 		//
 		// ================================================================================================
 		// PRIORITY BELONGS TO THE TASK, AND NOTHING MAY OVERRIDE IT ON RESUME.
 		//
-		// A task's hiPri is set once, at CreateTask, and defaults to 0. Push, Requeue and PushLocal
+		// A task's lane is set once, at CreateTask, and defaults to 0. Push, Requeue and PushLocal
 		// all route on it; IoReactor splits its completion batch by it precisely so PushBatch taking
 		// priority as a PARAMETER cannot quietly drop it. There is no path that promotes a task to
 		// the lane behind the caller's back, and there must not be one.
 		//
-		// THE TEMPTING CHANGE IS "RESUMES SHOULD BE hiPri" -- a woken fiber or coroutine is latency
+		// THE TEMPTING CHANGE IS "RESUMES SHOULD BE lane" -- a woken fiber or coroutine is latency
 		// sensitive, the argument goes, so put it on the fast lane. It is wrong for a reason that has
 		// nothing to do with how long the resumed body runs:
 		//
@@ -1501,7 +1501,7 @@ namespace JLib {
 		// of their idle passes beside a buried sibling. Lane stealing drains the queue behind such a
 		// task but cannot touch the task itself.
 		//
-		// So hiPri stays OPT-IN, per task, defaulting off -- and setting it is a claim about the work
+		// So lane stays OPT-IN, per task, defaulting off -- and setting it is a claim about the work
 		// ("every resume of this is short, and it is worth one of my K slots"), not a request for
 		// speed. Only the caller can make that claim; the scheduler cannot infer it.
 		// ================================================================================================
@@ -1510,9 +1510,9 @@ namespace JLib {
 		// would strand it. The worker sites pair this with a cheap non-empty check on their OWN
 		// queues (a local cache line, one load) so anything stranded is still drained. Remote probes
 		// get no such fallback: those are the ping-pong, and there is nothing to rescue there.
-		// EVERY worker serves hiPri now. It used to be the K hot workers only, which at K=0 meant
-		// nobody -- so a task in a hiPri inbox was drained by the stray path or not at all. With
-		// priority expressed as ORDER rather than as a reserved subset, every worker checks its hiPri
+		// EVERY worker serves lane now. It used to be the K hot workers only, which at K=0 meant
+		// nobody -- so a task in a lane inbox was drained by the stray path or not at all. With
+		// priority expressed as ORDER rather than as a reserved subset, every worker checks its lane
 		// inbox before its own deque and before stealing.
 		// WorkerServesHiPri(q) IS GONE. It was `q < GetHotWorkers()` -- a third name for the question
 		// the worker already answers as `q < bandsNow.k`, and a second load to answer it with. Ask
@@ -1881,8 +1881,8 @@ namespace JLib {
 		// worker". That distinction is why this lives here and not on TaskMPSCQueue, where a
 		// try-push would be a check that can never fail.
 		//
-		// REQUIRES A hiPri TASK, and returns false for anything else rather than placing it. K reads
-		// only its hiPri inbox, so a loPri task sent to a reserved worker is not deprioritised, it is
+		// REQUIRES A lane TASK, and returns false for anything else rather than placing it. K reads
+		// only its lane inbox, so a loPri task sent to a reserved worker is not deprioritised, it is
 		// UNREACHABLE -- inbox work is unstealable and K never looks. That exact routing hung the
 		// whole reactor until 9-02. Refusing here means a caller that gets it wrong sees a false and
 		// sends the task to the floor, instead of silently losing it.
@@ -1891,7 +1891,7 @@ namespace JLib {
 		// behind; one already advertising a lane backlog past kLaneStealDepth is not. Reading the
 		// mask rather than K per-worker queries keeps this at one atomic load per call.
 		//
-		// Returns false when: K == 0, the task is not hiPri, or every reserved worker is buried.
+		// Returns false when: K == 0, the task is not lane, or every reserved worker is buried.
 		bool PushIO(Task* task) noexcept;
 		// ---- WHERE A RESUMED TASK WENT, AND WHO MAY TAKE IT ------------------------------------
 		//
@@ -1926,7 +1926,7 @@ namespace JLib {
 		// already-homogeneous submission) already know their batch is one class, and a scan-and-
 		// partition on every call would tax that common case to serve the one caller that needs it.
 		void PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity=0, size_t minPerSegment=64,
-		               bool hiPri=false, CorePref pref=CorePref::Default);
+		               Lane lane = Lane::Normal, CorePref pref=CorePref::Default);
 
 		// Submit [begin, end) as ceil(n/chunkSize) TASKS rather than n of them, each task looping
 		// over its own chunk and calling fn(i) per index. Returns the number of tasks created.
@@ -1966,11 +1966,11 @@ namespace JLib {
 		// the work). If the arena is exhausted the remaining chunks run INLINE on the caller, which
 		// is the same graceful degradation ParallelFor does rather than dropping work on the floor.
 		template<typename F>
-		// hiPri routes every chunk task to the high-priority queue; default is low, matching
+		// lane routes every chunk task to the high-priority queue; default is low, matching
 		// CreateTask and PushBatch. Priority here is QUEUE ORDER only -- it never implies placement,
 		// which is CorePref's job (see Task.h).
 		size_t PushArray(size_t begin, size_t end, size_t chunkSize, F&& fn, WaitGroup* wg = nullptr,
-		                 bool hiPri = false) {
+		                 Lane lane = Lane::Normal) {
 			if (end <= begin) return 0;
 			if (chunkSize == 0) chunkSize = 1;
 			const size_t total  = end - begin;
@@ -1984,7 +1984,7 @@ namespace JLib {
 				// Wide: these are chunks of one range, split precisely so other workers run them.
 				// See the splitter and cursor paths -- same argument, same currency.
 				Task* t = CreateInternalTask([fn, lo, hi]() { for (size_t i = lo; i < hi; ++i) fn(i); },
-				                             hiPri, CorePref::Wide);
+				                             lane, CorePref::Wide);
 				if (!t) {                                   // arena exhausted: run it here
 					for (size_t i = lo; i < hi; ++i) fn(i);
 					continue;
@@ -1999,7 +1999,7 @@ namespace JLib {
 			if (wg && !ts.empty())
 				wg->n.fetch_add((int)ts.size(), std::memory_order_relaxed);
 			if (!ts.empty())
-				PushBatch(ts.data(), ts.size(), 0, /*minPerSegment*/64, hiPri);
+				PushBatch(ts.data(), ts.size(), 0, /*minPerSegment*/64, lane);
 			return ts.size();
 		}
 		// PushImmediate was REMOVED in 4.0.1 -- use TaskScheduler::SetReservedCores and run a plain
@@ -2657,7 +2657,7 @@ namespace JLib {
 		// __cpp_impl_coroutine there reads the LIBRARY's language version and would reject every
 		// legitimate coroutine (Spawn calls this exact overload). Inlined into the header, the same
 		// macro reads the CALLER's TU, which is the thing actually being asked about.
-		Task* CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, TaskType type, CorePref corePref);
+		Task* CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type, CorePref corePref);
 
 		// ---- THE PUBLIC JOB IS A FIBER --------------------------------------------------------
 		//
@@ -2678,11 +2678,11 @@ namespace JLib {
 		//
 		// Native has NOT gone away -- see CreateInternalTask. It is no longer the thing a caller
 		// gets by accident.
-		Task* CreateTask(void(*fn)(void*), void* data, uint8_t hipri = false, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
+		Task* CreateTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
 #if !defined(__cpp_impl_coroutine) || __cpp_impl_coroutine < 201902L
 			assert(type != TaskType::Coroutine && "coroutines require a C++20 build");
 #endif
-			return CreateTaskImpl(fn, data, hipri, type, corePref);
+			return CreateTaskImpl(fn, data, lane, type, corePref);
 		}
 
 		// ---- INTERNAL JOBS: NATIVE ON PURPOSE, AND THE REASONS ARE NOT INTERCHANGEABLE ----------
@@ -2710,15 +2710,15 @@ namespace JLib {
 		// for it explicitly is asking for "this may never wait on anything", which is a real and
 		// occasionally correct thing to want. This overload exists so the library's own internal
 		// jobs say so at the call site instead of passing an enum whose meaning is a footnote.
-		Task* CreateInternalTask(void(*fn)(void*), void* data, uint8_t hipri = false,
+		Task* CreateInternalTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal,
 		                         CorePref corePref = CorePref::Default) {
-			return CreateTaskImpl(fn, data, hipri, TaskType::Native, corePref);
+			return CreateTaskImpl(fn, data, lane, TaskType::Native, corePref);
 		}
 
 
 		// Fiber by default, for the reasons on the raw overload above.
 		template<typename F>
-		auto CreateTask(F&& f, uint8_t hipri = false, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
+		auto CreateTask(F&& f, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
 			using L = LambdaTask<std::decay_t<F>>;
 			// NO SIZE CEILING, as of 4.0.1. A capture larger than the biggest slot used to be a
 			// COMPILE ERROR, which made the task path stricter than the coroutine path for no reason
@@ -2752,7 +2752,7 @@ namespace JLib {
 			if (!mem) mem = ::operator new(sizeof(L));
 			if (!mem) return static_cast<L*>(nullptr);
 			L* t = ::new (mem) L(std::forward<F>(f));
- 			t->hiPri = hipri;
+ 			t->lane = lane;
 
 			t->type = type;
 			t->corePref = corePref;
@@ -2767,8 +2767,8 @@ namespace JLib {
 		// ParallelFor's three leaf paths (flat chunks, cursor lanes, the lazy splitter) are the
 		// callers, and their bodies provably never wait.
 		template<typename F>
-		auto CreateInternalTask(F&& f, uint8_t hipri = false, CorePref corePref = CorePref::Default) {
-			return CreateTask(std::forward<F>(f), hipri, TaskType::Native, corePref);
+		auto CreateInternalTask(F&& f, Lane lane = Lane::Normal, CorePref corePref = CorePref::Default) {
+			return CreateTask(std::forward<F>(f), lane, TaskType::Native, corePref);
 		}
 
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
@@ -2846,7 +2846,7 @@ namespace JLib {
 		std::atomic<bool> paused{ false };
 
 		// THE WORK-STEALING DEQUES, one per worker plus one for the non-worker lane at the end.
-		// Named `loPri` until 5.0.1, which was a contrast with a `hiPri` array that no longer
+		// Named `loPri` until 5.0.1, which was a contrast with a `lane` array that no longer
 		// exists -- there is one deque per worker now, so the priority half of the name described
 		// nothing. Priority survives where it is still real: hiPriInboxes vs loPriInboxes.
 		//
@@ -2855,7 +2855,7 @@ namespace JLib {
 		// so it has not been done in the same pass that could not be checked by the compiler.
 		std::vector<std::unique_ptr<TaskDeque>> deques;
 
-		// ---- THE hiPri DEQUE IS THE BACKUP QUEUE, AND IT IS BACK (5.0.0) ---------------------
+		// ---- THE lane DEQUE IS THE BACKUP QUEUE, AND IT IS BACK (5.0.0) ---------------------
 		//
 		// It was deleted on the argument that "a Chase-Lev deque exists to be stolen from, nobody
 		// steals lane work, and a reserved worker wants an inbox and nothing else on the path that
@@ -2879,7 +2879,7 @@ namespace JLib {
 		// what "no unloading step" bought, and it is what the io p50/p99 numbers came from. Only the
 		// REMAINDER is staged here, at dispatch, in one batch, and only when there is a remainder.
 		// The common case -- one completion arrives, one worker takes it -- never touches this.
-		// THE LANE DEQUE IS GONE (5.0.1). `std::vector<std::unique_ptr<TaskDeque>> hiPri` sat here:
+		// THE LANE DEQUE IS GONE (5.0.1). `std::vector<std::unique_ptr<TaskDeque>> lane` sat here:
 		// one Chase-Lev ring per worker, parallel to loPri, holding lane work that a reserved
 		// worker had unloaded from its inbox on its way into a task body.
 		//
@@ -2899,7 +2899,7 @@ namespace JLib {
 		static void ApplyIngressBackpressure();
 
 		// ---------- the NON-WORKER LANE ----------
-		// loPri/hiPri carry ONE EXTRA deque pair past the workers, at index `nonWorkerLane`
+		// loPri/lane carry ONE EXTRA deque pair past the workers, at index `nonWorkerLane`
 		// (== workers.size(), fixed by StartPool). Everything else -- inboxes,
 		// the P/E sets and PickNextWorker -- stays worker-indexed.
 		//
@@ -2988,9 +2988,9 @@ namespace JLib {
 		// -----------------------------------------------
 
 		// ---- loPri starvation prevention: steal fairness ----
-		// After kStealFairnessWindow consecutive hiPri steals, GetTask() forces a loPri scan so a
-		// steady stream of hiPri work can't starve loPri tasks. (There used to also be age-based
-		// promotion -- boost old loPri tasks to hiPri -- but it's redundant now that stealing is
+		// After kStealFairnessWindow consecutive lane steals, GetTask() forces a loPri scan so a
+		// steady stream of lane work can't starve loPri tasks. (There used to also be age-based
+		// promotion -- boost old loPri tasks to lane -- but it's redundant now that stealing is
 		// single-item: a stolen task runs immediately, so the steal itself un-starves it.)
 		//
 		// PER THREAD, NOT PER SCHEDULER -- see the definition in TaskScheduler.cpp. This was a plain
@@ -3001,7 +3001,7 @@ namespace JLib {
 		// than intended. Thread.cpp's `consecutiveMisses` backoff counter is thread_local for
 		// exactly these two reasons and this now matches it.
 		static thread_local int consecutiveHiPriSteals;
-		static constexpr int kStealFairnessWindow = 8; // after 8 hiPri steals, force a loPri scan
+		static constexpr int kStealFairnessWindow = 8; // after 8 lane steals, force a loPri scan
 		uint64_t GetCurrentTimeMs() const;
 		// ----
 
@@ -3012,19 +3012,19 @@ namespace JLib {
 
 		void RunCounted(WaitGroup& wg, Task* t);
 		static size_t GetSafeTC();
-		// Steals ONE task (hiPri-then-loPri, with steal fairness) for a non-worker helper. nullptr
+		// Steals ONE task (lane-then-loPri, with steal fairness) for a non-worker helper. nullptr
 		// if nothing stealable. See definition.
 		Task* GetTask();
 		void StartPool(size_t poolSize);
 		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
-		// `hiPri` selects WHICH SET is rotated, and that is what makes the lane invariant structural
-		// rather than a convention every call site has to remember. A hiPri task rotates the hot
+		// `lane` selects WHICH SET is rotated, and that is what makes the lane invariant structural
+		// rather than a convention every call site has to remember. A lane task rotates the hot
 		// workers only; everything else rotates the ordinary ones only. One branch, one place, and
 		// no caller can route a lane task somewhere nothing serves it.
-		int PickNextWorker(CorePref pref = CorePref::Default, bool hiPri = false);
+		int PickNextWorker(CorePref pref = CorePref::Default, Lane lane = Lane::Normal);
 		// Picks a worker from the requested class set (P/E), SPILLING to the other class if unavailable;
 		// Default/Any/Wide (and non-hybrid / all-pinned) use the original full-pool round-robin. Placement
-		// is governed SOLELY by CorePref -- hiPri is queue order only, never consulted for placement.
+		// is governed SOLELY by CorePref -- lane is queue order only, never consulted for placement.
 		// Preference is a hint -- never a constraint.
 
 		// NOTE: an external-submitter fan-out cap was tried here and REMOVED. See CHANGELOG 1.1.1.
@@ -3083,7 +3083,7 @@ namespace JLib {
 		// (Intel hybrid, e.g. i9-13900K = 8 P + 16 E). Derived in BuildTopology from each core's
 		// PROCESSOR_RELATIONSHIP.EfficiencyClass (highest class present = P). Non-hybrid CPU -> all 1
 		// (harmless). DATA ONLY for now: nothing schedules on it yet. Foundation for P/E-aware routing
-		// (hiPri->P, loPri/bulk->E) + a P/E-aware core reserve -- needed manually because the pool is
+		// (lane->P, loPri/bulk->E) + a P/E-aware core reserve -- needed manually because the pool is
 		// HARD-PINNED (Thread::StartWorker SetThreadAffinityMask), so the OS can't place work P/E for us.
 		std::vector<char> isPCore;
 		// isPCpu[logical CPU] -- P/E class of every logical processor, same EfficiencyClass
@@ -3275,8 +3275,8 @@ namespace JLib {
 		}
 		// ---- HIPRI PRESENCE, ONE BIT PER WORKER ----------------------------------------------
 		//
-		// Set when anything lands in worker q's hiPri inbox or deque; cleared by q itself when both
-		// are empty. A thief probes a remote hiPri deque ONLY when the bit says there is something
+		// Set when anything lands in worker q's lane inbox or deque; cleared by q itself when both
+		// are empty. A thief probes a remote lane deque ONLY when the bit says there is something
 		// there, so the common case -- no I/O in flight -- costs a register test rather than a
 		// steal_if against another worker's cache line.
 		//
@@ -3284,7 +3284,7 @@ namespace JLib {
 		// unused since K was stubbed. Same shape (one word, one bit per worker, workers 0..63),
 		// same publisher-sets/owner-clears discipline, so nothing new has to be reasoned about --
 		// only the meaning of the bit changed, from "this hot worker has lane work buried" to
-		// "this worker has hiPri work at all".
+		// "this worker has lane work at all".
 		void SetHiPriHint(size_t q) noexcept {
 			if (q >= 64) return;
 			stealHintLane.fetch_or(1ull << q, std::memory_order_release);
@@ -3297,7 +3297,7 @@ namespace JLib {
 			if (q >= 64) return true;   // past the bitmap: probe rather than miss work
 			return (stealHintLane.load(std::memory_order_acquire) & (1ull << q)) != 0;
 		}
-		// The whole word, for a worker that needs to ask "is there hiPri work ANYWHERE" rather than
+		// The whole word, for a worker that needs to ask "is there lane work ANYWHERE" rather than
 		// "at q". A reserved worker's idle decision needs exactly that: it may not take loPri, so
 		// loPri advertisements must not keep it awake. See Thread::Worker's advertisedCount.
 		unsigned long long HiPriHintWord() const noexcept {
@@ -3452,7 +3452,7 @@ namespace JLib {
 		//
 		//   0  no lane hint, no hot->hot stealing (the shipped behaviour before this)
 		//   1  hint maintained at the DRAIN only, from a local count
-		//   2  hint maintained per pickup, from hiPri->size()  (touches the thief-written line)
+		//   2  hint maintained per pickup, from lane->size()  (touches the thief-written line)
 
 		// A SCHMITT TRIGGER, not a threshold. Sets at kLaneStealDepth, clears at laneClearDepth, and
 		// the gap between them is the whole point.
@@ -3483,15 +3483,15 @@ namespace JLib {
 				// it affordable to do here, on the hot worker itself, microseconds before it
 				// disappears into a long handler.
 				// NO LANE WAKE. The bit is a PRESENCE flag for the K controller, not a reason to
-				// wake anybody: with the hiPri deque gone there is nothing for a woken worker to
+				// wake anybody: with the lane deque gone there is nothing for a woken worker to
 				// steal, and the lane.s owner pops its own inbox on its next pass. Waking a
 				// worker that can only look at a queue it may not touch is the pure-cost shape
-				// this file already records for the removed hiPri steal probe.
+				// this file already records for the removed lane steal probe.
 				//
 				// A MaybeAdjustHotWorkers() EDGE FIRED HERE AND IS GONE WITH THE CONTROLLER. The
 				// argument for it was good -- this is the moment saturation BECOMES true, on the
 				// worker that just got buried, rather than whenever somebody next samples. It did
-				// not matter, because the controller it woke never moved K in 2.5M hiPri tasks. K
+				// not matter, because the controller it woke never moved K in 2.5M lane tasks. K
 				// is static now; this bit is a steal hint and nothing else.
 			}
 			else      stealHintLane.fetch_and(~bit, std::memory_order_relaxed);
@@ -3553,21 +3553,21 @@ namespace JLib {
 	// and its single call site was removed five days later in 21719ac, the rewrite that turned this
 	// from a spinlock into the suspend-or-help lock described above. Both functions are now DELETED
 	// (see the note where they lived in TaskScheduler.cpp): Boost had no callers, which made
-	// `priorityBoost` permanently 0 and Unboost a permanent no-op -- and once hiPri became the
+	// `priorityBoost` permanently 0 and Unboost a permanent no-op -- and once lane became the
 	// low-latency lane, a mechanism that promotes an aged ORDINARY task into it would have pushed
 	// bulk work onto the hot workers, which is precisely what the lane excludes. The packed
 	// `priorityBoost` bit is left in place so Task's layout fingerprint is unchanged.
 	//
 	// That removal was correct, and it is worth knowing WHY so nobody re-adds the boost as a fix for
 	// a hang it cannot cause. Classic priority inversion needs a high-priority waiter to starve the
-	// holder of CPU. Nothing here can: `hiPri` is QUEUE ORDER ONLY -- never OS thread priority,
+	// holder of CPU. Nothing here can: `lane` is QUEUE ORDER ONLY -- never OS thread priority,
 	// never placement -- every worker runs at the same OS priority, and a task that has already
-	// STARTED owns its worker until it yields or finishes, so no amount of hiPri work can deschedule
+	// STARTED owns its worker until it yields or finishes, so no amount of lane work can deschedule
 	// a running lock holder. What made inversion real in the old design was that waiters SPUN, so
 	// they genuinely competed with the holder for a core; suspending and helping both removed that.
 	// The one residual case -- the holder is a suspended fiber whose resume sits in a loPri queue
-	// while hiPri work floods in -- is bounded by kStealFairnessWindow, which forces a loPri scan
-	// every 8 consecutive hiPri steals. Same shape as the age-based promotion that was removed once
+	// while lane work floods in -- is bounded by kStealFairnessWindow, which forces a loPri scan
+	// every 8 consecutive lane steals. Same shape as the age-based promotion that was removed once
 	// single-item stealing made it redundant: a mitigation outliving its premise.
 	// One queued waiter on a SchedulerMutex or SchedulerSemaphore. EXACTLY ONE of the two pointers is
 	// non-null, and which one decides how the waiter is released:

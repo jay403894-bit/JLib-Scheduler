@@ -195,7 +195,7 @@ int main() {
                         if (released.load(std::memory_order_acquire)) gate->SignalAll();
                     });
                     g_done.fetch_add(1, std::memory_order_release);
-                }, nullptr, false, TaskType::Fiber);
+                }, nullptr, JLib::Lane::Normal, TaskType::Fiber);
                 if (!t) { std::printf("  FAIL  CreateTask returned null\n"); ++g_failures; break; }
                 sched.Push(t);
             }

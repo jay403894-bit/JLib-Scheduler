@@ -20,7 +20,7 @@ namespace JLib {
 	class TaskScheduler;
 
     // ================================ STEAL INSTRUMENTATION (opt-in) ============================
-    // Counts steal PROBES (one call against one victim, hiPri then loPri) and HITS (probes that
+    // Counts steal PROBES (one call against one victim, lane then loPri) and HITS (probes that
     // claimed a task). Built to answer one question: past the point where the pool can drain faster
     // than a single producer can submit, do the surplus workers actually burn themselves on empty
     // deques? A probe/hit ratio that explodes across that crossover says yes.
@@ -118,7 +118,7 @@ namespace JLib {
         Count
     };
     inline const char* WorkerPhaseName(unsigned char p) {
-        static const char* k[] = { "start", "hiPri", "resumed", "ownDeque", "drain",
+        static const char* k[] = { "start", "lane", "resumed", "ownDeque", "drain",
                                    "stealScan", "parkGate", "floorSpin", "PARKED", "RUNNING", "?" };
         return p < (unsigned char)WorkerPhase::Count ? k[p] : "?";
     }

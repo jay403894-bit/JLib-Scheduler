@@ -432,20 +432,20 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     int  seconds = 60, rate = 60, load = 0;
-    bool plain = false, hipri = false, pinHot = false, elevate = false, noActivate = false;
+    bool plain = false, lane = false, pinHot = false, elevate = false, noActivate = false;
     size_t    kmin = 1, kmax = 2;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)   seconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--rate") && i + 1 < argc) rate    = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--load") && i + 1 < argc) load    = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--plain"))                plain   = true;
-        else if (!std::strcmp(argv[i], "--hipri"))                hipri   = true;
-        else if (!std::strcmp(argv[i], "--k") && i + 1 < argc) { kmin = kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
+        else if (!std::strcmp(argv[i], "--lane"))                lane   = true;
+        else if (!std::strcmp(argv[i], "--k") && i + 1 < argc) { kmin = kmax = (size_t)std::atoi(argv[++i]); lane = true; }
         // Range and policy are SEPARATE flags on purpose. Bundling them would make every
         // policy comparison also a range comparison, and there would be no way to
         // say which one moved the number.
-        else if (!std::strcmp(argv[i], "--kmin") && i + 1 < argc) { kmin = (size_t)std::atoi(argv[++i]); hipri = true; }
-        else if (!std::strcmp(argv[i], "--kmax") && i + 1 < argc) { kmax = (size_t)std::atoi(argv[++i]); hipri = true; }
+        else if (!std::strcmp(argv[i], "--kmin") && i + 1 < argc) { kmin = (size_t)std::atoi(argv[++i]); lane = true; }
+        else if (!std::strcmp(argv[i], "--kmax") && i + 1 < argc) { kmax = (size_t)std::atoi(argv[++i]); lane = true; }
         else if (!std::strcmp(argv[i], "--pin"))                  pinHot   = true;
         else if (!std::strcmp(argv[i], "--prio"))                 elevate  = true;
         else if (!std::strcmp(argv[i], "--noactivate"))            noActivate = true;
@@ -522,7 +522,7 @@ int main(int argc, char** argv) {
     g_paintGaps.reserve(packets);
 
     Out("udp_latency_bench -- %s receive, %d s at %d Hz%s\n",
-                plain ? "PLAIN blocking" : (hipri ? "JLib lane" : "JLib reactor"), seconds, rate,
+                plain ? "PLAIN blocking" : (lane ? "JLib lane" : "JLib reactor"), seconds, rate,
                 load ? "  [pool under load]" : "");
 
     SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -577,7 +577,7 @@ int main(int argc, char** argv) {
         if (load) { JLib::TaskScheduler::Init(0); loadThread = std::thread(LoadThread, load); }
     } else {
         JLib::TaskScheduler::EnableIoReactor(true);
-        // --hipri is the whole reason the lane exists, and this is the case it was built for: a
+        // --lane is the whole reason the lane exists, and this is the case it was built for: a
         // short, latency-critical body that must not queue behind a pool full of ordinary frame
         // work. Without it the receive coroutine is an ordinary task and waits its turn, which is
         // correct default behaviour and visibly wrong for this particular job.
@@ -587,11 +587,11 @@ int main(int argc, char** argv) {
         if (pinHot)  JLib::TaskScheduler::SetHotWorkerPin(true);
         if (elevate) JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
         // Adaptive K is gone; kmax was the ceiling, so pin K there.
-        if (hipri) JLib::TaskScheduler::SetHotWorkers(kmax ? kmax : kmin);
+        if (lane) JLib::TaskScheduler::SetHotWorkers(kmax ? kmax : kmin);
         JLib::TaskScheduler::Init(0);
         auto& io = JLib::IoReactor::Instance();
         if (!io.RegisterSocket(s)) { Out("RegisterSocket failed\n"); return 1; }
-        JLib::Spawn(RecvLoop(s, hwnd, scope.Token()), &wg, hipri ? 1 : 0);
+        JLib::Spawn(RecvLoop(s, hwnd, scope.Token()), &wg, lane ? JLib::Lane::LowLatency : JLib::Lane::Normal);
         if (load) loadThread = std::thread(LoadThread, load);
     }
 

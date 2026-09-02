@@ -205,7 +205,7 @@ static std::vector<long long> SoakRun(int n, int iters, double& secsOut) {
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < n; ++i)
-        JLib::Spawn(SoakOp(i, iters), static_cast<JLib::WaitGroup*>(nullptr), (uint8_t)1);
+        JLib::Spawn(SoakOp(i, iters), static_cast<JLib::WaitGroup*>(nullptr), JLib::Lane::LowLatency);
 
     // No WaitGroup: these are long-lived loops, and a WaitFor from main would spin-help and perturb
     // the very dispatch being measured. Poll the live count instead.
@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
             JLib::WaitGroup wg;
             // hiPri: with K-hot + hotRT this is what keeps the hot worker at TIME_CRITICAL while it
             // runs the completion. An ordinary task demotes it to Normal first -- see Thread.cpp.
-            JLib::Spawn(OneOp(i), &wg, 1);
+            JLib::Spawn(OneOp(i), &wg, JLib::Lane::LowLatency);
 
             // Give the receive time to be posted, then feed it.
             std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -432,7 +432,7 @@ int main(int argc, char** argv) {
         for (int rd = 0; rd < rounds; ++rd) {
             std::this_thread::sleep_for(std::chrono::milliseconds(coldMs));
             JLib::WaitGroup wg;
-            for (int i = 0; i < kBurst; ++i) JLib::Spawn(BurstOp(i, rd), &wg, 1);
+            for (int i = 0; i < kBurst; ++i) JLib::Spawn(BurstOp(i, rd), &wg, JLib::Lane::LowLatency);
             std::this_thread::sleep_for(std::chrono::microseconds(400));
             // One wave, back to back, so the completions land close enough to coalesce.
             for (int i = 0; i < kBurst; ++i)

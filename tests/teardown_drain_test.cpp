@@ -114,7 +114,7 @@ int main() {
         Task* t = sched.CreateTask([body] {
             g_entered.fetch_add(1, std::memory_order_release);
             body();
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned a task"); return; }
         sched.Push(t);
     };

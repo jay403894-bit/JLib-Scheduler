@@ -331,7 +331,7 @@ int main() {
                     cancelled.fetch_add(1, std::memory_order_relaxed);
                 else
                     acquired.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -388,7 +388,7 @@ int main() {
                 if (r == JLib::WaitResult::Cancelled) cancelled.fetch_add(1, std::memory_order_relaxed);
                 else                                  woke.fetch_add(1, std::memory_order_relaxed);
                 m.Unlock();          // UNCONDITIONAL -- the whole point of the invariant
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -428,7 +428,7 @@ int main() {
             cv.Wait(m);                                   // NOT the cancellable spelling
             woke.fetch_add(1, std::memory_order_relaxed);
             m.Unlock();
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->cancelToken = scope.Token().Raw();             // cancelled scope, uncancellable wait
         t->waitGroup = &wg;
         sched.Push(t);
@@ -461,7 +461,7 @@ int main() {
             if (cv.WaitCancellable(m) == JLib::WaitResult::Ok)
                 ok.fetch_add(1, std::memory_order_relaxed);
             m.Unlock();
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->waitGroup = &wg;                                // no scope at all
         sched.Push(t);
 
@@ -490,7 +490,7 @@ int main() {
                     cancelled.fetch_add(1, std::memory_order_relaxed);
                 else
                     acquired.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -522,7 +522,7 @@ int main() {
             parked.fetch_add(1, std::memory_order_relaxed);
             sem.Wait();                                   // NOT the cancellable spelling
             acquired.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->cancelToken = scope.Token().Raw();             // cancelled scope, uncancellable wait
         t->waitGroup = &wg;
         sched.Push(t);
@@ -553,7 +553,7 @@ int main() {
             parked.fetch_add(1, std::memory_order_relaxed);
             if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
                 doomedCancelled.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         a->cancelToken = doomed.Token().Raw();
         a->waitGroup = &wg;
         sched.Push(a);
@@ -562,7 +562,7 @@ int main() {
             parked.fetch_add(1, std::memory_order_relaxed);
             if (sem.WaitCancellable() == JLib::WaitResult::Ok)
                 keptAcquired.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         b->cancelToken = kept.Token().Raw();
         b->waitGroup = &wg;
         sched.Push(b);
@@ -598,7 +598,7 @@ int main() {
             scope.Cancel();                               // now running, and now cancelled
             result.store(sem.WaitCancellable() == JLib::WaitResult::Cancelled ? 1 : 0,
                          std::memory_order_release);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->cancelToken = scope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);
@@ -619,7 +619,7 @@ int main() {
         auto* t = sched.CreateTask([&] {
             if (sem.WaitCancellable() == JLib::WaitResult::Ok)
                 ok.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->waitGroup = &wg;                                // NO cancel token at all
         sched.Push(t);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -654,7 +654,7 @@ int main() {
             // held -- which is what this section is actually about.
             while (!holderRelease.load(std::memory_order_acquire)) JLib::Thread::CoYield();
             m.Unlock();
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         ht->waitGroup = &wg;
         sched.Push(ht);
 
@@ -674,7 +674,7 @@ int main() {
                 }
                 okWaits.fetch_add(1, std::memory_order_relaxed);
                 m.Unlock();
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -685,7 +685,7 @@ int main() {
             m.Lock();                              // unscoped, not cancellable, must be served
             okWaits.fetch_add(1, std::memory_order_relaxed);
             m.Unlock();
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         keep->waitGroup = &wg;
         sched.Push(keep);
 
@@ -742,7 +742,7 @@ int main() {
                     got.fetch_add(1, std::memory_order_relaxed);
                     m.Unlock();
                 }
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -828,7 +828,7 @@ int main() {
             parked.store(true, std::memory_order_release);
             sched.WaitOnEvent(hold);
             m.Unlock();
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         ht->waitGroup = &wg;
         sched.Push(ht);
 
@@ -848,7 +848,7 @@ int main() {
             // Reached either way. If the resume had been discarded, this never runs and the
             // WaitFor below hangs -- which is the failure this check exists to catch.
             reachedEnd.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->cancelToken = scope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);
@@ -904,7 +904,7 @@ int main() {
                 cancelled.fetch_add(1, std::memory_order_relaxed);
             else
                 acquired.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->waitGroup = &wg;                       // deliberately no cancelToken
         sched.Push(t);
 
@@ -941,7 +941,7 @@ int main() {
                 cancelled.fetch_add(1, std::memory_order_relaxed);
             else
                 acquired.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->cancelToken = op.Token().Raw();          // the INNER scope only
         t->waitGroup = &wg;
         sched.Push(t);
@@ -986,7 +986,7 @@ int main() {
                     cancelled.fetch_add(1, std::memory_order_relaxed);
                 else
                     acquired.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->cancelToken = op.Token().Raw();      // the INNERMOST scope
             t->waitGroup = &wg;
             sched.Push(t);
@@ -1022,7 +1022,7 @@ int main() {
             parked.fetch_add(1, std::memory_order_relaxed);
             if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
                 leftCancelled.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         a->cancelToken = left.Token().Raw();
         a->waitGroup = &wg;
         sched.Push(a);
@@ -1031,7 +1031,7 @@ int main() {
             parked.fetch_add(1, std::memory_order_relaxed);
             if (sem.WaitCancellable() == JLib::WaitResult::Ok)
                 rightAcquired.fetch_add(1, std::memory_order_relaxed);
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         b->cancelToken = right.Token().Raw();
         b->waitGroup = &wg;
         sched.Push(b);
@@ -1080,7 +1080,7 @@ int main() {
             m.Lock();
             cleanedUp.fetch_add(1, std::memory_order_relaxed);
             m.Unlock();
-        }, false, JLib::TaskType::Fiber);
+        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
         t->cancelToken = scope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);
@@ -1321,7 +1321,7 @@ int main() {
             JLib::WaitGroup warm;
             warm.n.fetch_add(1, std::memory_order_relaxed);
             auto* w = sched.CreateTask([&] { sched.WaitOnEvent(ev); },
-                                       false, JLib::TaskType::Fiber);
+                                       JLib::Lane::Normal, JLib::TaskType::Fiber);
             w->waitGroup = &warm;
             sched.Push(w);
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -1337,7 +1337,7 @@ int main() {
             auto* t = sched.CreateTask([&] {
                 parked.fetch_add(1, std::memory_order_relaxed);
                 sched.WaitOnEvent(ev);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -1370,7 +1370,7 @@ int main() {
                     cancelled.fetch_add(1, std::memory_order_relaxed);
                 else
                     normal.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -1404,7 +1404,7 @@ int main() {
                 parked.fetch_add(1, std::memory_order_relaxed);
                 if (sched.WaitOnEventCancellable(ev) == JLib::WaitResult::Ok)
                     ok.fetch_add(1, std::memory_order_relaxed);
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &wg;
             sched.Push(t);
         }

@@ -56,7 +56,7 @@ struct Arm {
     const char* label;
     size_t      k;         // hot workers
     bool        spin;      // true: main spins on the count. false: main parks in WaitFor.
-    bool        hipri;     // true: push to the LANE, which is what K hot workers serve
+    bool        lane;     // true: push to the LANE, which is what K hot workers serve
     bool        fiber;     // Fiber task rather than Native
     const char* note;
 };
@@ -75,10 +75,10 @@ double TimeArm(const Arm& arm, int pings) {
         JLib::WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
 
-        // hipri is what routes to the LANE. Setting K without this was the mistake the first
+        // lane is what routes to the LANE. Setting K without this was the mistake the first
         // version of this bench made: K hot workers serve the lane, so a generic Push cannot
         // reach them and K reads as doing nothing.
-        JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr, arm.hipri ? 1 : 0,
+        JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr, arm.lane ? JLib::Lane::LowLatency : JLib::Lane::Normal,
                                          arm.fiber ? JLib::TaskType::Fiber : JLib::TaskType::Native);
         t->waitGroup = &wg;
         sched.Push(t);
@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
     const Arm arms[] = {
         { "Native generic K=0", 0, false, false, false, "what compare_marl measures today" },
         { "Fiber  generic K=0", 0, false, false, true,  "task type is the only change from row 1" },
-        { "Fiber  hiPri   K=2", 2, false, true,  true,  "the lane" },
+        { "Fiber  lane   K=2", 2, false, true,  true,  "the lane" },
         { "Native generic K=0", 0, false, false, false, "SAME-VS-SAME CONTROL -- must read 1.00x" },
     };
     const int kArms = int(sizeof arms / sizeof arms[0]);

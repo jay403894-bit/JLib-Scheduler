@@ -68,16 +68,63 @@ namespace JLib {
     // Standard is 0 so a zero-initialised Task asks for what it used to get.
     enum class StackClass : uint8_t { Standard = 0, Tiny = 1, Deep = 2 };
 
-    // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). Orthogonal to hiPri in the
-    // dimension THIS field governs: priority never implies a core class, and a loPri P-core task and a
-    // hiPri E-core task are both legitimate.
+    // ---- WHICH LANE A TASK RUNS IN. Replaces `bool hiPri`. --------------------------------------
     //
-    // hiPri DOES INFLUENCE WHICH WORKER, and this said otherwise for several versions after it stopped
-    // being true. A hiPri push is routed to the reserved band when one exists, because QUEUE ORDER
-    // ALONE CANNOT DELIVER LOW LATENCY -- being first in a queue nobody is currently reading is worth
-    // nothing, which is exactly how a completion aimed at a parked worker sat for a second. Reserved
-    // workers never park, so handing hiPri work to one is the mechanism that makes the priority real
-    // rather than nominal. Core CLASS remains this field's business alone; that part never changed. Unset (Default) means no preference: the full-pool round-robin, the
+    // THE BOOL WAS A LIE IN BOTH DIRECTIONS and it cost real debugging time. "hiPri" says PRIORITY,
+    // so a loPri task landing on a reserved worker read as merely deprioritised -- when in fact K
+    // never reads its loPri inbox, inbox work is unstealable, and the task was UNREACHABLE. The pool
+    // deadlocked and reported it as a lost wake. Nothing in the name "low priority" suggests
+    // "will never run"; "not on the low-latency lane" does.
+    //
+    // It lied the other way too. A caller reads "hiPri" as "this work is IMPORTANT" and marks bulk
+    // work with it -- which funnels volume onto K workers while the floor idles, because the lane's
+    // capacity is K plus spill and nothing else. LowLatency does not invite that reading.
+    //
+    //   Normal       rides the floor and its adaptive awake set. This is where THROUGHPUT lives:
+    //                the floor is most of the pool, and a lane on the floor already measured 15-19x
+    //                over no lane at all. Correct for essentially all work.
+    //   LowLatency   routed to the reserved band, which exists so this work meets a worker that is
+    //                not competing for its place in a queue. Costs a core off the floor per reserved
+    //                worker. For latency-critical, LOW-RATE work: I/O completions, subsystem
+    //                messages. Never for volume.
+    //
+    // WHETHER THE BAND SPINS IS A POLICY, NOT PART OF THIS CONTRACT, and conflating the two is easy:
+    // SetHotWorkers(k) reserves and lets them park, SetIoHotLane(k) reserves and pins them awake.
+    // Parking costs ~5.5 us p50 to get the core back (6.7 parked vs 1.2 spinning, measured); the
+    // spin costs a whole core held against every other thread in the process, producer included.
+    //
+    // PARKING IS NOT THE HAZARD -- being UNREADABLE is. The pool deadlock that motivated this enum
+    // happened because K never READS its loPri inbox, not because K was asleep. A parked reserved
+    // worker with a LowLatency push waiting for it gets notified and wakes; an awake one holding
+    // work in a queue it will never look at does not. Those are independent properties and only the
+    // second is a correctness question.
+    //
+    // TWO VALUES, FROZEN. Reservation is a tail-latency instrument, not a general resource to hand
+    // out: every reserved thread comes off the floor, "reserve me one" is a request every subsystem
+    // will make and none can price, and two of them on a small box with the timer and reactor
+    // already reserved leaves almost no floor. More Lane:: values only if two reserved classes turn
+    // out to genuinely fight over the band -- and then it is a 6.0 decision with evidence, not a
+    // speculative third enumerator today.
+    //
+    // Normal is 0 so a zero-initialised Task stays off the lane, which is the safe default: the
+    // floor always drains, and a task that should have been LowLatency is slow rather than stuck.
+    enum class Lane : uint8_t { Normal = 0, LowLatency = 1 };
+
+    // Spelled out rather than left to `lane ? ... : ...`, because an enum class deliberately has no
+    // conversion to bool and adding one would put the old ambiguity straight back: `if (lane)` reads
+    // as "if it has a lane", which is true of every task. Both names say which lane they mean.
+    constexpr bool IsLowLatency(Lane l) noexcept { return l == Lane::LowLatency; }
+    constexpr bool IsNormalLane(Lane l) noexcept { return l == Lane::Normal; }
+
+    // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). Orthogonal to Lane in the
+    // dimension THIS field governs: the lane never implies a core class, and a Normal P-core task and
+    // a LowLatency E-core task are both legitimate.
+    //
+    // LANE DOES INFLUENCE WHICH WORKER, and the comment here claimed otherwise for several versions
+    // after it stopped being true. LowLatency routes to the reserved band when one exists, because
+    // queue order alone cannot deliver latency -- being first in a queue nobody is currently reading
+    // is worth nothing, which is exactly how a completion aimed at a parked worker sat for a second.
+    // Core CLASS remains this field's business alone; that part never changed. Unset (Default) means no preference: the full-pool round-robin, the
     // scheduler's original placement behavior. Preference is a HINT, not a constraint: PickNextWorker
     // spills to the other class when the preferred one is unavailable, and stealing stays deliberately
     // preference-blind (work-conserving). Non-hybrid CPUs: all workers are P-labeled, so every value
@@ -155,7 +202,7 @@ namespace JLib {
 //                 has a reader (Thread::AcquireFiber) from the day it lands, which is precisely
 //                 what the old one never had.
 #define JLIB_TASK_FLAG_FIELDS            \
-        uint8_t   hiPri         : 1;     \
+        Lane      lane          : 1;     \
         TaskType  type          : 2;     \
         uint8_t   priorityBoost : 1;     \
         CorePref  corePref      : 2;     \
@@ -289,13 +336,12 @@ namespace JLib {
         // Members are listed in declaration order so the initialization order is the written one.
         Task()
             : fn(nullptr), data(nullptr), assignedFiber(nullptr), next(nullptr),
-              hiPri(0), type(TaskType::Native),
+              lane(Lane::Normal), type(TaskType::Native),
               priorityBoost(0), corePref(CorePref::Default), trivialDtor(0),
               stackClass(StackClass::Standard) { ; }
-        Task(Func f, void* d = nullptr, uint8_t hipri = false)
-            // hipri is a uint8_t taking any value; normalize rather than truncate into one bit.
+        Task(Func f, void* d = nullptr, Lane ln = Lane::Normal)
             : fn(f), data(d), assignedFiber(nullptr), next(nullptr),
-              hiPri(hipri ? 1 : 0), type(TaskType::Native),
+              lane(ln), type(TaskType::Native),
               priorityBoost(0), corePref(CorePref::Default), trivialDtor(0),
               stackClass(StackClass::Standard) {
         }
@@ -380,7 +426,7 @@ namespace JLib {
                 for (size_t i = 0; i < sizeof p; ++i) mixByte(raw[i]);
             };
 
-            probe([](TaskFlagPacking& f) { f.hiPri         = 1; });
+            probe([](TaskFlagPacking& f) { f.lane          = Lane::LowLatency; });
             // A requiredSize probe sat here. Removing the field CHANGES THIS FINGERPRINT, which is
             // correct and is the point: the flag block's layout really did change, so a library
             // built before the removal must not link against a header from after it. The guard will

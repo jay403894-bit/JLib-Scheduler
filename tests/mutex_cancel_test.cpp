@@ -50,7 +50,7 @@ int main() {
             result.store((int)r, std::memory_order_release);
             if (r == WaitResult::Ok) m.Unlock();      // only unlock if we actually got it
             done.store(true, std::memory_order_release);
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         t->cancelToken = scope.Token().Raw();      // LockCancellable reads the TASK's token
         t->waitGroup = &wg;
         sched.Push(t);
@@ -93,7 +93,7 @@ int main() {
             const WaitResult r = m.LockCancellable();
             if (r == WaitResult::Ok) m.Unlock();
             bystanderDone.store(true, std::memory_order_release);
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         t->cancelToken = bystanderScope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);

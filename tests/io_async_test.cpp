@@ -141,7 +141,7 @@ int main() {
         JLib::CancelScope op(conn.Token());        // nested, as a real operation would be
         Reset();
         JLib::WaitGroup wg;
-        JLib::Spawn(ReadOnce(server, 64, 0, op.Token()), &wg, 0,
+        JLib::Spawn(ReadOnce(server, 64, 0, op.Token()), &wg, JLib::Lane::Normal,
                     JLib::CorePref::Default, op.Token().Raw());
 
         Check(WaitUntil([&] { return io.InFlight() == 1; }), "the read is in flight");
@@ -170,7 +170,7 @@ int main() {
 
         const auto t0 = std::chrono::steady_clock::now();
         JLib::Deadline d(ms(120), op.Token(), JLib::EjectIoReactor, &io);
-        JLib::Spawn(ReadOnce(server, 64, 0, op.Token()), &wg, 0,
+        JLib::Spawn(ReadOnce(server, 64, 0, op.Token()), &wg, JLib::Lane::Normal,
                     JLib::CorePref::Default, op.Token().Raw());
         sched.WaitFor(wg);
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -199,7 +199,7 @@ int main() {
 
         {
             JLib::Deadline d(ms(3000), op.Token(), JLib::EjectIoReactor, &io);
-            JLib::Spawn(ReadOnce(server, 64, 0, op.Token()), &wg, 0,
+            JLib::Spawn(ReadOnce(server, 64, 0, op.Token()), &wg, JLib::Lane::Normal,
                         JLib::CorePref::Default, op.Token().Raw());
             sched.WaitFor(wg);
         }
@@ -267,7 +267,7 @@ int main() {
         Reset();
 
         for (int i = 0; i < kN; ++i)
-            JLib::Spawn(ReadOnce(server, 8, 0, scope.Token()), &wg, 0,
+            JLib::Spawn(ReadOnce(server, 8, 0, scope.Token()), &wg, JLib::Lane::Normal,
                         JLib::CorePref::Default, scope.Token().Raw());
 
         Check(WaitUntil([&] { return io.InFlight() == kN; }, 8000), "all of them are in flight");

@@ -19,7 +19,7 @@
 //      assertion is what actually distinguishes the two versions. Without it the test would pass
 //      either way and prove nothing -- an outcome this project has shipped before.
 //
-// SHAPE. K=1, so q0 is the whole reserved band. A lane task is pushed hiPri (it lands in q0's
+// SHAPE. K=1, so q0 is the whole reserved band. A lane task is pushed lane (it lands in q0's
 // reserved inbox) and blocks on a WaitGroup of ordinary bulk tasks that were pushed BEFORE it. The
 // bulk tasks record which worker ran them. q0, blocked inside the lane task, reaches the spin-help
 // path with an empty lane inbox -- exactly the situation the change governs.
@@ -105,7 +105,7 @@ int main() {
     JLib::Task* lane = sched.CreateTask(LaneBlockingPayload, nullptr);
     if (!lane) { std::printf("  CreateTask(lane) returned null\n"); return 1; }
     lane->waitGroup = &laneWg;
-    lane->hiPri = true;             // routes to the reserved band -- this is the lane task
+    lane->lane = JLib::Lane::LowLatency;             // routes to the reserved band -- this is the lane task
     sched.Push(lane);
 
     // BOUNDED WAIT, NOT WaitFor. If the change did introduce the hang the old comment feared, a

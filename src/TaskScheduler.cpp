@@ -310,7 +310,7 @@ void TaskScheduler::EnableIoReactor(bool on, unsigned completionThreads) noexcep
 	//
 	// This wiring did not exist and its absence was invisible. `SetIoHotLane` has been the named
 	// "I want a latency lane" API since K came back, and NOTHING in the tree ever called it -- so
-	// every reactor application got K=0: hiPri routes to the ordinary lane, no worker is reserved,
+	// every reactor application got K=0: lane routes to the ordinary lane, no worker is reserved,
 	// and no worker is kept awake for it. What `EnableIoReactor` reserved was a CORE for the
 	// completion thread, which is pool budgeting and a different question entirely.
 	//
@@ -516,7 +516,7 @@ void TaskScheduler::Init(size_t poolSize) {
 					secs, b.k, b.f, b.fbase, inst->workers.size(), TaskDeque::GrowCount());
 				for (size_t q = 0; q < inst->workers.size(); ++q) {
 					std::fprintf(stderr,
-						// THE hiPri DEQUE COLUMNS ARE GONE AND SO ARE THEIR SPECIFIERS. They outlived
+						// THE lane DEQUE COLUMNS ARE GONE AND SO ARE THEIR SPECIFIERS. They outlived
 						// their arguments when the lane deque was deleted, which is not a cosmetic
 						// bug: two orphan %zu shifted the three %s onto pointers, so the watchdog
 						// CRASHED the process it was called to diagnose (0xC0000005, mid-line).
@@ -854,7 +854,7 @@ void TaskScheduler::Join() {
 }
 // The worker the most recent placement-chosen push was aimed at, -1 before any. Read only by
 // DumpPoolState, to mark the row a stalled round trip is waiting on -- see the write site, which is
-// after the hiPri spill redirect so it names where the task actually went.
+// after the lane spill redirect so it names where the task actually went.
 //
 // Unconditional rather than behind the stats define: it is one relaxed store on a path that already
 // does several, and a stall dump is precisely when a normal Release build needs to know this.
@@ -868,10 +868,10 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 	// per-task cost, measured) to answer a question the queues already know the answer to. Summing
 	// is O(workers) in a function that only runs when a watchdog has already given up.
 	size_t queued = 0;
-	// loPri/hiPri are one longer than `workers` -- the extra pair is the non-worker lane, summed
+	// loPri/lane are one longer than `workers` -- the extra pair is the non-worker lane, summed
 	// here too. A watchdog that omitted it would report zero queued work while main's lane held a
 	// stranded lazy split, which is exactly the case this dump exists to make visible.
-	// hiPri has no deque any more and an MPSC has no size(), so only the loPri deques are counted.
+	// lane has no deque any more and an MPSC has no size(), so only the loPri deques are counted.
 	for (size_t i = 0; i < deques.size(); ++i) queued += deques[i]->size();
 	printf("queuedTasks=%zu  paused=%d  poolActive=%d  workers=%zu\n",
 		queued,
@@ -1138,7 +1138,7 @@ TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.l
 // cares about background CPU more than about its tail. 1 is the cheap middle.
 // ---- THE FLOOR IS THE RESERVED SET, AND NOTHING ELSE ----------------------------------------
 //
-// Workers [0, R) are dedicated to hiPri AND never park. Ordinary work never targets them, so there
+// Workers [0, R) are dedicated to lane AND never park. Ordinary work never targets them, so there
 // is no second population to size, no clamp, and no way for the two to fight over the same indices.
 // Default 1: one core held for I/O.
 //
@@ -1148,7 +1148,7 @@ TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.l
 //
 // Every never-parking worker taxes the producer more than it returns as a receiver, which is the
 // same reason IdlePolicy::NoSleep is not the default. The floor was originally introduced to remove
-// the OS wake from the dispatch path, and that job now belongs to the reserved hiPri workers, who
+// the OS wake from the dispatch path, and that job now belongs to the reserved lane workers, who
 // are awake for a reason rather than on the chance that a push arrives.
 //
 // THE FRAGILITY THIS REMOVES was not theoretical: with the floor and the reserved set sized
@@ -1156,7 +1156,7 @@ TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.l
 // awake target, and the bench stalled during warmup. One population cannot outgrow the other when
 // there is only one population.
 //
-// So: [0, R) hiPri only and always awake; [R, N) ordinary, parks when idle.
+// So: [0, R) lane only and always awake; [R, N) ordinary, parks when idle.
 // ---- K, F AND Fbase LIVE IN ONE WORD -------------------------------------------------------------
 //
 // THE BANDS ARE [0,K) [K,K+F) [K+F,N), SO BAND MEMBERSHIP IS A QUESTION ABOUT THE PAIR, NOT ABOUT
@@ -1340,18 +1340,18 @@ bool TaskScheduler::GetPlacementFollowsGrownFloor() noexcept {
 	return g_placementFollowsGrownFloor.load(std::memory_order_relaxed);
 }
 
-// ---- RESERVED FOR hiPri ----------------------------------------------------------------------
+// ---- RESERVED FOR lane ----------------------------------------------------------------------
 //
-// Workers [0, R) take hiPri work ONLY. Ordinary placement skips them, so a completion steered there
+// Workers [0, R) take lane work ONLY. Ordinary placement skips them, so a completion steered there
 // finds a worker that is awake AND not already inside a bulk body.
 //
 // WHY THIS AND NOT THE FLOOR ALONE. The floor makes a worker awake; it does not make it free.
-// Measured with hiPri steered at the unreserved floor (tests/io_overlap_test.cpp, pool saturated
-// with 400 us bodies): hiPri lost to ordinary placement at p99 -- 0.12x, 0.91x, 0.62x -- because
+// Measured with lane steered at the unreserved floor (tests/io_overlap_test.cpp, pool saturated
+// with 400 us bodies): lane lost to ordinary placement at p99 -- 0.12x, 0.91x, 0.62x -- because
 // steering concentrated every completion onto two workers that were busy, while an unsteered push
 // dispersed across all 31. Concentrating only wins if the target is kept free.
 //
-// AND ORDERING CANNOT SUBSTITUTE. "Drain hiPri before your own deque" applies when a worker picks
+// AND ORDERING CANNOT SUBSTITUTE. "Drain lane before your own deque" applies when a worker picks
 // its NEXT task; it does nothing about the 400 us body it is already in, and a running task cannot
 // be preempted. That is why the busy-pool max was 378-1160 us -- one to three whole bodies -- with
 // a p50 of 0.8 us. Reservation is the only thing that addresses the max.
@@ -1940,7 +1940,7 @@ size_t TaskScheduler::HiPriSpillTarget(size_t chosen) noexcept {
 	//
 	// A busy owner is not pathological on its own -- workers are busy most of the time in a loaded
 	// pool -- so this runs often, and an unbounded sweep would put O(workers) atomic loads on the
-	// hiPri push path at exactly the moment the pool is under pressure. The bound is no longer a
+	// lane push path at exactly the moment the pool is under pressure. The bound is no longer a
 	// probe budget: it is K itself, which is 1, 2 or 4. The whole scan is at most three acquire
 	// loads and it cannot leave the reserved band, so there is nothing left to budget.
 	//
@@ -2701,7 +2701,7 @@ void TaskScheduler::SetHotWorkers(size_t k) {
 	// away most of what the cores were spent on -- the completion pays an OS wake anyway, which is
 	// the cost K existed to remove.
 	//
-	// MEASURED, io_overlap hiPri completion latency on a BUSY pool:
+	// MEASURED, io_overlap lane completion latency on a BUSY pool:
 	//     reservation only   p50 5.90  p99 43.00  max 66.90 us
 	//     + never-park       p50 2.00  p99  6.30  max 13.00 us
 	// Exclusion works either way (300 of 300 ran inside [0,K) in both arms) -- this is purely the
@@ -2895,8 +2895,8 @@ size_t TaskScheduler::GetHotWorkers() {
 	// K IS BEING REMOVED, AND THIS IS THE GATE THAT MAKES THE WHOLE LANE INERT FIRST.
 	//
 	// Returning 0 here turns off every consumer of K in one place, because they all reduce to this:
-	//   HiPriLaneActive()  -> false, so every push routes to loPriInboxes and hiPri gets nothing
-	//   PickNextWorker     -> the lane branch is `hiPri && hotN`, and the ordinary branch's
+	//   HiPriLaneActive()  -> false, so every push routes to loPriInboxes and lane gets nothing
+	//   PickNextWorker     -> the lane branch is `IsLowLatency(lane) && hotN`, and the ordinary branch's
 	//                         `idx < hotN` skip stops reserving workers 0..K-1
 	//   isReservedWorker        -> `GetHotWorkers() > qIndex` is false for every worker
 	//   WorkerServesHiPri  -> false, so nobody drains or steals the lane
@@ -2907,7 +2907,7 @@ size_t TaskScheduler::GetHotWorkers() {
 	// breaks during the deletion is the deletion.
 	//
 	// hiPriStray stays live through this phase ON PURPOSE: it is the path that drains a lane queue
-	// nobody serves, so anything already sitting in hiPri when this flipped still gets run.
+	// nobody serves, so anything already sitting in lane when this flipped still gets run.
 	//
 	// ---- K IS BACK, STATIC, AND DISJOINT FROM THE FLOOR (4.0.2) ---------------------------
 	//
@@ -3196,7 +3196,7 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 				const int hi = (lo + grain > end) ? end : lo + grain;
 				(*f)(lo, hi);
 			}
-			}, false, CorePref::Wide);
+			}, Lane::Normal, CorePref::Wide);
 		// Wide: a cursor LANE is a worker's worth of participation in one range. Steering these at
 		// the floor is self-defeating -- every lane lands on the same couple of threads and the
 		// cursor they share has nobody else pulling on it, which is the fan-out failure this whole
@@ -3603,7 +3603,7 @@ void TaskScheduler::RunLazyRange(int lo, int hi, LazyRangeState* st) {
 		// Default therefore stays, on the cheaper-push argument rather than on Wide being worse:
 		// when two options measure the same, take the one that does not pay a kernel wake.
 		Task* t = CreateInternalTask([this, mid, hi, st]() { RunLazyRange(mid, hi, st); },
-		                             false,
+		                             Lane::Normal,
 		                             ParallelSplitWide() ? CorePref::Wide : CorePref::Default);
 		if (!t) break;                      // slab exhausted: run the remainder inline, no error
 		t->waitGroup = st->wg;
@@ -4133,7 +4133,7 @@ haveWidth:
 	//
 	// A BARE caller (main, or a Native task) has nothing to park into, so WaitFor spin-helps via
 	// TryRunStolenNativeTask -> GetTask. That is CORRECT but the wrong tool for our own splits:
-	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 hiPri plus
+	// GetTask does `rand() % 32` -- a libc call taking a lock -- and then scans up to 32 lane plus
 	// 32 loPri deques with a steal CAS at each, to reach tasks that are sitting on THIS thread's
 	// own lane where a 4.6 ns pop_bottom would have them. Measured, that scan was most of the cost
 	// of a cheap ParallelFor from main.
@@ -4953,7 +4953,7 @@ WaitResult TaskScheduler::WaitFor(WaitGroup& wg, CancelToken tok) {
 }
 
 void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment,
-	bool hiPri, CorePref pref)
+	Lane lane, CorePref pref)
 {
 	if (!tasks || count == 0) return;
 
@@ -4986,13 +4986,13 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		for (size_t i = first; i + 1 < first + len; ++i)
 			tasks[i]->next.store(tasks[i + 1], std::memory_order_relaxed);
 		// Priority is a PARAMETER, not read from the tasks: a batch is documented as homogeneous, and
-		// silently routing a hiPri run into the loPri inbox is a priority inversion no caller could
+		// silently routing a lane run into the loPri inbox is a priority inversion no caller could
 		// see. Before this existed, every batch went to loPri unconditionally.
-		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes hiPri, so a batch routed there
+		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes lane, so a batch routed there
 		// would never run. Same rule as PushLocal and Requeue, asked of the same predicate.
-		const bool useHi = hiPri && HiPriLaneActive();
-		(useHi ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
-		if (useHi) SetHiPriHint((size_t)chosen);   // so a thief knows to probe this hiPri deque
+		const Lane useHi = (IsLowLatency(lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
+		(IsLowLatency(useHi) ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
+		if (IsLowLatency(useHi)) SetHiPriHint((size_t)chosen);   // so a thief knows to probe this lane deque
 		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
 		// is private and nothing wakes it without a notify targeting it specifically.
 		workers[chosen]->MarkQueuedWork();
@@ -5029,13 +5029,13 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	if (minPerSegment == 0) minPerSegment = 1;
 	const size_t nw = workers.size();
 
-	// CAP AT THE WORKERS THIS BATCH CAN ACTUALLY REACH, not at the pool. A hiPri batch goes to the
+	// CAP AT THE WORKERS THIS BATCH CAN ACTUALLY REACH, not at the pool. A lane batch goes to the
 	// hot set; everything else goes to the ordinary set. Capping at the whole pool cuts the batch
 	// into more pieces than there are destinations for them, so segments pile up on the same
 	// workers -- paying the per-segment notify without buying the spread it is meant to buy.
 	// SetHotWorkers is clamped so both sets are non-empty.
 	const size_t hotN = GetHotWorkers();
-	const size_t reachable = (hiPri && hotN) ? hotN
+	const size_t reachable = (IsLowLatency(lane) && hotN) ? hotN
 	                       : (nw > hotN ? nw - hotN : nw);
 
 	size_t segments = (nw == 0) ? 1 : (count / minPerSegment);
@@ -5048,10 +5048,10 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 	for (size_t s = 0; s < segments; ++s) {
 		const size_t len = per + (s < rem ? 1 : 0);
 		if (len == 0) continue;
-		// Same lane branch as the single-task path -- a hiPri BATCH rotates the hot set. The retry
+		// Same lane branch as the single-task path -- a lane BATCH rotates the hot set. The retry
 		// applies to ordinary placement only; PickNextWorker settles a fully-claimed hot set itself,
 		// and yielding in a loop here on K = 1 would never terminate.
-		const bool useHiSeg = hiPri && HiPriLaneActive();
+		const Lane useHiSeg = (IsLowLatency(lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
 		const int chosen = PickNextWorker(pref, useHiSeg);
 		submitRun(first, len, chosen);
 		first += len;
@@ -5066,9 +5066,9 @@ bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 bool TaskScheduler::PushIO(Task* task) noexcept {
 	if (!task) return false;
 
-	// NOT hiPri: refuse rather than place. K reads only its hiPri inbox, so this would be
+	// NOT lane: refuse rather than place. K reads only its lane inbox, so this would be
 	// unreachable there -- unstealable, and nobody looking. The caller sends it to the floor.
-	if (!task->hiPri) return false;
+	if (!IsLowLatency(task->lane)) return false;
 
 	const size_t k = GetHotWorkers();
 	if (k == 0) return false;                       // no lane at all -- caller uses the floor
@@ -5081,8 +5081,8 @@ bool TaskScheduler::PushIO(Task* task) noexcept {
 	//
 	//   UNREACHABLE  a loPri task on K. Genuinely fatal: K never reads its loPri inbox, inbox work
 	//                is unstealable, and the pool deadlocks. Still refused, above.
-	//   BUSY         a hiPri task aimed at a K worker that is already working. COMPLETELY FINE. The
-	//                inbox is a queue; K reads its hiPri inbox; the task drains in order at worker
+	//   BUSY         a lane task aimed at a K worker that is already working. COMPLETELY FINE. The
+	//                inbox is a queue; K reads its lane inbox; the task drains in order at worker
 	//                speed. Queueing was never the problem.
 	//
 	// Refusing on the second turned the backlog from backpressure into a load balancer that paid a
@@ -5283,9 +5283,9 @@ void TaskScheduler::Stop(Task* worker_task) {
 
 
 // Steals ONE task for a NON-worker helper (e.g. main spinning in WaitFor, or a Native task spinning
-// on a SchedulerMutex). Random-start, hiPri-then-loPri scan with fairness: after
-// kStealFairnessWindow consecutive hiPri steals it forces a loPri scan so loPri work can't starve
-// behind a stream of hiPri steals. Single-item steal() is the only correct steal in the lock-free
+// on a SchedulerMutex). Random-start, lane-then-loPri scan with fairness: after
+// kStealFairnessWindow consecutive lane steals it forces a loPri scan so loPri work can't starve
+// behind a stream of lane steals. Single-item steal() is the only correct steal in the lock-free
 // deque (see TaskDeque.h). Returns nullptr if nothing was stealable anywhere.
 Task* TaskScheduler::GetTask() {
 	bool forceLoPri = (consecutiveHiPriSteals >= kStealFairnessWindow);
@@ -5337,14 +5337,14 @@ Task* TaskScheduler::GetTask() {
 	// onto a thread that is not spinning, is not elevated, and may be about to block again. Every
 	// reason ordinary workers are kept out applies harder to main.
 	//
-	// K = 0 leaves this exactly as it was -- no lane exists, and skipping hiPri there would strand
+	// K = 0 leaves this exactly as it was -- no lane exists, and skipping lane there would strand
 	// whatever is in it.
 	// ---- AT K = 0 THE LANE MUST BE SCANNED HERE, OR IT STRANDS ------------------------------
 	//
-	// With no reserved band there is no owner obliged to drain a hiPri deque, so a helper that
+	// With no reserved band there is no owner obliged to drain a lane deque, so a helper that
 	// skips the lane leaves whatever is in it unreachable. This loop had been reduced to a bare
 	// rotation with an EMPTY BODY -- scanning nothing -- which was survivable only because the
-	// owning worker still popped its own hiPri deque. Restored with a body.
+	// owning worker still popped its own lane deque. Restored with a body.
 	// NO LANE STEAL FROM HERE, and that is how it shipped: this loop existed with an EMPTY BODY,
 	// rotating over the lanes and taking nothing. I gave it a body while "restoring" it, which is a
 	// behaviour change invented during a revert -- helpers would then pull lane work at K=0 where
@@ -5352,10 +5352,10 @@ Task* TaskScheduler::GetTask() {
 	size_t numThreads = deques.size();
 	// ONE rand() FOR BOTH SCANS. It is a libc call that takes a lock -- measured as most of the
 	// cost of a cheap ParallelFor from main, which is why the bare-caller wait avoids this function
-	// entirely -- so a second draw for the hiPri pass would double the only expensive part of it.
+	// entirely -- so a second draw for the lane pass would double the only expensive part of it.
 	size_t start = rand() % numThreads;
 
-	// ---- hiPri DEQUES FIRST. THIS IS WHAT MAKES LANE WORK RESCUABLE ---------------------------
+	// ---- lane DEQUES FIRST. THIS IS WHAT MAKES LANE WORK RESCUABLE ---------------------------
 	//
 	// The lane inbox cannot be stolen from and never will be: an MPSC has one legal consumer. The
 	// deque is the structure that lets anybody reach lane work whose owner has stopped coming back
@@ -5377,8 +5377,8 @@ Task* TaskScheduler::GetTask() {
 	// UNCONDITIONALLY rather than skipped: an absent bit must mean "unknown", never "empty", or the
 	// backlog on worker 64 would be advertised to nobody and stranded exactly the way this whole
 	// change exists to prevent.
-	// THE LANE SWEEP THAT WAS HERE IS GONE WITH THE LANE DEQUE. It walked hiPri[] under the lane
-	// bitmap and took one with steal_if. There is no hiPri[] now: the lane is an MPSC inbox, which
+	// THE LANE SWEEP THAT WAS HERE IS GONE WITH THE LANE DEQUE. It walked lane[] under the lane
+	// bitmap and took one with steal_if. There is no lane[] now: the lane is an MPSC inbox, which
 	// has exactly one legal consumer, so nothing outside the owner can take from it at any price.
 	//
 	// The fairness counter it fed goes with it. `consecutiveHiPriSteals` existed so a saturated
@@ -5965,11 +5965,11 @@ void JLib::detail::ReportTaskSizesTo(std::FILE* out) {
 }
 #endif
 
-Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, uint8_t hipri, TaskType type, CorePref corePref) {
+Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type, CorePref corePref) {
 	void* mem = taskAllocator.AllocSized(sizeof(Task));   // a bare Task is exactly 64 B
 	if (!mem) return nullptr;
 	detail::RecordTaskSize(sizeof(Task));   // exactly 64 -- a quarter of the slot it just took
-	Task* t = ::new (mem) Task(fn, data, hipri);
+	Task* t = ::new (mem) Task(fn, data, lane);
 	t->type = type;
 	t->corePref = corePref;
 	// Concrete type is exactly Task, whose destructor is empty -- the completion path can skip the
@@ -5997,19 +5997,19 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// AFFINITY DOES NOT DEMOTE. This branch pushed to loPriInboxes unconditionally, so
 		// Push(affinity, hiPriTask) silently landed lane work on the ordinary deque -- the exact
 		// priority inversion PushBatch's submitRun refuses by name ("no caller could see" it), and a
-		// direct contradiction of the contract on Task::hiPri, which lists PushLocal among the paths
+		// direct contradiction of the contract on Task::lane, which lists PushLocal among the paths
 		// that route on it. Nothing reported it: the task still ran, just never on the lane, so the
 		// lane simply never filled and its hint bit never set.
 		//
-		// Found by a reachability test that pinned hiPri work to one worker with affinity and then
+		// Found by a reachability test that pinned lane work to one worker with affinity and then
 		// could not explain why stealHintLane stayed 0x0.
 		//
-		// SAME PREDICATE AS EVERY OTHER PUSH PATH, deliberately: at K=0 nobody probes hiPri, so a
-		// task routed to the lane would never run at all -- collapsing to loPri is what makes hiPri
+		// SAME PREDICATE AS EVERY OTHER PUSH PATH, deliberately: at K=0 nobody probes lane, so a
+		// task routed to the lane would never run at all -- collapsing to loPri is what makes lane
 		// free rather than dangerous when the lane is off.
-		const bool useHi = task->hiPri && HiPriLaneActive();
-		(useHi ? hiPriInboxes : loPriInboxes)[idx]->push(task);
-		if (useHi) SetHiPriHint((size_t)idx);
+		const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
+		(IsLowLatency(useHi) ? hiPriInboxes : loPriInboxes)[idx]->push(task);
+		if (IsLowLatency(useHi)) SetHiPriHint((size_t)idx);
 		// EVERY inbox enqueue accounts for depth, including this one. Missing it here is what made
 		// the growth gate dead in a long-running process: the drain decrements whatever it pops, so
 		// a push path that does not increment walks the counter negative one task at a time. After
@@ -6030,10 +6030,10 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 	else {
 		const size_t hotN = GetHotWorkers();
 		// HiPriLaneActive(), NOT hotN. This site still spelled the gate as "K > 0", so with K stubbed it
-		// silently collapsed every hiPri push to loPri -- placement was never even asked for a reserved
-		// worker. Measured: 0 of 300 hiPri completions ran inside the reserved range while this stood.
+		// silently collapsed every lane push to loPri -- placement was never even asked for a reserved
+		// worker. Measured: 0 of 300 lane completions ran inside the reserved range while this stood.
 		// Two spellings of one predicate is one too many; there are none left.
-		const bool useHi = task->hiPri && HiPriLaneActive();
+		const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
 		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
 
 		// ---- DO NOT COMMIT ORDINARY WORK TO A WORKER THAT CANNOT REACH IT -------------------
@@ -6049,7 +6049,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// strictly better than guessing which body finishes first -- and it also closes the race,
 		// because a worker that goes away between the pick and this check is caught here.
 		//
-		// LANE WORK IS EXCLUDED. A hiPri task belongs to the reserved band by construction, and a
+		// LANE WORK IS EXCLUDED. A lane task belongs to the reserved band by construction, and a
 		// reserved worker never drains this queue -- diverting it here would take a completion off
 		// the lane it was routed to, which is the one thing the lane exists to prevent.
 		//
@@ -6092,7 +6092,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 
 		// ---- LANE OVERFLOW, AND IT HAS TO HAPPEN HERE ----------------------------------------
 		//
-		// A hiPri push aimed at a worker that is inside a task body would queue behind it in an
+		// A lane push aimed at a worker that is inside a task body would queue behind it in an
 		// MPSC that ONE thread may pop -- and that thread is not in Worker(), so it reaches neither
 		// the lane pop nor any spill of its own. Nothing downstream can rescue that task; the push
 		// is the last moment a definitely-running thread gets to choose. See HiPriSpillTarget.
@@ -6102,7 +6102,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// redirecting after any of it would leave the counters describing one worker and the task
 		// sitting on another. That is the same class of bug as a setter silently undoing an earlier
 		// one, and it would show up as a floor controller promoting against wakes nobody paid.
-		if (useHi) chosen = (uint8_t)HiPriSpillTarget((size_t)chosen);
+		if (IsLowLatency(useHi)) chosen = (uint8_t)HiPriSpillTarget((size_t)chosen);
 
 		// ---- REMEMBER WHERE THIS PUSH WENT, SO A STALL DUMP CAN POINT AT IT ------------------
 		//
@@ -6124,7 +6124,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// line (Thread.h:833) that the worker is concurrently RMW-ing, on the hottest path in the
 		// scheduler. NotifyWorker below reaches the same word for a reason; this read had none.
 
-		if (useHi) {
+		if (IsLowLatency(useHi)) {
 			// ---- A LANE MISS IS "THIS COMPLETION WILL QUEUE BEHIND ONE ALREADY LINKED" -------
 			//
 			// Asked against the MPSC we are about to push to, BEFORE the push, because there is no
@@ -6204,7 +6204,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// "whichever worker is next" is what makes `thread_id` and `Thread::instance` disagree across a
 	// suspend. See Fiber::homeWorker and resumedInboxes.
 	//
-	// THE hiPri LANE IS DELIBERATELY NOT CONSULTED HERE, and that is a real trade. A resumed hiPri
+	// THE lane LANE IS DELIBERATELY NOT CONSULTED HERE, and that is a real trade. A resumed lane
 	// task would normally be routed back onto the lane so a hot worker serves it; pinned, it goes
 	// to its home worker whether or not that worker is hot. The alternative -- honour the lane and
 	// migrate -- reintroduces exactly the hazard this exists to remove, and a lane task that has
@@ -6260,12 +6260,12 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 		}
 	}
 
-	// Same routing as PushLocal -- a RESUMED hiPri task is still on the lane, and sending it back to
+	// Same routing as PushLocal -- a RESUMED lane task is still on the lane, and sending it back to
 	// an ordinary worker would strand it just as surely as a fresh one.
 	const size_t hotN = GetHotWorkers();
 	// HiPriLaneActive(), NOT hotN -- see the identical fix above.
 
-	const bool useHi = task->hiPri && HiPriLaneActive();
+	const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
 	if (task->assignedFiber) JLIB_RQ_BUMP(g_rqPlaced);
 	const uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
 #if defined(JLIBSCHED_REQUEUE_TRACE)
@@ -6274,7 +6274,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 		task->assignedFiber->lastPlacedOn = (size_t)chosen;
 	}
 #endif
-	if (useHi) {
+	if (IsLowLatency(useHi)) {
 		// Same hook as PushLocal, and it has to be here too: a RESUMED completion queueing behind
 		// another is the exact pressure the K controller is meant to see, and on an I/O workload
 		// resumes are most of the lane's traffic. See the note at the PushLocal site.
@@ -6292,17 +6292,17 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// to a deque, so this is Pinned by the same definition -- how many workers may run it NOW.
 	return RequeueResult::Pinned;
 }
-int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
-	// THE LANE INVARIANT, ENFORCED AT THE ONE PLACE PLACEMENT IS DECIDED. A hiPri task rotates the
+int TaskScheduler::PickNextWorker(CorePref pref, Lane lane) {
+	// THE LANE INVARIANT, ENFORCED AT THE ONE PLACE PLACEMENT IS DECIDED. A lane task rotates the
 	// HOT workers only. Nothing downstream then has to rescue a lane task from a queue nobody
 	// drains, because none can ever be put there -- and a rescue would be bailing a sinking ship:
-	// it costs a second push, and multiple hiPri producers can outrun one bailing worker.
+	// it costs a second push, and multiple lane producers can outrun one bailing worker.
 	//
 	// Ordinary work takes the branch below and skips 0..K-1, so the two sets are disjoint. At K = 0
-	// there are no hot workers, `hiPri` cannot be true here (the push sites collapse it), and this
+	// there are no hot workers, `lane` cannot be true here (the push sites collapse it), and this
 	// is the original function unchanged.
 	const size_t hotN = GetHotWorkers();
-	if (hiPri && hotN) {
+	if (IsLowLatency(lane) && hotN) {
 		const size_t n = workers.size();
 		const size_t m = (hotN < n) ? hotN : n;
 		// One rotation step. This used to scan for the first UNPINNED hot worker and fall through to
@@ -6326,7 +6326,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	// FALLS THROUGH IF THE FLOOR IS EMPTY. floor=0 means there is no awake band to aim at, and
 	// ordinary placement -- which prefers awake workers anyway -- is a better answer than picking
 	// index 0 and calling it a lane.
-	if (hiPri && HiPriFloorLane()) {
+	if (IsLowLatency(lane) && HiPriFloorLane()) {
 		const Bands  b     = GetBands();
 		const size_t baseF = GetAwakeFloorBase();
 		const size_t n     = workers.size();
@@ -6339,12 +6339,12 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 
 	// ---- HIPRI GOES TO THE RESERVED RANGE -----------------------------------------------------
 	//
-	// [0, R) takes hiPri only -- ordinary placement skips it below -- so a completion steered here
+	// [0, R) takes lane only -- ordinary placement skips it below -- so a completion steered here
 	// finds a worker that is awake and NOT inside a bulk body. That second half is what the awake
-	// floor could not give, and it is the whole reason steering hiPri at the bare floor measured
+	// floor could not give, and it is the whole reason steering lane at the bare floor measured
 	// WORSE than not steering it at all (see ReservedHiPri).
-	// (the hiPri branch above already routes over [0, K) when K > 0; with K == 0 there is no
-	//  reserved band and a hiPri push takes ordinary placement, which is the K=0 contract)
+	// (the lane branch above already routes over [0, K) when K > 0; with K == 0 there is no
+	//  reserved band and a lane push takes ordinary placement, which is the K=0 contract)
 
 	// ---- RE-MEASURED 2026-08-30: THE CLAIM BELOW DID NOT REPRODUCE -----------------------------
 	//
@@ -6354,7 +6354,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	// SetHiPriFloorLane(true) at K=0 is the configuration that paragraph describes, and it is an arm
 	// of that test.
 	//
-	// hiPri p99, completions probed against a saturated pool, us:
+	// lane p99, completions probed against a saturated pool, us:
 	//
 	//     bulk body      5 us      20 us     400 us
 	//     reserved K=2   4.20       7.70       1.90     <- FLAT. Does not care about the grain.
@@ -6362,9 +6362,9 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	//     no lane      164.90     423.50    5030.90
 	//
 	// SO THE FLOOR LANE DOES NOT LOSE. It beats no lane by 15-19x at every grain, which is the
-	// opposite of "hiPri never won". What it does is degrade with body length, exactly as the
+	// opposite of "lane never won". What it does is degrade with body length, exactly as the
 	// reasoning below predicts and for the reason given -- awake is not available. The old result
-	// most likely measured a build where the floor had no hiPri INBOX drained ahead of its deque,
+	// most likely measured a build where the floor had no lane INBOX drained ahead of its deque,
 	// so ordering was absent and only steering remained; that cannot be confirmed, which is the
 	// point of not deleting a test.
 	//
@@ -6377,39 +6377,39 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 	//  path there, so that is the harness checking itself. Its 400 us row is noise-dominated and
 	//  should not be read.)
 	//
-	// ---- (history: hiPri was briefly steered at the unreserved floor, and it lost) ------------
+	// ---- (history: lane was briefly steered at the unreserved floor, and it lost) ------------
 	//
-	// This block used to round-robin a hiPri push over [0, base) -- the awake floor -- on the
+	// This block used to round-robin a lane push over [0, base) -- the awake floor -- on the
 	// reasoning that a floor worker never parks, so a completion would land on a running thread and
 	// pay no OS wake. Half of that is true and the other half is what matters.
 	//
 	// tests/io_overlap_test.cpp, pool saturated with 400 us bulk bodies, completion latency
-	// push -> first instruction, hiPri and loPri interleaved so both see the same machine state:
+	// push -> first instruction, lane and loPri interleaved so both see the same machine state:
 	//
-	//     loPri/hiPri at p99:  0.12x, 0.91x, 0.62x   (>1 would mean hiPri wins)
+	//     loPri/lane at p99:  0.12x, 0.91x, 0.62x   (>1 would mean lane wins)
 	//
-	// hiPri never won and was 8x worse at the tail in the first run. The reason is that the floor is
+	// lane never won and was 8x worse at the tail in the first run. The reason is that the floor is
 	// AWAKE but not RESERVED: steering sends every completion to the same 2 workers, and under load
 	// those two are inside bulk bodies, while an unsteered loPri push spreads across all ~31 awake
 	// workers through the bitmap pick below. Concentrating on two busy threads beats dispersing
 	// across thirty only if those two are kept free -- which is precisely what K did and the floor
 	// does not.
 	//
-	// AND ORDERING CANNOT RESCUE IT. "Drain hiPri before your own deque" only applies when a worker
+	// AND ORDERING CANNOT RESCUE IT. "Drain lane before your own deque" only applies when a worker
 	// goes looking for its next task; it says nothing about the 400 us body it is already inside,
 	// and a running task cannot be preempted.
 	//
-	// So hiPri now takes the same placement as everything else and keeps only the part that pays:
-	// queue ORDER. A hiPri task still lands in hiPriInboxes, is still drained before the worker's
+	// So lane now takes the same placement as everything else and keeps only the part that pays:
+	// queue ORDER. A lane task still lands in hiPriInboxes, is still drained before the worker's
 	// own deque, and is still stolen before loPri -- it just is not aimed at two threads that are
 	// already busy.
 	//
-	// THE REAL FIX IS DISJOINT RANGES -- hiPri at [0, R), bulk steered at [R, base) -- which gives
+	// THE REAL FIX IS DISJOINT RANGES -- lane at [0, R), bulk steered at [R, base) -- which gives
 	// back the reservation without K's lane bitmap or dynamic-K machinery. That needs base > R to
 	// mean anything, so it is a decision about pool shape rather than a one-line change, and it is
 	// not made here.
 
-	// Placement is governed SOLELY by CorePref (see Task.h) -- queue priority (hiPri) is never consulted
+	// Placement is governed SOLELY by CorePref (see Task.h) -- queue priority (lane) is never consulted
 	// here; the two axes are fully orthogonal by design. Default/Any/Wide all mean "no class preference"
 	// and fall through to the original full-pool round-robin below.
 
@@ -6466,7 +6466,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 
 		// ---- NEVER THE RESERVED BAND, AND UNCONDITIONALLY ON F ------------------------------
 		//
-		// [0, K) takes hiPri only. A reserved worker does not drain its loPri inbox AT ALL --
+		// [0, K) takes lane only. A reserved worker does not drain its loPri inbox AT ALL --
 		// drainOwnInbox() opens `if (task_to_run || isReservedWorker) return false;` (Thread.cpp)
 		// -- and that gate does not consult the floor. So this mask must not consult it either.
 		//
@@ -6554,7 +6554,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 		if (const size_t baseF = GetAwakeFloorBase()) {
 			unsigned long long steerW[kHintWords] = {};
 			unsigned long long anySteer = 0;
-			// KEEP [reserved, baseF). The low end is excluded because those workers take hiPri
+			// KEEP [reserved, baseF). The low end is excluded because those workers take lane
 			// only -- steering bulk work there is exactly what made a completion queue behind a
 			// 400 us body.
 			// THE FLOOR IS [K, K+F), NOT [0, F). K reserved workers sit below it and ordinary work
@@ -7092,8 +7092,8 @@ Task* TaskScheduler::GetCurrentTask() const {
 // spinlock mutex, and Boost had had no callers since 21719ac -- which made Unboost a permanent
 // no-op, since priorityBoost could only ever be zero.
 //
-// Deleting them matters now rather than being tidiness: hiPri is THE LOW-LATENCY LANE, so a
-// mechanism that promotes an AGED ORDINARY TASK to hiPri would push bulk work onto the hot
+// Deleting them matters now rather than being tidiness: lane is THE LOW-LATENCY LANE, so a
+// mechanism that promotes an AGED ORDINARY TASK to lane would push bulk work onto the hot
 // workers -- exactly the long-running work the lane is defined to exclude, and unstealable once
 // there. A dead function that would be actively wrong if revived is worse than no function.
 //

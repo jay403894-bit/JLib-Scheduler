@@ -213,7 +213,7 @@ static void TestCoroutineCancellableAwaiters(JLib::TaskScheduler& sched) {
 
         constexpr int kN = 4;
         for (int i = 0; i < kN; ++i) {
-            JLib::Spawn(LockCancelProbe(), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+            JLib::Spawn(LockCancelProbe(), &wg, JLib::Lane::Normal, JLib::CorePref::Default, scope.Token().Raw());
         }
         for (int s = 0; s < 200 && g_coParked.load() < kN; ++s)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -257,7 +257,7 @@ static void TestCoroutineCancellableAwaiters(JLib::TaskScheduler& sched) {
 
         constexpr int kN = 4;
         for (int i = 0; i < kN; ++i)
-            JLib::Spawn(AcquireCancelProbe(), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+            JLib::Spawn(AcquireCancelProbe(), &wg, JLib::Lane::Normal, JLib::CorePref::Default, scope.Token().Raw());
 
         for (int s = 0; s < 200 && g_coParked.load() < kN; ++s)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -300,7 +300,7 @@ static void TestCoroutineCancellableAwaiters(JLib::TaskScheduler& sched) {
                 if (r == JLib::WaitResult::Cancelled) g_coCancelled.fetch_add(1, std::memory_order_relaxed);
                 else g_coAcquired.fetch_add(1, std::memory_order_relaxed);
                 co_return;
-            }(&sem), &wg, 0, JLib::CorePref::Default, scope.Token().Raw());
+            }(&sem), &wg, JLib::Lane::Normal, JLib::CorePref::Default, scope.Token().Raw());
         }
 
         for (int s = 0; s < 200 && g_coParked.load() < kN; ++s)
@@ -476,7 +476,7 @@ int main() {
                     fx.overlap.fetch_sub(1, std::memory_order_acq_rel);
                     fx.m.Unlock();
                 }
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &fiberWg;
             sched.Push(t);
         }
@@ -526,7 +526,7 @@ int main() {
                     fx.sem.Signal();
                     fx.semDone.fetch_add(1, std::memory_order_relaxed);
                 }
-            }, false, JLib::TaskType::Fiber);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
             t->waitGroup = &fiberWg;
             sched.Push(t);
         }

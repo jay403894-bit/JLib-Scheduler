@@ -91,7 +91,7 @@ TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
             "  switch away to, so any suspension inside one fail-fasts with no message.\n"
             "  A public job is a fiber by DEFAULT, so this is what you get from a plain CreateTask.\n"
             "  For a main node, ask for the non-suspending type explicitly:\n"
-            "      CreateTask(fn, data, /*hipri*/0, TaskType::Native)\n"
+            "      CreateTask(fn, data, /*lane*/0, TaskType::Native)\n"
             "  Or put the suspending work on a pool node (CreateNode) and give the main node a\n"
             "  dependency on it.\n");
         std::fflush(stderr);
@@ -512,7 +512,7 @@ void TaskDAG::Fire(TaskNode* node, TaskNode::Outcome outcome) {
     //
     // NOTE THAT `priority` ITSELF DOES NOTHING ELSE -- it is written by CreateNode and read by no
     // one. So today passing a priority only ever COST you the node. Left in place rather than
-    // removed: making it mean something (hiPri, say) is a design decision, and deleting a public
+    // removed: making it mean something (lane, say) is a design decision, and deleting a public
     // parameter is a separate change from fixing the hang it causes.
 #if !defined(JLIB_DAGFIRE_CTL_NO_DEFAULT_PUSH)
     else {

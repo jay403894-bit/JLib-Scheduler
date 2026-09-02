@@ -679,7 +679,7 @@ int main() {
                     woke.fetch_add(1, std::memory_order_relaxed);
                     if (s != 0) { got.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
                     co_return;
-                }(&acc3, op.Token()), &wg, 0, JLib::CorePref::Default, op.Token().Raw());
+                }(&acc3, op.Token()), &wg, JLib::Lane::Normal, JLib::CorePref::Default, op.Token().Raw());
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             Check(woke.load() == 0, "three waiters parked under a nested scope");
@@ -708,7 +708,7 @@ int main() {
                 deadWoke.fetch_add(1, std::memory_order_relaxed);
                 if (s != 0) { deadGot.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
                 co_return;
-            }(&acc3, dead.Token()), &wg, 0, JLib::CorePref::Default, dead.Token().Raw());
+            }(&acc3, dead.Token()), &wg, JLib::Lane::Normal, JLib::CorePref::Default, dead.Token().Raw());
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -716,7 +716,7 @@ int main() {
                 const JLib::IoSocket s = co_await JLib::AcceptAsync(*a, t);
                 if (s != 0) { liveGot.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
                 co_return;
-            }(&acc3, live.Token()), &wg, 0, JLib::CorePref::Default, live.Token().Raw());
+            }(&acc3, live.Token()), &wg, JLib::Lane::Normal, JLib::CorePref::Default, live.Token().Raw());
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -770,7 +770,7 @@ int main() {
             woke.fetch_add(1, std::memory_order_relaxed);
             if (s != 0) { got.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
             co_return;
-        }(&acc4, op.Token()), &wg, 0, JLib::CorePref::Default, op.Token().Raw());
+        }(&acc4, op.Token()), &wg, JLib::Lane::Normal, JLib::CorePref::Default, op.Token().Raw());
 
         sched.WaitFor(wg);
         const auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -940,7 +940,7 @@ int main() {
             const JLib::IoResult r = co_await JLib::AcceptAsync(l, a, ab, tok);
             g_acceptStatus.store(static_cast<int>(r.status), std::memory_order_release);
             co_return;
-        }(listener, pending, &addrs2, op.Token()), &wg, 0,
+        }(listener, pending, &addrs2, op.Token()), &wg, JLib::Lane::Normal,
           JLib::CorePref::Default, op.Token().Raw());
 
         Check(WaitUntil([&] { return io.InFlight() == 1; }), "the accept is in flight");
@@ -976,7 +976,7 @@ int main() {
             const JLib::IoResult r = co_await JLib::AcceptAsync(l, a, ab, tok);
             g_acceptStatus.store(static_cast<int>(r.status), std::memory_order_release);
             co_return;
-        }(listener, pending, &addrs3, op.Token()), &wg, 0,
+        }(listener, pending, &addrs3, op.Token()), &wg, JLib::Lane::Normal,
           JLib::CorePref::Default, op.Token().Raw());
 
         sched.WaitFor(wg);

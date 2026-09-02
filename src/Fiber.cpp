@@ -61,7 +61,7 @@ void Fiber::Resume() {
 		TaskScheduler::Instance().Requeue(this->owningTask);
 }
 
-void JLib::RequeueResumedBatch(Task** tasks, size_t n, bool hiPri) {
+void JLib::RequeueResumedBatch(Task** tasks, size_t n, Lane lane) {
 	if (n == 0) return;
 	// PINNED: THE BATCH CANNOT BE ONE BATCH. Every task here holds a fiber, and each of those fibers
 	// is pinned to whichever worker bound it, so a wake of N fibers is a wake of up to N DIFFERENT
@@ -74,10 +74,10 @@ void JLib::RequeueResumedBatch(Task** tasks, size_t n, bool hiPri) {
 	// What is genuinely given up is the single notify for a SignalAll that wakes many fibers on one
 	// worker; if that shows up in a profile, the fix is to group by homeWorker here, not to migrate.
 	//
-	// `hiPri` is now unused. It is kept in the signature rather than removed because the routing it
+	// `lane` is now unused. It is kept in the signature rather than removed because the routing it
 	// used to select is decided by Requeue from the task's own tag, and changing the signature would
 	// churn every Event call site to no effect.
-	(void)hiPri;
+	(void)lane;
 	auto& sched = TaskScheduler::Instance();
 	for (size_t i = 0; i < n; ++i) sched.Requeue(tasks[i]);
 }

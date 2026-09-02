@@ -3,10 +3,10 @@
 //
 // DOES A COMPLETION STILL LOSE WHEN IT LANDS ON A WORKER THAT IS RUNNING BULK?
 //
-// WHY THIS FILE EXISTS AGAIN. PickNextWorker carries a recorded result -- "hiPri was briefly
+// WHY THIS FILE EXISTS AGAIN. PickNextWorker carries a recorded result -- "lane was briefly
 // steered at the unreserved floor, and it lost" -- with numbers from a test of this name:
 //
-//     loPri/hiPri at p99:  0.12x, 0.91x, 0.62x     (>1 would mean hiPri wins)
+//     loPri/lane at p99:  0.12x, 0.91x, 0.62x     (>1 would mean lane wins)
 //
 // The comment outlived the harness. tests/io_overlap_test.cpp was not in the tree when the
 // question came up again, so the one measurement standing between the reserved band and its
@@ -20,7 +20,7 @@
 // grain at ~75 us of total serial work split across ~29 workers, i.e. single-digit-microsecond
 // leaves. Waiting behind one of those is nothing; waiting behind 400 us is the entire finding.
 //
-// So this sweeps the body length and reports the ratio at each. If hiPri stops losing at game
+// So this sweeps the body length and reports the ratio at each. If lane stops losing at game
 // grain, the reserved band is dead weight for that workload and the deletion is clean. If it only
 // loses at 400 us, K is an option for applications that admit long bodies rather than a default.
 //
@@ -35,7 +35,7 @@
 // informs is a human one; its job is to produce the table honestly and to fail only when
 // something is actually broken.
 //
-// THE CONTROL IS THE INTERLEAVE. hiPri and loPri probes alternate within the same loop against the
+// THE CONTROL IS THE INTERLEAVE. lane and loPri probes alternate within the same loop against the
 // same bulk load, so both arms see the same machine state, the same thermal condition and the same
 // background noise. Measuring one arm and then the other would compare two different machines.
 #include "TaskScheduler.h"
@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     }
 
     // ARGV[2] = NEVER-PARK, and it is not optional for a fair reading. Without it the reserved band
-    // SLEEPS between completions, so every hiPri probe pays a ~3 us kernel wake and the lane's p50
+    // SLEEPS between completions, so every lane probe pays a ~3 us kernel wake and the lane's p50
     // measures the park primitive rather than the placement. That is a real configuration -- it is
     // the default -- but comparing a parking lane against an awake pool answers a question nobody
     // asked.
@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
         std::printf("  NOTE: floorlane is INERT at K>0 -- the reserved branch wins in\n"
                     "        PickNextWorker. This run is the plain reserved lane.\n");
     else if (floorLane)
-        std::printf("  arms: hiPri -> awake floor [0,%zu), NOT reserved -- lands on a worker that\n"
+        std::printf("  arms: lane -> awake floor [0,%zu), NOT reserved -- lands on a worker that\n"
                     "        is awake but may be inside a bulk body.\n",
                     JLib::TaskScheduler::GetAwakeFloorBase());
     else if (JLib::TaskScheduler::GetHotWorkers() == 0)
@@ -210,8 +210,8 @@ int main(int argc, char** argv) {
     constexpr int kProbesPerArm = 500;
     constexpr int kBulkBatch    = 256;
 
-    std::printf("%-10s %-28s %-28s %s\n", "body", "hiPri p50/p99/max (us)",
-                "loPri p50/p99/max (us)", "loPri/hiPri  (>1 = hiPri wins)");
+    std::printf("%-10s %-28s %-28s %s\n", "body", "lane p50/p99/max (us)",
+                "loPri p50/p99/max (us)", "loPri/lane  (>1 = lane wins)");
     std::printf("---------------------------------------------------------------------"
                 "------------------------------------\n");
 
@@ -236,8 +236,8 @@ int main(int argc, char** argv) {
         // NO WAITGROUP ON BULK. Nothing waits for these; the drain below is what makes them safe to
         // leave running, and the body touches only globals.
         //
-        // Pushed with PushBatch and hiPri=false: this is bulk, it must spread, and it must never
-        // take the lane. Routing it hiPri would make the probe compete with itself.
+        // Pushed with PushBatch and lane=false: this is bulk, it must spread, and it must never
+        // take the lane. Routing it lane would make the probe compete with itself.
         std::atomic<bool> stop{ false };
         std::atomic<long long> bulkDone{ 0 };
         const int kInFlightCap = (int)workers * 8;
@@ -250,7 +250,7 @@ int main(int argc, char** argv) {
                 }
                 int made = 0;
                 for (int i = 0; i < kBulkBatch; ++i) {
-                    JLib::Task* t = sched.CreateTask(BulkBody, nullptr, /*hiPri*/ 0);
+                    JLib::Task* t = sched.CreateTask(BulkBody, nullptr, /*lane*/ JLib::Lane::Normal);
                     if (!t) break;
                     arr[i] = t;
                     ++made;
@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
                 // visible, so counting up afterwards can drive the counter negative and uncap the
                 // producer -- which is the bug this cap exists to prevent, wearing a disguise.
                 g_bulkInFlight.fetch_add(made, std::memory_order_release);
-                sched.PushBatch(arr.data(), (size_t)made, 0, 64, /*hiPri*/ false);
+                sched.PushBatch(arr.data(), (size_t)made, 0, 64, /*lane*/ JLib::Lane::Normal);
                 bulkDone.fetch_add(made, std::memory_order_relaxed);
             }
         });
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
                 ProbeSlot slot;
                 JLib::WaitGroup wg;
                 wg.n.store(1, std::memory_order_relaxed);
-                JLib::Task* t = sched.CreateTask(ProbeBody, &slot, useHi ? 1 : 0);
+                JLib::Task* t = sched.CreateTask(ProbeBody, &slot, useHi ? JLib::Lane::LowLatency : JLib::Lane::Normal);
                 if (!t) continue;
                 t->waitGroup = &wg;
                 slot.postNs = NowNs();
@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
     finished.store(true, std::memory_order_release);
     watchdog.join();
 
-    std::printf("\nHOW TO READ THE RATIO. >1 means the hiPri arm was faster, i.e. the lane earned\n"
+    std::printf("\nHOW TO READ THE RATIO. >1 means the lane arm was faster, i.e. the lane earned\n"
                 "its place. <1 means an unsteered ordinary push beat it -- which is what the\n"
                 "recorded result found at 400 us, because steering concentrates every completion on\n"
                 "the few floor workers while an ordinary push spreads across the whole pool. Compare\n"

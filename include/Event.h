@@ -132,12 +132,12 @@ namespace JLib {
             // Handles the WANTS_SUSPEND/SUSPENDED race exactly as Resume() does; true means this
             // call won the SUSPENDED -> READY transition and now owns re-queueing the task.
             if (!t->assignedFiber->ResumeQueueless()) return;
-            if (t->hiPri) {
+            if (IsLowLatency(t->lane)) {
                 hi[nhi++] = t;
-                if (nhi == cap) { RequeueResumedBatch(hi, nhi, true); nhi = 0; }
+                if (nhi == cap) { RequeueResumedBatch(hi, nhi, Lane::LowLatency); nhi = 0; }
             } else {
                 lo[nlo++] = t;
-                if (nlo == cap) { RequeueResumedBatch(lo, nlo, false); nlo = 0; }
+                if (nlo == cap) { RequeueResumedBatch(lo, nlo, Lane::Normal); nlo = 0; }
             }
         }
 
@@ -263,8 +263,8 @@ namespace JLib {
                     }
                 }
             }
-            RequeueResumedBatch(hi, nhi, true);
-            RequeueResumedBatch(lo, nlo, false);
+            RequeueResumedBatch(hi, nhi, Lane::LowLatency);
+            RequeueResumedBatch(lo, nlo, Lane::Normal);
         }
 
         // Wake everyone waiting on this event.
@@ -276,7 +276,7 @@ namespace JLib {
         // called SignalAll. Measured elsewhere: single Push ~1 M/s, PushBatch ~12 M/s.
         //
         // Split by priority because PushBatch takes ONE priority for the whole run -- merging them
-        // would silently demote a hiPri fiber. Buffers are fixed and flushed when full, so this
+        // would silently demote a lane fiber. Buffers are fixed and flushed when full, so this
         // allocates nothing on a path that may run from any thread, including a signaller that is
         // not a worker.
         void SignalAll() {
@@ -310,8 +310,8 @@ namespace JLib {
                         WakeOne(t, hi, nhi, lo, nlo, kBuf);
                 }
             }
-            RequeueResumedBatch(hi, nhi, true);
-            RequeueResumedBatch(lo, nlo, false);
+            RequeueResumedBatch(hi, nhi, Lane::LowLatency);
+            RequeueResumedBatch(lo, nlo, Lane::Normal);
         }
 
         // Wake AT MOST ONE waiter. Returns whether one was woken.
@@ -338,7 +338,7 @@ namespace JLib {
                     if (old & m) {
                         if (Task* t = TakeSlot(tb, (w << 6) + b)) {
                             if (t->assignedFiber->ResumeQueueless())
-                                RequeueResumedBatch(&t, 1, t->hiPri);
+                                RequeueResumedBatch(&t, 1, t->lane);
                             return true;
                         }
                     }

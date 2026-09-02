@@ -127,7 +127,7 @@ int main() {
     noise.n.store(kInterferes, std::memory_order_relaxed);
 
     for (int i = 0; i < kInterferes; ++i) {
-        JLib::Task* t = sched.CreateTask(InterferenceBody, nullptr, false,
+        JLib::Task* t = sched.CreateTask(InterferenceBody, nullptr, JLib::Lane::Normal,
                                          JLib::TaskType::Fiber);
         if (!t) { noise.n.fetch_sub(1, std::memory_order_release); continue; }
         t->waitGroup = &noise;
@@ -137,7 +137,7 @@ int main() {
     for (int i = 0; i < kSubjects; ++i) {
         JLib::Task* t = sched.CreateTask(SubjectBody,
                                          reinterpret_cast<void*>(static_cast<std::uintptr_t>(i)),
-                                         false, JLib::TaskType::Fiber);
+                                         JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { subjects.n.fetch_sub(1, std::memory_order_release); continue; }
         t->waitGroup = &subjects;
         sched.Push(t);

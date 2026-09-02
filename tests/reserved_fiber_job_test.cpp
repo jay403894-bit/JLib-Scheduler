@@ -11,10 +11,10 @@
 // either: SchedulerMutex::Lock refuses a fiberless task rather than stranding the worker's
 // unstealable inbox. So K binds a fiber and the lane gets the capability it exists to provide.
 //
-// KEYED ON WHERE A TASK ACTUALLY RAN, NOT WHERE IT WAS AIMED. hiPri is routed into the reserved band
-// but can SPILL to another hiPri inbox when K is busy, so "I pushed it hiPri" does not mean "it ran
-// on K". Each run records its own (queue index, had a fiber) pair and the assertions are computed
-// from that -- otherwise a spill would look like a violation.
+// KEYED ON WHERE A TASK ACTUALLY RAN, NOT WHERE IT WAS AIMED. Lane::LowLatency routes to the
+// reserved band but can SPILL to another lane inbox when K is busy, so "I pushed it LowLatency" does
+// not mean "it ran on K". Each run records its own (queue index, had a fiber) pair and the
+// assertions are computed from that -- otherwise a spill would look like a violation.
 //
 // THE FLOOR ARM IS THE NEGATIVE CONTROL, and it is why this file cannot pass by accident. If the
 // change had bound a fiber to EVERY Native task instead of only K's, arm 1 would still be green --
@@ -77,9 +77,10 @@ int main() {
 
     int created = 0;
     for (int i = 0; i < kTasks; ++i) {
-        // Alternate hiPri (routed to the reserved band) and loPri (floor). Both NATIVE -- the type
-        // is held constant on purpose, so the only variable is WHICH BAND ran it.
-        JLib::Task* t = sched.CreateTask(Payload, nullptr, /*hiPri*/ (i % 2) == 0,
+        // Alternate LowLatency (routed to the reserved band) and Normal (the floor). Both NATIVE on
+        // purpose -- the type is held constant, so the only variable is WHICH BAND ran it.
+        JLib::Task* t = sched.CreateTask(Payload, nullptr,
+                                         ((i % 2) == 0) ? JLib::Lane::LowLatency : JLib::Lane::Normal,
                                          JLib::TaskType::Native, JLib::CorePref::Default);
         if (!t) break;
         sched.Push(t);
@@ -121,7 +122,7 @@ int main() {
             started.store(true, std::memory_order_release);
             JLib::TaskScheduler::Instance().WaitOnEvent(ev);   // needs a fiber
             resumed.store(true, std::memory_order_release);
-        }, /*hiPri*/ true);
+        }, JLib::Lane::LowLatency);
         sched.Push(t);
 
         const auto d2 = std::chrono::steady_clock::now() + std::chrono::seconds(5);

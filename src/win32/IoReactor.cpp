@@ -291,7 +291,7 @@ namespace JLib {
             // would preempt exactly the thread it is trying to hand work to.
             TaskScheduler::ExcludeCurrentThreadFromHotCpus();
 
-            // SPLIT BY PRIORITY. Push honours task->hiPri; PushBatch takes it as a PARAMETER and
+            // SPLIT BY PRIORITY. Push honours task->lane; PushBatch takes it as a PARAMETER and
             // applies it to the whole batch -- so batching them together silently forced every
             // resumption to low priority and threw away what the app chose at Spawn. Two runs, two
             // flushes, priority preserved.
@@ -300,7 +300,7 @@ namespace JLib {
             // resumption outranks other work is an application question -- a server usually wants
             // it (finishing started work bounds latency and frees buffers and sockets), a game
             // usually does not (the frame deadline is the hard one; a read can wait 16ms). And if
-            // everything is hiPri then nothing is.
+            // everything is lane then nothing is.
             Task* batchHi[kBatch]; std::size_t nHi = 0;
             Task* batchLo[kBatch]; std::size_t nLo = 0;
 #if defined(JLIBSCHED_IO_LOCK_STATS)
@@ -369,13 +369,13 @@ namespace JLib {
                 // opportunistically under laneHintMode 4, without anyone paying a wake for it, and
                 // that is the right place for that decision.
                 const std::size_t hotN = TaskScheduler::GetHotWorkers();
-                auto pushSteered = [&](Task** arr, std::size_t n, bool hiPri) {
+                auto pushSteered = [&](Task** arr, std::size_t n, Lane lane) {
                     if (!n) return;
                     auto& s = TaskScheduler::Instance();
                     // NO K: PushBatch ALREADY STEERS THIS, and that is not the no-op it once was.
-                    // Since 4.0.2 a hiPri push routes on its own -- PushBatch computes
-                    // `useHiSeg = hiPri && HiPriLaneActive()`, PickNextWorker sends a hiPri task to
-                    // a worker on the AWAKE FLOOR, and it lands in that worker's hiPri INBOX with
+                    // Since 4.0.2 a lane push routes on its own -- PushBatch computes
+                    // `useHiSeg = lane && HiPriLaneActive()`, PickNextWorker sends a lane task to
+                    // a worker on the AWAKE FLOOR, and it lands in that worker's lane INBOX with
                     // the presence bit set for thieves. So a completion reaches a thread that is
                     // already running, ahead of that thread's own deque, without this lambda doing
                     // anything -- which is the larger half of what the explicit steering below was
@@ -384,7 +384,7 @@ namespace JLib {
                     // WHAT IS STILL MISSING WITHOUT K is reservation: the floor is awake but not
                     // reserved, so bulk work is steered at the same indices and a completion can
                     // queue behind a task already running there. Priority is ORDER, not isolation.
-                    if (hotN == 0) { s.PushBatch(arr, n, 0, 64, hiPri); return; }
+                    if (hotN == 0) { s.PushBatch(arr, n, 0, 64, lane); return; }
 
                     // ---- LOPRI IS NEVER STEERED TO K. IT WOULD BE UNREACHABLE THERE. ------------
                     //
@@ -395,7 +395,7 @@ namespace JLib {
                     //
                     // The steering below predates that invariant and still aims every completion at
                     // [0, hotN). A completion whose task is loPri -- which is the DEFAULT, since
-                    // CreateTask's `hipri` defaults to false -- therefore landed in a reserved
+                    // CreateTask's `lane` defaults to false -- therefore landed in a reserved
                     // worker's loPri inbox and stayed there. Every worker then parks with work
                     // outstanding: a permanent hang that reports as a lost wake. That is
                     // io_c17_test, whose continuation is a plain default-priority task.
@@ -405,7 +405,7 @@ namespace JLib {
                     // not belong on the lane in the first place -- K-steering is for LANE work, and
                     // loPri completions are, by definition, not that. They go to the floor, which is
                     // where PushBatch would have put them anyway.
-                    if (!hiPri) { s.PushBatch(arr, n, 0, 64, false); return; }
+                    if (IsNormalLane(lane)) { s.PushBatch(arr, n, 0, 64, Lane::Normal); return; }
 
 
                     // Candidate hot workers, by queue index. Bounded by the hint's own width: past
@@ -429,13 +429,13 @@ namespace JLib {
                     std::size_t off = 0, w = steer++;
                     while (off < n) {
                         const std::size_t len = (per < n - off) ? per : (n - off);
-                        s.PushBatch(arr + off, len, std::uint8_t(1 + cand[w % nc]), 64, hiPri);
+                        s.PushBatch(arr + off, len, std::uint8_t(1 + cand[w % nc]), 64, lane);
                         off += len;
                         ++w;
                     }
                 };
-                pushSteered(hi, nh, true);  nh = 0;
-                pushSteered(lo, nl, false); nl = 0;
+                pushSteered(hi, nh, Lane::LowLatency);  nh = 0;
+                pushSteered(lo, nl, Lane::Normal); nl = 0;
             };
 
             for (;;) {
@@ -542,9 +542,9 @@ namespace JLib {
                 // push happens now or at the flush, because collecting only copies the Task*.
                 if (resume) {
 #if defined(JLIBSCHED_IO_LOCK_STATS)
-                    if (resume->hiPri) outHi[nHi] = r->out; else outLo[nLo] = r->out;
+                    if (IsLowLatency(resume->lane)) outHi[nHi] = r->out; else outLo[nLo] = r->out;
 #endif
-                    if (resume->hiPri) batchHi[nHi++] = resume;
+                    if (IsLowLatency(resume->lane)) batchHi[nHi++] = resume;
                     else               batchLo[nLo++] = resume;
                     if (nHi == kBatch || nLo == kBatch) Flush(batchHi, nHi, batchLo, nLo);
                 }

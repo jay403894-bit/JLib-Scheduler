@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
                 g_reached.store(true, std::memory_order_release);
                 g_gate.Lock();                    // PARKS the fiber while the guard is held
                 g_gate.Unlock();
-            }, false, TaskType::Fiber);
+            }, JLib::Lane::Normal, TaskType::Fiber);
             t->waitGroup = &wg;
             wg.n.fetch_add(1, std::memory_order_relaxed);
             sched.Push(t);

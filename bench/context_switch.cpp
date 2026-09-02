@@ -243,7 +243,7 @@ double TimeSuspendResume(bool gateOn, PreFn pre, long long iters) {
             sched.WaitOnEvent(ev);
             g_wakes.fetch_add(1, std::memory_order_release);
         }
-    }, false, JLib::TaskType::Fiber);
+    }, JLib::Lane::Normal, JLib::TaskType::Fiber);
     if (!t) { std::fprintf(stderr, "CreateTask returned null\n"); std::exit(2); }
     t->waitGroup = &wg;
     sched.Push(t);

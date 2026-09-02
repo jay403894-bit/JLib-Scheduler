@@ -100,7 +100,7 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(kHoldMs));
             m.Unlock();
             done.store(true, std::memory_order_release);
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         sched.Push(holder);
 
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
@@ -138,7 +138,7 @@ int main() {
             m.Lock();
             m.Unlock();
             ran.store(true, std::memory_order_release);
-        }, false, TaskType::Native);
+        }, JLib::Lane::Normal, TaskType::Native);
         sched.Push(t);
         while (!ran.load(std::memory_order_acquire)) std::this_thread::yield();
         Check(!g_hookFired.load(std::memory_order_acquire),
@@ -155,7 +155,7 @@ int main() {
             held.store(true, std::memory_order_release);
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             m.Unlock();
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         sched.Push(holder);
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
 
@@ -163,7 +163,7 @@ int main() {
             m.Lock();
             got.store(true, std::memory_order_release);
             m.Unlock();
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         sched.Push(waiter);
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -197,7 +197,7 @@ int main() {
             held.store(true, std::memory_order_release);
             sched.WaitOnEvent(hold);
             m.Unlock();
-        }, false, TaskType::Fiber);
+        }, JLib::Lane::Normal, TaskType::Fiber);
         sched.Push(holder);
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
 
@@ -210,7 +210,7 @@ int main() {
                 m.Unlock();
             }
             attempted.store(true, std::memory_order_release);
-        }, false, TaskType::Native);
+        }, JLib::Lane::Normal, TaskType::Native);
         sched.Push(offender);
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);

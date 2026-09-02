@@ -294,5 +294,5 @@ namespace JLib {
 	// Re-queue fibers already transitioned to READY by ResumeQueueless. Lives here rather than in
 	// Event.h because Event.h only knows Fiber.h -- reaching TaskScheduler from a header it already
 	// includes would be circular.
-	void RequeueResumedBatch(Task** tasks, size_t n, bool hiPri);
+	void RequeueResumedBatch(Task** tasks, size_t n, Lane lane);
 }

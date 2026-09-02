@@ -270,7 +270,7 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
         if (!TaskScheduler::IsInitialized()) { nHi = nLo = 0; return; }
         auto& s = TaskScheduler::Instance();
         // PRIORITY IS A PARAMETER to PushBatch, so the two runs are split and pushed separately --
-        // routing a hiPri run into the loPri inbox is the priority inversion PushBatch refuses by
+        // routing a lane run into the loPri inbox is the priority inversion PushBatch refuses by
         // name. The Windows side steers across the hot set here; that is deliberately NOT copied
         // yet, because steering wants the same measurement the Windows one got and this path has
         // never been run.
@@ -451,7 +451,7 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
             if (r->onComplete) r->onComplete(r);   // after the lock, before the push
 
             if (resume) {
-                if (resume->hiPri) batchHi[nHi++] = resume;
+                if (resume->lane) batchHi[nHi++] = resume;
                 else               batchLo[nLo++] = resume;
                 if (nHi == kBatch || nLo == kBatch) flush();
             }

@@ -111,7 +111,7 @@ static Arm RunArm(TaskScheduler& sched, const char* name, const char* gateName) 
                                         std::memory_order_relaxed);
 #endif
             g_ran.fetch_add(1, std::memory_order_relaxed);
-        }, (void*)(intptr_t)i, false, TaskType::Fiber);
+        }, (void*)(intptr_t)i, JLib::Lane::Normal, TaskType::Fiber);
         if (!t) { std::printf("  %s: CreateTask returned null\n", name); return { -1, -1, -1 }; }
         t->waitGroup = &wg;
         sched.Push(t);
