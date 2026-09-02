@@ -98,6 +98,7 @@
 #include "Task.h"
 #include "CancelToken.h"
 #include "TaskMPSCQueue.h"
+#include "concurrentqueue.h"   // the shared lane intake -- see laneIntake
 #include "Epochs.h"
 #include "TaskDeque.h"
 #include "TaskAllocator.h"
@@ -1850,32 +1851,30 @@ namespace JLib {
 		bool Push(Task* task);
 		void WaitFor(WaitGroup& wg);
 
-		// Cancellable WaitFor: returns Cancelled if `tok` fires while still waiting, Ok if the group
-		// completed. Cancelling ends THIS WAIT ONLY -- the count is untouched, the outstanding tasks
-		// still run and still decrement, and any other waiter on the same group is unaffected.
+		// ---- THE CANCELLABLE WaitFor WAS REMOVED (9-02). WaitGroup IS NOT A WAIT PRIMITIVE. -----
 		//
-		// ############ INCOMPLETE. A FIBER THAT PARKS HERE CAN WAIT FOREVER. ############
+		// `WaitFor(wg, token)` and `WaitGroup::CancelWaiters` are gone. The header carried its own
+		// obituary for weeks: "INCOMPLETE. A FIBER THAT PARKS HERE CAN WAIT FOREVER."
 		//
-		// YOU MUST CALL wg.CancelWaiters(tok) YOURSELF. scope.Cancel() DOES NOT REACH THIS WAIT.
+		// THE IDEA WAS WRONG, NOT JUST THE DELIVERY. A WaitGroup is a CONCURRENCY COUNTER -- N
+		// outstanding, and a join that ends at zero. Event, the semaphore and the condition variable
+		// own a QUEUE OF WAITERS, which is the thing cancellation ejects from; a counter owns none.
+		// That is why the old CancelWaiters had to promise in capitals that it did not touch `n`:
+		// it could not, because cancelling a wait while the counted work keeps running leaves the
+		// count outstanding and the tasks decrementing into a group nobody is joined to.
 		//
-		// WHY: the token stored by this wait is PASSIVE. It is a filter applied by whoever walks
-		// WaitGroup::cancellable -- it is not a wake, and holding one creates no path out. The
-		// cancellation machinery dispatches ejection BY TYPE, and that table is Event,
-		// SchedulerSemaphore, SchedulerConditionVariable and IoAcceptor (see Timer.cpp's Eject*
-		// functions and IoShared.cpp). THERE IS NO EjectWaitGroup.
+		// So there was nothing coherent to deliver, and an EjectWaitGroup would have made an
+		// incoherent operation reliable rather than correct.
 		//
-		// So a parked fiber here is released by exactly two things: the group COMPLETING, or an
-		// explicit wg.CancelWaiters(tok). Cancel the scope on a group that will never complete --
-		// which is what cancelling usually means -- and nothing wakes it. A parked fiber cannot
-		// poll a flag.
+		// WHAT IT COST: waitgroup_cancel_test deadlocked 2-13% of runs, and a deadlocked test does
+		// not fail -- it spins every worker until something kills it. Its only user was itself, and
+		// it stayed green by calling `inner.CancelWaiters(...)` by hand on the line after
+		// `scope.Cancel()`, working around the very gap it existed to cover.
 		//
-		// tests/waitgroup_cancel_test.cpp passes only because it calls inner.CancelWaiters(...) by
-		// hand on the line after scope.Cancel(). Remove that line and it hangs. It is ~2% flaky
-		// today for a related reason: whether the group happens to complete first.
+		// IF YOU NEED A JOIN YOU CAN ABANDON, compose it from a primitive that HAS waiters: wait on
+		// an Event the last task signals, and cancel the Event. The counter stays a counter.
 		//
-		// THE FIX IS NOT ANOTHER ENTRY IN THE DISPATCH TABLE -- a table that must list every
-		// primitive is the same bug waiting for the next primitive. See design/NOTES.md.
-		WaitResult WaitFor(WaitGroup& wg, CancelToken tok);
+		// Plain WaitFor(wg) below is untouched and was always the uncancellable one by contract.
 		bool Push(uint8_t cpu_affinity, Task* task);
 
 		// ---- PUSH TO THE LANE, OR SAY YOU COULD NOT. ------------------------------------------
@@ -1902,6 +1901,40 @@ namespace JLib {
 		//
 		// Returns false when: K == 0, the task is not lane, or every reserved worker is buried.
 		bool PushIO(Task* task) noexcept;
+
+		// ---- THE SHARED LANE INTAKE: producer, consumer, and the park probe -------------------
+		//
+		// PushLaneIntake  N reactor producers, one bulk enqueue, then ONE notify so a reserved
+		//                 worker that is allowed to park cannot sleep on a non-empty intake.
+		//                 Returns false when K == 0 -- there are no consumers, so the caller must
+		//                 send the work somewhere that has one rather than let it sit.
+		// TakeLaneIntake  called only by a reserved worker, on its own pass.
+		// LaneIntakeIdle  the park probe. MUST be named by every predicate that can park a reserved
+		//                 worker: this queue has K legal consumers rather than one, but zero of them
+		//                 are looking while they are all asleep, and the intake is not attached to
+		//                 any worker for a drain to find.
+		//
+		// APPROXIMATE BY CONSTRUCTION, and that is why it is spelled "Idle" rather than "empty".
+		// moodycamel's size_approx can lag a concurrent enqueue, so this may say idle while an item
+		// is in flight -- exactly the window TaskMPSCQueue::quiescent() exists to close for the
+		// inboxes. The notify in PushLaneIntake is what makes that safe: the producer stores, then
+		// wakes, so a worker that parks on a stale idle reading is woken by the push that raced it.
+		// A predicate that trusted this ALONE would be the lost wake again.
+		static bool  PushLaneIntake(Task** tasks, size_t n) noexcept;
+		static Task* TakeLaneIntake() noexcept;
+		static bool  LaneIntakeIdle() noexcept;
+
+		// THE A/B ARM. Off restores per-worker steering at push time -- the control the intake has
+		// to beat. A RUNTIME flag rather than a build one on purpose: the two arms must be
+		// comparable inside one process, because separately built binaries once moved a dispatch
+		// bench's K=1 rows by 2x and that was machine drift reported as a result.
+		//
+		// Turning it off does NOT stop reserved workers reading the intake -- it stops the reactor
+		// filling it, so anything already queued still drains. Flipping it mid-run is therefore
+		// safe in both directions.
+		static inline std::atomic<bool> laneIntakeOn{ true };
+		static void SetLaneIntake(bool on) noexcept { laneIntakeOn.store(on, std::memory_order_relaxed); }
+		static bool LaneIntakeEnabled() noexcept { return laneIntakeOn.load(std::memory_order_relaxed); }
 		// ---- WHERE A RESUMED TASK WENT, AND WHO MAY TAKE IT ------------------------------------
 		//
 		// NOT A bool, AND THE REASON IS THAT `false` WOULD MEAN TWO THINGS. Today false means "this
@@ -2993,6 +3026,30 @@ namespace JLib {
 		size_t LaneIndexForCurrentThread();
 		void RunLazyRange(int lo, int hi, LazyRangeState* st);
 		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
+		// ---- THE SHARED LANE INTAKE. One queue, K consumers. ----------------------------------
+		//
+		// THE PROBLEM IT SOLVES IS REACHABILITY, NOT CAPACITY. A per-worker lane inbox is MPSC with
+		// exactly ONE legal consumer, so a completion queued behind a worker that just entered a
+		// body cannot be taken by an idle sibling -- and the MPMC-prize counters measured that
+		// directly: ~100% of stranded backlogs had an idle worker somewhere in [0,K+F) while only
+		// ~42% had one in [0,K). The threads to run that work already existed. Adding reserved
+		// workers adds capacity to a reachability problem, which is why K=2 and K=4 measured the
+		// same to within noise.
+		//
+		// THIS IS NOT THE CHASE-LEV THAT WAS REMOVED ON 8-30, and the distinction matters because
+		// the rule reads like it forbids this. That was a PER-WORKER deque, and a Chase-Lev exists
+		// entirely to be stolen from -- useless on workers that neither steal nor are stolen from,
+		// and it cost a push-then-pop hop on the one path that exists for latency. This is a SHARED
+		// intake: one queue for the whole band, which is the property the inbox structurally cannot
+		// have. "Reserved workers use the MPSC inbox directly" stays true for everything else.
+		//
+		// NOT STRICT MPMC, AND IT DOES NOT NEED TO BE. Strict global FIFO across all completions is
+		// the wrong property anyway: two sockets do not owe each other an ordering. Per-socket order
+		// is the coroutine that owns the socket -- IoStream keeps exactly one transfer per direction
+		// in the kernel -- so ordering is a property of the CHAIN, not of the runqueue, and no
+		// scheduling decision here can reorder a stream against itself.
+		moodycamel::ConcurrentQueue<Task*> laneIntake;
+
 		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
 		// RESUMED FIBERS, ONE QUEUE PER WORKER, DRAINED ONLY BY ITS OWNER AND NEVER INTO A DEQUE.
 		//

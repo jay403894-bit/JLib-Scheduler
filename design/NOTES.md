@@ -2020,3 +2020,35 @@ requires an accessible `operator delete`; Fiber has no virtuals, so the compile-
 available and cannot be reached at runtime to assert. A heap-allocated Fiber has no arena stack, no
 poolIndex any table can name, and no epoch slot -- invisible to both the cleanup chain and hazard
 reclamation. Placement new is unaffected because every site writes `::new (mem) T(...)`.
+
+## Removed: the cancellable WaitGroup wait. A WaitGroup is not a wait primitive. (9-02)
+
+`TaskScheduler::WaitFor(wg, token)`, `WaitGroup::CancelWaiters` and the `cancellable` vector are
+gone. The header had carried its own obituary for weeks -- *"INCOMPLETE. A FIBER THAT PARKS HERE CAN
+WAIT FOREVER."*
+
+**Jay's framing, and it is the right one: the IDEA was wrong, not the delivery path.** A WaitGroup is
+a CONCURRENCY COUNTER -- N outstanding, a join that ends at zero. Event, the semaphore and the
+condition variable own a QUEUE OF WAITERS, which is what cancellation ejects from. A counter owns
+none. That is why the old `CancelWaiters` had to promise in capitals that it did not touch `n`: it
+could not, because cancelling a wait while the counted work keeps running leaves the count
+outstanding and the tasks decrementing into a group nobody is joined to.
+
+So there was nothing coherent to deliver. Adding an `EjectWaitGroup` -- which is what I had been
+planning all day -- would have made an incoherent operation *reliable* rather than *correct*.
+
+**What it cost.** `waitgroup_cancel_test` deadlocked 2-13% of runs, and a deadlocked test does not
+fail: it spins every worker until something kills it. It was the suite's only recurring red for
+weeks, and it burned cores every time.
+
+**Its only user was itself**, and it stayed green by calling `inner.CancelWaiters(...)` by hand on
+the line after `scope.Cancel()` -- working around the exact gap it existed to cover. Nothing in the
+library, the benches or the samples ever called either function.
+
+**The lesson worth keeping is about the measurement, not the code.** I wanted to characterise the
+flake rate before acting. Jay: *"why do you need a measurement, 2% is enough to just fix or get rid
+of a feature."* A deadlock is not a number to estimate -- one confirmed instance is the whole
+argument, and a rate only tells you how long you can ignore it.
+
+**If a join you can abandon is ever needed:** compose it from a primitive that HAS waiters -- wait on
+an Event the last task signals, and cancel the Event. The counter stays a counter.

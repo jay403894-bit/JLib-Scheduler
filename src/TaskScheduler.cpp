@@ -680,6 +680,36 @@ void TaskScheduler::Join() {
 	if (TimersEnabled())
 		TimerQueue::Instance().Stop();
 
+	// ---- DRAIN THE SHARED LANE INTAKE ONTO THE FLOOR ------------------------------------------
+	//
+	// IT BELONGS TO NO WORKER, WHICH IS THE ENTIRE POINT AND THE ENTIRE HAZARD. Every other queue
+	// here has an owner whose own teardown reaches it; this one is reachable only by a reserved
+	// worker that chooses to look, and the workers are about to stop looking. Anything left in it
+	// is a completion nobody runs, and every waiter behind it hangs -- silently, because from the
+	// reactor's side the push succeeded.
+	//
+	// ONTO THE FLOOR, NOT BACK INTO THE LANE. K may be zero by now, and a reserved worker that has
+	// already left cannot be handed anything; the floor is the destination that is always drainable.
+	// Pushed as Lane::Normal so placement keeps it OFF the reserved band -- the same reason the
+	// reactor's own fallback does.
+	//
+	// BEFORE THE PRIMITIVE DRAIN BELOW, because these tasks are work that unwinding may be waiting
+	// on, and after the service threads stopped above, so nothing refills it behind us.
+	{
+		size_t rescued = 0;
+		while (Task* t = TakeLaneIntake()) {
+			PushLocal(t, 0);
+			++rescued;
+		}
+		if (rescued) {
+			fprintf(stderr, "[JLib::Scheduler] teardown: moved %zu queued I/O completion(s) from the\n"
+			                "  shared lane intake to the floor. Not an error -- the reserved band was\n"
+			                "  stopping and the floor is the queue that is always drainable.\n",
+			        rescued);
+			fflush(stderr);
+		}
+	}
+
 	// DRAIN EVERY REGISTERED PRIMITIVE, BEFORE THE WORKERS ARE JOINED.
 	//
 	// This is what makes teardown a drain rather than an abandonment. Each primitive releases its
@@ -4923,59 +4953,6 @@ void TaskScheduler::WaitFor(WaitGroup& wg) {
 		}
 	}
 }
-// WaitFor that a cancel can end early. Returns Cancelled when `tok` fires while still waiting.
-//
-// WHAT IT DOES NOT DO: touch n. Cancelling a wait is "I stopped waiting", not "the group finished".
-// Every task still outstanding stays outstanding and still decrements when it completes, so a second
-// waiter -- or a later WaitFor on the same group -- still sees the truth. This is why Cancel() must
-// never smash the count to zero: that would strand every task still in flight with nothing left to
-// release, and lie to everyone else looking at the same group.
-//
-// COMPLETION WINS OVER CANCELLATION when both are true. A group that genuinely finished reports Ok,
-// because it did; reporting Cancelled there would tell the caller to discard results that exist.
-WaitResult TaskScheduler::WaitFor(WaitGroup& wg, CancelToken tok) {
-	auto thread = Thread::GetCurrent();
-	Fiber* current = (thread != nullptr) ? thread->currentFiber : nullptr;
-
-	if (current != nullptr) {
-		WaitOnEventDirectArmed([&wg, tok](DirectEvent* ev) {
-			std::lock_guard<std::mutex> lock(wg.mtx);
-			wg.cancellable.push_back(WaitGroup::CancelWaiter{ ev, tok.Raw() });
-			const int old = wg.n.fetch_or(WaitGroup::WAITER_BIT, std::memory_order_acq_rel);
-
-			// Two reasons to wake ourselves instead of parking, checked under the SAME lock that
-			// published us -- which is what makes the second one sound. A cancel landing between the
-			// caller's check and this push would otherwise walk a list we are not on yet, and we
-			// would park with nobody holding us: the park-publish race, exactly as on the semaphore
-			// and Event paths.
-			if ((old & WaitGroup::COUNT_MASK) == 0 || tok.Cancelled()) {
-				wg.cancellable.pop_back();   // we are last: we pushed under this same lock
-				ev->Signal();
-			}
-			});
-
-		if ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) == 0)
-			return WaitResult::Ok;
-		return tok.Cancelled() ? WaitResult::Cancelled : WaitResult::Ok;
-	}
-
-	// BARE THREAD: nothing to park, so cancellation is observed between helping passes rather than
-	unsigned waitSpins = 0;   // per-wait; see BareWaitBackoff
-	// delivered. Same helping policy and the same two reentrancy guards as the uncancellable path.
-	while ((wg.n.load(std::memory_order_acquire) & WaitGroup::COUNT_MASK) > 0) {
-		if (tok.Cancelled()) return WaitResult::Cancelled;
-		bool ranSomething = false;
-		if (t_heldMutexes == 0) {
-			++t_spinHelpDepth;
-			ranSomething = TryRunStolenNativeTask();
-			--t_spinHelpDepth;
-		}
-		if (!ranSomething)
-			BareWaitBackoff(waitSpins);
-	}
-	return WaitResult::Ok;
-}
-
 void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffinity, size_t minPerSegment,
 	Lane lane, CorePref pref)
 {
@@ -5084,6 +5061,46 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 
 bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 	return PushLocal(task, cpu_affinity);
+}
+
+// ---- THE SHARED LANE INTAKE ------------------------------------------------------------------
+bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
+	if (!tasks || n == 0) return false;
+	TaskScheduler* s = instance;
+	// NOT Instance(): a completion arriving during teardown is an ordinary outcome, not an
+	// exceptional one. The caller gets false and routes it to the floor instead.
+	if (!s || !s->poolActive) return false;
+	if (GetHotWorkers() == 0) return false;      // no consumers: refuse rather than strand
+
+	if (!s->laneIntake.enqueue_bulk(tasks, n)) return false;   // allocation failed
+
+	// WAKE ONE RESERVED WORKER. Under SetIoHotLane they never park and this is a store nobody
+	// waits on, but SetHotWorkers reserves WITHOUT pinning them awake -- and in that configuration
+	// a parked band with a full intake is a permanent stall, because this queue belongs to no
+	// worker and no drain will find it. Cheap enough to do unconditionally: the alternative is a
+	// policy read on the completion path to save a store.
+	//
+	// PUSH FIRST, NOTIFY SECOND, the same order as every other producer here. The reverse loses the
+	// wake outright -- the target observes an empty intake, eats its permit, and parks with the
+	// work arriving just behind it.
+	const size_t k = GetHotWorkers();
+	for (size_t w = 0; w < k && w < s->workers.size(); ++w) {
+		if (s->workers[w]) { s->workers[w]->MarkQueuedWork(); s->workers[w]->NotifyWorker(); break; }
+	}
+	return true;
+}
+
+Task* TaskScheduler::TakeLaneIntake() noexcept {
+	TaskScheduler* s = instance;
+	if (!s || !s->poolActive) return nullptr;
+	Task* t = nullptr;
+	return s->laneIntake.try_dequeue(t) ? t : nullptr;
+}
+
+bool TaskScheduler::LaneIntakeIdle() noexcept {
+	TaskScheduler* s = instance;
+	if (!s || !s->poolActive) return true;
+	return s->laneIntake.size_approx() == 0;
 }
 
 // ---- THE ONE PUSH THAT MAY SAY NO. See the contract above the declaration. ---------------------

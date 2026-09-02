@@ -2383,6 +2383,30 @@ void Thread::Worker() {
 			// checks this inbox before anything else on every pass, so the work is found, just
 			// not advertised. Nothing strands. The reverse (bit set, inbox empty) costs one
 			// failed probe.
+			// ---- THE SHARED LANE INTAKE, BEFORE THE OWN INBOX --------------------------------
+			//
+			// UNOWNED WORK FIRST, and the order is the whole point. A task in this queue is bound
+			// to NO worker: whichever reserved worker asks next gets it. A task in the inbox below
+			// is already committed to THIS worker and nobody else may take it -- so if this worker
+			// takes its own inbox first while unowned work waits, that unowned work sits until some
+			// reserved worker happens to run dry, which is the reachability failure the intake
+			// exists to remove.
+			//
+			// THIS IS WHY THE REACTOR-SIDE BACKLOG CHANGED NOTHING. A strand is recorded when a
+			// reserved worker enters a body with its own inbox non-empty -- by then the task was
+			// ALREADY committed to that inbox at push time, and no amount of queueing in front of
+			// the push can undo a binding the push already made. The intake fixes it by never
+			// making the binding.
+			//
+			// RESERVED WORKERS ONLY. A floor worker taking from here would defeat the reservation
+			// and, worse, would race the band it is supposed to be isolated from.
+			if (!task_to_run && isReservedWorker) {
+				if (Task* shared = TaskScheduler::TakeLaneIntake()) {
+					task_to_run = shared;
+					laneSourced = true;
+				}
+			}
+
 			if (!task_to_run) {
 				JLIBSCHED_PHASE(qIndex, HiPri);
 				Task* hp = nullptr;
@@ -3203,7 +3227,14 @@ void Thread::Worker() {
 						// on a race being won rather than on the queue being read. Naming it makes
 						// it correct by construction, which is what the other unstealable queues
 						// already get.
-						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)))) {
+						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
+						// THE SHARED LANE INTAKE. It has K legal consumers rather than one, but
+						// none of them are looking while they are all asleep -- and unlike every
+						// other queue named here it belongs to NO worker, so there is no owner
+						// whose drain would find it. GATED like loPri and K: only a reserved
+						// worker reads it, so only a reserved worker may wait on it. Approximate
+						// by construction; PushLaneIntake's notify is what closes the window.
+						|| (isReservedWorker && !TaskScheduler::LaneIntakeIdle())))) {
 				// Never advertised, so nothing to publish back -- just go and search again.
 				JLIBSCHED_LATENCY_MARK(Wake);
 				if (!running.load(std::memory_order_acquire)) break;
@@ -3701,7 +3732,9 @@ void Thread::Worker() {
 							        && !scheduler->loPriInboxes[qIndex]->quiescent())
 							    || !scheduler->resumedInboxes[qIndex]->quiescent()
 							    // One legal consumer, same as the resume inbox above it.
-							    || FiberRegistry::Instance().HolderHasWork((size_t)qIndex);
+							    || FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
+							    // Gated, term for term with the recheck above.
+							    || (isReservedWorker && !TaskScheduler::LaneIntakeIdle());
 						});
 					}
 					else
@@ -3718,7 +3751,10 @@ void Thread::Worker() {
 					       // Inverted like every other term here: keep spinning only while the
 					       // cleanup chain is EMPTY. One legal consumer, so parking on a full one
 					       // never resolves itself.
-					       && !FiberRegistry::Instance().HolderHasWork((size_t)qIndex)) {
+					       && !FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
+					       // Inverted like every other term here: keep spinning only while the
+					       // shared intake is idle. Gated, term for term with the two above.
+					       && (!isReservedWorker || TaskScheduler::LaneIntakeIdle())) {
 #if defined(JLIB_PLATFORM_WINDOWS)
 						// Address-based: no kernel object to create, own or leak, and no mutex on
 						// the push path. The waker changes workerState and then wakes this address

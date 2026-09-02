@@ -415,12 +415,90 @@ namespace JLib {
                     std::size_t  nc = 0;
                     const std::size_t scanN = (hotN < kMaxSteer) ? hotN : kMaxSteer;
 
-                    if (TaskScheduler::GetSteerSkip()) {
-                        const unsigned long long busy = TaskScheduler::LaneBacklogMask();
-                        for (std::size_t i = 0; i < scanN; ++i)
-                            if (!(busy & (1ull << i))) cand[nc++] = std::uint8_t(i);
+                    // COMPUTED UNCONDITIONALLY, unlike the skip below it. GetSteerSkip is the A/B
+                    // knob for the SLICING experiment and defaults off; the fallback decision is a
+                    // different question and must not inherit that gate, or it would never fire.
+                    const unsigned long long buried = TaskScheduler::LaneBacklogMask();
+                    std::size_t nFree = 0;
+                    for (std::size_t i = 0; i < scanN; ++i)
+                        if (!(buried & (1ull << i))) ++nFree;
+
+                    // ---- EVERY RESERVED WORKER IS BACKED UP: TAKE THE FLOOR --------------------
+                    //
+                    // This branch used to steer at them ANYWAY -- the old `nc == 0` arm below
+                    // conflated "the skip experiment is off" with "there is nowhere free to go" and
+                    // treated both as "use the whole hot set". So a completion arriving when every
+                    // reserved worker was already past kLaneStealDepth got queued behind a body,
+                    // and waited for it.
+                    //
+                    // THE MEASUREMENT SAID DO THIS. The MPMC-prize counters report ~100% of stranded
+                    // backlogs having an idle worker somewhere in [0, K+F) while only ~42% had one
+                    // in [0, K): the threads to run this work already exist, they are simply not
+                    // reachable from an MPSC lane inbox with one legal consumer. Adding reserved
+                    // workers adds capacity to a REACHABILITY problem, which is why K=2 and K=4
+                    // measured the same.
+                    //
+                    // PUSHED AS Lane::Normal, WHICH IS THE POINT AND NOT A DEMOTION. Pushing it as
+                    // LowLatency with no affinity would route it straight back into [0,K) -- the
+                    // placement policy would undo the decision this branch just made. Normal is what
+                    // makes PickNextWorker keep it OFF the reserved band, and the floor's ordinary
+                    // inbox is one its workers actually read. The task's own `lane` field is
+                    // untouched; only this push's routing changes.
+                    //
+                    // IT DOES NOT WAIT, and that distinction is the whole reason this is safe where
+                    // the reverted backlog was not. That version HELD the completion and retried on
+                    // a 1 ms timer, which turned a microsecond read into a ~500 ms one. This hands
+                    // the work to a worker that is idle right now. There is no timer to get wrong.
+                    //
+                    // THE TRADE, STATED: lane isolation for latency, on exactly the operations that
+                    // were going to wait behind a body anyway. A completion that lands on the floor
+                    // shares a queue with ordinary work and can queue behind it -- which is worse
+                    // than an idle reserved worker and better than a busy one.
+                    // ---- THE SHARED INTAKE: DO NOT BIND THIS TO A WORKER AT ALL ----------------
+                    //
+                    // THE BINDING WAS THE BUG, and it is why the reactor-side backlog changed
+                    // nothing. A strand is recorded when a reserved worker enters a body with its
+                    // OWN inbox non-empty -- and by that point the completion had already been
+                    // committed to that inbox, at push time, by the slicing below. Queueing in
+                    // front of the push cannot undo a binding the push already made; it only
+                    // delays making it. That is the whole reason holding-and-retrying measured the
+                    // same as pushing straight through, and then measured far worse once it slept.
+                    //
+                    // So this does not choose a worker. The completion goes into a queue owned by
+                    // nobody, and whichever reserved worker asks next takes it. Placement moves
+                    // from push time to consume time, which is the only place it can be right --
+                    // the producer cannot know which worker will be free a microsecond later, and
+                    // the spill's 42% ceiling was exactly that ignorance measured.
+                    //
+                    // FLOOR IF THERE IS NO CONSUMER. PushLaneIntake refuses at K == 0, because a
+                    // shared queue with nobody reading it is the stranding failure in a new shape.
+                    // A RUNTIME ARM, not a build flag: the per-worker slicing below is the control,
+                    // and the two have to be comparable INSIDE ONE PROCESS. Three separately built
+                    // binaries once moved the K=1 rows of a dispatch bench by 2x, which was machine
+                    // drift presented as a result.
+                    if (TaskScheduler::LaneIntakeEnabled()) {
+                        if (TaskScheduler::PushLaneIntake(arr, n)) {
+                            detail::g_ioToLane.fetch_add(n, std::memory_order_relaxed);
+                            return;
+                        }
+                        detail::g_ioFloorFallback.fetch_add(n, std::memory_order_relaxed);
+                        detail::g_ioToFloor.fetch_add(n, std::memory_order_relaxed);
+                        s.PushBatch(arr, n, 0, 64, Lane::Normal);
+                        return;
                     }
-                    if (nc == 0)                                  // skip disabled, or all of them buried
+
+                    if (nFree == 0) {
+                        detail::g_ioFloorFallback.fetch_add(n, std::memory_order_relaxed);
+                        detail::g_ioToFloor.fetch_add(n, std::memory_order_relaxed);
+                        s.PushBatch(arr, n, 0, 64, Lane::Normal);
+                        return;
+                    }
+
+                    if (TaskScheduler::GetSteerSkip()) {
+                        for (std::size_t i = 0; i < scanN; ++i)
+                            if (!(buried & (1ull << i))) cand[nc++] = std::uint8_t(i);
+                    }
+                    if (nc == 0)                                  // skip experiment disabled
                         for (std::size_t i = 0; i < scanN; ++i) cand[nc++] = std::uint8_t(i);
 
                     // Slice across the workers actually taking work, not across the whole hot set --

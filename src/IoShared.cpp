@@ -477,18 +477,21 @@ namespace JLib {
     namespace detail {
         std::atomic<std::uint64_t> g_ioToLane{ 0 };
         std::atomic<std::uint64_t> g_ioToFloor{ 0 };
+        std::atomic<std::uint64_t> g_ioFloorFallback{ 0 };
     }
 
     IoRoutingStats ReadIoRoutingStats() noexcept {
         IoRoutingStats s;
         s.toLane  = detail::g_ioToLane.load(std::memory_order_relaxed);
         s.toFloor = detail::g_ioToFloor.load(std::memory_order_relaxed);
+        s.floorFallback = detail::g_ioFloorFallback.load(std::memory_order_relaxed);
         return s;
     }
 
     void ResetIoRoutingStats() noexcept {
         detail::g_ioToLane.store(0, std::memory_order_relaxed);
         detail::g_ioToFloor.store(0, std::memory_order_relaxed);
+        detail::g_ioFloorFallback.store(0, std::memory_order_relaxed);
     }
 
 } // namespace JLib

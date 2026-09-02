@@ -310,6 +310,12 @@ namespace JLib {
     struct IoRoutingStats {
         std::uint64_t toLane  = 0;
         std::uint64_t toFloor = 0;
+        // Of toFloor: the ones that WANTED the lane and took the floor because every reserved
+        // worker was already past kLaneStealDepth. Zero means the lane always had room. A large
+        // share means the reserved band is undersized for this arrival rate -- or, read the other
+        // way, that the floor is already doing the work the lane exists to do, which is the
+        // measurement that motivated the fallback in the first place.
+        std::uint64_t floorFallback = 0;
     };
     IoRoutingStats ReadIoRoutingStats() noexcept;
     void           ResetIoRoutingStats() noexcept;
@@ -319,6 +325,7 @@ namespace JLib {
         // where there is no reactor, and correctly sees zeros.
         extern std::atomic<std::uint64_t> g_ioToLane;
         extern std::atomic<std::uint64_t> g_ioToFloor;
+        extern std::atomic<std::uint64_t> g_ioFloorFallback;
     }
 
     class IoReactor {

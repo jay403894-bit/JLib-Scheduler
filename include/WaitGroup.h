@@ -38,14 +38,44 @@ namespace JLib {
         std::mutex mtx;
         std::unordered_set<DirectEvent*> waiters;  // fibers parked on this group
 
-        // Waiters that asked to be released early if their scope is cancelled. Kept apart from
-        // `waiters` because they are the only ones CancelWaiters may touch -- a plain WaitFor is
-        // uncancellable by contract and must never be woken by somebody else's cancel.
-        struct CancelWaiter {
-            DirectEvent* ev = nullptr;
-            uint32_t     token = 0xFFFFFFFFu;   // CancelToken::kNone
-        };
-        std::vector<CancelWaiter> cancellable;
+        // ---- THE CANCELLABLE WAIT WAS REMOVED (9-02). ------------------------------------------
+        //
+        // `WaitFor(wg, token)` and `WaitGroup::CancelWaiters` are gone, along with the `cancellable`
+        // vector that fed them. They did not work, and the header said so for weeks in its own
+        // words: "INCOMPLETE. A FIBER THAT PARKS HERE CAN WAIT FOREVER."
+        //
+        // THE DEFECT WAS STRUCTURAL, not a bug to chase. The token a waiter stored here was PASSIVE
+        // -- a filter applied by whoever walked this vector, never a wake. Cancellation dispatches
+        // ejection BY TYPE (Event, SchedulerSemaphore, SchedulerConditionVariable, IoAcceptor) and
+        // there was no EjectWaitGroup, so `scope.Cancel()` could not reach a waiter parked here.
+        // Cancelling a scope on a group that will never complete -- which is what cancelling usually
+        // MEANS -- woke nothing at all.
+        //
+        // WHAT IT COST: waitgroup_cancel_test deadlocked ~2-13% of runs, and a deadlocked test does
+        // not fail, it spins every worker until something kills it. The only thing keeping it green
+        // the rest of the time was the test calling `inner.CancelWaiters(...)` by hand on the line
+        // after `scope.Cancel()` -- so the feature's own test was working around it.
+        //
+        // ONE USER, AND IT WAS THAT TEST. Nothing in the library, the benches or the samples ever
+        // called either function. A cancellable wait that the cancellation machinery cannot reach is
+        // not a feature with a flaky test; it is a promise the API could not keep.
+        //
+        // AND IT SHOULD NOT COME BACK, because the defect was not the delivery path -- it was the
+        // idea. A WaitGroup IS NOT A WAIT PRIMITIVE. It is a concurrency counter: N outstanding, and
+        // a join that ends when N reaches zero. Event, the semaphore and the condition variable own
+        // a QUEUE OF WAITERS, which is the thing cancellation ejects from; a counter owns none.
+        //
+        // That is why the old CancelWaiters had to promise, in capitals, that it did not touch `n`.
+        // It could not: cancelling a wait while the counted work keeps running leaves the count
+        // outstanding and the tasks still decrementing into a group nobody is joined to. So the
+        // operation had no coherent meaning to deliver, and building a delivery path for it -- an
+        // EjectWaitGroup, or deriving from WaitPrimitive -- would have made an incoherent operation
+        // reliable rather than making it correct.
+        //
+        // If you need a join you can abandon, compose it from a primitive that HAS waiters: wait on
+        // an Event that the last task signals, and cancel the Event. The counter stays a counter.
+        //
+        // Plain `WaitFor(wg)` is untouched and was always the uncancellable one by contract.
 
         // ---- DIRECT WAITERS: no mutex, no allocation, no DirectEvent ---------------------------
         //
@@ -77,11 +107,9 @@ namespace JLib {
         // Release the waiters whose scope is `tok` (or inside it) and tell them they were cancelled.
         // Returns how many were woken.
         //
-        // DOES NOT TOUCH n, AND THAT IS THE WHOLE POINT. Cancelling a wait means "I stopped
-        // waiting", not "this group is finished": the outstanding tasks are still outstanding and
-        // still decrement when they complete. Zeroing the count here would be a lie that a second
-        // waiter, or a later WaitFor on the same group, would believe -- and it would strand every
-        // task still in flight with nothing left to release.
-        std::size_t CancelWaiters(CancelToken tok) noexcept;
+        // CancelWaiters WAS HERE and is gone with the cancellable wait -- see the note above the
+        // removed `cancellable` vector. Its own comment used to insist, in capitals, that it did not
+        // touch `n`, which was the tell: an operation that cannot affect the thing the group counts
+        // is not cancelling the group, and the group has no waiter queue to eject from either.
     };
 }
