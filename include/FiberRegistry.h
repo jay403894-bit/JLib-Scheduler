@@ -177,13 +177,30 @@ namespace JLib {
 
 	private:
 		FiberRegistry() = default;
+		// Resolve a seam to the installed hook or the real default, with ONE load each.
+		DispatchFn Dispatcher();
+		RecycleFn  Recycler();
+
 		std::vector<Fiber*> table;
 		// One chain head per HOLDER. A vector of atomics cannot be resized while anyone reads it,
 		// which is why Build() is an Init-time call made before any worker exists.
 		std::vector<std::atomic<Fiber*>> inbound;
 		size_t workers = 0;
 		std::atomic<size_t> externalNext{ 0 };
-		ReleaseFn release = nullptr;
+
+		// ---- THE SEAMS ARE ATOMIC, AND THAT IS NOT PEDANTRY ------------------------------------
+		//
+		// These are read by WORKERS -- AdvanceCleanup and DrainHolder run on whichever thread owes
+		// something -- and they are written by whoever installs a seam. fiber_drain_live_test
+		// installs its release hook AFTER TaskScheduler::Init, so the pool is already up and the
+		// write genuinely races the reads. As plain pointers that is UB that happens to work on
+		// x86, which is the worst combination: it survives every run and TSan is right about it.
+		//
+		// Relaxed is enough. The pointer is the whole payload -- there is no data published
+		// alongside it that a reader must see -- so there is nothing to acquire.
+		std::atomic<DispatchFn> dispatchFn{ nullptr };
+		std::atomic<RecycleFn>  recycleFn{ nullptr };
+		std::atomic<ReleaseFn>  releaseFn{ nullptr };
 		// Kept from Build. The registry returns fibers to the pool it enumerated, rather than
 		// reaching TaskScheduler::globalPool -- one source, and it cannot go stale against the
 		// table it is indexing.

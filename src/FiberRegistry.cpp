@@ -148,7 +148,7 @@ namespace JLib {
 			f->cleanupNext = nullptr;
 			// RELEASE WHAT THIS HOLDER OWES, then hand on. Running the release BEFORE advancing is
 			// load-bearing: advance may recycle the fiber, and a recycled fiber is a new fiber.
-			if (release) release(holder, f);
+			if (ReleaseFn r = releaseFn.load(std::memory_order_relaxed)) r(holder, f);
 			AdvanceCleanup(f);
 			++n;
 			f = nxt;
@@ -162,7 +162,7 @@ namespace JLib {
 		return n;
 	}
 
-	void FiberRegistry::SetRelease(ReleaseFn fn) { release = fn; }
+	void FiberRegistry::SetRelease(ReleaseFn fn) { releaseFn.store(fn, std::memory_order_relaxed); }
 
 	bool FiberRegistry::ReturnToPool(Fiber* f) {
 		if (!f || !pool) return false;
@@ -181,8 +181,8 @@ namespace JLib {
 		return true;
 	}
 
-	void FiberRegistry::SetDispatch(DispatchFn fn) { dispatch = fn; }
-	void FiberRegistry::SetRecycle(RecycleFn fn)   { recycle  = fn; }
+	void FiberRegistry::SetDispatch(DispatchFn fn) { dispatchFn.store(fn, std::memory_order_relaxed); }
+	void FiberRegistry::SetRecycle(RecycleFn fn)   { recycleFn.store(fn, std::memory_order_relaxed); }
 
 	// ---- the default dispatch: THE FIBER ITSELF, onto the creditor's chain -----------------------
 	//
@@ -207,6 +207,18 @@ namespace JLib {
 		FiberRegistry::Instance().ReturnToPool(f);
 	}
 
+	// ONE LOAD, USED ONCE. Reading the atomic twice -- test-then-call -- would let a seam be
+	// installed between the two, so the call would go to a pointer the test never checked.
+	// Defined here rather than with the other members because it names the two defaults above.
+	FiberRegistry::DispatchFn FiberRegistry::Dispatcher() {
+		DispatchFn d = dispatchFn.load(std::memory_order_relaxed);
+		return d ? d : &DefaultDispatch;
+	}
+	FiberRegistry::RecycleFn FiberRegistry::Recycler() {
+		RecycleFn r = recycleFn.load(std::memory_order_relaxed);
+		return r ? r : &DefaultRecycle;
+	}
+
 	bool FiberRegistry::AdvanceCleanup(Fiber* f) {
 		if (!f) return false;
 
@@ -220,10 +232,10 @@ namespace JLib {
 			for (;;) {
 				const size_t h = f->TakeCreditor();
 				if (h == SIZE_MAX) break;
-				(dispatch ? dispatch : &DefaultDispatch)(h, f);
+				Dispatcher()(h, f);
 				any = true;
 			}
-			(recycle ? recycle : &DefaultRecycle)(f);
+			Recycler()(f);
 			return any;
 		}
 #endif
@@ -231,11 +243,11 @@ namespace JLib {
 		if (worker == SIZE_MAX) {
 			// NOBODY IS OWED. The chain ends here, and whoever is running this hop is the last
 			// worker that owed anything -- which is what makes a completion count unnecessary.
-			(recycle ? recycle : &DefaultRecycle)(f);
+			Recycler()(f);
 			return false;
 		}
 
-		if ((dispatch ? dispatch : &DefaultDispatch)(worker, f))
+		if (Dispatcher()(worker, f))
 			return true;
 
 		// DISPATCH FAILED, AND THE CREDITOR IS ALREADY OFF THE SET -- TakeCreditor removed it. Put

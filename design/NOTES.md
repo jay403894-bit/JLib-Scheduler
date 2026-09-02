@@ -1496,3 +1496,51 @@ that happened to be awake, which is why the assertion is on all 8 rather than on
 
 The pattern is the same every time: a harness that reports the reassuring answer. **When a control
 passes, check that the define reached the compiler before concluding anything about the code.**
+
+## Is FiberRegistry thread-safe? The audit, member by member
+
+Asked directly, and worth writing down because the answer is "yes, but for a structural reason, and
+three things rest on call ordering rather than on the types."
+
+**No striped mutex is needed, and the striping is already there.** The only shared mutable state on
+the hot path is `inbound[h]` -- ONE ATOMIC HEAD PER HOLDER. A Treiber push (CAS) and a drain
+(exchange) on a per-holder head have no shared head to contend on, so partitioning by holder IS the
+stripe. There is no cross-holder operation on any hot path.
+
+| member | protection |
+|---|---|
+| `inbound[h]` | atomic head; Treiber push, one-exchange drain. Many producers, one legal consumer -- the same split the resume inboxes have. |
+| `externalNext` | `fetch_add`, with the bounds check on the PRE-increment value so a counter that runs past the end still refuses. |
+| `Fiber::creditors` | `fetch_or` to record, CAS-to-clear to take. Two threads taking concurrently get distinct creditors. |
+| `CurrentHolder`'s cache | `thread_local`, and a bare thread never migrates -- the same argument `CurrentEpochSlot`'s thread fallback rests on. |
+| `table`, `workers`, `pool` | written ONLY by `Build`, read everywhere. Safe because Build runs at Init before any worker exists -- **an ordering precondition, not a type guarantee**. |
+| the seams | were plain pointers. **This was a real race** -- see below. |
+
+### The one real race, and where it came from
+
+`fiber_drain_live_test` installs its release hook AFTER `TaskScheduler::Init`, so the pool is already
+up and workers are calling `DrainHolder` -- which read `release` as a plain `ReleaseFn`. That is a
+data race that happens to work on x86, which is the worst combination: every run survives it and
+TSan is right about it.
+
+Now `std::atomic<DispatchFn/RecycleFn/ReleaseFn>`, relaxed -- the pointer is the whole payload, there
+is nothing published alongside it to acquire. Resolved through `Dispatcher()` / `Recycler()`, which
+load ONCE: the old `(dispatch ? dispatch : &Default)` reads the pointer twice, so a seam installed
+between the test and the call would be invoked without ever having been checked.
+
+### What is still ordering-based
+
+`Build` swaps `inbound` (a vector of atomics can only be rebuilt and swapped, never resized), and
+clears `table`/`workers`/`pool`. Doing that while anything reads them is UB. It is currently
+prevented by StartPool calling it before any worker is constructed -- correct today, and enforced by
+nothing. If dynamically joining threads ever land, this is the first thing that breaks.
+
+## Sequencing note: what "everything is a fiber" actually unlocks
+
+The tick was unsafe on a worker because it runs arbitrary deleters on a bare thread that CANNOT
+suspend -- unbounded time, and a deadlock if a deleter ever waits on something whose resume is pinned
+to that same worker. **A tick that runs on a fiber can just suspend**, and the worker moves on.
+
+So the fiber default is not a cost paid for tidiness; it is what makes worker-side reclamation legal
+again, which is what lets the epoch garbage lists be thread-local without needing a message to
+discharge them. The order matters: the fiber flip had to land before the epoch rework, not after.
