@@ -1489,7 +1489,7 @@ namespace JLib {
 		// ================================================================================================
 		// PRIORITY BELONGS TO THE TASK, AND NOTHING MAY OVERRIDE IT ON RESUME.
 		//
-		// A task's lane is set once, at CreateTask, and defaults to 0. Push, Requeue and PushLocal
+		// A task's lane is set once, at CreateTask, and defaults to 0. Push, Requeue and PushTarget
 		// all route on it; IoReactor splits its completion batch by it precisely so PushBatch taking
 		// priority as a PARAMETER cannot quietly drop it. There is no path that promotes a task to
 		// the lane behind the caller's back, and there must not be one.
@@ -2857,12 +2857,12 @@ namespace JLib {
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
 		void Push(F&& f) {
 			auto* t = CreateTask(std::forward<F>(f));
-			PushLocal(t);
+			PushTarget(t);
 		}
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>
 		void Push(uint8_t cpu_affinity, F&& f) {
 			auto* t = CreateTask(std::forward<F>(f));
-			PushLocal(t, cpu_affinity);
+			PushTarget(t, cpu_affinity);
 		}
 	private:
 		// ---- CONSTRUCTION NO LONGER STARTS THE POOL, AND THAT IS A RACE FIX -------------------
@@ -3123,7 +3123,7 @@ namespace JLib {
 		// if nothing stealable. See definition.
 		Task* GetTask();
 		void StartPool(size_t poolSize);
-		bool PushLocal(Task* task, uint8_t cpuaffinity = 0);
+		bool PushTarget(Task* task, uint8_t cpuaffinity = 0);
 		// `lane` selects WHICH SET is rotated, and that is what makes the lane invariant structural
 		// rather than a convention every call site has to remember. A lane task rotates the hot
 		// workers only; everything else rotates the ordinary ones only. One branch, one place, and
@@ -3136,7 +3136,7 @@ namespace JLib {
 
 		// NOTE: an external-submitter fan-out cap was tried here and REMOVED. See CHANGELOG 1.1.1.
 		// It made single-producer submission much faster and burst parallelism much worse, and it
-		// could livelock against the pinned-core retry loop PushLocal used to carry, which was safe
+		// could livelock against the pinned-core retry loop PushTarget used to carry, which was safe
 		// with thirty-one candidates and not with four (that loop went with PushImmediate). If you are
 		// tempted to reintroduce it, the useful version is preferring workers that are already
 		// AWAKE, not capping how many exist.

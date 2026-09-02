@@ -116,7 +116,7 @@ static void *worker(void *arg) {
 }
 
 // ---- the pusher ------------------------------------------------------------------------------
-// Mirrors PushLocal(): publish the task, then decide whether the worker needs waking. The whole
+// Mirrors PushTarget(): publish the task, then decide whether the worker needs waking. The whole
 // optimisation is the `else` -- an AWAKE worker will find this on its next loop iteration, so the
 // mutex and the condvar are skipped entirely.
 static void *pusher(void *arg) {

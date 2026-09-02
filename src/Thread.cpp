@@ -1827,7 +1827,7 @@ void Thread::Worker() {
 			// four lines below with a RELAXED STORE to a line this worker already owns -- was
 			// already publishing for free.
 			//
-			// So the escape-hatch check reads `busy` instead (see PushLocal). Same question, same
+			// So the escape-hatch check reads `busy` instead (see PushTarget). Same question, same
 			// answer, no shared write. The lesson is not "away was wrong" -- it is that a second
 			// publication of a fact you already have is not free just because the store is small.
 

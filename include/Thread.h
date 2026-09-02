@@ -390,7 +390,7 @@ namespace JLib {
     public:
         // ---- WHAT ONE PUSH TOUCHES ON THIS OBJECT ------------------------------------------
         //
-        // PushLocal writes three fields on the worker it selected -- inboxDepth, hasQueuedWork and
+        // PushTarget writes three fields on the worker it selected -- inboxDepth, hasQueuedWork and
         // workerState -- while that worker is concurrently reading or RMW-ing all three. Every
         // DISTINCT CACHE LINE among them is a coherence transfer the producer pays PER TASK, and
         // PushBatch pays once per batch. That difference is most of why Push measures ~422 ns/task
@@ -571,7 +571,7 @@ namespace JLib {
         // on a pair the model never covered, so shutdown does not get the optimisation.
         void NotifyWorker(bool force = false);
 
-        // Called by TaskScheduler (PushLocal/PushBatch/ParallelFor/Requeue) whenever a task is
+        // Called by TaskScheduler (PushTarget/PushBatch/ParallelFor/Requeue) whenever a task is
         // pushed specifically to THIS worker's inbox, right alongside the matching
         // NotifyWorker() call -- lets Worker()'s sleep predicate depend only on "did MY OWN
         // queue change," not a pool-wide counter (see hasQueuedWork's comment).
@@ -733,7 +733,7 @@ namespace JLib {
 
         // ---- THE THIRD FIELD EVERY PUSH WRITES, MOVED HERE FOR THE CACHE LINE ----------------
         //
-        // Declared next to inboxDepth and hasQueuedWork because PushLocal writes all three on the
+        // Declared next to inboxDepth and hasQueuedWork because PushTarget writes all three on the
         // target worker, once per task. Measured at 64-byte granularity they used to straddle two
         // coherence lines (2460/2472 on line 38, 2520 on line 39), so a producer paid two transfers
         // per push against a worker concurrently RMW-ing the same words. Now one.
@@ -899,7 +899,7 @@ namespace JLib {
         // THE MEMBER ITSELF MOVED UP, next to inboxDepth and hasQueuedWork. The enum stays here
         // with the reasoning above; only the storage was relocated, and only for layout.
         //
-        // WHY: PushLocal writes all three of those fields on the target worker, and measured at
+        // WHY: PushTarget writes all three of those fields on the target worker, and measured at
         // 64-byte granularity they occupied TWO coherence lines -- inboxDepth 2460 and
         // hasQueuedWork 2472 on line 38, workerState 2520 on line 39, with ~48 bytes of lane and
         // debug counters between them. Two lines is two transfers per push from a producer that

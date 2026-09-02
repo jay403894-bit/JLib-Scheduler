@@ -698,7 +698,7 @@ void TaskScheduler::Join() {
 	{
 		size_t rescued = 0;
 		while (Task* t = TakeLaneIntake()) {
-			PushLocal(t, 0);
+			PushTarget(t, 0);
 			++rescued;
 		}
 		if (rescued) {
@@ -2766,7 +2766,26 @@ void TaskScheduler::SetHotWorkers(size_t k) {
 // like anything else.
 void TaskScheduler::SetIoHotLane(size_t k) {
 	SetHotWorkers(k);
-	SetReservedNeverParks(k > 0);
+
+	// ---- K PARKS AGAIN, BECAUSE THE INTAKE CHANGED WHAT PARKING COSTS ------------------------
+	//
+	// This forced the spin on, and the reason it had to was structural rather than a latency
+	// preference: a completion was BOUND to one worker's inbox at push time, so if that worker was
+	// asleep the work sat until it happened to wake. Spinning was how the lane guaranteed somebody
+	// was looking, and it bought that guarantee with a whole core per reserved worker.
+	//
+	// The shared intake removes the premise. Work is no longer bound to a sleeper: it sits in a
+	// queue any of the K may take, and PushLaneIntake notifies one on every push. So "somebody is
+	// looking" is now delivered by a wake rather than by never sleeping -- which costs ~5.5 us to
+	// get the core back, against holding that core against every other thread in the process.
+	//
+	// A DEFAULT, NOT A REMOVAL. SetReservedNeverParks(true) still pins them awake and is still the
+	// right answer for a workload that cannot afford the wake. It is opt-in now instead of implied,
+	// so the reactor stops taking a core from the floor without being asked.
+	//
+	// UNMEASURED AS OF THIS COMMIT, deliberately shipped as the arm to test rather than as a claim:
+	// the numbers that justify it are the K=1-vs-K=2 and intake-vs-control runs, and they are not
+	// mine to take. If the tail regresses, this line is the first thing to flip back.
 }
 
 // The move itself, without touching the bounds -- used by SetHotWorkers, by the range clamp, and by
@@ -4789,7 +4808,7 @@ void TaskScheduler::WaitOnEvent(Event& event) {
 void TaskScheduler::WaitOnEvent(const std::string& eventName) { WaitOnEvent(GetEvent(eventName)); }
 
 bool TaskScheduler::Push(Task* task) {
-	return PushLocal(task);
+	return PushTarget(task);
 }
 
 
@@ -4990,7 +5009,7 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// silently routing a lane run into the loPri inbox is a priority inversion no caller could
 		// see. Before this existed, every batch went to loPri unconditionally.
 		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes lane, so a batch routed there
-		// would never run. Same rule as PushLocal and Requeue, asked of the same predicate.
+		// would never run. Same rule as PushTarget and Requeue, asked of the same predicate.
 		const Lane useHi = (IsLowLatency(lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
 		(IsLowLatency(useHi) ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
 		if (IsLowLatency(useHi)) SetHiPriHint((size_t)chosen);   // so a thief knows to probe this lane deque
@@ -5060,7 +5079,7 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 }
 
 bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
-	return PushLocal(task, cpu_affinity);
+	return PushTarget(task, cpu_affinity);
 }
 
 // ---- THE SHARED LANE INTAKE ------------------------------------------------------------------
@@ -5602,7 +5621,7 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 		// loop while it spins, and inboxes are owner-drain-only, so anything in ITS OWN inbox is
 		// unreachable by the entire pool -- including, possibly, the task it is waiting for. That
 		// is a real deadlock, not a slow path: a Native task calling ParallelFor from a worker
-		// hangs deterministically, because PushLocal round-robins chunks over every worker
+		// hangs deterministically, because PushTarget round-robins chunks over every worker
 		// INCLUDING the calling one, and the chunk that lands at home is then stranded.
 		//
 		// NON-WORKERS SKIP THIS ENTIRELY, which is the common case: main and any app thread hitting
@@ -6064,7 +6083,7 @@ Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, Tas
 	return t;
 }
 
-bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
+bool TaskScheduler::PushTarget(Task* task, uint8_t cpuaffinity) {
 	if (!task) return false;
 
 	// BEFORE THE PUSH, not after: the point is to slow this producer down before it adds to a
@@ -6083,7 +6102,7 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// AFFINITY DOES NOT DEMOTE. This branch pushed to loPriInboxes unconditionally, so
 		// Push(affinity, hiPriTask) silently landed lane work on the ordinary deque -- the exact
 		// priority inversion PushBatch's submitRun refuses by name ("no caller could see" it), and a
-		// direct contradiction of the contract on Task::lane, which lists PushLocal among the paths
+		// direct contradiction of the contract on Task::lane, which lists PushTarget among the paths
 		// that route on it. Nothing reported it: the task still ran, just never on the lane, so the
 		// lane simply never filled and its hint bit never set.
 		//
@@ -6299,7 +6318,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 			// better than dropping a resumed fiber, which would strand a live 64KB stack.
 		}
 	}
-	// Re-queue a paused task (resumed after Suspend). Unlike PushLocal this does NOT
+	// Re-queue a paused task (resumed after Suspend). Unlike PushTarget this does NOT
 	// re-count the task -- it was already accounted for at its original submission and
 	// is only resuming, not newly created. (The yield path does the same, via the
 	// worker's push_bottom.) Otherwise every suspend->resume cycle leaks +1.
@@ -6368,7 +6387,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 		}
 	}
 
-	// Same routing as PushLocal -- a RESUMED lane task is still on the lane, and sending it back to
+	// Same routing as PushTarget -- a RESUMED lane task is still on the lane, and sending it back to
 	// an ordinary worker would strand it just as surely as a fresh one.
 	const size_t hotN = GetHotWorkers();
 	// HiPriLaneActive(), NOT hotN -- see the identical fix above.
@@ -6400,10 +6419,10 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	}
 #endif
 	if (IsLowLatency(useHi)) {
-		// Same hook as PushLocal, and it has to be here too: a RESUMED completion queueing behind
+		// Same hook as PushTarget, and it has to be here too: a RESUMED completion queueing behind
 		// another is the exact pressure the K controller is meant to see, and on an I/O workload
-		// resumes are most of the lane's traffic. See the note at the PushLocal site.
-		// Same deferred hook as the PushLocal site above -- see the note there.
+		// resumes are most of the lane's traffic. See the note at the PushTarget site.
+		// Same deferred hook as the PushTarget site above -- see the note there.
 		hiPriInboxes[chosen]->push(task);
 		SetHiPriHint((size_t)chosen);
 	}

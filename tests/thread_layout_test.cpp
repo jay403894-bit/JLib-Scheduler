@@ -1,6 +1,6 @@
 // WHICH CACHE LINES DOES A PUSH TOUCH ON THE CONSUMER'S Thread?
 //
-// PushLocal writes three fields on the worker it selected -- inboxDepth, hasQueuedWork (via
+// PushTarget writes three fields on the worker it selected -- inboxDepth, hasQueuedWork (via
 // MarkQueuedWork) and workerState (via NotifyWorker) -- while that worker is concurrently reading
 // or RMW-ing all three. Every distinct cache line among them is a coherence transfer the producer
 // pays PER TASK, and PushBatch pays once per 64. That difference is most of why Push measures

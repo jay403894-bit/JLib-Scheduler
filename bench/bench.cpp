@@ -2605,7 +2605,7 @@ static void BenchRequeueVsPushBatch(JLib::TaskScheduler& sched) {
 //
 // THE HOT API IS A lane PUSH. There is no PushHot(): PickNextWorker rotates the HOT set for lane
 // and the ordinary set for everything else, so priority IS the routing. That also means the two
-// arms below are only different when K > 0 -- at K = 0 the lane is collapsed and PushLocal's
+// arms below are only different when K > 0 -- at K = 0 the lane is collapsed and PushTarget's
 // `useHi = lane && HiPriLaneActive()` sends a lane task to loPri anyway, deliberately, because
 // nobody probes lane at K=0 and a task routed there would never run. So at K=0 this prints ONE row
 // and says why, rather than printing two identical numbers side by side and inviting someone to
