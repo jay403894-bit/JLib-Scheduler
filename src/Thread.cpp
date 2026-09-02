@@ -14,7 +14,7 @@
 #include <cstring>   // std::memset -- MSVC pulls this in transitively, libstdc++ does not
 #include <utility>   // std::swap, for drainInbox`s in-place corePref partition
 
-// ApplyHotPriority needs these, and it is defined near the top of this file -- so they cannot live
+// ApplyWorkerPriority needs these, and it is defined near the top of this file -- so they cannot live
 // in the !JLIB_PLATFORM_WINDOWS block further down, which comes after it.
 #if !JLIB_PLATFORM_WINDOWS
 #include <sys/resource.h>       // PRIO_PROCESS, setpriority
@@ -72,9 +72,10 @@ namespace {
 // stays one protocol on every OS; without that the loop grows three copies of the same state
 // machine and they drift, which is a failure this file has already had.
 //
-// Called on the CURRENT thread only, and only when HotThreadPolicy != Normal -- the callers gate on
-// hotPriorityRaised, which is never set under Normal. So this is a no-op configuration by
-// construction rather than by an extra branch on the per-task path.
+// Called on the CURRENT thread only, and only when HotThreadPolicy != Normal -- the caller tests
+// that policy directly, alongside a `bandPrio != curPrio` compare that makes the common pass a
+// register test. So this is a no-op configuration by construction rather than by an extra branch on
+// the per-task path, and a syscall happens only on a genuine band transition.
 //
 // EVERY BACKEND SWALLOWS FAILURE. Elevation is privileged on POSIX and can be refused at runtime in
 // a way the Win32 call never is; refusing is not an error, it is the unprivileged answer. The
@@ -142,7 +143,7 @@ void ApplyWorkerPriority(WorkerPrio p) noexcept {
 // OPT THIS THREAD OUT OF (OR INTO) OS POWER THROTTLING. Windows only; every other platform is a
 // deliberate no-op, explained below.
 //
-// THIS IS NOT PRIORITY, and it is the reason ApplyHotPriority does not cover it. Priority decides
+// THIS IS NOT PRIORITY, and it is the reason ApplyWorkerPriority does not cover it. Priority decides
 // who wins a timeslice contest. EcoQoS decides whether the thread runs at reduced FREQUENCY and
 // gets parked on efficiency cores -- a thread can be TIME_CRITICAL and still be throttled, because
 // the scheduler happily gives full priority within a clamped budget. So this applies to EVERY
@@ -164,13 +165,13 @@ void ApplyWorkerPriority(WorkerPrio p) noexcept {
 //
 // NOT A GUARANTEE, and nothing here checks otherwise. The call is a REQUEST; the OS may still
 // throttle for thermal or battery reasons, and on a version older than Windows 10 1809 it simply
-// fails with ERROR_INVALID_PARAMETER. Failure is ignored for the same reason ApplyHotPriority
+// fails with ERROR_INVALID_PARAMETER. Failure is ignored for the same reason ApplyWorkerPriority
 // ignores EPERM: refusing is the system's answer, not an error in the caller.
 //
 // NO POSIX EQUIVALENT EXISTS, and the absence is not an oversight. Linux expresses the same idea
 // through cgroup cpu.uclamp and per-task util_clamp, which are administrative settings a library
 // has no business writing; on Android the cgroup arbitration overrides anything a thread asks for
-// anyway. macOS folds it into QoS, which ApplyHotPriority already sets -- QOS_CLASS_USER_INTERACTIVE
+// anyway. macOS folds it into QoS, which ApplyWorkerPriority already sets -- QOS_CLASS_USER_INTERACTIVE
 // is both the priority and the "do not park me on an E-core" request there.
 void ApplyPowerThrottling(TaskScheduler::PowerThrottling p) noexcept {
 #if JLIB_PLATFORM_WINDOWS
@@ -1279,18 +1280,6 @@ void Thread::Worker() {
 	//
 	// Thread-local for the same reason task_to_run is: it has to survive that continue.
 	static thread_local bool laneSourced = false;
-	// IdlePolicy spin state for THIS worker. Both are reset the moment work is found, not only on
-	// the fall-through to park -- otherwise a worker that spun most of its budget and then got a
-	// task would carry that count into its next idle episode and park early ever after.
-	// TRUE while this worker holds the elevated priority. Raised when it becomes hot, and DROPPED
-	// again when it stops -- it used to be one-way, which was correct only while the hot set was
-	// static. Dynamic K made "was hot once" permanent while K itself sheds; see the stand-down
-	// branch in the idle section for why that mattered under NoSleep.
-	// Cross-platform again as of the POSIX port -- ApplyHotPriority has a backend on every OS now.
-	// Sample counter for the dynamic-K controller; only worker 0 ever looks at it.
-	unsigned laneDutyTick = 0;
-	// Generation-driven lane reconciliation. Seeded from the current generation so a worker that
-	// starts life after a K change does not treat its own startup as a transition.
 	// "This worker may have raised its OWN lane bit." Set while hot, and by the stray drain; cleared
 	// when the bit is retired. Sound because nobody else can raise this worker`s bit from zero.
 	// SEEDED FALSE, NOT FROM A PRE-LOOP GetHotWorkers(). It used to read K here, once, for the life
