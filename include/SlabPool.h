@@ -375,6 +375,31 @@ namespace JLib {
             return slot;
         }
 
+        // ---- FREE ON ANY THREAD IS LEGAL, AND THAT IS NOT AN ACCIDENT ------------------------
+        //
+        // ASKED DIRECTLY (9-02): does this need FiberRegistry's creditor/reaper machinery, so a slot
+        // is returned on the thread that allocated it? It does not, and the reason is what that
+        // machinery is FOR.
+        //
+        // The reaper exists for THREAD-AFFINE resources -- a COM apartment, a thread-owned handle, a
+        // TLS slot -- where releasing on the wrong thread is ILLEGAL, not merely untidy. Slab memory
+        // is not one of those. The arena is shared; SlotInSlab() validates membership in THE SLAB,
+        // not in a thread; and a slot freed here simply joins the freeing thread's cache and is
+        // handed out by that thread later. Any thread may use any slot, which is the whole premise.
+        //
+        // THE +1/-1 LANDING ON DIFFERENT SHARDS IS A COUNTER, NOT AN OWNERSHIP RECORD. See
+        // LiveCount(): shards deliberately go negative and only the total is meaningful. Nothing
+        // reads an individual shard, so nothing can be wrong about which one moved.
+        //
+        // WHAT CROSS-THREAD FREE ACTUALLY COSTS is cache migration: an allocate-here/free-there
+        // pattern drains one cache and overflows another, so both pay refill/flush under the shared
+        // pool's lock. That is throughput, and rebalancing it is what the shared pool is for.
+        //
+        // WHEN THIS WOULD CHANGE, and it is worth stating because someone will try it: if a size
+        // class ever stopped being fungible -- slabs carved from thread-local arenas, or NUMA-pinned
+        // pages that must go back to their own node -- then free-on-the-wrong-thread becomes wrong
+        // rather than slow, and the creditor set IS the mechanism for it. Adding such a class
+        // without also routing its frees is the bug this note exists to prevent.
         void Free(void* slot) {                // lock-free unless the cache overflows
             JLIBSCHED_STAT_BUMP(frees);
             Cache& c = local();
