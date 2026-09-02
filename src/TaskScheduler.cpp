@@ -2767,26 +2767,32 @@ void TaskScheduler::SetHotWorkers(size_t k) {
 void TaskScheduler::SetIoHotLane(size_t k) {
 	SetHotWorkers(k);
 
-	// ---- K PARKS AGAIN, BECAUSE THE INTAKE CHANGED WHAT PARKING COSTS ------------------------
+	// ---- K NEVER PARKS, BECAUSE STEALING MADE THE SPIN CHEAP --------------------------------
 	//
-	// This forced the spin on, and the reason it had to was structural rather than a latency
-	// preference: a completion was BOUND to one worker's inbox at push time, so if that worker was
-	// asleep the work sat until it happened to wake. Spinning was how the lane guaranteed somebody
-	// was looking, and it bought that guarantee with a whole core per reserved worker.
+	// This went round twice in one session and the reasoning is worth keeping, because the answer
+	// flipped when a DIFFERENT part of the system changed.
 	//
-	// The shared intake removes the premise. Work is no longer bound to a sleeper: it sits in a
-	// queue any of the K may take, and PushLaneIntake notifies one on every push. So "somebody is
-	// looking" is now delivered by a wake rather than by never sleeping -- which costs ~5.5 us to
-	// get the core back, against holding that core against every other thread in the process.
+	// It was forced on originally for a structural reason: a completion was BOUND to one worker's
+	// inbox at push time, so if that worker slept the work sat until it woke. Spinning was how the
+	// lane guaranteed somebody was looking, and it bought that with a whole core.
 	//
-	// A DEFAULT, NOT A REMOVAL. SetReservedNeverParks(true) still pins them awake and is still the
-	// right answer for a workload that cannot afford the wake. It is opt-in now instead of implied,
-	// so the reactor stops taking a core from the floor without being asked.
+	// The shared intake removed that premise -- work is no longer bound to a sleeper, and
+	// PushLaneIntake notifies -- so parking briefly became defensible. But that traded a ~5.5 us
+	// wake for a core the FLOOR still did not get: the pool is sized at N-K whatever K is doing, so
+	// parking returns the core to the OS and not to the pool.
 	//
-	// UNMEASURED AS OF THIS COMMIT, deliberately shipped as the arm to test rather than as a claim:
-	// the numbers that justify it are the K=1-vs-K=2 and intake-vs-control runs, and they are not
-	// mine to take. If the tail regresses, this line is the first thing to flip back.
+	// STEALING IS WHAT SETTLES IT. A reserved worker now takes floor work once the lane has been
+	// quiet (see IoLaneQuiet), so it is not spinning on nothing -- it is doing useful work whenever
+	// there is no I/O, and instantly available when there is. The spin costs what it always should
+	// have: nothing, when there is something else to do.
+	//
+	// AND IT IS NOT IN ANY PROOF. workerspin_model.c says outright that the park machine is not
+	// under test; sleepwake_model.c and sleepwake_permit_model.c model publish-then-notify without
+	// reference to reservation. Both settings are covered by the same wake model, so this is a
+	// policy and flipping it re-proves nothing.
+	SetReservedNeverParks(k > 0);
 }
+
 
 // The move itself, without touching the bounds -- used by SetHotWorkers, by the range clamp, and by
 // the controller, which must not rewrite the bounds it is being steered by.
@@ -5084,6 +5090,7 @@ bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 
 static std::atomic<long long> g_ioLastPushNs{ 0 };
 static std::atomic<unsigned>  g_ioQuietUs{ 500 };
+static std::atomic<bool>      g_reservedSteal{ true };
 
 // ---- THE SHARED LANE INTAKE ------------------------------------------------------------------
 bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
@@ -5147,9 +5154,21 @@ unsigned TaskScheduler::IoQuietWindowUs() noexcept {
 	return g_ioQuietUs.load(std::memory_order_relaxed);
 }
 
+void TaskScheduler::SetReservedStealing(bool on) noexcept {
+	g_reservedSteal.store(on, std::memory_order_relaxed);
+}
+bool TaskScheduler::ReservedStealing() noexcept {
+	return g_reservedSteal.load(std::memory_order_relaxed);
+}
+
 bool TaskScheduler::IoLaneQuiet() noexcept {
+	if (!g_reservedSteal.load(std::memory_order_relaxed)) return false;   // stealing off: never quiet
 	const long long last = g_ioLastPushNs.load(std::memory_order_relaxed);
-	if (last == 0) return true;            // no I/O has ever pushed: nothing to protect
+	// NEVER PUSHED MEANS NEVER PROTECTED. A program with no reactor would otherwise keep K spinning
+	// on a lane that will never carry anything -- reserved cores held against work that does not
+	// exist. This is also why the quiet WINDOW cannot express "do not steal": it is not consulted
+	// on this path at all, which is what SetReservedStealing is for.
+	if (last == 0) return true;
 	const long long win = (long long)g_ioQuietUs.load(std::memory_order_relaxed) * 1000ll;
 	return (MonotonicNs() - last) > win;
 }

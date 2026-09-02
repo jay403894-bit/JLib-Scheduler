@@ -69,6 +69,29 @@ static void Arm(const char* name, size_t floor) {
     JLib::TaskScheduler::SetAwakeFloor(floor);
     JLib::TaskScheduler::SetIoHotLane(kK);   // K + ReservedNeverParks -- the reactor config
 
+    // ---- STEALING OFF, BECAUSE THIS FILE IS ABOUT PLACEMENT ---------------------------------
+    //
+    // TWO DIFFERENT PROPOSITIONS, and this test can only see one of them. Since 9-02 a reserved
+    // worker STEALS ordinary work once the lane has been quiet -- so ordinary tasks legitimately
+    // run on [0,K), and this file's vacuity guard fired exactly as designed: "reserved workers ran
+    // 1 ordinary tasks -- no reservation in effect".
+    //
+    // The guard was right and the assertion was still worth keeping, because the invariant that
+    // matters is unchanged: NOTHING MAY PUSH ORDINARY WORK TO K. That is what makes a Normal task
+    // reachable, and violating it is the unreachable-inbox hang. A reserved worker CHOOSING to take
+    // ordinary work off a floor deque is a different thing entirely -- it is reachable by
+    // definition, since the taker is the one running it.
+    //
+    // AND THE GUARD'S INFERENCE IS WHAT EXPIRED, not its arithmetic. "Reserved workers ran ordinary
+    // tasks, therefore no reservation is in effect" was sound while K could only run what was PLACED
+    // on it. It is false now: K running ordinary work is K earning its core back.
+    //
+    // This file measures where tasks RAN, so it cannot tell placement from theft. Rather than weaken
+    // the assertion into something that would still pass under a real placement bug, stealing is
+    // switched off here -- then "ran on [0,K)" means "was PLACED there" again and the inference
+    // holds. The steal behaviour is a separate question and wants its own file.
+    JLib::TaskScheduler::SetReservedStealing(false);
+
     const size_t n = sched.GetWorkerCount();
     const size_t k = JLib::TaskScheduler::GetHotWorkers();
     std::printf("\n%s (K=%zu, awake floor base=%zu, pool=%zu)\n", name, k, floor, n);

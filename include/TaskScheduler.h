@@ -1937,6 +1937,14 @@ namespace JLib {
 		// inter-arrival gap does not read as quiet and short enough to reclaim a core promptly, but
 		// no measurement here chose it. Raise it if the lane's tail regresses; lower it if the floor
 		// is visibly short of workers while I/O idles.
+		// The on/off arm for the whole behaviour, and the A/B against a purely reserved band. Off
+		// means a reserved worker takes nothing but lane work, however long the lane stays quiet --
+		// which is what the placement invariant has to be measured against, since with stealing on
+		// "ordinary work ran on [0,K)" no longer distinguishes a placement bug from K earning its
+		// core back.
+		static void     SetReservedStealing(bool on) noexcept;
+		static bool     ReservedStealing() noexcept;
+
 		static void     SetIoQuietWindowUs(unsigned us) noexcept;
 		static unsigned IoQuietWindowUs() noexcept;
 		static bool     IoLaneQuiet() noexcept;
