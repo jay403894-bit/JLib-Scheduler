@@ -24,11 +24,16 @@ DAGs, the verified concurrency -- builds and runs there. Coroutines live in one 
 The boundary is enforced by the build rather than by discipline: the library target is compiled as
 C++17, so anything that leaked out of that header would fail to compile.
 
-**Practically: include the headers and build your project as C++20 for the full runtime (coroutines
-plus the I/O reactor).** The job system itself -- threads, fibers, DAGs, adaptive K-hot -- does not
-require C++20, and a C++17 translation unit can use that core in full. Coroutine *tasks* are
-rejected unless the TU is C++20. That last check is a runtime `assert` rather than a compile error
-because `TaskType::Coroutine` is an enumerator in `Task.h`, which is C++17: a C++17 TU can always
+**And that includes the I/O reactor.** `IoReactor` is a C++17 class over IOCP; what C++20 buys is
+the *awaiter* -- `co_await` sugar over the same completion-first API a C++17 caller drives with
+callbacks. `tests/io_c17_test.cpp` is compiled at `cxx_std_17`, links the reactor and passes, and it
+exists for exactly this claim: it is the one that would silently stop being true. (An earlier version
+of this section told you to build as C++20 "for the full runtime, coroutines plus the I/O reactor."
+The reactor half was wrong, and the test disproving it had been green the whole time.)
+
+Coroutine *tasks* are rejected unless the TU is C++20. That check is a runtime `assert` rather than
+a compile error because `TaskType::Coroutine` is an enumerator in `Task.h`, which is C++17: a C++17
+TU can always
 NAME it, so the compiler has nothing to object to. It cannot legally MAKE one, because `Spawn()`
 lives in `Coroutine.h` and that header `#error`s below C++20 -- but passing the enumerator straight
 to `CreateTask()` used to slip through both, and produced no crash to trace back. The type is read
