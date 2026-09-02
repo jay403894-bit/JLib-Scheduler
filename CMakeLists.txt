@@ -1095,6 +1095,15 @@ target_compile_features(SchedulerFiberDrainLiveTest PRIVATE cxx_std_17)
 # a PowerShell loop once expanded nothing and ran two "controls" against the unmodified build.
 # The DAG Fire() default-push control: removes the else arm, so dag_priority_node_test MUST time
 # out on the priority cases. Same PUBLIC-define reasoning as the holder controls below.
+# DAG TERMINAL TRACE: counts arrivals at OnTaskFinished per node and reports a SECOND one. Seven
+# call sites reach that path and nothing guards "exactly one wins", so 0 terminals (zombie node,
+# graph hangs) and 2 terminals (dependents fired twice, node retired twice) are indistinguishable
+# from the outside -- both look like "the test hangs sometimes". Diagnostic; default OFF.
+if(JLIBSCHED_DAG_TERMINAL_TRACE)
+  target_compile_definitions(Scheduler PUBLIC JLIBSCHED_DAG_TERMINAL_TRACE=1)
+  message(STATUS "JLib::Scheduler: DAG terminal trace ON (diagnostic build)")
+endif()
+
 if(JLIBSCHED_DAGFIRE_CTL)
   target_compile_definitions(Scheduler PUBLIC JLIB_DAGFIRE_CTL_${JLIBSCHED_DAGFIRE_CTL}=1)
   message(STATUS "JLib::Scheduler: NEGATIVE CONTROL DAGFIRE ${JLIBSCHED_DAGFIRE_CTL} -- dag_priority_node_test MUST fail")

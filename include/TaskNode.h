@@ -94,6 +94,17 @@ namespace JLib {
         DagEdge* firstEdge = nullptr;
         std::atomic<int> dependencies_left;
         std::atomic<bool> submitted{ false };
+#if defined(JLIBSCHED_DAG_TERMINAL_TRACE)
+        // HOW MANY TIMES THIS NODE REACHED THE TERMINAL PATH. There are SEVEN call sites into
+        // OnTaskFinished and NOTHING guards "exactly one wins" -- `submitted` gates DISPATCH, not
+        // COMPLETION. So the two failure shapes are indistinguishable from the outside:
+        //
+        //   0 terminals -> zombie node; dependents never count down; the graph hangs.
+        //   2 terminals -> dependents fired twice and the node retired twice.
+        //
+        // Both present as "the test hangs sometimes". This tells them apart. Diagnostic only.
+        std::atomic<int> terminalCount{ 0 };
+#endif
         uint8_t cpuID    : 8;
         uint8_t priority : 8;
         uint8_t isLocal  : 1;

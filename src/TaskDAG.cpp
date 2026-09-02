@@ -323,6 +323,21 @@ void TaskDAG::EdgeChunkDeleter(void* p) {
 
 
 void TaskDAG::OnTaskFinished(TaskNode* node, TaskNode::Outcome outcome) {
+#if defined(JLIBSCHED_DAG_TERMINAL_TRACE)
+    // SEVEN CALL SITES, NO GUARD. Report the SECOND arrival, not the first -- the first is correct
+    // by definition and only a repeat is evidence. Once per process: a double terminal cascades
+    // through the dependents it fires twice, so printing each one buries the first.
+    if (node && node->terminalCount.fetch_add(1, std::memory_order_acq_rel) != 0) {
+        static std::atomic<bool> told{ false };
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                "[JLib::Scheduler] DAG DOUBLE TERMINAL: node %p reached OnTaskFinished more than "
+                "once (outcome=%d). Dependents fire twice and the node is retired twice.\n",
+                (void*)node, (int)outcome);
+            std::fflush(stderr);
+        }
+    }
+#endif
     // Trigger each dependent. AND fires when its countdown reaches 0; OR fires on the
     // FIRST predecessor -- Fire's `submitted` exchange turns later predecessors into no-ops.
     //
