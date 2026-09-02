@@ -1059,6 +1059,16 @@ add_executable(SchedulerFiberDebtTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_d
 target_link_libraries(SchedulerFiberDebtTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberDebtTest PRIVATE cxx_std_17)
 
+# A PARKED RESERVED WORKER MUST BE WOKEN BY A LANE PUSH. The shared intake belongs to no worker, so
+# nothing else will look at it -- PushLaneIntake's notify is the only thing between a full intake and
+# a permanently asleep lane. The race is closed by that NOTIFY and not by the park predicate, which
+# reads an approximate size_approx(), so this pins the notify against a future reader deleting it as
+# redundant. Uses SetHotWorkers rather than SetIoHotLane: the shipped config pins K awake and never
+# exercises this path at all.
+add_executable(SchedulerLaneIntakeWakeTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/lane_intake_wake_test.cpp")
+target_link_libraries(SchedulerLaneIntakeWakeTest PRIVATE Scheduler)
+target_compile_features(SchedulerLaneIntakeWakeTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerFiberLocalTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_local_test.cpp")
 target_link_libraries(SchedulerFiberLocalTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberLocalTest PRIVATE cxx_std_17)

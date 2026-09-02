@@ -5115,10 +5115,17 @@ bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
 	// PUSH FIRST, NOTIFY SECOND, the same order as every other producer here. The reverse loses the
 	// wake outright -- the target observes an empty intake, eats its permit, and parks with the
 	// work arriving just behind it.
+#if !defined(JLIB_LANEINTAKE_CTL_NO_NOTIFY)
 	const size_t k = GetHotWorkers();
 	for (size_t w = 0; w < k && w < s->workers.size(); ++w) {
 		if (s->workers[w]) { s->workers[w]->MarkQueuedWork(); s->workers[w]->NotifyWorker(); break; }
 	}
+#else
+	// NEGATIVE CONTROL: compile the notify out. lane_intake_wake_test MUST fail under this -- the
+	// park predicate reads size_approx(), which is allowed to lag an enqueue, so without the notify
+	// a reserved worker parks on a non-empty intake that nobody else will ever look at. If the test
+	// still passes here, it is not testing the wake and the pass means nothing.
+#endif
 	return true;
 }
 
