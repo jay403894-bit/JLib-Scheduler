@@ -286,6 +286,41 @@ namespace JLib {
     IoLockStats ReadIoLockStats() noexcept;
     void        ResetIoLockStats() noexcept;
 
+    // ---- WHERE DID THE COMPLETIONS ACTUALLY GO? -------------------------------------------------
+    //
+    // Since 9-02 the reactor routes by the completion's own Lane: LowLatency work is steered into
+    // the reserved band, Normal work goes to the floor. That fixed a hang -- a Normal task aimed at
+    // a reserved worker lands in an inbox K never reads, which is unreachable rather than merely
+    // deprioritised -- but it also means "my I/O is being handled on the pool" is now the CORRECT
+    // and expected outcome for any completion whose continuation was created at default priority,
+    // which is most of them.
+    //
+    // THERE WAS NO WAY TO TELL THOSE APART FROM THE OUTSIDE, and that is what this answers. The
+    // bench's `spilled` counter does not: that one means the producer moved a push to another idle
+    // worker WITHIN [0,K), so it is lane-internal rescue and is structurally 0 at K=1.
+    //
+    //   toLane    completions steered into the reserved band. Requires K > 0 AND a LowLatency
+    //             continuation; either missing sends it to the floor.
+    //   toFloor   completions handed to the general pool. Correct for Normal work, and correct for
+    //             everything when K == 0.
+    //
+    // A HIGH toFloor IS NOT A FAULT BY ITSELF. Check what priority the continuations were created
+    // at before reading anything into it: `CreateTask`'s lane defaults to Lane::Normal, so a program
+    // that never asks for LowLatency will show toLane == 0 and be working exactly as designed.
+    struct IoRoutingStats {
+        std::uint64_t toLane  = 0;
+        std::uint64_t toFloor = 0;
+    };
+    IoRoutingStats ReadIoRoutingStats() noexcept;
+    void           ResetIoRoutingStats() noexcept;
+
+    namespace detail {
+        // Defined in IoShared.cpp, which every platform compiles -- so a caller reading these links
+        // where there is no reactor, and correctly sees zeros.
+        extern std::atomic<std::uint64_t> g_ioToLane;
+        extern std::atomic<std::uint64_t> g_ioToFloor;
+    }
+
     class IoReactor {
     public:
         static IoReactor& Instance();

@@ -384,7 +384,7 @@ namespace JLib {
                     // WHAT IS STILL MISSING WITHOUT K is reservation: the floor is awake but not
                     // reserved, so bulk work is steered at the same indices and a completion can
                     // queue behind a task already running there. Priority is ORDER, not isolation.
-                    if (hotN == 0) { s.PushBatch(arr, n, 0, 64, lane); return; }
+                    if (hotN == 0) { detail::g_ioToFloor.fetch_add(n, std::memory_order_relaxed); s.PushBatch(arr, n, 0, 64, lane); return; }
 
                     // ---- LOPRI IS NEVER STEERED TO K. IT WOULD BE UNREACHABLE THERE. ------------
                     //
@@ -405,7 +405,7 @@ namespace JLib {
                     // not belong on the lane in the first place -- K-steering is for LANE work, and
                     // loPri completions are, by definition, not that. They go to the floor, which is
                     // where PushBatch would have put them anyway.
-                    if (IsNormalLane(lane)) { s.PushBatch(arr, n, 0, 64, Lane::Normal); return; }
+                    if (IsNormalLane(lane)) { detail::g_ioToFloor.fetch_add(n, std::memory_order_relaxed); s.PushBatch(arr, n, 0, 64, Lane::Normal); return; }
 
 
                     // Candidate hot workers, by queue index. Bounded by the hint's own width: past
@@ -429,6 +429,7 @@ namespace JLib {
                     std::size_t off = 0, w = steer++;
                     while (off < n) {
                         const std::size_t len = (per < n - off) ? per : (n - off);
+                        detail::g_ioToLane.fetch_add(len, std::memory_order_relaxed);
                         s.PushBatch(arr + off, len, std::uint8_t(1 + cand[w % nc]), 64, lane);
                         off += len;
                         ++w;

@@ -198,6 +198,52 @@ namespace JLib {
 		using ReleaseFn = void (*)(size_t holder, Fiber* f);
 		void SetRelease(ReleaseFn fn);
 
+		// ---- WHO FREES A FIBER-LOCAL SLOT, IF ANYONE ------------------------------------------
+		//
+		// A slot is a `void*`. The library has no type for it, so by default it CLEARS one on
+		// recycle and never frees it -- which is correct for a borrowed pointer and a leak for an
+		// owning one, and only the application knows which it handed over.
+		//
+		// This is how it says. Install a deleter for a slot and that slot becomes OWNING: on
+		// recycle its value is handed to your function and then cleared. Leave a slot without one
+		// and it stays borrowed -- cleared, never freed. Mixing the two across slots is the point;
+		// a single registry-wide deleter would free borrowed pointers.
+		//
+		// `void (*)(void*)` DELIBERATELY, so it fits whatever allocator you actually use. `free`,
+		// an arena's release, a pool's, a lambda-free static that downcasts and calls delete -- the
+		// registry never needs to know, and nothing here assumes the pointer came from `new`.
+		//
+		//     static void FreeScratch(void* p) { MyArena::Release(p); }
+		//     FiberRegistry::Instance().SetSlotDeleter((size_t)Fls::Scratch, &FreeScratch);
+		//
+		// IT RUNS ON THE RECYCLE PATH, inside Fiber::ResetForReuse, which is the ONE place both
+		// return paths converge -- a worker's batch return and the registry's own ReturnToPool. It
+		// therefore runs on whatever thread recycled the fiber, which is not necessarily the thread
+		// that allocated the pointer: an allocator with thread-affine free needs to say so through
+		// the creditor mechanism instead, which is what that mechanism is for.
+		//
+		// COSTS NOTHING WHEN UNUSED. One relaxed load of a mask and a return, for every program
+		// that installs no deleters -- which is all of them until one does.
+		//
+		// SET IT BEFORE THE POOL RUNS, AND DO NOT WITHDRAW IT WHILE POINTERS ARE IN FLIGHT. Both
+		// ends of that were found by measurement rather than reasoning:
+		//
+		//   INSTALLING LATE FREES SOMEBODY ELSE'S VALUE. A slot that already holds non-owning
+		//   values -- a sentinel, a tag, a borrowed pointer -- becomes owning the moment a deleter
+		//   appears, and the next fiber recycled with one of those in it hands it to your free.
+		//   This is not hypothetical: it crashed the test for this feature, on a slot two earlier
+		//   arms had used to park integer sentinels.
+		//
+		//   WITHDRAWING EARLY LEAKS. Fibers sit in a worker's local cache between tasks and are only
+		//   scrubbed when recycled, so at any instant some slots still hold live pointers. Clearing
+		//   the deleter means those are cleared rather than freed. The same test measured it: 150
+		//   allocations, 144 frees, 6 fibers not yet recycled when the deleter came out.
+		//
+		// Neither is a bug in the mechanism -- both are what "this slot is owning" means arriving or
+		// leaving at a moment when the pool disagrees. Install once at startup, leave it installed.
+		using SlotDeleter = void (*)(void*);
+		void SetSlotDeleter(size_t slot, SlotDeleter fn);
+
 	private:
 		FiberRegistry() = default;
 		// Resolve a seam to the installed hook or the real default, with ONE load each.

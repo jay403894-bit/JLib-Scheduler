@@ -88,6 +88,20 @@ int main() {
 
     Check(done.load() == 1, "the continuation ran on completion with the right bytes");
 
+    // WHERE IT WENT, printed rather than asserted. This continuation is Lane::Normal (CreateTask's
+    // default), so the FLOOR is the correct destination -- steering Normal work at a reserved worker
+    // is what hung this very test until 9-02, because K never reads its Normal inbox. Reported so
+    // "my I/O was handed to the pool" can be distinguished from "my I/O is broken" without guessing.
+    {
+        const JLib::IoRoutingStats r = JLib::ReadIoRoutingStats();
+        std::printf("  routing: %llu completion(s) to the LANE, %llu to the FLOOR (K=%zu)\n",
+                    (unsigned long long)r.toLane, (unsigned long long)r.toFloor,
+                    JLib::TaskScheduler::GetHotWorkers());
+        Check(r.toLane + r.toFloor > 0, "the routing counters saw this completion at all");
+        Check(r.toLane == 0,
+              "a Lane::Normal continuation went to the FLOOR, not the reserved band");
+    }
+
     bool right = true;
     for (int i = 0; i < 256; ++i)
         if ((unsigned char)st->buf[i] != (unsigned char)(i & 0xFF)) right = false;

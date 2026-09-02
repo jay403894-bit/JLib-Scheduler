@@ -470,4 +470,25 @@ namespace JLib {
     }
 
 
+    // ---- WHERE COMPLETIONS WENT. See IoRoutingStats in IoReactor.h. -----------------------
+    //
+    // Here rather than in the Windows backend that writes them, so a caller reading these links on
+    // a platform with no reactor and sees the truthful answer: zero of each.
+    namespace detail {
+        std::atomic<std::uint64_t> g_ioToLane{ 0 };
+        std::atomic<std::uint64_t> g_ioToFloor{ 0 };
+    }
+
+    IoRoutingStats ReadIoRoutingStats() noexcept {
+        IoRoutingStats s;
+        s.toLane  = detail::g_ioToLane.load(std::memory_order_relaxed);
+        s.toFloor = detail::g_ioToFloor.load(std::memory_order_relaxed);
+        return s;
+    }
+
+    void ResetIoRoutingStats() noexcept {
+        detail::g_ioToLane.store(0, std::memory_order_relaxed);
+        detail::g_ioToFloor.store(0, std::memory_order_relaxed);
+    }
+
 } // namespace JLib

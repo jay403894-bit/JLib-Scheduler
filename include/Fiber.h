@@ -18,6 +18,18 @@ namespace JLib {
 		SUSPENDED,     // Parked, not queued; only now may Resume() make it READY + re-queue
 		DEAD           // Finished, pending cleanup/reclamation
 	};
+	namespace detail {
+		// The seam ResetForReuse calls to release owning fiber-local slots. Declared here and
+		// DEFINED IN FiberRegistry.cpp so Fiber.h does not have to include the registry -- Fiber is
+		// included by nearly everything, and pulling the registry in behind it would invert the
+		// dependency that keeps Fiber a plain data type.
+		//
+		// It is the registry's table, not Fiber's, because the deleters are an application-level
+		// policy registered once, and a per-fiber copy of eight function pointers would cost more
+		// memory than the slots themselves.
+		void ReleaseFiberSlots(void** slots, size_t n) noexcept;
+	}
+
 	struct alignas(16) Fiber {
 		Context ctx;
 		uint64_t id;
@@ -290,6 +302,11 @@ namespace JLib {
 			// THE LIBRARY DOES NOT FREE WHAT A SLOT POINTS AT. It cannot -- it has no type. A slot
 			// holding an owning pointer must be released by the task that put it there, before the
 			// task ends. Clearing here prevents a stale READ, not a leak.
+			// FREE BEFORE CLEARING, for slots that declared how. See FiberRegistry::SetSlotDeleter:
+			// a slot with no deleter is BORROWED and is only cleared, a slot with one is owning and
+			// is handed to it. One relaxed load and a return when nobody installed any, which is
+			// every program that does not use the feature.
+			detail::ReleaseFiberSlots(local, kLocalSlots);
 			for (size_t i = 0; i < kLocalSlots; ++i) local[i] = nullptr;
 			status.store(FiberStatus::READY, std::memory_order_release);
 		}

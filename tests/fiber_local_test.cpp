@@ -23,6 +23,8 @@
 #include "TaskScheduler.h"
 #include "Thread.h"
 #include "Fiber.h"
+#include "FiberRegistry.h"
+#include <cstdlib>
 
 #include <atomic>
 #include <chrono>
@@ -50,6 +52,12 @@ JLIB_NOINLINE static void  TlsSet(void* v) { t_tls = v; }
 JLIB_NOINLINE static void* TlsGet()        { return t_tls; }
 
 static constexpr int kFibers = 64;
+
+// Arm 4 slots. FILE SCOPE so the task lambdas can name them without an explicit capture, and
+// deliberately slots NO EARLIER ARM TOUCHES -- see arm 4.
+static constexpr size_t kOwning   = 2;
+static constexpr size_t kBorrowed = 3;
+static_assert(kOwning < JLib::Fiber::kLocalSlots && kBorrowed < JLib::Fiber::kLocalSlots, "");
 
 struct Rec {
     int   workerBefore = -1;
@@ -175,6 +183,77 @@ int main() {
         Check(ran.load(std::memory_order_acquire) == kRounds, "every recycle-probe task ran");
         Check(dirty.load(std::memory_order_relaxed) == 0,
               "a recycled fiber NEVER carries the previous occupant's slot");
+    }
+
+    // ---- ARM 4: SLOT DELETERS, AND THE SLOT THAT MUST NOT BE FREED --------------------------
+    //
+    // A slot is a void*, so the library cannot free one without being told how. SetSlotDeleter is
+    // how an application says "this slot is OWNING, and here is my allocator's free" -- which is the
+    // point of taking a `void (*)(void*)` rather than assuming `new`/`delete`.
+    //
+    // THE BORROWED SLOT IS THE CONTROL AND IT IS THE ONE THAT MATTERS. An over-eager implementation
+    // that freed every non-null slot would pass an "owning slots get freed" test perfectly and
+    // corrupt every program that parks a borrowed pointer in a slot. Slot 1 is never given a
+    // deleter, is handed a pointer to a live object, and must come back untouched.
+    {
+        static std::atomic<int> s_freed{ 0 };
+        static std::atomic<int> s_borrowedFreed{ 0 };
+        struct Owned { int magic; };
+
+        // Deliberately not `new`/`delete`: the whole reason the hook takes a void* is that the
+        // allocator is the caller's business.
+        struct Alloc {
+            static void* Get()        { return std::malloc(sizeof(Owned)); }
+            static void  Free(void* p) { s_freed.fetch_add(1, std::memory_order_relaxed); std::free(p); }
+            static void  NeverCalled(void* )   { s_borrowedFreed.fetch_add(1, std::memory_order_relaxed); }
+        };
+        (void)&Alloc::NeverCalled;   // referenced only to keep the intent visible
+
+        // SLOTS NO EARLIER ARM TOUCHED, and this is the test obeying the rule SetSlotDeleter
+        // states rather than a tidiness preference. Arms 1 and 3 wrote FAKE pointers into slot 0
+        // (0xF1BE00xx, 0xDEAD) as sentinels. Declaring slot 0 owning here made the first fiber
+        // still cached with one of those free(0xDEAD) on recycle -- a hard crash, and exactly the
+        // failure the header warns about: "installing a deleter for a slot that already holds live
+        // pointers in flight would start freeing values the application still believes it owns."
+        // The library did what it was told; the test was what was wrong.
+        auto& reg = JLib::FiberRegistry::Instance();
+        reg.SetSlotDeleter(kOwning, &Alloc::Free);
+        // kBorrowed gets NO deleter on purpose. It is the control.
+
+        static Owned s_live{ 0xABCD };
+        std::atomic<int> ran{ 0 };
+        std::atomic<int> sawStale{ 0 };
+        const int kRounds = 150;
+
+        for (int i = 0; i < kRounds; ++i) {
+            auto* t = sched.CreateTask([&ran, &sawStale] {
+                if (JLib::TaskScheduler::FiberLocal(kOwning) != nullptr ||
+                    JLib::TaskScheduler::FiberLocal(kBorrowed) != nullptr)
+                    sawStale.fetch_add(1, std::memory_order_relaxed);
+                JLib::TaskScheduler::FiberLocal(kOwning)   = Alloc::Get();   // owning
+                JLib::TaskScheduler::FiberLocal(kBorrowed) = &s_live;        // BORROWED
+                ran.fetch_add(1, std::memory_order_release);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            if (t) sched.Push(t);
+        }
+
+        const auto d4 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (ran.load(std::memory_order_acquire) < kRounds
+               && std::chrono::steady_clock::now() < d4)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        std::printf("  deleters: %d/%d tasks ran, %d owning frees, borrowed object magic=0x%X\n",
+                    ran.load(), kRounds, s_freed.load(), (unsigned)s_live.magic);
+
+        Check(ran.load(std::memory_order_acquire) == kRounds, "every deleter-probe task ran");
+        Check(sawStale.load(std::memory_order_relaxed) == 0, "no task inherited a previous slot");
+        Check(s_freed.load(std::memory_order_relaxed) > 0,
+              "the OWNING slot's deleter ran (else the hook is not wired at all)");
+        Check(s_borrowedFreed.load(std::memory_order_relaxed) == 0,
+              "CONTROL: a slot with NO deleter was never freed -- borrowed pointers survive");
+        Check(s_live.magic == 0xABCD, "and the borrowed object is intact");
+
+        reg.SetSlotDeleter(kOwning, nullptr);   // withdraw before the pool tears down
     }
 
     // ---- OFF A FIBER: answerable, not fatal ------------------------------------------------
