@@ -60,7 +60,28 @@ namespace {
 	// turning it off answers and why it must not be quoted as a fairness knob. Declared HERE rather
 	// than beside its setter because WaitFor reads it a few thousand lines earlier in this file.
 	// Atomic for the reader in the wait loop; relaxed, since a late flip costs one helped task.
-	std::atomic<bool> g_bareWaitHelp{ true };
+	// ---- DEFAULT OFF SINCE THE PUBLIC JOB BECAME A FIBER --------------------------------------
+	//
+	// A BARE THREAD CANNOT HELP WITH FIBER WORK AND NEVER COULD. GetTask vets steal candidates with
+	// `fiberlessRunnable`, which rejects TaskType::Fiber outright -- so a bare waiter helping a pool
+	// of fiber tasks walks the pool to claim something it is not permitted to take, every iteration.
+	// TryRunStolenNativeTask says so about itself: "the primitives tests hang rather than fail --
+	// they wait on fiber tasks from a bare thread, so the help loop can never terminate through the
+	// help path", and it is the 664 us round trip in the same note.
+	//
+	// THAT WAS ALREADY TRUE FOR FIBER TASKS; MAKING THE PUBLIC JOB A FIBER MADE IT TRUE FOR ALMOST
+	// EVERYTHING. The only things left a bare waiter may claim are the internal Native ones --
+	// ParallelFor grains, cleanup hops, main DAG nodes -- and a user waiting on user work will never
+	// meet one. So the help is no longer a mostly-useful optimisation with a bad case; it is a
+	// mostly-useless scan with a good case.
+	//
+	// THE WAIT IS JUST A WAIT NOW. Workers run the work; the waiter blocks. The hint-bitmap early-out
+	// made FAILING cheap, which is not the same as making helping possible.
+	//
+	// STILL A SWITCH, not a deletion: ParallelFor's main participation is a DIFFERENT caller with a
+	// different need -- it helps run Native splits IT published -- and turning that off is the
+	// documented ParallelFor regression. This flag covers WaitFor only, as its own comment says.
+	std::atomic<bool> g_bareWaitHelp{ false };
 
 	constexpr uint32_t kIdleSpinsBeforeYield = 1000;
 
