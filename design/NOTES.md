@@ -2181,7 +2181,29 @@ provision a small deep count by default; fall back to Standard when the asked-fo
 CreateTask and return nullptr, which is loud and matches the slab's "grow rather than fail" lesson
 only partly. Worth deciding before anyone ships against the new parameter.
 
-## OPEN: a reserved worker that steals SUSPENDABLE work loses it forever (2026-09-02)
+## Reserved stealing vs fiber mode -- HALF FIXED (2026-09-02)
+
+Jay's rule, and it is sharper than any of the three options this note first listed:
+
+  * PINNED  -- K MUST NOT STEAL. A pinned fiber resumes only on its home worker; if that worker is
+               reserved, the resumption is unreachable by construction. SHIPPED: the steal gate now
+               reads `!TaskScheduler::FibersMigrate()`.
+  * MIGRATE -- K MAY STEAL, because anyone who finds the resumption should be able to take it.
+
+THE SECOND HALF IS NOT TRUE YET, WHICH IS WHY THE TEST STILL DISABLES STEALING. Requeue's
+migratable path does `if (lane->push_bottom(task)) return RequeueResult::Stealable;` -- it pushes
+and returns "Stealable" WITHOUT advertising a steal hint and without notifying anyone. Compare
+PushTarget, which does MarkQueuedWork() + NotifyWorker() after every push. So "Stealable" is a claim
+rather than a fact: `advertised queues = 0` in the dump, and no thief ever probes it.
+
+It stayed invisible because a FLOOR owner rescans its own deque and finds the task anyway. A
+RESERVED owner never reads loPri, so once K steals, the task is unreachable from BOTH ends at once.
+MEASURED with the pinned gate in and stealing on: 2 passes in 6.
+
+NEXT: advertise (and/or notify) on the stealable requeue path. It is a small change in the wake
+protocol, which is where every lost wake in this project has lived, so it wants its own pass.
+
+## Original note: a reserved worker that steals SUSPENDABLE work loses it forever (2026-09-02)
 
 Reserved-worker stealing (added 9-02, so K does not waste two cores while the lane is quiet) is sound
 for work that runs to completion and UNSOUND for work that suspends:

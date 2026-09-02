@@ -2777,6 +2777,32 @@ void Thread::Worker() {
 					// The clock read costs nothing HERE specifically: this worker has already
 					// failed to find lane work and is about to walk victims, which is orders of
 					// magnitude more expensive than asking the time.
+					// ---- AND IN PINNED MODE A RESERVED WORKER MAY NOT STEAL AT ALL -----------
+					//
+					// THE FIBER MODE DECIDES WHETHER STEALING IS SAFE HERE, and the two answers are
+					// opposite. What a reserved worker risks is not running the task -- it is what
+					// happens if that task SUSPENDS:
+					//
+					//   MIGRATE  Requeue pushes the resumption to the current worker's deque bottom
+					//            and returns Stealable. Whoever is free takes it, including the
+					//            floor. A reserved worker holding it for a moment costs latency and
+					//            nothing else, so stealing is fine.
+					//
+					//   PIN      a pinned fiber resumes ONLY on the worker it was bound to. If that
+					//            worker is reserved, the resumption lands in a reserved worker's
+					//            loPri deque -- and K NEVER READS ONE. Nobody may take it and the
+					//            owner is forbidden to look, so the task is not slow, it is LOST.
+					//
+					// So the mode is the gate. MEASURED as the shape of a real hang: io_socket_test
+					// passed 1 run in 5 with reserved stealing on, 5 in 5 with it off, and the pool
+					// dump showed every worker idle with q0/q1 -- the reserved band -- each holding
+					// deque(hi/lo) 0/1.
+					//
+					// THIS IS THE SAME INVARIANT AS THE PLACEMENT RULE, FROM THE OTHER END. Nothing
+					// may PUSH ordinary work at K (reserved_lopri_placement_test guards that); this
+					// says nothing may leave RESUMABLE work there either. Every "K never reads X"
+					// has two entrances, and only the first was closed.
+					if (isReservedWorker && !TaskScheduler::FibersMigrate()) return false;
 					if (isReservedWorker && !TaskScheduler::IoLaneQuiet()) return false;
 					auto s = scheduler->deques[target]->steal_if(classOK);
 					if (!s) return false;

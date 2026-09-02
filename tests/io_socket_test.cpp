@@ -73,28 +73,11 @@ int main() {
 
     JLib::TaskScheduler::EnableTimers(true);
     JLib::TaskScheduler::EnableIoReactor(true);
-    // ---- WORKAROUND FOR A LIVE SCHEDULER BUG. NOT A PROPERTY OF THIS TEST. ------------------
-    //
-    // A RESERVED WORKER THAT STEALS SUSPENDABLE WORK CAN LOSE IT FOREVER.
-    //
-    // Reserved workers steal ordinary work when the lane is quiet (added 9-02, so the pool does not
-    // waste two cores). That is sound for work that RUNS TO COMPLETION. It is not sound for work
-    // that SUSPENDS: a stolen Lane::Normal fiber that parks on I/O has its resumption published
-    // back onto the worker that was running it -- and that worker is in the reserved band, WHICH
-    // NEVER READS A LOPRI DEQUE. Nobody may take it, so it never runs again.
-    //
-    // MEASURED HERE: 1 pass in 5 with stealing on, 5 in 5 with it off. The watchdog dump names it
-    // exactly -- every worker idle, advertised queues = 0, and `q0`/`q1` (the reserved band) each
-    // holding `deque(hi/lo) 0/1`. Two tasks, both unreachable.
-    //
-    // THIS IS THE SAME INVARIANT AS THE 8-31 REACTOR BREAK, reached from the other end. That one
-    // was about PLACEMENT -- never push loPri at K -- and is guarded by
-    // reserved_lopri_placement_test. This is about RESUMPTION, which that file cannot see: it
-    // disables stealing itself, and says so, because it measures where tasks ran and cannot tell
-    // placement from theft.
-    //
-    // Turned off here so the suite tests SOCKETS rather than re-finding this every run. Remove the
-    // line once the scheduler stops publishing resumed loPri work onto a reserved worker.
+    // WORKAROUND, NOT A PREFERENCE -- see design/NOTES.md. Requeue's migratable path pushes a
+    // resumption to a deque and returns Stealable WITHOUT advertising a steal hint, so no thief
+    // probes it. A floor owner rescans its own deque and finds it anyway; a RESERVED owner never
+    // reads loPri, so with K stealing the task is unreachable from both ends. 4 hangs in 6 without
+    // this line. Remove it when the stealable requeue advertises.
     JLib::TaskScheduler::SetReservedStealing(false);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
