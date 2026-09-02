@@ -795,6 +795,8 @@ int main() {
         JLib::SchedulerMutex m;
         JLib::CancelScope scope;
         std::atomic<int> reachedEnd{ 0 };
+        // OBSERVED, NOT SLEPT FOR. See the wait below.
+        std::atomic<bool> entered{ false };
         std::atomic<bool> parked{ false }, release{ false };
         JLib::WaitGroup wg;
 
@@ -815,6 +817,12 @@ int main() {
 
         wg.n.fetch_add(1, std::memory_order_relaxed);
         auto* t = sched.CreateTask([&] {
+            // MARK ENTRY BEFORE BLOCKING. Task::started is set at PICKUP, before the body runs, so
+            // by the time this line executes the task is already past the point where
+            // DiscardIfCancelled may throw it away. Observing this is therefore sufficient to
+            // establish the precondition -- the remaining gap before it actually parks in the
+            // mutex is covered by started == 1, which routes a cancel through the RESUME path.
+            entered.store(true, std::memory_order_release);
             if (m.LockCancellable() == JLib::WaitResult::Ok) m.Unlock();
             // Reached either way. If the resume had been discarded, this never runs and the
             // WaitFor below hangs -- which is the failure this check exists to catch.
@@ -824,7 +832,26 @@ int main() {
         t->waitGroup = &wg;
         sched.Push(t);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));   // let it park
+        // ---- THIS WAS A 120 ms SLEEP, AND THAT WAS THE 25% ----------------------------------
+        //
+        // The check below asserts a SUSPENDED task is resumed rather than discarded. If `t` is still
+        // QUEUED when Cancel lands, started == 0 and DiscardIfCancelled discards it -- which is
+        // CORRECT, and is the rule Task::started exists to enforce. The test was asserting a
+        // precondition it had only hoped for, so it failed whenever the pool was slow to pick the
+        // task up: ~25% standalone, and it looked exactly like a library race because a timing
+        // window is a timing window whichever side of the API it is on.
+        //
+        // Waiting on an OBSERVATION makes the precondition true rather than likely.
+        {
+            const auto pd = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!entered.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < pd) std::this_thread::yield();
+            Check(entered.load(std::memory_order_acquire),
+                  "the cancellable task actually started (else the case below tests nothing)");
+        }
+        // A short settle so it is parked in the mutex rather than merely started. Not load-bearing:
+        // started == 1 already routes a cancel through the resume path either way.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         scope.Cancel();
         release.store(true, std::memory_order_release);
         sched.WaitFor(wg);
