@@ -125,7 +125,8 @@ method.
 | Dispatch latency, p99 | ~2.4 µs (2000+ samples) |
 | Context switch | **9.8 ns** (AVX-dirty), 9.4 ns (clean) |
 | 64-fiber wake storm | ~1.7 µs per fiber, median |
-| Idle tax of the shipped floor | indistinguishable from zero |
+| Idle tax, shipped floor (2 workers) | **indistinguishable from zero** (−0.05% … +0.13%) |
+| Idle tax, whole pool held awake (31) | **~+20%** |
 
 Read ratios and orders of magnitude, not last digits. The bench prints observed ranges and says
 **INDISTINGUISHABLE** where two arms overlap rather than letting you infer a winner from two medians
@@ -143,6 +144,20 @@ overlap — and +32 ns on a noisier run, so treat it as free rather than as a tu
 XMM6-15 past a deliberate clobber for every variant, and a same-vs-same control that must read
 1.00× (measured 0.998× and 1.011×). A speed number from a variant that does not preserve the
 registers is not a number at all, which is why the gate runs first.
+
+**The two idle-tax rows are the argument for the whole topology**, so they are worth reading
+together. An idle pool is not free to the rest of your process: hold **every** worker awake and a
+memory-bound main thread pays **~20%** — cores are occupied, and no amount of cheapening the spin
+recovers that. Hold **two** awake and the same thread cannot tell the difference.
+
+That is why the runtime has a *bounded, shedding* floor instead of a "never park" switch, and why
+the switch was removed rather than left as an option. The +20% is what the design is buying its way
+out of, measured — not the cost of using it.
+
+Both figures survived everything we could think to attack them with: three workload lengths
+(0.4 ms / 4 ms / 15 ms), a machine with every other application closed, and two different idle
+strategies. The bench prints all of it, and prints which conclusion the data supports rather than
+the one that would read best.
 
 **There are no comparisons against other schedulers here, on purpose.** A head-to-head implies a
 shared objective function, and schedulers are not built for the same things — this one trades
