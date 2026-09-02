@@ -1936,3 +1936,41 @@ because it has more hours on it, and flipping to pinned is a useful bisect for a
 load. Not public yet -- 5.0 is a substantially different product from what shipped before it
 (everything-is-a-fiber, Lane, K frozen at 2, migratable default), and it wants a real test pass and
 at least an epoll backend before any release claim.
+
+## Fiber-local slots, and the park predicate that was not naming the cleanup chain (9-02)
+
+**1. The cleanup chain was drained by the pass but not named by the park predicate.**
+`FiberRegistry::Deliver` already notified correctly -- push first, `NotifyHolder` second, workers
+only, with a negative-control define. But the three park predicates listed `hasQueuedWork`,
+`laneWake`, the hiPri inbox, the loPri inbox and `resumedInboxes` and **not** the holder chain, while
+the pass drains it at the top (Thread.cpp:1347).
+
+It worked only because `NotifyHolder` also sets `hasQueuedWork` -- and that flag is EDGE TRIGGERED
+and cleared every pass, so the chain's safety rested on winning a race rather than on the queue being
+read. That is exactly the argument the predicate itself refuses two clauses earlier for
+`resumedInboxes`: *one legal consumer, so parking on a non-empty one is a resource never given back,
+not a delay.* All three predicates now name it, so the set the search covers and the set the recheck
+asks about are the same set by construction.
+
+**2. Fiber-local storage replaces `thread_local` for fibers.** `Fiber::local[kLocalSlots]`, eight
+`void*` slots indexed by a compile-time constant, reached through `TaskScheduler::FiberLocal(slot)`.
+One load and an index -- no map, no hash, no lock, no allocation, because it has to be cheap enough
+to use where TLS would have been or nobody will.
+
+- **Eight is a memory decision, not a guess at demand.** Every pooled fiber carries the array; at 64
+  fibers per worker on 32 workers that is 2048 fibers, so each slot costs 16 KB across the pool.
+  Eight is 128 KB against the 64 KB stack each of those fibers already owns.
+- **Scrubbed in `ResetForReuse`.** The most forgettable of the reset fields, because nothing in the
+  library ever reads a slot -- only the application would see it break, and a stale pointer to a
+  still-allocated object reads back fine rather than faulting.
+- **The library cannot free what a slot points at**, having no type. Clearing prevents a stale READ,
+  not a leak.
+- **Off a fiber it returns a per-thread scratch `void*`** rather than asserting: a Native task and a
+  bare thread legitimately have none, and library code that may run in either context needs to be
+  able to ASK. `HasFiberLocal()` is the explicit test.
+
+`tests/fiber_local_test.cpp` measured 49/64 fibers resuming on a different worker: **FLS 64 held / 0
+lost, TLS 0 of 49 migrated fibers still seeing their own value.** The TLS arm is the negative control
+and it is load-bearing -- arm 1 passing alone is equally consistent with "nothing migrated". Its
+accessor is `noinline` because MSVC caches a thread_local base across an opaque call, which is what
+once made migratable_fiber_test report 0 migrations out of 206.

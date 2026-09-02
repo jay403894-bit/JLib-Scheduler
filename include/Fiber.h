@@ -58,6 +58,31 @@ namespace JLib {
 		// SIZE_MAX means "not bound" -- a fiber sitting in a pool cache. It is not a valid target.
 		size_t homeWorker = SIZE_MAX;
 
+		// ---- FIBER-LOCAL STORAGE: what `thread_local` cannot be here ---------------------------
+		//
+		// Migratable fibers resume on whichever worker is free, so a `thread_local` read before a
+		// suspension point is not the same object after it -- silently, because you simply get the
+		// resuming worker's copy. That is the one real cost of the default mode, and this is the
+		// thing to use instead: storage attached to the FIBER, which is the object that actually
+		// survives the suspension.
+		//
+		// A FIXED ARRAY, INDEXED BY A COMPILE-TIME SLOT. One load from a pointer the caller already
+		// has -- no map, no hash, no lock, no allocation. That matters because the whole point is to
+		// be cheap enough to use on the path where TLS would have been used.
+		//
+		// EIGHT SLOTS, and the number is a memory decision rather than a guess at demand. Every
+		// fiber in the pool carries this whether it uses it or not, and the pool is sized by the
+		// fiber budget -- at 64 standard fibers per worker on a 32-worker box that is 2048 fibers,
+		// so each slot costs 16 KB of committed memory across the pool. Eight is 128 KB, which is
+		// nothing beside the 64 KB stack each of those fibers already owns. Raising it is a
+		// one-line change with a visible price; a dynamic map would have neither property.
+		//
+		// SLOT MEANING IS THE APPLICATION'S. The library defines the storage and the count and never
+		// reads a slot. Callers declare their own `enum class : uint16_t` ending in COUNT and
+		// static_assert it against kLocalSlots -- see FiberLocal() in TaskScheduler.h.
+		static constexpr size_t kLocalSlots = 8;
+		void* local[kLocalSlots] = {};
+
 #if defined(JLIBSCHED_REQUEUE_TRACE)
 		// WHERE Requeue SENT THIS FIBER on its last resume, stamped by the router and read back by
 		// the fiber once it is running again. Diagnostic only, compiled out by default.
@@ -255,6 +280,17 @@ namespace JLib {
 			// Owned by whichever primitive the fiber was parked on. A survivor means the next
 			// occupant appears to be queued on a wait list it never joined.
 			nextWaiter = nullptr;
+			// FIBER-LOCAL SLOTS ARE THE OCCUPANT'S, NEVER THE SLOT'S. A recycled fiber carrying
+			// live pointers would hand the next occupant another task's state -- and it would look
+			// like working code, because a stale pointer to a still-allocated object reads fine.
+			// This is the same rule owedKinds and nextWaiter above are here for, and it is the one
+			// most likely to be forgotten, because unlike those two nothing in the library ever
+			// reads these: only the application does, so only the application would see it break.
+			//
+			// THE LIBRARY DOES NOT FREE WHAT A SLOT POINTS AT. It cannot -- it has no type. A slot
+			// holding an owning pointer must be released by the task that put it there, before the
+			// task ends. Clearing here prevents a stale READ, not a leak.
+			for (size_t i = 0; i < kLocalSlots; ++i) local[i] = nullptr;
 			status.store(FiberStatus::READY, std::memory_order_release);
 		}
 

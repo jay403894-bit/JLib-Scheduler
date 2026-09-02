@@ -1033,6 +1033,15 @@ target_compile_features(SchedulerReservedLoPriPlacementTest PRIVATE cxx_std_17)
 # that stops "K got fibers" being confused with "everyone got fibers", which would put a
 # ContextSwitch on every task in the pool. Asserts the capability (a Native task suspending on an
 # event) and not just the binding.
+# FIBER-LOCAL STORAGE. The answer to the one cost of migratable mode: TLS read before a suspension
+# point belongs to a thread the fiber may no longer be on. Asserts both halves -- FLS survives a
+# migration, thread_local does NOT -- because arm 1 alone is also consistent with "nothing migrated".
+# The TLS accessor is noinline: MSVC caches a thread_local base across an opaque call, which once
+# made migratable_fiber_test report 0 migrations out of 206.
+add_executable(SchedulerFiberLocalTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_local_test.cpp")
+target_link_libraries(SchedulerFiberLocalTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberLocalTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerReservedFiberJobTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_fiber_job_test.cpp")
 target_link_libraries(SchedulerReservedFiberJobTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedFiberJobTest PRIVATE cxx_std_17)

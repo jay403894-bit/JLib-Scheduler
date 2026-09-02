@@ -3189,7 +3189,21 @@ void Thread::Worker() {
 						// a permanent hang rather than a delay. Same reasoning as the loPri inbox
 						// above, one degree worse -- that one at least ends when its owner wakes
 						// for another reason.
-						|| !scheduler->resumedInboxes[qIndex]->quiescent()))) {
+						|| !scheduler->resumedInboxes[qIndex]->quiescent()
+						// THE FIBER CLEANUP CHAIN, for exactly the reason above it. A creditor's
+						// chain has ONE legal consumer -- this worker -- so parking on a non-empty
+						// one is a resource never given back, not a delay.
+						//
+						// IT WAS NOT NAMED HERE, and the pass DRAINS it (see the DrainHolder at the
+						// top of the pass). That breaks the rule this predicate states two clauses
+						// up in the other direction: the set the search covers and the set the
+						// recheck asks about must be the same set. It happened to work because
+						// Deliver's NotifyHolder also sets hasQueuedWork -- but that flag is EDGE
+						// TRIGGERED and cleared every pass, so the chain's safety rested entirely
+						// on a race being won rather than on the queue being read. Naming it makes
+						// it correct by construction, which is what the other unstealable queues
+						// already get.
+						|| FiberRegistry::Instance().HolderHasWork((size_t)qIndex)))) {
 				// Never advertised, so nothing to publish back -- just go and search again.
 				JLIBSCHED_LATENCY_MARK(Wake);
 				if (!running.load(std::memory_order_acquire)) break;
@@ -3685,7 +3699,9 @@ void Thread::Worker() {
 							    // loPri, so K must never WAIT on it either.
 							    || (!isReservedWorker
 							        && !scheduler->loPriInboxes[qIndex]->quiescent())
-							    || !scheduler->resumedInboxes[qIndex]->quiescent();
+							    || !scheduler->resumedInboxes[qIndex]->quiescent()
+							    // One legal consumer, same as the resume inbox above it.
+							    || FiberRegistry::Instance().HolderHasWork((size_t)qIndex);
 						});
 					}
 					else
@@ -3698,7 +3714,11 @@ void Thread::Worker() {
 					       // Gated, term for term with the recheck and the condvar predicate.
 					       && (isReservedWorker
 					           || scheduler->loPriInboxes[qIndex]->quiescent())
-					       && scheduler->resumedInboxes[qIndex]->quiescent()) {
+					       && scheduler->resumedInboxes[qIndex]->quiescent()
+					       // Inverted like every other term here: keep spinning only while the
+					       // cleanup chain is EMPTY. One legal consumer, so parking on a full one
+					       // never resolves itself.
+					       && !FiberRegistry::Instance().HolderHasWork((size_t)qIndex)) {
 #if defined(JLIB_PLATFORM_WINDOWS)
 						// Address-based: no kernel object to create, own or leak, and no mutex on
 						// the push path. The waker changes workerState and then wakes this address

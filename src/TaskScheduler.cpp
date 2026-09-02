@@ -5896,6 +5896,41 @@ bool TaskScheduler::NotifyHolder(size_t worker) {
 
 bool TaskScheduler::MigratableFibers() { return g_migratableFibers.load(std::memory_order_relaxed); }
 
+// ---- FIBER-LOCAL STORAGE ----------------------------------------------------------------------
+//
+// NO SYNCHRONISATION, and that is not an omission. A fiber runs on exactly one worker at a time --
+// that is what a fiber IS -- so its slots have a single accessor for their whole lifetime. What
+// changes under migration is WHICH thread that accessor runs on, and the array travels with the
+// fiber rather than with the thread, which is the entire point. The handoff is already ordered by
+// the ContextSwitch and the status store around a suspend; nothing here needs to add to it.
+static Fiber* CurrentFiberOrNull() noexcept {
+	Thread* t = Thread::GetCurrent();
+	return t ? t->currentFiber : nullptr;
+}
+
+bool TaskScheduler::HasFiberLocal() noexcept { return CurrentFiberOrNull() != nullptr; }
+
+void*& TaskScheduler::FiberLocal(size_t slot) noexcept {
+	// PER-THREAD FALLBACK RATHER THAN AN ASSERT. Off a fiber -- a Native task, a bare thread, main
+	// -- there is nowhere fiber-local to put anything, but returning a reference is the contract, so
+	// there has to be somewhere. This gives a harmless one: writes land in a slot nobody else reads,
+	// reads give nullptr. Code that must TELL the difference calls HasFiberLocal().
+	//
+	// thread_local IS CORRECT HERE SPECIFICALLY BECAUSE THERE IS NO FIBER. Nothing can suspend and
+	// resume elsewhere in this path, so the one hazard TLS has in this library cannot arise.
+	static thread_local void* t_offFiber = nullptr;
+
+	Fiber* f = CurrentFiberOrNull();
+	if (!f || slot >= Fiber::kLocalSlots) {
+		// An out-of-range slot is a caller bug, but a reference has to be returned rather than
+		// crashed on -- and silently aliasing slot 0 would be worse than obviously doing nothing.
+		// The static_assert in the caller's own enum is where this is meant to be caught.
+		t_offFiber = nullptr;
+		return t_offFiber;
+	}
+	return f->local[slot];
+}
+
 // ---- REQUEUE BRANCH TRACE -------------------------------------------------------------------
 //
 // See the header. Three exits, counted separately, compiled out unless the option is on.

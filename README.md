@@ -958,8 +958,25 @@ co_something_that_suspends();
 tls->field = 1;                       // WRONG: `tls` may belong to another worker now
 ```
 
-If your code -- or a library you cannot audit -- keeps state in `thread_local` across a wait, take
-**pinned mode** instead:
+**The fix, if the state is yours: fiber-local slots.** They live on the fiber, which is the object
+that actually survives the wait, so they are correct in *both* modes:
+
+```cpp
+enum class Fls : uint16_t { Scratch = 0, LastError = 1, COUNT };
+static_assert((size_t)Fls::COUNT <= JLib::Fiber::kLocalSlots, "too many FLS slots");
+
+TaskScheduler::FiberLocal((size_t)Fls::Scratch) = p;          // void*&, one load and an index
+auto* s = TaskScheduler::FiberLocalAs<Scratch>((size_t)Fls::Scratch);
+```
+
+Eight slots per fiber, indexed by a compile-time constant -- no map, no lock, no allocation. The
+library never reads a slot and clears them when a fiber is recycled, so a fiber never hands its
+successor stale state; it cannot *free* what a slot points at, having no type, so an owning pointer
+must be released by the task that set it. Off a fiber -- a `Native` task, a bare thread, main --
+`FiberLocal()` reads `nullptr` rather than crashing, and `HasFiberLocal()` is the explicit check.
+
+If the state is *not* yours -- a library you cannot audit keeps its own `thread_local` across a wait
+-- take **pinned mode** instead:
 
 ```cpp
 JLib::TaskScheduler::SetMigratableFibers(false);   // BEFORE Init()

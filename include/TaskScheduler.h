@@ -2459,6 +2459,39 @@ namespace JLib {
 		static void SetMigratableFibers(bool on);
 		static bool MigratableFibers();
 
+		// ---- FIBER-LOCAL STORAGE: use this where you would have used thread_local -------------
+		//
+		// Migratable fibers resume on whichever worker is free, so TLS read before a suspension
+		// point is not the same object after it. This is attached to the FIBER, which is the thing
+		// that actually survives the wait, so it is correct in BOTH modes and needs no #if.
+		//
+		//     enum class Fls : uint16_t { Scratch = 0, LastError = 1, COUNT };
+		//     static_assert((size_t)Fls::COUNT <= JLib::Fiber::kLocalSlots, "too many FLS slots");
+		//
+		//     auto* s = TaskScheduler::FiberLocalAs<Scratch>((size_t)Fls::Scratch);
+		//     TaskScheduler::FiberLocal((size_t)Fls::LastError) = err;      // raw void*&
+		//
+		// ONE LOAD AND AN INDEX. No map, no hash, no lock, no allocation -- it has to be cheap
+		// enough to use on the path TLS would have been used on, or nobody will.
+		//
+		// RETURNS nullptr OFF A FIBER, rather than asserting. A Native task and a bare thread have
+		// no fiber, and that is a legitimate state rather than a bug -- library code that may run in
+		// either context needs to be able to ASK. FiberLocal() returns a reference to a per-thread
+		// scratch void* in that case, so a write is harmless and a read gives nullptr; HasFiberLocal()
+		// is the explicit check for code that must distinguish.
+		//
+		// THE SLOT'S MEANING IS YOURS. The library never reads one. It clears them on recycle -- so
+		// a fiber never hands its successor stale state -- but it cannot free what they point at,
+		// having no type: a slot holding an owning pointer must be released by the task that set it,
+		// before that task ends.
+		static bool   HasFiberLocal() noexcept;
+		static void*& FiberLocal(size_t slot) noexcept;
+
+		template <typename T>
+		static T* FiberLocalAs(size_t slot) noexcept {
+			return static_cast<T*>(FiberLocal(slot));
+		}
+
 		// ---- WHICH BRANCH DID A RESUME TAKE? (diagnostic, OFF unless JLIBSCHED_REQUEUE_TRACE) ---
 		//
 		// Requeue has three exits and they are indistinguishable from outside, which is exactly the
