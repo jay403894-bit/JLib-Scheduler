@@ -342,7 +342,18 @@ int main(int argc, char** argv) {
 
     std::printf("    ^ THE Normal ROW IS THE CONTROL AND IT MUST BE MUCH WORSE. If it is close to the\n"
                 "      LowLatency rows the background load did not saturate the floor, and this table\n"
-                "      is table 1 again with extra steps. The steal=on vs steal=off gap is what\n"
-                "      stealing COSTS -- weigh it against the ~3%% throughput it returns above.\n");
+                "      is table 1 again with extra steps.\n");
+    std::printf("    ^ THE Normal NUMBER IS ARBITRARY AND THE RATIO IS MEANINGLESS. It is queueing\n"
+                "      behind HeavyFloorBody, so it scales with the size of a body this file chose:\n"
+                "      make the background 10 ms and Normal reads ~10 ms. What matters is that the\n"
+                "      LowLatency row DOES NOT MOVE with it -- lane latency is independent of how\n"
+                "      long floor work runs, which is the actual property. Quoting 'the lane is\n"
+                "      1500x faster' is quoting this file's body size.\n");
+    std::printf("    ^ THE STEAL ARMS ARE NOT COMPARABLE HERE, and the run above showed why: every\n"
+                "      Lane::LowLatency push stamps the lane-activity clock, so 300 back-to-back\n"
+                "      samples keep the lane 'busy' and K never steals in EITHER arm. That the two\n"
+                "      arms match is evidence the gate WORKS, not that stealing is free. Measuring\n"
+                "      its cost needs a sampler that goes quiet longer than the %u us window.\n",
+                TaskScheduler::IoQuietWindowUs());
     return 0;
 }
