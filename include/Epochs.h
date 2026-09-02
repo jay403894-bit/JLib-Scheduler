@@ -399,14 +399,16 @@ namespace JLib {
 				const size_t n = devRetiredWhileDisabled.fetch_add(1, std::memory_order_relaxed) + 1;
 				if (n > 100000 && !devNoTickWarned.exchange(true, std::memory_order_relaxed)) {
 					std::fprintf(stderr,
-						"[JLib::Scheduler] %zu pointers retired and Tick() was NEVER CALLED. Memory "
-						"will grow without bound.\n"
-						"  RECLAMATION IS THE APPLICATION'S JOB. Workers no longer self-trigger it:\n"
-						"  the sweep walks every participant and a worker doing that has stopped\n"
-						"  being available for the work that lands a microsecond later, which showed\n"
-						"  up as tail latency and not in any mean.\n"
-						"  Call EpochManager::Instance().Tick() at a natural idle point -- a frame\n"
-						"  boundary is the obvious one -- where a pause costs nothing.\n"
+						"[JLib::Scheduler] %zu pointers retired and Tick() has NEVER RUN. Memory is\n"
+						"  growing without bound, and this is a BUG IN THE SCHEDULER rather than\n"
+						"  something you forgot.\n"
+						"  Reclamation is queued as a TASK by FiberRegistry::QueueReclaim on every\n"
+						"  fiber death, so a healthy pool sweeps without you doing anything. Seeing\n"
+						"  this means those tasks are not running: either no fiber has died (a pool\n"
+						"  that only runs Native tasks never recycles one), or the pool was never\n"
+						"  started, or the sweep task is being dropped.\n"
+						"  You CAN call EpochManager::Instance().Tick() yourself as a workaround, but\n"
+						"  please report it -- the reaper is supposed to make that unnecessary.\n"
 						"  This warning prints once.\n", n);
 					std::fflush(stderr);
 				}

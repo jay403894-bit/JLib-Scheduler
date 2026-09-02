@@ -198,6 +198,14 @@ namespace JLib {
 		using ReleaseFn = void (*)(size_t holder, Fiber* f);
 		void SetRelease(ReleaseFn fn);
 
+		// ---- QUEUE A RECLAMATION SWEEP AS A TASK ----------------------------------------------
+		//
+		// Called on every fiber death, rate-limited to one sweep in flight. The reaper SENDS a task
+		// rather than sweeping inline, and rather than asking the application to call Tick() --
+		// see the definition for why both of those were tried and rejected. Static because it needs
+		// no registry state: it reaches the scheduler and the two reclamation domains directly.
+		static void QueueReclaim();
+
 		// ---- WHO FREES A FIBER-LOCAL SLOT, IF ANYONE ------------------------------------------
 		//
 		// A slot is a `void*`. The library has no type for it, so by default it CLEARS one on

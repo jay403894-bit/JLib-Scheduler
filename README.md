@@ -1174,19 +1174,26 @@ never diverted into it, or a completion would leave the lane it was routed to.
 worker, nothing ever enters it. It shows up in `DumpPoolState` alongside the away map if you want
 to see whether your workload reaches it.
 
-### Garbage collection is yours to schedule
+### Garbage collection is a task, and you do not schedule it
 
-**Workers do not reclaim. You must call `Tick()`.** There is no switch and no default that does it
-for you — `SetSelfReclaim` and `SetSelfScan` are gone.
+**You do not have to call anything.** The reaper queues reclamation as an ordinary task on fiber
+death, rate-limited to one sweep in flight. `SetSelfReclaim` and `SetSelfScan` are gone, and so is
+the obligation they implied.
 
-They existed because a worker used to perform reclamation itself: once enough pointers were retired,
-whichever worker noticed next stopped and ran a reclaim pass over every epoch participant — roughly
-2,300 slots on a 31-worker machine. Not much total work, but it landed on a thread that was supposed
-to be running your frame, at a moment you did not choose. That cost never showed in a mean and always
-showed in a tail, which is the worst possible shape for something enabled by default.
+Three designs were tried and the first two were wrong:
 
-So it was removed rather than turned off. Call it at a natural idle point, where a pause costs
-nothing:
+| | what it did | why it lost |
+|---|---|---|
+| worker-inline | whichever worker crossed the threshold stopped and swept | **p99 killer** — walks every participant on a thread that was running your frame, at a moment nobody chose |
+| app-driven | you call `Tick()` at a frame boundary | better tail, but a **library cannot require a loop its embedder may not have**, and forgetting leaks silently in release |
+| **a task** | the sweep is queued like any other work | displaces nothing; goes out as `Lane::Normal` so it never lands on the reserved band |
+
+The difference between the first and the third is not *who* runs it — a task runs on a worker too —
+it is **when**. Inline, a worker abandons its pass mid-flight. Queued, the sweep waits its turn
+behind work that was already there.
+
+You can still call `Tick()` and `Scan()` yourself if you have a natural idle point and want the
+sweeps to land there, but nothing requires it:
 
 ```cpp
 JLib::TaskScheduler::Init(workerCount);
@@ -1206,16 +1213,26 @@ while (running) {
 | `Tick()` on your thread | 60.5 / 58.7 / 58.5 | 69.3 / 67.8 / 66.3 | **125 / 111 / 104** |
 
 **Throughput does not change.** Median and p90 are a wash. What changes is the tail: **p99 improves
-about 3x**, because the same scan happens between frames instead of stalling a worker inside one.
-That 3x is why this stopped being an option and became the rule — a default that costs a third of
-your p99 is not a default, it is a trap with a knob next to it.
+about 3x**, because the same scan stops stalling a worker mid-pass. That 3x is why worker-inline
+reclamation was removed rather than left as a default — a default that costs a third of your p99 is
+not a default, it is a trap with a knob next to it.
 
-**If you never call `Tick()`, retired memory grows without bound.** A development build prints a
-one-time warning after 100,000 retirements to say so; a release build will not tell you. This is the
-one real obligation the scheduler places on its embedder, and it is deliberate: a library cannot
-choose a good moment inside your frame, and it should not pretend it can.
+**The second row was measured with `Tick()` on the app's thread**, which was the design at the time.
+The task-queued version should land in the same place for the same reason — the sweep is off the
+critical path either way — but **that has not been re-measured**, and the row is left as what it
+actually was rather than relabelled to match the current design.
 
-#### Hazard pointers, same rule
+**A development build warns once after 100,000 retirements if no sweep has run.** That now indicates
+a scheduler problem rather than something you forgot: it means fiber deaths are not producing reclaim
+tasks — a pool that only runs `Native` tasks never recycles a fiber, so nothing triggers one. A
+release build will not tell you.
+
+Historically this section argued the opposite — that ticking was the embedder's job, because a
+library cannot choose a good moment inside your frame. The first half of that is still true; the
+conclusion was not. A queued task does not have to choose a moment at all, which is what makes it
+better than either the worker doing it inline or you doing it by hand.
+
+#### Hazard pointers, same mechanism
 
 Epochs are not the only reclamation here. Structures that must stay readable across a *suspend* use
 hazard pointers instead -- epochs cannot, because no fiber or coroutine may suspend inside an

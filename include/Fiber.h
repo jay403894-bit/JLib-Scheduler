@@ -72,6 +72,21 @@ namespace JLib {
 		// policy registered once, and a per-fiber copy of eight function pointers would cost more
 		// memory than the slots themselves.
 		void ReleaseFiberSlots(void** slots, size_t n) noexcept;
+
+		// HAND THE DEBT LIST TO THE REAPER RATHER THAN RELEASING IT HERE.
+		//
+		// ResetForReuse runs on the recycle path, which is a worker finishing a fiber and about to
+		// look for more work. Running arbitrary user deleters there is the same mistake as sweeping
+		// epochs there: unbounded work of the caller's choosing, on a thread that was doing
+		// something, at a moment nobody picked.
+		//
+		// So the list is SPLICED onto a pending stack and the reclaim task drains it, alongside the
+		// epoch Tick and the hazard Scan. One task, one place, everything reclaimed together --
+		// which is also the only arrangement where a deleter that itself retires something gets
+		// swept by the same pass rather than waiting for the next one.
+		//
+		// TAKES THE WHOLE CHAIN AND LEAVES THE HEAD NULL, so the fiber carries nothing forward.
+		void HandOffFiberDebts(FiberDebt* head) noexcept;
 	}
 
 	struct alignas(16) Fiber {
@@ -384,19 +399,9 @@ namespace JLib {
 			// claimed, and dropping it silently would leak the resource it names. Running it late on
 			// the wrong thread is the lesser wrong of the two, and it is loud in a debugger; leaking
 			// is neither.
-			{
-				FiberDebt* d = debts;
+			if (debts) {
+				detail::HandOffFiberDebts(debts);
 				debts = nullptr;
-				while (d) {
-					// READ next BEFORE releasing. The node usually lives INSIDE the object being
-					// released, so `release` is free to destroy the node along with it -- reading
-					// the link afterwards is a use-after-free, and an intrusive list is exactly
-					// where that mistake is easy to make.
-					FiberDebt* nxt = d->next;
-					d->next = nullptr;
-					if (d->release && d->obj) d->release(d->obj);
-					d = nxt;
-				}
 			}
 			status.store(FiberStatus::READY, std::memory_order_release);
 		}

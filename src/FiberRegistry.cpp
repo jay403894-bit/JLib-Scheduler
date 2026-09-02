@@ -9,6 +9,8 @@
 #include "../include/GlobalFiberPool.h"
 #include "../include/TaskScheduler.h"
 #include "../include/Thread.h"
+#include "../include/Epochs.h"    // EpochManager::Tick -- the reclaim task's body
+#include "../include/Hazard.h"    // HazardDomain::Scan -- the other half of it
 
 namespace JLib {
 
@@ -239,6 +241,10 @@ namespace JLib {
 		}
 	}
 
+	// EVERY FIBER DEATH IS A RECLAIM OPPORTUNITY, and this is the one path both routes converge
+	// on -- the creditor chain ends here and so does the no-debt fast path. Rate-limited by the CAS
+	// inside, so this costs one relaxed load when a sweep is already pending, which under any burst
+	// is almost every call.
 	bool FiberRegistry::ReturnToPool(Fiber* f) {
 		if (!f || !pool) return false;
 		// CLAIM IT. DEAD is precisely "finished, pending cleanup/reclamation", so it is the state a
@@ -252,6 +258,7 @@ namespace JLib {
 		// ReturnBatch calls Fiber::ResetForReuse, so the scrub happens on exactly one path whether
 		// a fiber comes back from here or from a worker's batch return. Doing it here as well
 		// would be a second place to forget a field.
+		QueueReclaim();
 		pool->ReturnBatch(&f, 1);
 		return true;
 	}
@@ -292,6 +299,138 @@ namespace JLib {
 	FiberRegistry::RecycleFn FiberRegistry::Recycler() {
 		RecycleFn r = recycleFn.load(std::memory_order_relaxed);
 		return r ? r : &DefaultRecycle;
+	}
+
+	// ---- THE REAPER SENDS A TASK. IT DOES NOT SWEEP, AND IT DOES NOT ASK THE APP. --------------
+	//
+	// THREE DESIGNS, AND THE FIRST TWO WERE BOTH WRONG:
+	//
+	//   WORKER-INLINE   whichever worker crossed the threshold stopped and swept. That is a p99
+	//                   killer: it walks every epoch participant on a thread that was supposed to be
+	//                   running a frame, at a moment nobody chose. Measured 331 us p99 against
+	//                   113 us without, with p50 and p90 unchanged.
+	//   APP-DRIVEN      the embedder calls Tick() at a frame boundary. Better tail, but it makes a
+	//                   LIBRARY depend on a loop its embedder may not have, and forgetting leaks
+	//                   silently in release. Not an obligation this can place.
+	//   A TASK          this. The sweep is queued like any other work, so it displaces nothing, and
+	//                   it goes out as Lane::Normal so it can never land on the reserved band.
+	//
+	// The difference from worker-inline is not WHO runs it -- a task runs on a worker too -- it is
+	// WHEN. Inline, a worker abandons its pass mid-flight; queued, the sweep waits its turn behind
+	// work that was already there.
+	//
+	// HERE RATHER THAN IN Epochs.h, because this is the reaper and reclamation policy is its job.
+	// Epochs.h stays a data structure that knows nothing about scheduling, which is also what keeps
+	// it includable from Task.h without a cycle.
+	//
+	// ONE SWEEP IN FLIGHT, enforced by the CAS. Fiber deaths come in bursts; without it a burst
+	// queues one sweep per death, each walking every participant to free what the first already
+	// freed. The task clears the flag on its way out, so the next death after a sweep completes may
+	// queue another.
+	static std::atomic<bool> g_reclaimQueued{ false };
+
+	// ---- THE THIRD RECLAMATION DOMAIN: user memory owed by dead fibers ------------------------
+	//
+	// A Treiber stack, many producers (any thread recycling a fiber), one consumer (the reclaim
+	// task). Spliced onto here by Fiber::ResetForReuse rather than released there, for the same
+	// reason the sweeps are not done there: a recycle is a worker finishing a fiber and about to
+	// look for work, and running arbitrary user deleters at that moment is unbounded work of the
+	// caller's choosing on a thread that was doing something.
+	//
+	// LEAKED-BY-DESIGN IS NOT NEEDED HERE, unlike the epoch and hazard orphan stores: this is a
+	// plain atomic with constant initialisation and no destructor, so it stays readable however
+	// late a thread recycles a fiber during teardown.
+	static std::atomic<FiberDebt*> g_pendingDebts{ nullptr };
+
+	namespace detail {
+		void HandOffFiberDebts(FiberDebt* head) noexcept {
+			if (!head) return;
+			// FIND THE TAIL, then splice the whole chain in one CAS. Pushing node-by-node would be
+			// N CAS operations on a line every recycling thread shares; the walk is local to a list
+			// this thread exclusively owns and is typically one or two nodes.
+			FiberDebt* tail = head;
+			while (tail->next) tail = tail->next;
+
+			FiberDebt* old = g_pendingDebts.load(std::memory_order_relaxed);
+			do {
+				tail->next = old;
+			} while (!g_pendingDebts.compare_exchange_weak(old, head,
+						std::memory_order_release, std::memory_order_relaxed));
+
+			// QUEUE THE SWEEP HERE, because this is where the need actually arises.
+			//
+			// Triggering only from ReturnToPool was not enough and the debt test caught it at zero
+			// released: that is the REGISTRY's return path, while the common one is the worker's
+			// own ReleaseFiber into its local cache. Most recycles never touch ReturnToPool, so
+			// most handed-off debts would have waited for a fiber that happened to die the other
+			// way -- which in a pool doing no cleanup work is never.
+			//
+			// Tying it to the handoff means the trigger and the garbage are the same event.
+			FiberRegistry::QueueReclaim();
+		}
+	}
+
+	// Drain and discharge. Returns how many ran, for the caller's diagnostics.
+	static size_t ReleasePendingDebts() {
+		// ONE EXCHANGE TAKES THE WHOLE STACK, so a producer racing this pushes onto a fresh chain
+		// and is swept by the next pass rather than contending for every node.
+		FiberDebt* d = g_pendingDebts.exchange(nullptr, std::memory_order_acq_rel);
+		size_t n = 0;
+		while (d) {
+			// READ next BEFORE releasing. The node usually lives INSIDE the object being released,
+			// so the deleter is free to destroy it -- reading the link afterwards is a
+			// use-after-free, and an intrusive list is where that mistake is easiest to make.
+			FiberDebt* nxt = d->next;
+			d->next = nullptr;
+			if (d->release && d->obj) d->release(d->obj);
+			++n;
+			d = nxt;
+		}
+		return n;
+	}
+
+	void FiberRegistry::QueueReclaim() {
+		bool expected = false;
+		if (!g_reclaimQueued.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel, std::memory_order_relaxed))
+			return;                                   // one is already pending
+
+		TaskScheduler* s = TaskScheduler::IsInitialized() ? &TaskScheduler::Instance() : nullptr;
+		// NO POOL IS A LEGITIMATE STATE, not an error -- a fiber can die during teardown, and a
+		// retire can happen before Init. Release the flag so a later death tries again.
+		if (!s) { g_reclaimQueued.store(false, std::memory_order_release); return; }
+
+		// ---- ONE PASS, ALL THREE DOMAINS. THIS IS THE SMR SCHEME. ----------------------------
+		//
+		// Safe Memory Reclamation here is not one mechanism but three, and they are discharged
+		// together on purpose:
+		//
+		//   EPOCHS    Tick() -- advance, then free what no reader can still reach
+		//   HAZARDS   Scan() -- free what no reader has named
+		//   DEBTS     user memory a dead fiber owed, through the deleter its owner registered
+		//
+		// ORDER MATTERS, and this is the reason the debts go LAST. A user deleter may itself retire
+		// something -- freeing a node whose children are epoch-protected is the ordinary case -- and
+		// running the deletes before the sweeps would leave those retirements for the NEXT pass.
+		// Running them after means the retirement is already in a bag when the following pass
+		// sweeps, which is one pass of latency rather than two.
+		//
+		// It also means a single reclaim task is the whole story: an app watching for leaks has one
+		// thing to look at, not three that fire on different triggers.
+		Task* t = s->CreateInternalTask([] {
+			EpochManager::Instance().Tick();
+			HazardDomain::Instance().Scan();
+			ReleasePendingDebts();
+			// CLEARED LAST, after all three: clearing earlier would let a second sweep queue while
+			// this one is still walking, which is the burst the flag exists to collapse.
+			g_reclaimQueued.store(false, std::memory_order_release);
+		}, Lane::Normal);
+
+		// ALLOCATION CAN FAIL ON A DEATH PATH, which is exactly where it is least welcome. Dropping
+		// the sweep is safe -- the bag simply stays full and the next fiber death queues another --
+		// so this releases the flag rather than leaving it latched forever.
+		if (!t) { g_reclaimQueued.store(false, std::memory_order_release); return; }
+		s->Push(t);
 	}
 
 	bool FiberRegistry::AdvanceCleanup(Fiber* f) {
