@@ -1672,3 +1672,59 @@ tail cost, invisible to a throughput mean, and it is the price of deleting the g
 
     MinActiveEpoch   0.629 us / 2016 slots   ->   0.015 us / 32 slots
     guards/sec       1.65e9                  ->   3.60e9
+
+## busy=1 + lo=1 is a SELF-DEADLOCK, and it looks exactly like a lost wake
+
+`dag_cancel_test`'s 25% was not a cancellation defect, not a lost wake, and not a race on
+`Task::started`. `DumpPoolState` at the moment of failure:
+
+    23  NOTIFIED  queued=1  busy=1  inbox(hi/lo/rs) 0/1/0   <-- LAST PUSH TARGET
+    awake bits = 3 (0x800003)      advertised queues = 0
+
+**Someone running on worker 23 was blocked, while the work they were waiting for sat in worker 23's
+own inbox.** An inbox has exactly one legal consumer and nothing may steal from it, so the only
+thread permitted to pop it was the one that could not.
+
+In this instance the blocking was a busy-wait in a test holder:
+
+    m.Lock();
+    while (!release.load()) std::this_thread::yield();   // occupies the worker forever
+    m.Unlock();
+
+**AND PLACEMENT PREFERS THAT WORKER.** Steering favours AWAKE workers, and a worker spinning in a
+task body is awake precisely BECAUSE it is spinning -- so it is a preferred target for the very task
+that will then be stranded on it. The 25% is the probability that placement picked the one worker
+that could never drain it. Holder suspends on an Event instead: 20/20 green, from 6/2, 8/2, 14/6.
+
+### THE GENERAL SHAPE, WHICH THE TEST FIX DOES NOT ADDRESS
+
+    something blocks WITHOUT SUSPENDING on a worker
+      + the work it waits for is in that worker's own inbox
+      = deadlock, unstealable by construction, indistinguishable from a lost wake in a dump
+
+A FIBER that blocks is fine -- it suspends and frees the worker; that is what fibers are for. The
+dangerous callers are the ones that block while still occupying the thread:
+
+  * a busy-wait in a task body (this bug)
+  * `ContendedSpinStep` -- the lock's contended path spins ON a worker, so a contended
+    SchedulerMutex has this exact shape
+  * anything Native that waits, which is why Native must not
+
+So the diagnostic is worth keeping: **`busy=1` with a non-empty own inbox means look for a blocked
+non-suspending caller on that worker**, not for a missing NotifyWorker. The dump already says as
+much for the SLEEPING case ("state=SLEEPING and queued=1"); this is its awake twin, and it is the
+harder one to read because a busy worker looks healthy.
+
+### Sequence of wrong answers, kept because the eliminations are the useful part
+
+1. Missing `OnTaskDiscarded` on some discard path -- WRONG. One call site, every discard routes
+   through it, guarded by `!task->started`.
+2. Double terminal (dependents fired twice) -- WRONG. Instrumented every arrival at OnTaskFinished:
+   2 failures in 10 runs, ZERO doubles.
+3. Bare-thread wait helping -- WRONG. Turning it off left the rate identical (2/8 either way).
+4. A visibility race on `Task::started` -- WRONG. The task never started at all.
+5. The test's 120 ms sleep being too short -- WRONG, and the fix that disproved it is what found
+   the real answer: replacing the sleep with an OBSERVATION made the failure say
+   "the task never started", which is a dispatch statement rather than a cancel one.
+
+Every one of those was eliminated by measurement rather than argument. The dump is what ended it.

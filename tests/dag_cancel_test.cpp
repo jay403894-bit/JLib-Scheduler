@@ -797,15 +797,36 @@ int main() {
         std::atomic<int> reachedEnd{ 0 };
         // OBSERVED, NOT SLEPT FOR. See the wait below.
         std::atomic<bool> entered{ false };
-        std::atomic<bool> parked{ false }, release{ false };
+        std::atomic<bool> parked{ false };
         JLib::WaitGroup wg;
+
+        // ---- THE HOLDER SUSPENDS; IT DOES NOT SPIN. THIS WAS THE 25%. ------------------------
+        //
+        // The holder must keep the lock while the task below tries to take it. Doing that with
+        // `while (!release) yield();` holds it by OCCUPYING ITS WORKER -- and a worker spinning
+        // inside a task body never returns to its scheduling loop to drain its own INBOX. An inbox
+        // has exactly one legal consumer, and nothing may steal from it.
+        //
+        // MEASURED, not deduced. DumpPoolState at the moment of failure:
+        //
+        //   23  NOTIFIED  queued=1  busy=1  inbox(hi/lo/rs) 0/1/0   <-- LAST PUSH TARGET
+        //   awake bits = 3 (0x800003)      advertised queues = 0
+        //
+        // The task was sitting in the inbox of the very worker the holder was spinning on, with no
+        // thief permitted to take it. Placement steers to AWAKE workers, and the holder's worker is
+        // awake precisely BECAUSE it is spinning -- so it is a PREFERRED target. That is the whole
+        // 25%: the probability that placement picked the one worker that could never drain it.
+        //
+        // Waiting on an Event suspends the FIBER instead. The lock stays held (a fiber may hold a
+        // SchedulerMutex across a suspend), and the worker goes back to its loop.
+        JLib::Event& hold = sched.GetEvent("dagcancel_hold_lock");
 
         // Holder keeps the lock so the task below genuinely parks in the waiter queue.
         wg.n.fetch_add(1, std::memory_order_relaxed);
         auto* ht = sched.CreateTask([&] {
             m.Lock();
             parked.store(true, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+            sched.WaitOnEvent(hold);
             m.Unlock();
         }, false, JLib::TaskType::Fiber);
         ht->waitGroup = &wg;
@@ -853,7 +874,7 @@ int main() {
         // started == 1 already routes a cancel through the resume path either way.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         scope.Cancel();
-        release.store(true, std::memory_order_release);
+        hold.SignalAll();          // releases the holder's fiber, which then unlocks
         sched.WaitFor(wg);
 
         Check(reachedEnd.load() == 1, "the suspended task was resumed and unwound, not discarded");
