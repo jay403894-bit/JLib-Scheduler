@@ -144,7 +144,7 @@ namespace JLib {
 		// would then disagree about this class's layout. That is precisely the failure this file's
 		// own stale-library guard exists to catch, and manufacturing more of it to save 16 bytes in
 		// a singleton would be a bad trade. Unused in Release; costs nothing there.
-		std::atomic<size_t> devRetiredWhileDisabled{ 0 };
+		std::atomic<size_t> devRetiredNeverSwept{ 0 };
 		std::atomic<bool>   devNoTickWarned{ false };
 
 		std::atomic<size_t> globalEpoch{ 0 };
@@ -224,7 +224,7 @@ namespace JLib {
 			// cumulative -- a cumulative count would fire on CORRECT usage (ticking every frame)
 			// as soon as enough frames had gone by, and a warning that fires when you did the right
 			// thing is worse than no warning at all.
-			devRetiredWhileDisabled.store(0, std::memory_order_relaxed);
+			devRetiredNeverSwept.store(0, std::memory_order_relaxed);
 #endif
 		}
 	
@@ -394,9 +394,17 @@ namespace JLib {
 			// the matching Tick() is unbounded memory growth with nothing to point at, which is the
 			// one genuinely bad property of the OFF path. Counting here costs a relaxed increment in
 			// builds where that is irrelevant, and buys a single sentence naming the exact mistake.
-			// Release keeps paying nothing: the branch above is all it sees.
-			else {
-				const size_t n = devRetiredWhileDisabled.fetch_add(1, std::memory_order_relaxed) + 1;
+			// Release keeps paying nothing: it does not compile this block at all.
+			//
+			// UNCONDITIONAL, AND IT USED TO BE AN `else`. It was the else-arm of an
+			// `if (ShouldSelfReclaim())` -- when self-reclaim was removed the `if` went and this
+			// arm was left behind, an `else` with nothing to attach to. RELEASE NEVER NOTICED,
+			// because the whole block is inside the !NDEBUG guard, so every local Release build was
+			// green while Debug did not compile at all. Retiring is now always worth counting: with
+			// the sweep queued on fiber death, a retire that never gets swept means the reaper is
+			// not running, which is a scheduler bug rather than a missing call.
+			{
+				const size_t n = devRetiredNeverSwept.fetch_add(1, std::memory_order_relaxed) + 1;
 				if (n > 100000 && !devNoTickWarned.exchange(true, std::memory_order_relaxed)) {
 					std::fprintf(stderr,
 						"[JLib::Scheduler] %zu pointers retired and Tick() has NEVER RUN. Memory is\n"
