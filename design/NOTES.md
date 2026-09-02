@@ -1974,3 +1974,49 @@ lost, TLS 0 of 49 migrated fibers still seeing their own value.** The TLS arm is
 and it is load-bearing -- arm 1 passing alone is equally consistent with "nothing migrated". Its
 accessor is `noinline` because MSVC caches a thread_local base across an opaque call, which is what
 once made migratable_fiber_test report 0 migrations out of 206.
+
+## The death/reaper contract, checked against the code (9-02)
+
+Jay's three requirements for an append-only creditor chain, and where each actually stands.
+
+**1. Unique by worker, not one node per hop -- ALREADY STRUCTURAL.** `creditors` is a bitmask
+(`fetch_or` of one bit per worker, `kCreditorWords = 6` -> 384 holders). A worker that steals the
+fiber ten times sets the same bit ten times, and `TakeCreditor` clears it before dispatching. There
+is no hop log to flood an inbox with, and there could not be one anyway: `cleanupNext` is a SINGLE
+pointer, so a fiber cannot be on two chains at once -- surplus deliveries would be silently lost
+rather than merely wasteful. Pinned by `fiber_reaper_contract_test`: 10 pickups -> 1 delivery.
+
+**2. Idempotent cleanup on a historical owner -- THE CONTRACT WAS UNWRITTEN.** `ReleaseFn` had two
+lines of comment and said nothing about it. Now stated on `SetRelease`, both halves:
+
+- What the REGISTRY guarantees: at most one dispatch per worker per fiber life. A correct hook is
+  never asked to be idempotent by the library itself.
+- What the HOOK owes: tolerating that it may no longer hold what it owed. By the time a hop lands
+  the worker has run arbitrary other work. **If the epoch slot it would clear already reads
+  SIZE_MAX, return** -- a hook written as "I am being called, therefore I still own this"
+  double-retires, or touches a slot a LATER life is already using. The library cannot enforce this,
+  because only the hook knows what it owned.
+- Release runs BEFORE the hop advances, deliberately: advancing can recycle, and a recycled fiber is
+  a different life.
+
+**3. The list is the reuse fence -- ALREADY STRONGER THAN ASKED.** The requirement was "clear after
+the cleanup tasks are queued". The chain does better: it recycles only when `TakeCreditor` returns
+SIZE_MAX, which is after the last hop has RUN. The `JLIB_FIBERHOLDER_CTL_FANOUT` control exists
+precisely to prove queued != run.
+
+**A CORRECTION WORTH KEEPING.** I claimed `DrainAllForTeardown`'s single forward sweep could strand a
+fiber behind itself and called it a bug. It cannot: `TakeCreditor` pops the LOWEST set bit first, so
+every hop hands FORWARD and a forward sweep is always sufficient. The multi-sweep stayed anyway, but
+relabelled as defence in depth -- the single-pass version is correct only because of an ordering
+guarantee that lives in another file and is neither stated nor tested. Change TakeCreditor to pop the
+highest bit, or rotate for fairness, and teardown starts leaking silently.
+
+**No `Unregister` is needed for this model** -- bounded unique owners plus idempotent tagged cleanup
+is the whole requirement.
+
+**Fiber gets `new`/`delete` stubs**, same reasoning as Task's but deleted OUTRIGHT rather than
+defined-and-asserting: Task has a virtual destructor, so the compiler emits a deleting destructor and
+requires an accessible `operator delete`; Fiber has no virtuals, so the compile-time form is
+available and cannot be reached at runtime to assert. A heap-allocated Fiber has no arena stack, no
+poolIndex any table can name, and no epoch slot -- invisible to both the cleanup chain and hazard
+reclamation. Placement new is unaffected because every site writes `::new (mem) T(...)`.

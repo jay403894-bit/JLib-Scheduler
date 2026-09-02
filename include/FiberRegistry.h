@@ -172,6 +172,29 @@ namespace JLib {
 
 		// Where a resource wrapper hooks in. Nothing sets a debt kind yet, so this is unset and the
 		// chain is exercised end to end without pretending a debt exists.
+		//
+		// ---- THE CONTRACT, AND BOTH HALVES ARE LOAD-BEARING ------------------------------------
+		//
+		// IT MUST BE IDEMPOTENT, AND IT MUST TOLERATE NOT OWNING ANYTHING.
+		//
+		// The registry guarantees AT MOST ONE dispatch per worker per fiber life -- `creditors` is a
+		// bitmask, so a worker that picked the fiber up ten times is one bit, and TakeCreditor
+		// clears that bit before dispatching. What the registry does NOT and cannot guarantee is
+		// that the worker still holds what it owed. By the time a hop lands, that worker has run
+		// arbitrary other work; the thing being released may already be gone, released by teardown,
+		// or released by the resource's own destructor.
+		//
+		// So the hook checks its own state and returns when there is nothing to do. Concretely: if
+		// the epoch slot it would clear already reads SIZE_MAX, that is the answer -- return, do not
+		// clear it again. A hook written as "I am being called, therefore I still own this" produces
+		// a double retire, or worse, touches a slot a LATER life is already using.
+		//
+		// IT RUNS BEFORE THE HOP ADVANCES, deliberately (see DrainHolder). Advancing can recycle the
+		// fiber, and a recycled fiber is a different life -- so a hook that ran after would be
+		// inspecting the next occupant's state while believing it was cleaning up the last one.
+		//
+		// IT IS NOT WHERE THE FIBER IS FREED. The registry owns that: the chain recycles when the
+		// creditor set drains, which is after the last hop has RUN rather than merely been queued.
 		using ReleaseFn = void (*)(size_t holder, Fiber* f);
 		void SetRelease(ReleaseFn fn);
 

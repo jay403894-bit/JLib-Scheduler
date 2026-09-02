@@ -294,6 +294,35 @@ namespace JLib {
 			status.store(FiberStatus::READY, std::memory_order_release);
 		}
 
+		// ---- A FIBER IS NEVER HEAP-ALLOCATED AND NEVER DELETED --------------------------------
+		//
+		// Fibers live in GlobalFiberPool's `std::vector<Fiber> fibers[kClassCount]`, each paired
+		// with a stack carved out of a FiberStackArena that was mapped ONCE at startup. The pool
+		// hands them out and takes them back; nothing else may create or destroy one.
+		//
+		// A heap-allocated Fiber is not merely unusual, it is unrecoverable: it has no arena stack
+		// under it, no poolIndex that any table can name, no epoch slot -- and FiberRegistry indexes
+		// EVERYTHING by poolIndex, so such a fiber is invisible to the cleanup chain and to hazard
+		// reclamation both. `delete` on a pooled one is worse: it frees memory the vector owns, and
+		// the recycle path hands the same address out again afterwards.
+		//
+		// DELETED OUTRIGHT, unlike Task's, and the difference is instructive. Task has a VIRTUAL
+		// destructor, so the compiler emits a deleting destructor into its vtable and requires an
+		// accessible `operator delete` whether or not anything calls it -- which is why Task defines
+		// one that asserts instead. Fiber has no virtual anything, so the compile-time form is
+		// available here and is strictly better: it cannot be reached at runtime to assert.
+		//
+		// PLACEMENT NEW IS UNAFFECTED, and this is the part worth stating because declaring any
+		// operator new at class scope HIDES all of them, placement included. Every site in this
+		// library writes `::new (mem) T(...)` with the global qualifier, and the standard library's
+		// allocator_traits::construct does the same -- so `std::vector<Fiber>` keeps working. An
+		// unqualified `new (p) Fiber(...)` would now fail to compile, which is the correct outcome:
+		// the pool is the only thing that should be constructing these.
+		void* operator new(std::size_t) = delete;
+		void* operator new[](std::size_t) = delete;
+		void  operator delete(void*) = delete;
+		void  operator delete[](void*) = delete;
+
 		std::atomic<FiberStatus>  status;
 		// EBR participation slot. SIZE_MAX == "not in an epoch". The fiber is the unit
 		// that migrates across workers, so the slot lives here (not on the thread).

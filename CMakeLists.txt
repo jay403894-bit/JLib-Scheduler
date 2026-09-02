@@ -1038,6 +1038,14 @@ target_compile_features(SchedulerReservedLoPriPlacementTest PRIVATE cxx_std_17)
 # migration, thread_local does NOT -- because arm 1 alone is also consistent with "nothing migrated".
 # The TLS accessor is noinline: MSVC caches a thread_local base across an opaque call, which once
 # made migratable_fiber_test report 0 migrations out of 206.
+# THE DEATH/REAPER CONTRACT. The creditor chain is append-only for one fiber life, which is safe only
+# if owners are unique per worker (not one node per hop), cleanup is idempotent, and the chain is a
+# real reuse fence. Every one of those failures produces a PLAUSIBLE run -- a flooded inbox still
+# completes, a double release still returns -- so the counts are the only thing that separates them.
+add_executable(SchedulerFiberReaperContractTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_reaper_contract_test.cpp")
+target_link_libraries(SchedulerFiberReaperContractTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberReaperContractTest PRIVATE cxx_std_17)
+
 add_executable(SchedulerFiberLocalTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_local_test.cpp")
 target_link_libraries(SchedulerFiberLocalTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberLocalTest PRIVATE cxx_std_17)

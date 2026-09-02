@@ -157,8 +157,36 @@ namespace JLib {
 	}
 
 	size_t FiberRegistry::DrainAllForTeardown() {
+		// ---- SWEEP UNTIL QUIESCENT. DEFENCE IN DEPTH, NOT A BUG FIX. ---------------------------
+		//
+		// A single forward pass over [0, size) is CORRECT TODAY, and only for a reason that lives in
+		// another file: TakeCreditor pops the LOWEST set bit first, so every hop hands the fiber to
+		// a HIGHER worker index than the one it is on, and a forward sweep can never be handed work
+		// behind itself.
+		//
+		// That coupling is invisible from here. Change TakeCreditor to pop the highest bit, or to
+		// rotate its start for fairness across creditors, and this becomes a silent leak: draining
+		// holder 9 hands the fiber to holder 1, which this sweep already walked past, so its chain
+		// is never drained again -- the fiber is not recycled, the resource is never given back, and
+		// every local step still looks correct.
+		//
+		// One extra pass at shutdown buys independence from an ordering guarantee nothing states or
+		// tests. That is worth it HERE specifically because this is the last look anyone takes: the
+		// steady-state drain is forward-only and stays that way, since its holder is a live worker
+		// that will look at its own chain again next pass.
+		//
+		// BOUNDED, because the chain is finite by construction and a runaway here would hang
+		// shutdown rather than leak. Each fiber has at most kCreditorWords*64 creditors and every
+		// hop CLEARS one bit before dispatching, so the number of hops a fiber can still take is
+		// strictly decreasing -- one sweep per possible creditor is a ceiling nothing can reach.
+		// Stopping early on a clean sweep is what makes the common case one pass, not 384.
 		size_t n = 0;
-		for (size_t h = 0; h < inbound.size(); ++h) n += DrainHolder(h);
+		for (size_t sweep = 0; sweep < Fiber::kCreditorWords * 64; ++sweep) {
+			size_t moved = 0;
+			for (size_t h = 0; h < inbound.size(); ++h) moved += DrainHolder(h);
+			if (moved == 0) break;      // nothing left anywhere: done
+			n += moved;
+		}
 		return n;
 	}
 
