@@ -1868,6 +1868,31 @@ namespace JLib {
 		// primitive is the same bug waiting for the next primitive. See design/NOTES.md.
 		WaitResult WaitFor(WaitGroup& wg, CancelToken tok);
 		bool Push(uint8_t cpu_affinity, Task* task);
+
+		// ---- PUSH TO THE LANE, OR SAY YOU COULD NOT. ------------------------------------------
+		//
+		// Every other Push places the task SOMEWHERE and returns. This one is allowed to REFUSE, and
+		// that is its entire reason to exist: the I/O reactor needs to know whether a reserved
+		// worker actually took the completion, because if none did it keeps the task in its own
+		// backlog and retries rather than dumping it somewhere it will sit.
+		//
+		// The bool is NOT a queue-level failure -- the inbox is a Vyukov append and cannot fail once
+		// the item is committed. It is the result of TARGET SELECTION: "was there an available K
+		// worker". That distinction is why this lives here and not on TaskMPSCQueue, where a
+		// try-push would be a check that can never fail.
+		//
+		// REQUIRES A hiPri TASK, and returns false for anything else rather than placing it. K reads
+		// only its hiPri inbox, so a loPri task sent to a reserved worker is not deprioritised, it is
+		// UNREACHABLE -- inbox work is unstealable and K never looks. That exact routing hung the
+		// whole reactor until 9-02. Refusing here means a caller that gets it wrong sees a false and
+		// sends the task to the floor, instead of silently losing it.
+		//
+		// AVAILABILITY IS LaneBacklogMask(), not `busy`. A K worker mid-handler is fine to queue
+		// behind; one already advertising a lane backlog past kLaneStealDepth is not. Reading the
+		// mask rather than K per-worker queries keeps this at one atomic load per call.
+		//
+		// Returns false when: K == 0, the task is not hiPri, or every reserved worker is buried.
+		bool PushIO(Task* task) noexcept;
 		// ---- WHERE A RESUMED TASK WENT, AND WHO MAY TAKE IT ------------------------------------
 		//
 		// NOT A bool, AND THE REASON IS THAT `false` WOULD MEAN TWO THINGS. Today false means "this
@@ -3397,6 +3422,11 @@ namespace JLib {
 		// controller, set/cleared against the inbox (see laneSetDepth/laneClearDepth defaults).
 
 		std::atomic<unsigned long long> stealHintLane{ 0 };
+
+		// PushIO's round-robin start, so a steady completion stream does not pile on worker 0 while
+		// the rest of the reserved band idles. Relaxed everywhere: the only requirement is that
+		// successive calls differ, never that two threads agree on a value.
+		std::atomic<size_t> ioSteer_{ 0 };
 
 		// MAINTAINED BY THE OWNER AT ITS DRAIN, and the distinction from "owner maintained per pass"
 		// is the whole reason this works. The buried worker is not looping during its 200us handler

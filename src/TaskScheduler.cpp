@@ -5062,6 +5062,36 @@ bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 	return PushLocal(task, cpu_affinity);
 }
 
+// ---- THE ONE PUSH THAT MAY SAY NO. See the contract above the declaration. ---------------------
+bool TaskScheduler::PushIO(Task* task) noexcept {
+	if (!task) return false;
+
+	// NOT hiPri: refuse rather than place. K reads only its hiPri inbox, so this would be
+	// unreachable there -- unstealable, and nobody looking. The caller sends it to the floor.
+	if (!task->hiPri) return false;
+
+	const size_t k = GetHotWorkers();
+	if (k == 0) return false;                       // no lane at all
+
+	// ONE atomic load, not K per-worker queries. Bit w == worker w is advertising a lane backlog at
+	// or past kLaneStealDepth. Past worker 64 no bit exists and the worker reads as available, which
+	// is the safe direction: a spurious accept is a queued completion, a spurious refuse would be a
+	// completion the reactor holds for no reason.
+	const unsigned long long buried = LaneBacklogMask();
+
+	// ROTATE THE START, so a steady stream does not pile on worker 0 while 1..K-1 idle. Relaxed: the
+	// only requirement is that successive calls differ, not that they agree with any other thread.
+	const size_t start = ioSteer_.fetch_add(1, std::memory_order_relaxed) % k;
+
+	for (size_t i = 0; i < k; ++i) {
+		const size_t w = (start + i) % k;
+		if (w < 64 && (buried & (1ull << w))) continue;         // buried: do not aim here
+		// affinity is 1-BASED -- 0 means "no preference" -- so worker w is w + 1.
+		if (Push(static_cast<uint8_t>(1 + w), task)) return true;
+	}
+	return false;                                   // every reserved worker is buried
+}
+
 void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& arm) {
 	auto* thread = Thread::GetCurrent();
 	Task* myTask = thread->currentRunningTask;

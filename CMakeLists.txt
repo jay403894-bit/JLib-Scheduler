@@ -822,6 +822,15 @@ if(WIN32)
     target_link_libraries(SchedulerIoC17Test PRIVATE Scheduler)
     target_compile_features(SchedulerIoC17Test PRIVATE cxx_std_17)
 
+    # THE REACTOR BACKLOG. Lane completions queue in the completion thread's FIFO and drain through
+    # PushIO, which may refuse -- so the backlog is a real queue with a queue's failure modes. Asserts
+    # only correctness (nothing held and forgotten, nothing lost, it ends empty) and REPORTS depth and
+    # high water rather than asserting on them: those depend on how fast this box drains a lane, which
+    # is a measurement and not a pass condition.
+    add_executable(SchedulerIoBacklogTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_backlog_test.cpp")
+    target_link_libraries(SchedulerIoBacklogTest PRIVATE Scheduler)
+    target_compile_features(SchedulerIoBacklogTest PRIVATE cxx_std_17)
+
     if(JLIBSCHED_COROUTINES)
         add_executable(SchedulerIoAsyncTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_async_test.cpp")
         target_link_libraries(SchedulerIoAsyncTest PRIVATE Scheduler)

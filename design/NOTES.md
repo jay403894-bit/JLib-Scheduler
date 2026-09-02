@@ -1834,3 +1834,46 @@ and only the floor arm going red distinguishes those two.
 
 Keyed on where each task ACTUALLY ran, not where it was aimed: hiPri is routed into the reserved band
 but can spill to another hiPri inbox when K is busy, so "I pushed it hiPri" is not "it ran on K".
+
+## The reactor owns its backlog, and PushIO is the one Push that may say no (9-02)
+
+Lane completions no longer go straight to a worker. They queue in the completion thread's own FIFO
+deque and drain into a reserved worker through `TaskScheduler::PushIO`, which **returns false** when
+every K worker is buried -- and then the completion STAYS in the backlog instead of being dumped
+somewhere it would sit behind a handler.
+
+**The bool is target selection, not a queue failure.** `TaskMPSCQueue::push` cannot fail -- its own
+note says so, "the item is committed". A try-push at the queue level would be a check that always
+returns true, which is worse than no check because it reads like a guard. So `PushIO` lives on the
+scheduler, where the question ("was there an available K worker") actually has two answers.
+Availability is `LaneBacklogMask()` -- one atomic load, not K per-worker queries -- and it refuses a
+non-hiPri task outright, because a loPri task on K is the unreachable-inbox hang all over again.
+
+**FIFO, not LIFO**, and this was the one real design fork. An item in the backlog has ALREADY waited
+on the wire; LIFO would serve the newest first and starve the oldest without bound under load, which
+is the opposite of what a reserved lane is for. The usual LIFO argument is cache locality and it does
+not apply here -- the completion goes to a DIFFERENT thread, so the buffer is cold either way.
+
+Three things that are easy to get wrong and were:
+
+- **The timeout has THREE cases, not two.** Batch collected -> poll at 0 (unchanged). Nothing
+  collected but a backlog held -> a SHORT FINITE wait. Both empty -> INFINITE. Zero-timeout retry is
+  wrong because the completion thread runs at TIME_CRITICAL: it would hard-spin at priority 15
+  against the very workers that have to drain the lane. INFINITE is wrong because the held tasks
+  would wait for an unrelated I/O event.
+- **The WAIT_TIMEOUT path must drain.** Without it the short wait just wakes, finds nothing, and
+  sleeps again with the tasks still held.
+- **Both exit paths must flush to the FLOOR, not through PushIO.** K may be permanently buried or
+  gone at shutdown; a completion left in the backlog is a task nobody runs and every waiter behind it
+  hangs. Correctness at teardown outranks lane placement.
+
+**INSTRUMENTED BECAUSE IT IS NOW THE GLOBAL QUEUE FOR I/O.** `ReadIoBacklogStats()` is unconditional
+-- unlike `IoLockStats`, which is behind a define and defined only under `_WIN32`. Counters live in
+`IoShared.cpp` so a test reading them links on a platform with no reactor, where they read zero.
+**High water is the load-bearing one**; instantaneous depth sampled from another thread is almost
+always zero even when the backlog spikes.
+
+First run at K=1, 256 concurrent reads: `highWater=109 pushed=256 declined=241 drains=242`, ending
+empty with all 256 correct. A non-zero `declined` is the mechanism WORKING, not a failure. But 241
+declines against 256 pushes says K=1 cannot absorb that arrival rate -- which is the number that
+makes K=2 the next thing to try. Depth depends on drain speed, so it is indicative, not a measurement.

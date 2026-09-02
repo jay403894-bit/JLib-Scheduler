@@ -469,5 +469,45 @@ namespace JLib {
         return impl->ready.size();
     }
 
+    // ---- BACKLOG TELEMETRY, UNCONDITIONAL AND ON EVERY PLATFORM -------------------------------
+    //
+    // Deliberately NOT behind JLIBSCHED_IO_LOCK_STATS. Once lane completions queue in the reactor
+    // instead of going straight out, that deque IS the global queue for I/O, and "how deep did it
+    // get" stops being a profiling curiosity and becomes the answer to whether the lane is keeping
+    // up. A number available only in a special build is a number nobody has when it matters.
+    //
+    // HERE RATHER THAN IN THE WINDOWS BACKEND THAT WRITES THEM, because a test that reads these has
+    // to link on a platform with no reactor. There they simply stay zero, which is the truthful
+    // answer -- no reactor, no backlog.
+    //
+    // Five relaxed counters on a path that already makes a syscall per wake, so the cost is not
+    // measurable.
+    namespace detail {
+        std::atomic<std::uint64_t> g_blDepth{ 0 };
+        std::atomic<std::uint64_t> g_blHigh{ 0 };
+        std::atomic<std::uint64_t> g_blPushed{ 0 };
+        std::atomic<std::uint64_t> g_blDeclined{ 0 };
+        std::atomic<std::uint64_t> g_blDrains{ 0 };
+    }
+
+    IoBacklogStats ReadIoBacklogStats() noexcept {
+        IoBacklogStats s;
+        s.depth     = detail::g_blDepth.load(std::memory_order_relaxed);
+        s.highWater = detail::g_blHigh.load(std::memory_order_relaxed);
+        s.pushed    = detail::g_blPushed.load(std::memory_order_relaxed);
+        s.declined  = detail::g_blDeclined.load(std::memory_order_relaxed);
+        s.drains    = detail::g_blDrains.load(std::memory_order_relaxed);
+        return s;
+    }
+
+    // DOES NOT CLEAR `depth`. Depth is a live reading owned by the completion thread, not an
+    // accumulator -- zeroing it here would publish a lie until the next drain pass corrected it.
+    // Everything else is a running total and is what a caller means by "reset".
+    void ResetIoBacklogStats() noexcept {
+        detail::g_blHigh.store(0, std::memory_order_relaxed);
+        detail::g_blPushed.store(0, std::memory_order_relaxed);
+        detail::g_blDeclined.store(0, std::memory_order_relaxed);
+        detail::g_blDrains.store(0, std::memory_order_relaxed);
+    }
 
 } // namespace JLib
