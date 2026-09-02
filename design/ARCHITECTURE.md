@@ -247,10 +247,27 @@ empty level costs nothing to skip.
 
 ## 11. Parallel algorithms
 
-**`ParallelFor` has no cost model.** No probe, no calibrated constant, no measurement of the body.
-Work is divided by an atomic slice-stealing cursor: idle workers take slices, so the division is
-decided by *who is free* rather than by a guess about how long an item takes. A cost model would have
-to be right about hardware it has never seen.
+**`ParallelFor` has no calibrated constant, and its division is decided by stealing.** Work is handed
+out through an atomic slice-stealing cursor: idle workers take slices, so how the range is split is
+decided by *who is free* rather than by a guess about how long an item takes. There is no tuned
+threshold to get wrong on hardware it has never seen — the old body-probe-plus-threshold design was
+removed in 1.4 for exactly that reason.
+
+**One estimate survives, and it decides FAN-OUT WIDTH rather than the split.** `SetMeasuredWidth`
+(on by default) times the first chunk on the calling thread and picks a width of `sqrt(W/c)`, where
+`c` is the wake cost — the *k* minimising `W/k + k·c`. It exists to fill a missing middle: without
+it, fan-out has two states, serial or the whole pool, chosen by an iteration count that never looks
+at the body. Measured, that meant trivial work at N=256 recruiting 23 workers for ~2 µs of work,
+while heavy work at the same N was refused outright.
+
+The probe is close to free — the first chunk is work the range must do anyway, so it costs two clock
+reads — but it is **a lower bound by design, and it does not always hit.** A back-loaded body makes
+the first chunk unrepresentative; so does measuring on a caller running at single-core boost before
+the rest of the pool spins up and the clock drops. Range recruitment corrects upward as expensive
+leaves complete, so the probe picks a defensible start rather than a final answer — and how quickly
+recruitment catches up is a real source of run-to-run variance in wide, uniform ranges.
+
+`SetMeasuredWidth(false)` restores the older behaviour exactly.
 
 **`TaskDAG`** — dependency graphs with **AND/OR gates** (`CreateGate`, `TaskNode::LogicType`). A gate
 carries no task: when its trigger fires it propagates instantly rather than scheduling work, so gates

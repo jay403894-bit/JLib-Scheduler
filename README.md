@@ -184,7 +184,7 @@ int main() {
     sched.Push(t);
     sched.WaitFor(wg);
 
-    // ---- a parallel loop, with no cost model to tune -----------------------------------
+    // ---- a parallel loop: no threshold to tune, steals decide the split ---------------
     std::function<void(int,int)> body = [&](int lo, int hi) {
         for (int i = lo; i < hi; ++i) { /* ... */ }
     };

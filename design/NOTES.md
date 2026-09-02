@@ -2505,3 +2505,37 @@ AND THE LESSON IS ABOUT SAMPLE COUNT, AGAIN. A five-rep smoke run produced a con
 that twenty-five reps overturned -- the same failure as the p99-over-fifteen-samples one, in a
 different costume. The bench prints its verdict from the data, which is what let the data change it;
 it would have been very easy to keep the tidy "occupancy explains everything" story instead.
+
+## ParallelFor DOES have a probe, and it explains the run-to-run spread (2026-09-02)
+
+Jay, on the 10.78x vs 14.60x gap between two runs of the same compute-bound body: "its because of
+the probe, sometimes it fails a little... probes are better than nothing but estimates and dont
+always hit."
+
+HE IS RIGHT AND I HAD WRITTEN THE OPPOSITE INTO TWO DOCUMENTS THAT DAY. ARCHITECTURE.md said
+"ParallelFor has no cost model. No probe, no calibrated constant, no measurement of the body." The
+first half is true and the second is not: `SetMeasuredWidth` is ON BY DEFAULT since 2026-08-31. It
+times the first chunk on the CALLER and picks fan-out width as sqrt(W/c), the k minimising
+W/k + k*c.
+
+WHAT I CONFUSED. The BODY PROBE plus threshold was removed in 1.4 -- that is the thing the "no cost
+model" line is about, and the header says so explicitly ("different from the body probe removed in
+1.4"). A different, cheaper probe was ADDED later for a different decision: not whether to go
+parallel, but HOW WIDE to fan out. I read the removal note and stopped.
+
+WHY IT MISSES, and the header predicts both mechanisms:
+  * "a LOWER BOUND by design -- a back-loaded body makes the first chunk unrepresentative"
+  * and the one that bites a uniform body: the probe runs on the caller at SINGLE-CORE BOOST, before
+    the rest of the pool spins up and the all-core clock drops. Per-item cost is therefore measured
+    optimistically, width comes out narrow, and range recruitment has to widen on evidence
+    afterwards. How fast recruitment catches up is the run-to-run variance.
+
+So the spread is not the body and not the splitter -- it is the estimate, exactly as described.
+
+THE DESIGN IS STILL RIGHT: without it fan-out has two states, serial or the whole pool, chosen by an
+iteration count that never looks at the body -- measured at 0.02x for trivial work at N=256 and 6.9x
+for heavy work at the same N. No threshold serves both. The probe costs two clock reads over work
+the range must do anyway. It is a defensible START that recruitment corrects, not a final answer.
+
+SetMeasuredWidth(false) restores the old behaviour and is the A/B control if the width is ever
+suspected.
