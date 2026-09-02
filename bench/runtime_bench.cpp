@@ -122,19 +122,41 @@ static void BenchDispatch(JLib::TaskScheduler& sched, int reps) {
     // a park, which is a kernel round trip that has nothing to do with steady-state dispatch.
     for (int i = 0; i < 200; ++i) { Samples junk; one(JLib::Lane::Normal, junk); one(JLib::Lane::LowLatency, junk); }
 
-    std::printf("  %d rounds: ", reps);
-    for (int r = 0; r < reps; ++r) {
+    // ---- SAMPLE COUNT IS DECOUPLED FROM `reps` HERE, AND ONLY HERE. --------------------------
+    //
+    // A TAIL NEEDS SAMPLES. Every other section aggregates internally -- 20k tasks, 64 fibers -- so
+    // fifteen of them is fifteen real measurements. This one times ONE dispatch per sample, so
+    // fifteen samples is fifteen numbers, and pct(0.99) over fifteen resolves to index 14: it IS
+    // the maximum, wearing a percentile's name. The first run of this file duly reported a "p99" of
+    // 53.70 us from a single descheduling hiccup on a path the same run had just proved was
+    // identical to its neighbour.
+    //
+    // So the latency arms take thousands of samples regardless of `reps`, and the percentile label
+    // is withheld below unless there are enough to mean anything.
+    const int kLatSamples = std::max(2000, reps * 200);
+    std::printf("  %d samples per arm: ", kLatSamples);
+    const int dot = std::max(1, kLatSamples / 15);
+    for (int r = 0; r < kLatSamples; ++r) {
         if (r & 1) { one(JLib::Lane::Normal, normal);  one(JLib::Lane::LowLatency, lane); }
         else       { one(JLib::Lane::LowLatency, lane); one(JLib::Lane::Normal, normal); }
-        std::printf("."); std::fflush(stdout);
+        if ((r % dot) == 0) { std::printf("."); std::fflush(stdout); }
     }
     std::printf("\n");
 
     std::printf("  (K=%zu reserved worker(s); with K=0 the two arms are the same code path)\n\n", K);
     Row("Lane::Normal   (floor)", normal, "us");
     Row("Lane::LowLatency (K)", lane, "us");
-    std::printf("  %-34s %9.2f us   p99\n", "Lane::Normal   p99", normal.pct(0.99));
-    std::printf("  %-34s %9.2f us   p99\n", "Lane::LowLatency p99", lane.pct(0.99));
+    // p99 IS ONLY PRINTED WHEN IT IS ONE. Below ~100 samples the 99th percentile and the maximum
+    // are the same element, and calling the maximum a percentile invites a reader to treat one
+    // descheduling event as a property of the scheduler.
+    if (normal.v.size() >= 100) {
+        std::printf("  %-34s %9.2f us\n", "Lane::Normal   p99", normal.pct(0.99));
+        std::printf("  %-34s %9.2f us\n", "Lane::LowLatency p99", lane.pct(0.99));
+        std::printf("  %-34s %9.2f us   <- one sample; environment, not the lane\n",
+                    "worst single dispatch seen", std::max(normal.hi(), lane.hi()));
+    } else {
+        std::printf("  (too few samples for a percentile -- the range above is all this run supports)\n");
+    }
 
     if (K == 0)
         std::printf("\n  NOTE: K=0, so LowLatency has no reserved band to go to and both arms are the\n"
@@ -331,7 +353,12 @@ static void BenchFiberSuspend(JLib::TaskScheduler& sched, int reps) {
     }
 
     Row("resume, per fiber", s, "us");
-    std::printf("  %-34s %9.2f us   p99\n", "resume p99", s.pct(0.99));
+    // SAME RULE AS SECTION 1: one sample per ROUND here, so `reps` samples, and a percentile over
+    // fifteen of them is the maximum with a better name. The per-fiber figure above already
+    // averages 64 resumes, which is where this section's statistics actually come from.
+    if (s.v.size() >= 100) std::printf("  %-34s %9.2f us\n", "resume p99", s.pct(0.99));
+    else                   std::printf("  %-34s %9.2f us   <- worst ROUND, not a percentile\n",
+                                       "slowest round seen", s.hi());
     std::printf("\n  %d fibers released by one SignalAll, so this includes the wake storm -- which is\n"
                 "  the realistic shape (an I/O burst or a frame boundary), not a single sleeper.\n"
                 "  A round is bounded at 10s; anything slower is reported as a stall rather than\n"
