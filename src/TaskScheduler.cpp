@@ -8,7 +8,7 @@
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
 #include "../include/FiberRegistry.h"   // registry table is built with the fiber pool
-#include "../include/TokenRegistry.h"   // reader-space cleanup index: built here, drained in Join
+
 #include "../include/IoReactor.h" // Join() stops the completion threads before clearing the pool
 #include <cstdlib>            // getenv / _dupenv_s -- JLIB_PARK selects the park primitive
 #include <cstring>            // strncpy -- the POSIX arm of the JLIB_WATCHDOG env read. MSVC pulls
@@ -605,9 +605,9 @@ void TaskScheduler::ProcessMainThread() {
 	// one: an engine that never calls ProcessMainThread accumulates whatever its own threads owe.
 	// It is a fair ask -- a DAG with main-affinity nodes already requires this call, so anything
 	// organising work through the DAG is polling here every frame regardless.
-	if (const size_t h = TokenRegistry::Instance().CurrentHolder(); h < kMaxHolders)
-		if (TokenRegistry::Instance().HolderHasWork(h))
-			TokenRegistry::Instance().DrainHolder(h);
+	if (const size_t h = FiberRegistry::Instance().CurrentHolder(); h != FiberRegistry::kNoHolder)
+		if (FiberRegistry::Instance().HolderHasWork(h))
+			FiberRegistry::Instance().DrainHolder(h);
 
 	Task* t;
 	while (mainQ.pop(t)) {
@@ -817,7 +817,7 @@ void TaskScheduler::Join() {
 	// SAFE EXACTLY HERE AND NOWHERE ELSE. Doing this while a worker still ran would execute its
 	// thread-affine release on the wrong thread, which is the entire bug the routing exists to
 	// prevent. What makes it legal is that the owner provably no longer exists.
-	TokenRegistry::Instance().DrainAllForTeardown();
+	FiberRegistry::Instance().DrainAllForTeardown();
 
 	{
 		poolMutex.lock();
@@ -4431,14 +4431,12 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// final hop has no pool to return the fiber to and would drop it -- a leaked fiber rather than
 	// a visible failure. Built here rather than lazily so the failure cannot be first observed at
 	// the moment a fiber dies owing something.
-	FiberRegistry::Instance().Build(globalPool);
-	// THE READER SPACE, SIZED ONCE BOTH BOUNDS ARE KNOWN. Fibers exist as of the line above and
-	// num_workers is already fixed, so this is the first point where the space can be sized at all.
-	// HazardDomain builds its table under the same constraint and for the same reason.
-	//
-	// NOT LAZY. Build() swaps a vector of atomics, which cannot be resized while a holder is
-	// reading its own chain head -- so it happens here, before any worker exists to read one.
-	TokenRegistry::Instance().Build(standardFiberCount, num_workers);
+	// BOTH BOUNDS ARE KNOWN HERE AND NOWHERE EARLIER: the fiber pool exists as of the line above and
+	// num_workers is already fixed. HazardDomain builds its table under the same constraint, for the
+	// same reason. NOT LAZY -- Build swaps a vector of atomics, which cannot be resized while a
+	// holder is reading its own chain head, so it happens before any worker exists to read one.
+	FiberRegistry::Instance().Build(globalPool, num_workers);
+
 	// Raw Thread*: delete before clearing. Normally empty here -- StartPool runs before any worker
 	// exists -- but an Init after a Join finds the leftovers of the previous pool.
 	for (Thread* w : workers) delete w;

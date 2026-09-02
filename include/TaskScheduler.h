@@ -2480,7 +2480,7 @@ namespace JLib {
 
 		// WAKE A WORKER THAT HAS BEEN HANDED CLEANUP, with nothing to push.
 		//
-		// TokenRegistry::Deliver links the token onto the holder's own chain -- there is no task and
+		// FiberRegistry::Deliver links the fiber onto the holder's own chain -- there is no task and
 		// no queue push -- but the WAKE is still required, and for the same reason PushResume does
 		// it: that chain has exactly one legal consumer, so a parked worker with tokens on it never
 		// drains them. The cost is not just delayed cleanup. A token cannot be recycled until its

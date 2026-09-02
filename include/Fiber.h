@@ -80,6 +80,20 @@ namespace JLib {
 		// pool reserves and leaks them -- so a link through a fiber cannot dangle that way.
 		Fiber* nextWaiter = nullptr;
 
+		// ---- THE CLEANUP CHAIN LINK -- SEPARATE FROM nextWaiter ON PURPOSE ----------------------
+		//
+		// THE FIBER IS THE MESSAGE. A dying fiber that owes a worker is linked onto that worker's
+		// inbound chain with one CAS, carrying everything the worker needs -- which fiber, and what
+		// it owes. The alternative, and what this replaced, was a real Task per hop: a 64-byte slab
+		// allocation, a task lifecycle, an inbox hop and a DestroyTask, to carry two words.
+		//
+		// NOT REUSING nextWaiter, even though a dead fiber is provably not parked on a primitive.
+		// That argument is true today and is exactly the kind that stops being true quietly: the
+		// two links have different owners (a primitive owns one, the registry the other) and
+        // different lifetimes, and sharing them would make "is this fiber parked or owing?" a
+		// question the pointer cannot answer. Fiber is not on a size budget; Task is.
+		Fiber* cleanupNext = nullptr;
+
 		// TSan's handle for this fiber, or null in any build without the sanitizer. Made once with
 		// the pool and never destroyed, because fibers are never destroyed -- the pool reserves and
 		// leaks them. See TsanFiber.h for why an unannotated fiber scheduler produces meaningless
@@ -114,8 +128,13 @@ namespace JLib {
 		// PINNED MODE IS THIS SET WITH EXACTLY ONE MEMBER. It is not a second mechanism and not a
 		// second code path -- the binding worker is added at bind, nothing else ever is, and the
 		// cleanup chain degenerates to one hop. See TaskScheduler::MigratableFibers.
-		static constexpr size_t kCreditorWords = 4;   // 256 workers; see the static_assert in
-		                                             // TaskScheduler.h that ties this to kHintWords
+		// WIDE ENOUGH FOR HOLDERS, NOT JUST WORKERS. A creditor is any THREAD that can own
+		// thread-affine state, and that is workers PLUS the external ids main and an app's own
+		// threads claim. At 4 words this covered 256 workers and silently refused every external
+		// holder above it -- NoteCreditor drops an out-of-range holder rather than wrapping, which
+		// is right, but the debt is then dropped with it. See the static_assert in
+		// FiberRegistry.cpp that ties this to kMaxHintQueues + kExternalReaders.
+		static constexpr size_t kCreditorWords = 6;   // 384 holders
 		std::atomic<uint64_t> creditors[kCreditorWords] = {};
 
 		// Record that `worker` now owes cleanup for this fiber. Idempotent BY CONSTRUCTION rather

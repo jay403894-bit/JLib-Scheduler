@@ -30,20 +30,27 @@
 //
 //     AdvanceCleanup(f):  take ONE creditor
 //                         no creditor left?  -> recycle the fiber, done
-//                         otherwise          -> make a cleanup task, push it to that worker's
-//                                               resume inbox, return
-//     the cleanup task:   release that worker's affine state, then call AdvanceCleanup(f) again
+//                         otherwise          -> LINK THE FIBER onto that holder's chain, return
+//     the holder's drain: release its affine state, then call AdvanceCleanup(f) again
 //
-// SO THE LAST WORKER TO OWE ANYTHING IS THE ONE THAT RECYCLES, and no separate completion count is
-// needed. The obvious alternative -- take every creditor, push N tasks, recycle -- is WRONG in a way
-// that reads as equivalent: those tasks are QUEUED, not run, so the fiber returns to the pool while
-// they still reference it. Pushing to the resume inbox makes them run soon; it does not make them
-// run before the next statement.
+// SO THE LAST HOLDER TO OWE ANYTHING IS THE ONE THAT RECYCLES, and no separate completion count is
+// needed. The obvious alternative -- take every creditor, deliver N times, recycle -- is WRONG in a
+// way that reads as equivalent: those deliveries are QUEUED, not run, so the fiber returns to the
+// pool while the chains still reference it. Delivery makes them run soon; it does not make them run
+// before the next statement.
 //
-// NOTHING CALLS AdvanceCleanup YET. The death-path hook is the next piece of work.
+// THE FIBER IS THE MESSAGE. Each hop is one CAS onto Fiber::cleanupNext plus a wake. This replaced
+// a real Task per hop -- a 64-byte slab allocation, a task lifecycle, an inbox hop and a
+// DestroyTask -- to carry two words that were already on the fiber.
+//
+// THE DEATH HOOK IS LIVE: Thread::OnFiberReturned routes a DEAD fiber here when it OwesCleanup(),
+// and the chain's last hop is what returns it to the pool. A fiber therefore cannot be handed out
+// again with debts outstanding. Nothing SETS a debt kind yet, so the gate is false for every fiber
+// today and the common path is one relaxed load.
 
 #pragma once
 #include "Fiber.h"
+#include <atomic>
 #include <cstddef>
 #include <vector>
 
@@ -56,9 +63,14 @@ namespace JLib {
 	public:
 		static FiberRegistry& Instance();
 
-		// Fill the address table from `pool`. Idempotent; safe to call again after a Join/Init
-		// cycle, which is why it clears first rather than appending.
-		void Build(GlobalFiberPool* pool);
+		// Fill the fiber table from `pool` and size the holder space to `workerCount`. Idempotent;
+		// safe to call again after a Join/Init cycle, which is why it clears first rather than
+		// appending.
+		//
+		// MUST RUN BEFORE ANY WORKER EXISTS -- it swaps a vector of atomics, which cannot be resized
+		// while a holder is reading its own chain head. StartPool calls it once the pool is built
+		// and num_workers is fixed, which is the first point both bounds are known.
+		void Build(GlobalFiberPool* pool, size_t workerCount);
 		void Reset();
 
 		size_t Count() const { return table.size(); }
@@ -99,9 +111,79 @@ namespace JLib {
 		// Returns false if the claim was lost or there is no pool to return to.
 		bool ReturnToPool(Fiber* f);
 
+		// ==== THE HOLDER SIDE ======================================================================
+		//
+		// TWO SPACES, TWO ARRAYS, AND THEY MUST NEVER BE INDEXED INTO EACH OTHER.
+		//
+		//     table[i]    -- fiber i's registration      (DEBTOR space, by Fiber::poolIndex)
+		//     inbound[h]  -- holder h's cleanup chain    (HOLDER space, threads only)
+		//
+		// Thread 3 is not fiber 3. Nothing here ever puts a thread into `table`, and the accessors
+		// are named for their space so writing that bug requires typing a word that contradicts it.
+		//
+		// WHY ONLY FIBERS ARE DEBTORS. A debtor is something that can borrow thread-affine state on
+		// one thread and die on another -- so its debt is a SET of threads and it needs a record
+		// that outlives the borrowing. A thread never travels, so its creditor set could only ever
+		// name itself. Threads do not get registrations; they get a chain and a drain point. This
+		// is why the reader-indexed registry that briefly existed alongside this one was deleted:
+		// it held entries for threads whose creditor sets are empty by construction.
+		//
+		// WHY EXTERNAL IDS ARE CLAIMED AND NEVER RELEASED: inherited from HazardDomain rather than
+		// re-decided. A program churning thousands of short-lived threads exhausts them and that
+		// ASSERTS rather than corrupting. Releasing would mean reusing an id whose debt may not be
+		// discharged, and a reused holder id turns a leak into a use-after-free.
+		static constexpr size_t kExternalReaders = 64;
+		static constexpr size_t kNoHolder        = ~size_t(0);
+
+		size_t HolderCount()             const { return workers + kExternalReaders; }
+		size_t HolderOfWorker(size_t w)  const { return w; }          // workers are the prefix
+		bool   IsWorkerHolder(size_t h)  const { return h < workers; }
+
+		// Claim the next external holder id. Lazy, one-shot, never released; kNoHolder when the 64
+		// are gone. Safe from any thread.
+		size_t ClaimExternal();
+
+		// This thread's holder id: its worker's if it is on one, else a lazily-claimed external id.
+		//
+		// THE WORKER BRANCH IS NOT CACHED AND THE BARE-THREAD BRANCH IS. A bare thread never
+		// migrates, so its id is stable for its whole life -- the same argument CurrentEpochSlot's
+		// thread fallback rests on. A worker's answer is only valid until the caller suspends.
+		// So this carries the contract the epoch guard already carries: DO NOT HOLD IT ACROSS A
+		// SUSPEND. It is a point read, not a value to keep.
+		size_t CurrentHolder();
+
+		// Link `f` onto `holder`'s chain. One CAS, then a WAKE -- see TaskScheduler::NotifyHolder
+		// for why the wake is mandatory rather than a latency choice.
+		bool   Deliver(size_t holder, Fiber* f);
+		// Take the WHOLE chain in one exchange. Caller owns every fiber in it and walks cleanupNext.
+		Fiber* TakeAll(size_t holder);
+		// ACQUIRE LOAD, NOT AN RMW -- this is polled every worker pass.
+		bool   HolderHasWork(size_t holder) const;
+
+		// Drain `holder`'s chain: release what it owes on each fiber, then advance that fiber's
+		// chain. MUST BE CALLED BY THE HOLDER ITSELF; calling it for someone else runs their
+		// thread-affine release on the wrong thread, which is the bug the routing exists to prevent.
+		size_t DrainHolder(size_t holder);
+
+		// Drain every holder. TEARDOWN ONLY -- it deliberately breaks "the holder drains its own",
+		// which is safe exactly once: after Join() has stopped the workers there is no holder left
+		// to run its own release, and the alternative is exiting still owing.
+		size_t DrainAllForTeardown();
+
+		// Where a resource wrapper hooks in. Nothing sets a debt kind yet, so this is unset and the
+		// chain is exercised end to end without pretending a debt exists.
+		using ReleaseFn = void (*)(size_t holder, Fiber* f);
+		void SetRelease(ReleaseFn fn);
+
 	private:
 		FiberRegistry() = default;
 		std::vector<Fiber*> table;
+		// One chain head per HOLDER. A vector of atomics cannot be resized while anyone reads it,
+		// which is why Build() is an Init-time call made before any worker exists.
+		std::vector<std::atomic<Fiber*>> inbound;
+		size_t workers = 0;
+		std::atomic<size_t> externalNext{ 0 };
+		ReleaseFn release = nullptr;
 		// Kept from Build. The registry returns fibers to the pool it enumerated, rather than
 		// reaching TaskScheduler::globalPool -- one source, and it cannot go stale against the
 		// table it is indexing.

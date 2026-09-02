@@ -7,7 +7,7 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Timer.h"   // MonotonicNs -- lane occupancy stamps
 #include "../include/FiberRegistry.h"   // the fiber-death cleanup chain -- see OnFiberReturned
-#include "../include/TokenRegistry.h"   // drain point 1 of 3: cleanup handed to this worker
+
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -1333,9 +1333,9 @@ void Thread::Worker() {
 		// occupied table unconditionally, so waking ONE waiter cost 35 RMWs at 31 workers -- a cost
 		// no test could see, because correctness was unaffected. A worker that owes nothing does not
 		// dirty a line.
-#if !defined(JLIB_TOKENDRAIN_CTL_NO_WORKER_DRAIN)
-		if (TokenRegistry::Instance().HolderHasWork((size_t)qIndex))
-			TokenRegistry::Instance().DrainHolder((size_t)qIndex);
+#if !defined(JLIB_FIBERHOLDER_CTL_NO_WORKER_DRAIN)
+		if (FiberRegistry::Instance().HolderHasWork((size_t)qIndex))
+			FiberRegistry::Instance().DrainHolder((size_t)qIndex);
 #endif  // CONTROL: worker never drains its own chain -- the live test's point-1 case must fail.
 
 		// Advertised-queue count for THIS pass, filled by the steal block below and read by the

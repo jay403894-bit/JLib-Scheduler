@@ -1056,38 +1056,46 @@ if(JLIB_FIBERCHAIN_CTL)
   target_compile_definitions(SchedulerFiberCleanupChainTest PRIVATE ${JLIB_FIBERCHAIN_CTL})
 endif()
 
-# THE TOKEN REGISTRY, IN ISOLATION. The generic reader-space index that replaces the fiber-only
-# registry: fibers as a prefix, then workers, then lazily-claimed external ids, so main and Native
-# tasks stop being special cases. No pool and no scheduler -- the seams exist so the assertion is
-# about the structure. Four -D negative controls, each of which must go RED:
-#   cmake -S . -B build-ctl -DJLIBSCHED_TOKENREG_CTL=FANOUT
-#   cmake --build build-ctl --config Release --target SchedulerTokenRegistryTest
-#   ./build-ctl/bin/Release/SchedulerTokenRegistryTest.exe      # MUST FAIL
+# THE HOLDER SIDE OF FiberRegistry, IN ISOLATION. Two spaces, two arrays: `table` by
+# Fiber::poolIndex (debtors), `inbound` by holder (threads). Thread 3 is not fiber 3, and aliasing
+# them would be silent, so the separation is asserted rather than assumed. No pool and no scheduler
+# -- the seams exist so the assertion is about the structure.
+add_executable(SchedulerFiberHolderTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_holder_test.cpp")
+target_link_libraries(SchedulerFiberHolderTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberHolderTest PRIVATE cxx_std_17)
+
+# THE THREE DRAIN POINTS, AGAINST A LIVE POOL. The test above proves the structure; this proves the
+# WIRING -- that a fiber delivered to holder N is released BY WORKER N, that a parked worker is woken
+# to do it, and that main and Join() settle what no worker can. Every assertion is about WHICH THREAD
+# ran the release, because a test that only counted releases would pass with the routing deleted.
+add_executable(SchedulerFiberDrainLiveTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_drain_live_test.cpp")
+target_link_libraries(SchedulerFiberDrainLiveTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberDrainLiveTest PRIVATE cxx_std_17)
+
+# ---- NEGATIVE CONTROLS FOR BOTH, ONE SWITCH -------------------------------------------------
+#
+# Every one of these must go RED. They live in the LIBRARY (Deliver, AdvanceCleanup, ClaimExternal,
+# the worker drain), so the define is PUBLIC on Scheduler -- reaching only the test would link it
+# against an unmodified registry and the control would silently pass.
+#
+#   cmake -S . -B build-ctl -DJLIBSCHED_FIBERHOLDER_CTL=FANOUT
+#   cmake --build build-ctl --config Release --target SchedulerFiberHolderTest
+#   ./build-ctl/bin/Release/SchedulerFiberHolderTest.exe          # MUST FAIL
+#
+#   NO_EXHAUST_GUARD   external claim wraps          -> holder test: distinctness
+#   FANOUT             deliver-all then recycle      -> holder test: "ran before first recycle"
+#   DROP_CREDITOR      one NoteCreditor skipped      -> holder test: creditor census
+#   NO_NOTIFY          Deliver stops waking          -> live test: the PARKED case
+#   NO_WORKER_DRAIN    worker never drains its own   -> live test: the PARKED case
+#
 # A CACHE variable, not CL_ADDITIONALOPTIONS: with no source change MSBuild skips the compile and
 # reruns the OLD binary, so every control reports as passing -- indistinguishable from the controls
-# being weak, and the same stale-binary trap that has produced false results here before.
-add_executable(SchedulerTokenRegistryTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/token_registry_test.cpp")
-target_link_libraries(SchedulerTokenRegistryTest PRIVATE Scheduler)
-target_compile_features(SchedulerTokenRegistryTest PRIVATE cxx_std_17)
-if(JLIBSCHED_TOKENREG_CTL)
-  # OVERLAP changes a header the LIBRARY compiles too, so the define has to reach both or the test
-  # links against a registry built without it and the control silently passes.
-  target_compile_definitions(Scheduler PUBLIC JLIB_TOKENREG_CTL_${JLIBSCHED_TOKENREG_CTL}=1)
-  message(STATUS "JLib::Scheduler: token registry NEGATIVE CONTROL ${JLIBSCHED_TOKENREG_CTL} -- the test MUST fail")
-endif()
-
-# THE THREE DRAIN POINTS, AGAINST A LIVE POOL. token_registry_test proves the structure; this proves
-# the WIRING -- that a token delivered to holder N is released BY WORKER N, that a parked worker is
-# woken to do it, and that main and Join() settle what no worker can. Every assertion is about WHICH
-# THREAD ran the release, because a test that only counted releases would pass with the routing gone.
-#   cmake -S . -B build-ctl -DJLIBSCHED_TOKENDRAIN_CTL=NO_NOTIFY   # the parked case MUST time out
-add_executable(SchedulerTokenDrainLiveTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/token_drain_live_test.cpp")
-target_link_libraries(SchedulerTokenDrainLiveTest PRIVATE Scheduler)
-target_compile_features(SchedulerTokenDrainLiveTest PRIVATE cxx_std_17)
-if(JLIBSCHED_TOKENDRAIN_CTL)
-  # PUBLIC: the control lives in the LIBRARY's Deliver, so it has to reach Scheduler's own compile.
-  target_compile_definitions(Scheduler PUBLIC JLIB_TOKENDRAIN_CTL_${JLIBSCHED_TOKENDRAIN_CTL}=1)
-  message(STATUS "JLib::Scheduler: token drain NEGATIVE CONTROL ${JLIBSCHED_TOKENDRAIN_CTL} -- the test MUST fail")
+# being weak, and the same stale-binary trap that has produced false results here before. VERIFY the
+# define reached the compiler (grep the generated .vcxproj) before believing a control that passes;
+# a PowerShell loop once expanded nothing and ran two "controls" against the unmodified build.
+if(JLIBSCHED_FIBERHOLDER_CTL)
+  target_compile_definitions(Scheduler PUBLIC JLIB_FIBERHOLDER_CTL_${JLIBSCHED_FIBERHOLDER_CTL}=1)
+  message(STATUS "JLib::Scheduler: NEGATIVE CONTROL ${JLIBSCHED_FIBERHOLDER_CTL} -- the matching test MUST fail")
 endif()
 
 # THE PUBLIC JOB IS A FIBER. Asserts the BEHAVIOUR, not the type tag: a plain CreateTask must be

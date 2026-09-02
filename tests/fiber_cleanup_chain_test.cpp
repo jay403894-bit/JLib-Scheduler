@@ -183,7 +183,7 @@ int main() {
 	{
 		reg.SetRecycle(nullptr);                 // the REAL recycler for this section
 		GlobalFiberPool* pool = GlobalFiberPool::Create(8);
-		reg.Build(pool);
+		reg.Build(pool, 8);
 		Check(reg.Count() == 8, "the address table covers the pool");
 		Check(reg.Get(0) != nullptr && reg.Get(8) == nullptr, "and is bounded by it");
 

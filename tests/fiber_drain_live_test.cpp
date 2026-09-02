@@ -1,6 +1,6 @@
 // THE THREE DRAIN POINTS, AGAINST A LIVE POOL.
 //
-// token_registry_test proves the STRUCTURE in isolation. It cannot prove the wiring: that a token
+// fiber_holder_test proves the STRUCTURE in isolation. It cannot prove the wiring: that a fiber
 // delivered to holder N is drained BY WORKER N, that a parked worker is woken to do it, and that
 // main discharges its own through ProcessMainThread. Those are three edits in three files and every
 // one of them can be absent while the structure test stays green -- which is exactly how a wired-up
@@ -11,13 +11,13 @@
 // test that only counted releases would pass with the routing deleted.
 //
 // NEGATIVE CONTROL:
-//   cmake -S . -B build-ctl -DJLIBSCHED_TOKENDRAIN_CTL=NO_NOTIFY
+//   cmake -S . -B build-ctl -DJLIBSCHED_FIBERHOLDER_CTL=NO_NOTIFY
 //     -> Deliver stops waking the holder. The PARKED-worker case must TIME OUT, because a parked
-//        worker with tokens on its chain never drains them. If that case still passes, the wake is
+//        worker with fibers on its chain never drains them. If that case still passes, the wake is
 //        not what is delivering the cleanup and this test is measuring something else.
 
 #include "../include/TaskScheduler.h"
-#include "../include/TokenRegistry.h"
+#include "../include/FiberRegistry.h"
 #include "../include/Thread.h"
 #include <cstdio>
 #include <atomic>
@@ -50,8 +50,8 @@ static int CurrentQ() {
     return w ? (int)w->qIndex : -1;
 }
 
-static void RecordRelease(size_t /*holder*/, DebtToken* t) {
-    const size_t idx = (size_t)(intptr_t)t->readerId;   // the test stamps readerId as its own index
+static void RecordRelease(size_t /*holder*/, Fiber* f) {
+    const size_t idx = f->poolIndex;   // the test stamps poolIndex as its own index
     if (idx < 512) g_ranOn[idx].store(CurrentQ(), std::memory_order_relaxed);
     g_released.fetch_add(1, std::memory_order_release);
 }
@@ -67,22 +67,22 @@ static bool WaitFor(size_t target, int ms) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("=== token drain: the three points, against a live pool ===\n");
-#if defined(JLIB_TOKENDRAIN_CTL_NO_NOTIFY)
+    std::printf("=== fiber drain: the three points, against a live pool ===\n");
+#if defined(JLIB_FIBERHOLDER_CTL_NO_NOTIFY)
     std::printf("  [CONTROL: NO_NOTIFY -- the PARKED-worker case MUST time out]\n");
 #endif
 
     TaskScheduler::Init(8);
     auto& sched = TaskScheduler::Instance();
-    auto& reg   = TokenRegistry::Instance();
+    auto& reg   = FiberRegistry::Instance();
     reg.SetRelease(&RecordRelease);
 
     const size_t nWorkers = sched.GetWorkerCount();
-    std::printf("  workers=%zu  holders=%zu  capacity=%zu\n",
-                nWorkers, reg.HolderCount(), reg.Capacity());
+    std::printf("  workers=%zu  holders=%zu  (external ids: %zu)\n",
+                nWorkers, reg.HolderCount(), FiberRegistry::kExternalReaders);
     Check(reg.HolderCount() >= nWorkers, "registry was built by StartPool (holders cover the workers)");
 
-    // ---- DRAIN POINT 1: a token delivered to worker N is released BY WORKER N -----------------
+    // ---- DRAIN POINT 1: a fiber delivered to worker N is released BY WORKER N -----------------
     //
     // THE POOL IS DELIBERATELY LEFT IDLE FIRST. A busy pool would drain on its way through the task
     // loop for reasons that have nothing to do with the wake, so an idle pool is what makes this a
@@ -92,10 +92,10 @@ int main() {
         g_released.store(0);
 
         const size_t n = nWorkers;
-        std::vector<DebtToken> toks(n);
+        std::vector<Fiber> toks(n);
         for (size_t i = 0; i < n; ++i) {
             for (auto& c : g_ranOn) c.store(-2, std::memory_order_relaxed);
-            toks[i].readerId = i;
+            toks[i].poolIndex = i;
         }
         for (size_t i = 0; i < n; ++i) reg.Deliver(i, &toks[i]);
 
@@ -110,7 +110,7 @@ int main() {
         }
         std::printf("    delivered=%zu released=%zu wrong-thread=%zu never-ran=%zu\n",
                     n, g_released.load(), wrongThread, unrun);
-        Check(unrun == 0,       "every delivered token was released");
+        Check(unrun == 0,       "every delivered fiber was released");
         Check(wrongThread == 0, "each release ran ON ITS OWN HOLDER (routing, not just delivery)");
     }
 
@@ -123,11 +123,11 @@ int main() {
         for (auto& c : g_ranOn) c.store(-2, std::memory_order_relaxed);
 
         const size_t mine = reg.CurrentHolder();
-        Check(mine != kMaxHolders, "main claimed an external holder id");
+        Check(mine != FiberRegistry::kNoHolder, "main claimed an external holder id");
         Check(mine >= nWorkers,    "main's holder is EXTERNAL, not a worker's (it is not a worker)");
 
-        DebtToken tok;
-        tok.readerId = 300;
+        Fiber tok;
+        tok.poolIndex = 300;
         reg.Deliver(mine, &tok);
 
         // NOT drained by anyone else, and that is the assertion -- give the pool a generous window
@@ -149,8 +149,8 @@ int main() {
         g_released.store(0);
         for (auto& c : g_ranOn) c.store(-2, std::memory_order_relaxed);
 
-        DebtToken tok;
-        tok.readerId = 301;
+        Fiber tok;
+        tok.poolIndex = 301;
         // Holder 0 while the pool is ALIVE would just be drained by worker 0. The point is to leave
         // a debt outstanding at teardown, so this one is aimed at an external holder nobody polls.
         const size_t idle = nWorkers + 1;
