@@ -3166,9 +3166,15 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
            "                 %llu (%.1f%%) had an idle worker in [0,K)    <- what the spill can reach\n"
            "                 %llu (%.1f%%) had an idle worker in [0,K+F)  <- what a SHARED lane could\n",
            strands, idlePeer, pctK, idleWide, pctKF);
-    printf("               ^ a strand is a dispatch that left a non-empty lane inbox behind, i.e.\n"
-           "                 work that just became unreachable -- one MPSC, one legal consumer, and\n"
-           "                 that consumer is entering a body. THE GAP BETWEEN THE TWO LINES is what\n"
+    printf("               ^ a strand is a dispatch that left a non-empty lane inbox behind: one\n"
+           "                 MPSC, one legal consumer, and that consumer is entering a body.\n"
+           "                 IT IS HEAD-OF-LINE BLOCKING, NOT A LOST TASK. The owner drains that\n"
+           "                 backlog the moment its body ends -- 'unreachable' here means to any\n"
+           "                 OTHER worker, for the length of one body, and NOT the permanent kind\n"
+           "                 where nobody may ever read the queue. A non-zero count is a queueing\n"
+           "                 cost to weigh, not a bug to chase; if work were truly lost the row\n"
+           "                 would never finish rather than finish slowly.\n"
+           "                 THE GAP BETWEEN THE TWO LINES is what\n"
            "                 changing the STRUCTURE buys that improving the spill never could: the\n"
            "                 first is bounded by K by definition, the second is the consumer set a\n"
            "                 pull queue would have. Neither counts the parkable band -- a parked\n"

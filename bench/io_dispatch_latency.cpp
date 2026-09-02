@@ -457,6 +457,10 @@ int main(int argc, char** argv) {
     // the number that decides whether K>1 and hot-worker rebalancing are live questions.
     {
         std::printf("\n  concurrent soak -- N independent coroutines, steady state (not a wave)\n");
+        std::printf("    NO BURN, and that is why this table is fast. Every K table BELOW burns\n"
+                    "    20 or 200 us on the hot worker every 8th resumption, so comparing this\n"
+                    "    against them measures the BURN, not the lane. K=1 sitting at ~2x K=2 in\n"
+                    "    those tables is capacity behaving exactly as predicted, not a lane fault.\n");
         std::printf("    recv-completion -> coroutine resumed, us\n");
         std::printf("      N     ops     p50      p90      p99      max     ops/sec\n");
 
@@ -634,7 +638,7 @@ int main(int argc, char** argv) {
         constexpr int kNW = 6;
 
         for (long long burn : { 20000LL, 200000LL }) {
-          for (std::size_t k : { (std::size_t)1, (std::size_t)4 }) {
+          for (std::size_t k : { (std::size_t)1, (std::size_t)2 }) {
             std::vector<double> p50[kNW], p90[kNW], p99[kNW], eps[kNW], wps[kNW], prb[kNW];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNW; ++a) {
@@ -724,13 +728,20 @@ int main(int argc, char** argv) {
     // reach.
     {
         const int n = 32, iters = 100;
-        std::printf("\n  dynamic K -- against the static rungs it climbs between\n");
-        std::printf("    dyn should sit near the K=4 row under load; K=1 means it never ramped.\n");
+        std::printf("\n  the static K rungs -- what a second reserved worker is worth\n");
+        std::printf("    ADAPTIVE K WAS REMOVED (8-30) and K is now clamped to %zu, so the old\n"
+                    "    dyn1-4 arm and the K=4 rung are gone: they pinned the same ceiling as K=2\n"
+                    "    and printed as if they were separate results.\n",
+                    JLib::TaskScheduler::kMaxReservedWorkers);
+        std::printf("    EVERY ROW HERE BURNS %s us on the hot worker every 8th resumption. These\n"
+                    "    numbers are NOT comparable to the concurrent soak above, which burns none --\n"
+                    "    the difference between the two tables is the burn, not the lane.\n",
+                    "20/200");
         std::printf("      arm        burn   skew      p50      p90      p99   endK\n");
 
         constexpr int kReps = 3;
-        const char* names[] = { "K=1", "K=2", "K=4", "dyn1-4" };
-        constexpr int kNA = 4;
+        const char* names[] = { "K=1", "K=2" };
+        constexpr int kNA = 2;
 
         for (long long burn : { 20000LL, 200000LL }) {
             std::vector<double> p50[kNA], p90[kNA], p99[kNA], endK[kNA];
@@ -738,9 +749,7 @@ int main(int argc, char** argv) {
               for (int a = 0; a < kNA; ++a) {
                 JLib::TaskScheduler::SetSteerSkip(false);
                 JLib::TaskScheduler::SetLaneClearDepth(3);
-                if (a < 3) JLib::TaskScheduler::SetHotWorkers(a == 0 ? 1 : (a == 1 ? 2 : 4));
-                // Arm 3 was the ADAPTIVE arm; K is static now, so it pins the same ceiling.
-                else       JLib::TaskScheduler::SetHotWorkers(4);
+                JLib::TaskScheduler::SetHotWorkers(a == 0 ? 1 : 2);
                 g_skewEveryNth = 8;
                 g_skewBurnNs   = burn;
 
@@ -827,7 +836,7 @@ int main(int argc, char** argv) {
         constexpr int kNA = 4;
 
         for (long long burn : { 20000LL, 200000LL }) {
-          for (std::size_t k : { (std::size_t)2, (std::size_t)4 }) {
+          for (std::size_t k : { (std::size_t)1, (std::size_t)2 }) {
             std::vector<double> p50[kNA], p90[kNA], p99[kNA], eps[kNA], wps[kNA], prb[kNA];
             for (int rep = 0; rep < kReps; ++rep) {
               for (int a = 0; a < kNA; ++a) {
@@ -947,7 +956,7 @@ int main(int argc, char** argv) {
 
         for (long long burn : { 20000LL, 200000LL }) {
           for (int skew : { 0, 8 }) {
-            for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+            for (std::size_t k : { (std::size_t)1, (std::size_t)2 }) {
                 if (skew == 0 && burn != 200000LL) continue;
                 std::vector<double> p50[kArms], p90[kArms], p99[kArms];
 
@@ -1022,7 +1031,7 @@ int main(int argc, char** argv) {
         // arms share thermal and background state; separated ones do not.
         for (long long burn : { 20000LL, 200000LL }) {
           for (int skew : { 0, 8 }) {
-            for (std::size_t k : { (std::size_t)1, (std::size_t)2, (std::size_t)4 }) {
+            for (std::size_t k : { (std::size_t)1, (std::size_t)2 }) {
               // THE ARM DIMENSION IS GONE. This swept laneHintMode { off, hot->hot, any }, and
               // every mode other than "off" selected a STEAL of the hot worker's lane -- which no
               // longer exists in any mode: the lane is an MPSC inbox with one legal consumer.
