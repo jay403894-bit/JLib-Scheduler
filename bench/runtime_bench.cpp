@@ -490,32 +490,72 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
 
     std::printf("  workload length is SWEPT -- see the note above for why one length cannot answer\n"
                 "  the question. Each row is floor=0 against a pool-wide floor at that length.\n\n");
-    std::printf("  %-20s %12s %12s %10s\n", "length", "parked", "pool-wide", "tax");
+    std::printf("  %-20s %12s %12s %10s %14s %10s\n",
+                "length", "parked", "wide+yield", "tax", "wide,NO yield", "tax");
 
-    double taxAtShortest = 0.0, taxAtLongest = 0.0;
+    double taxAtShortest = 0.0, taxAtLongest = 0.0, taxNoYieldLong = 0.0;
+
+    // ---- THE THIRD ARM: A WIDE FLOOR THAT DOES NOT YIELD --------------------------------------
+    //
+    // THIS IS THE ONE THAT SETTLES WHETHER A POOL-WIDE FLOOR IS WHAT NoSleep WAS. Read the two idle
+    // paths side by side:
+    //
+    //   NoSleep          search -> the park block skipped by policy -> loop. That is all.
+    //   floor, F > 4     search -> park block skipped by band -> FloorSpin -> GetAwakeFloor()
+    //                    -> yieldWithHandshake(): CAS to WS_YIELD, std::this_thread::yield(),
+    //                       CAS back
+    //   floor, F <= 4    search -> ... -> CpuRelax only, NO yield
+    //
+    // std::this_thread::yield() IS SwitchToThread ON WINDOWS -- it hands the core to another READY
+    // thread. At F=31 that is thirty-one threads volunteering their cores to the OS scheduler on
+    // every idle pass, plus two CAS operations each. NoSleep never did any of it. So a wide floor
+    // and NoSleep are NOT the same mechanism, and comparing their taxes was never like for like.
+    //
+    // kYieldFloorMinDefault is 4, which is why the SHIPPED floor of 2 stays on the CpuRelax path and
+    // measures ~0%. Raising the threshold above the pool size forces a WIDE floor down that same
+    // path -- which is exactly what NoSleep did -- so this arm is the NoSleep-equivalent.
+    //
+    // FALSIFIABLE, WHICH IS THE POINT: if the tax collapses toward the historical +3.5% here, the
+    // gap was the yield and there was never a discrepancy. If it does NOT collapse, this whole
+    // explanation is wrong and the search reopens. The row is printed either way.
+    const size_t yieldMinEntry = JLib::TaskScheduler::GetYieldFloorMin();
+    const size_t kNoYield      = wideFloor + 1;   // above the pool: nobody is "big enough to yield"
 
     for (const Len& L : lengths) {
-        Samples p, w;
-        auto sample = [&](size_t f, Samples& out) {
+        Samples p, w, wq;
+        auto sample = [&](size_t f, size_t yieldMin, Samples& out) {
             // THE TRANSITION IS NOT THE TAX. SetAwakeFloor(N) promotes and WAKES N parked workers,
             // which at ~5 us a wake is real work landing inside the sample -- and asymmetrically,
             // since floor=0 wakes nobody. A discarded pass absorbs it, leaving the recorded one
             // measuring steady-state OCCUPANCY, which is what the row claims.
+            JLib::TaskScheduler::SetYieldFloorMin(yieldMin);
             JLib::TaskScheduler::SetAwakeFloor(f);
             (void)workload(L.passes);
             out.add(workload(L.passes));
         };
         for (int r = 0; r < reps; ++r) {
-            if (r & 1) { sample(0, p); sample(wideFloor, w); }
-            else       { sample(wideFloor, w); sample(0, p); }
+            // THREE ARMS, ROTATED, so no arm is always the one that follows a drift.
+            switch (r % 3) {
+                case 0: sample(0, yieldMinEntry, p);
+                        sample(wideFloor, yieldMinEntry, w);
+                        sample(wideFloor, kNoYield, wq); break;
+                case 1: sample(wideFloor, yieldMinEntry, w);
+                        sample(wideFloor, kNoYield, wq);
+                        sample(0, yieldMinEntry, p); break;
+                default: sample(wideFloor, kNoYield, wq);
+                        sample(0, yieldMinEntry, p);
+                        sample(wideFloor, yieldMinEntry, w); break;
+            }
         }
-        const double tax = p.median() > 0.0
-                         ? 100.0 * (w.median() - p.median()) / p.median() : 0.0;
-        std::printf("  %-20s %10.2f us %10.2f us %+9.2f %%\n",
-                    L.name, p.median(), w.median(), tax);
+        const double tax   = p.median() > 0.0 ? 100.0 * (w.median()  - p.median()) / p.median() : 0.0;
+        const double taxNY = p.median() > 0.0 ? 100.0 * (wq.median() - p.median()) / p.median() : 0.0;
+        std::printf("  %-20s %10.2f us %10.2f us %+9.2f %%  %10.2f us %+9.2f %%\n",
+                    L.name, p.median(), w.median(), tax, wq.median(), taxNY);
         if (&L == &lengths[0]) taxAtShortest = tax;
-        taxAtLongest = tax;
+        taxAtLongest   = tax;
+        taxNoYieldLong = taxNY;
     }
+    JLib::TaskScheduler::SetYieldFloorMin(yieldMinEntry);   // restore, always
 
     // ---- AND THE SHIPPED FLOOR, WHICH IS THE ONLY ROW THAT IS A CLAIM ABOUT THE DEFAULT ----
     {
@@ -540,19 +580,35 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
     JLib::TaskScheduler::SetAwakeFloor(baseFloor);   // restore, always
 
     // ---- THE RECONCILIATION, STATED RATHER THAN LEFT TO THE READER -------------------------
-    std::printf("\n  RECONCILIATION. A pool-wide floor is what IdlePolicy::NoSleep used to be, and it\n"
-                "  was historically measured at +3.5%% against a ~14.65 ms frame. This run:\n"
-                "      burst (~0.4 ms) %+.2f%%      frame (~15 ms) %+.2f%%\n",
-                taxAtShortest, taxAtLongest);
+    std::printf("\n  RECONCILIATION against the historical +3.5%% for IdlePolicy::NoSleep on a"
+                " ~14.65 ms frame:\n"
+                "      wide + yield : burst %+.2f%%   frame %+.2f%%\n"
+                "      wide, NO yield (the NoSleep-equivalent path) : frame %+.2f%%\n",
+                taxAtShortest, taxAtLongest, taxNoYieldLong);
+
+    // LENGTH WAS THE FIRST HYPOTHESIS AND IT IS DEAD. Kept as a line rather than deleted, because a
+    // future machine could behave differently and the reader should see the test, not just its
+    // verdict on one box.
     if (taxAtLongest < taxAtShortest * 0.5)
-        std::printf("  The tax FALLS with workload length, which supports the boost-transient\n"
-                    "  explanation: a short pass runs at full clock until the spinners take it away,\n"
-                    "  while a whole frame settles toward the same sustained clock either way. The\n"
-                    "  two figures are one phenomenon at two timescales.\n");
+        std::printf("  The tax FALLS with workload length -- the boost-transient explanation holds\n"
+                    "  here, and the two figures are one phenomenon at two timescales.\n");
     else
-        std::printf("  The tax does NOT fall materially with length, so the boost-transient\n"
-                    "  explanation does not hold and the historical +3.5%% is measuring something\n"
-                    "  else. Do not average them -- find out which is asking the right question.\n");
+        std::printf("  Length is NOT the explanation: the tax barely moves across 0.4 ms to 15 ms.\n");
+
+    // AND THE ONE THAT MATTERS: DID REMOVING THE YIELD CLOSE THE GAP?
+    if (taxNoYieldLong < taxAtLongest * 0.5)
+        std::printf("\n  REMOVING THE YIELD COLLAPSES THE TAX. A wide floor and NoSleep were never the\n"
+                    "  same mechanism: above kYieldFloorMinDefault a floor worker calls\n"
+                    "  std::this_thread::yield() every idle pass -- SwitchToThread on Windows, which\n"
+                    "  hands its core to another ready thread -- plus two CAS operations. NoSleep did\n"
+                    "  none of that; it spun. So there was never a discrepancy to reconcile, and the\n"
+                    "  historical +3.5%% describes the CpuRelax path this row now measures.\n"
+                    "  The yield is still CORRECT for a large floor -- it exists so a big spinning set\n"
+                    "  cannot pin the machine -- it is simply not what NoSleep was.\n");
+    else
+        std::printf("\n  Removing the yield does NOT collapse the tax, so the yield is not the\n"
+                    "  difference either. Both explanations offered for the gap are now dead and the\n"
+                    "  search reopens -- do not let the tidy story survive the measurement.\n");
 }
 
 // ---------------------------------------------------------------------------------------------

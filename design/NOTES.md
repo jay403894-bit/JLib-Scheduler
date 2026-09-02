@@ -2409,3 +2409,41 @@ configuration that no longer exists.
 
 UNCHANGED AND WORTH REPEATING: the SHIPPED floor is +0.08% and indistinguishable from parked, at
 every length, on a silent machine. That is the number the library's default is answerable for.
+
+## The yield hypothesis is dead too -- and the +3.5% is the number to distrust (2026-09-02)
+
+Added a fourth arm: a pool-wide floor with SetYieldFloorMin raised ABOVE the pool, which forces a
+wide floor onto the CpuRelax-only path -- the path NoSleep took. If the yield were the difference,
+this arm should have collapsed toward +3.5%.
+
+    length            parked      wide+yield    tax        wide,NO yield   tax
+    ~0.4 ms          407.80 us     486.30 us  +19.25%        470.10 us   +15.28%
+    ~4 ms           4003.30 us    4865.30 us  +21.53%       4745.80 us   +18.55%
+    ~15 ms         14920.20 us   17930.80 us  +20.18%      17973.30 us   +20.46%
+
+AT THE FRAME LENGTH -- the one the historical figure used -- REMOVING THE YIELD CHANGES NOTHING.
+20.18% against 20.46%.
+
+I SUSPECTED THE ARM WAS VACUOUS AND CHECKED. The worry was real: there is an unconditional
+yieldWithHandshake() below the floor block, so if a floor worker fell through to it the arm would
+have suppressed nothing. It does not -- the floor branch ends in `continue`, so a floor worker never
+reaches the guest tail. The arm is valid.
+
+AND THE SAME READ SHOWS WHY MY STORY WAS WRONG. I claimed a floor worker yields EVERY idle pass.
+It does not: above the threshold the yield is gated on
+`((++spinTick + qIndex) & GetSpinYieldMask()) == 0` -- roughly one pass in eight. There was never
+enough yielding for its removal to matter, so the null result is exactly what the code predicts once
+read properly rather than skimmed.
+
+THREE EXPLANATIONS TESTED AND DEAD: workload length (swept, flat), machine noise (silent run,
+unchanged), the yield handshake (suppressed, unchanged). A pool-wide floor costs ~20% on this
+hardware and the cost is plain core occupancy.
+
+SO THE POSITION FLIPS. The +20% is now the best-supported number in this file -- three lengths, two
+noise conditions, two idle strategies. THE HISTORICAL +3.5% IS THE UNREPRODUCED ONE, and it should
+be treated as a measurement of something we can no longer identify rather than as a target this
+runtime fails to hit. Do not quote it again without re-deriving it.
+
+UNCHANGED, AND STILL THE ONLY IDLE-TAX NUMBER THE README CARRIES: the shipped floor of 2 sits on the
+CpuRelax path by design (kYieldFloorMinDefault = 4) and measures -0.05% to +0.13% -- indistinguishable
+from a fully parked pool at every length and under both noise conditions.
