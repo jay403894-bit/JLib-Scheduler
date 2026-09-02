@@ -231,13 +231,27 @@ namespace JLib {
 //                 with the heavy stack class; this is not that field returning by accident -- it
 //                 has a reader (Thread::AcquireFiber) from the day it lands, which is precisely
 //                 what the old one never had.
+//   lambdaBody    this task's body is a CLOSURE ON THE SLAB, so it must never be bound to a fiber.
+//                 CreateTask's lambda overload has no TaskType parameter and always produces
+//                 Native, which stops the CONSTRUCTOR from making a lambda fiber -- but `type` is a
+//                 public bitfield on a struct, and the library itself reassigns it (IoShared,
+//                 TaskScheduler::CreateTaskImpl). So this compiles and nothing diagnoses it:
+//
+//                     Task* t = sched.CreateTask([&]{ ...waits... });
+//                     t->type = TaskType::Fiber;          // <- the hole
+//
+//                 A static_assert guards a call; it cannot guard an object that stays mutable
+//                 afterwards. This bit is what the OBJECT carries, and Thread::AcquireFiber reads
+//                 it at the one moment that matters -- the instant a fiber row would be leased to
+//                 a body that cannot be trusted to return it.
 #define JLIB_TASK_FLAG_FIELDS            \
         Lane      lane          : 1;     \
         TaskType  type          : 2;     \
         uint8_t   priorityBoost : 1;     \
         CorePref  corePref      : 2;     \
         uint8_t   trivialDtor   : 1;     \
-        StackClass stackClass   : 2;
+        StackClass stackClass   : 2;     \
+        uint8_t   lambdaBody    : 1;
 
     struct alignas(16) Task {
         using Func = void(*)(void*);
@@ -368,12 +382,12 @@ namespace JLib {
             : fn(nullptr), data(nullptr), assignedFiber(nullptr), next(nullptr),
               lane(Lane::Normal), type(TaskType::Native),
               priorityBoost(0), corePref(CorePref::Default), trivialDtor(0),
-              stackClass(StackClass::Standard) { ; }
+              stackClass(StackClass::Standard), lambdaBody(0) { ; }
         Task(Func f, void* d = nullptr, Lane ln = Lane::Normal)
             : fn(f), data(d), assignedFiber(nullptr), next(nullptr),
               lane(ln), type(TaskType::Native),
               priorityBoost(0), corePref(CorePref::Default), trivialDtor(0),
-              stackClass(StackClass::Standard) {
+              stackClass(StackClass::Standard), lambdaBody(0) {
         }
         virtual ~Task() {
 
@@ -496,6 +510,9 @@ namespace JLib {
             func(std::move(f))
         {
             this->data = this;
+            // SET HERE, NOT AT THE CALL SITE, so it cannot be forgotten: every LambdaTask that
+            // exists went through one of these two constructors. See the flag note in the header.
+            this->lambdaBody = 1;
         }
 
         // Lvalue overload: copies the callable. No ambiguity with the one above -- an rvalue prefers
@@ -506,6 +523,7 @@ namespace JLib {
             func(f)
         {
             this->data = this;
+            this->lambdaBody = 1;
         }
 		~LambdaTask() {
 		}

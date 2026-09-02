@@ -1132,6 +1132,13 @@ add_executable(SchedulerEpochReclaimTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/epoc
 target_link_libraries(SchedulerEpochReclaimTest PRIVATE Scheduler)
 target_compile_features(SchedulerEpochReclaimTest PRIVATE cxx_std_17)
 
+# THE LAMBDA-FIBER GUARD, PROVEN TO FIRE. The static_assert in CreateTask guards the CONSTRUCTOR;
+# `type` is a public bitfield, so an object can still be flipped to Fiber afterwards. AcquireFiber
+# refuses, and this proves it -- illegal arm in a child process, because the violation aborts.
+add_executable(SchedulerLambdaFiberGuardTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/lambda_fiber_guard_test.cpp")
+target_link_libraries(SchedulerLambdaFiberGuardTest PRIVATE Scheduler)
+target_compile_features(SchedulerLambdaFiberGuardTest PRIVATE cxx_std_17)
+
 # THE EPOCH-GUARD SUSPEND CHECK, PROVEN TO FIRE. The check is enforced in Release at all eleven
 # ContextSwitch sites; this is the first thing that ever observed it doing anything. Two arms, so a
 # check that fired unconditionally would fail too -- see the file header.

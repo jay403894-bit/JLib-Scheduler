@@ -853,6 +853,44 @@ bool Thread::Ready(){
 }
        
 Fiber* Thread::AcquireFiber(Task* task) {
+	// ---- A CLOSURE MUST NEVER BE HANDED A FIBER ROW. CHECKED HERE, ON THE OBJECT. -------------
+	//
+	// CreateTask's lambda overload has no TaskType parameter, so the CONSTRUCTOR cannot make a
+	// lambda fiber. That is not the whole rule, because `type` is a public bitfield on a struct and
+	// the library itself reassigns it. This compiles, and until this check existed nothing said a
+	// word about it:
+	//
+	//     Task* t = sched.CreateTask([&]{ ...waits... });   // Native LambdaTask
+	//     t->type = TaskType::Fiber;                        // public field
+	//     sched.Push(t);                                    // a lambda fiber
+	//
+	// A static_assert guards a CALL. It cannot guard an OBJECT that stays mutable afterwards, and
+	// the guarantee we need is about the object at the moment a row is leased to it.
+	//
+	// THIS IS THE ONE PLACE THAT MATTERS, which is why the cost is acceptable in Release: every
+	// fiber-backed task passes through here exactly once, on a path that is already allocating a
+	// stack. One bitfield test against the branch predictor's favourite outcome.
+	//
+	// WHY IT IS FATAL RATHER THAN A FALLBACK TO NATIVE. Running it Native instead would abort at
+	// the first WaitOnEvent anyway, several frames away from the mistake and with a message about
+	// the wrong thing. The body asked to suspend; the honest answer is that this task can never be
+	// allowed to, and to say so at the line that caused it.
+	if (task && task->lambdaBody && task->type == TaskType::Fiber) {
+		std::fprintf(stderr,
+			"[JLib::Scheduler] INVARIANT VIOLATED: a LAMBDA task was marked TaskType::Fiber.\n"
+			"  A lambda body is a closure on the task slab. The worker loop frees that frame the\n"
+			"  instant the body returns, while the fiber belongs to whoever resumes it -- two\n"
+			"  owners, no shared destructor. If it suspends, it either resumes into a freed frame\n"
+			"  or never reaches FiberStatus::DEAD, and its row is gone for the life of the process.\n"
+			"  It will not fail here: SlabPool is append-only, so a released slot stays mapped\n"
+			"  holding its old bytes and the corruption surfaces nowhere near this line.\n"
+			"  CreateTask(lambda) cannot produce this -- something assigned `type` afterwards.\n"
+			"  Fix: use the raw overload -- CreateTask(void(*)(void*), void* ctx, lane,\n"
+			"  TaskType::Fiber) -- with the context on the caller's stack. See tests/fiber_body.h.\n");
+		std::fflush(stderr);
+		std::abort();
+	}
+
 	// SCRUB ON ACQUIRE, NOT ON RELEASE, AND THAT CLOSES A PRE-EXISTING HOLE.
 	//
 	// Fiber::ResetForReuse is called by GlobalFiberPool::ReturnBatch -- but ReleaseFiber does not
