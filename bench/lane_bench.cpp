@@ -117,11 +117,30 @@ static void LaneLatencyRun(TaskScheduler& sched, int samples, Lane lane,
 // stealing K should be indistinguishable from K extra floor workers. With stealing off those cores
 // spin on nothing and the floor runs N-K wide.
 static std::atomic<long long> g_spun{ 0 };
+static std::atomic<int>       g_bgOutstanding{ 0 };
 static void FloorBody(void*) {
     // A fixed slab of work, big enough that scheduling overhead is not what is being timed.
     volatile long long acc = 0;
     for (int i = 0; i < 4000; ++i) acc += i;
     g_spun.fetch_add((long long)acc, std::memory_order_relaxed);
+}
+
+// ---- THE SATURATING BODY, AND WHY IT HAD TO BE MUCH BIGGER ------------------------------------
+//
+// FloorBody is ~2 us. One producer thread pushing those CANNOT saturate 31 workers -- the pool
+// drains a round faster than a single thread can enqueue the next, so the floor sits mostly idle and
+// a Lane::Normal sample lands on an awake worker instantly. That is exactly what the control
+// reported: the Normal row came out FASTER than the LowLatency rows, which is not a result about
+// the lane, it is the load failing to arrive.
+//
+// ~100x longer, so 512 of these is ~40 ms of work spread over the pool rather than ~1 ms. The
+// producer can now stay ahead of the consumers, which is the only condition under which "the floor
+// is busy" is true and the lane has anything to win.
+static void HeavyFloorBody(void*) {
+    volatile long long acc = 0;
+    for (int i = 0; i < 400000; ++i) acc += i;
+    g_spun.fetch_add((long long)acc, std::memory_order_relaxed);
+    g_bgOutstanding.fetch_sub(1, std::memory_order_relaxed);   // pairs with the loader's cap
 }
 
 static double FloorThroughput(TaskScheduler& sched, int ms) {
@@ -236,8 +255,94 @@ int main(int argc, char** argv) {
                 "      idle. If on and off are equal, stealing is not firing -- check the quiet\n"
                 "      window (%u us), not the throughput.\n", TaskScheduler::IoQuietWindowUs());
 
-    std::printf("\n  NOT MEASURED HERE, deliberately: lane latency while the FLOOR is saturated.\n"
-                "  That is the case stealing is supposed to cost something in, and it needs a\n"
-                "  contended arm this file does not have yet. Do not read table 1 as covering it.\n");
+    // ---- TABLE 3: THE ONLY TABLE THAT CAN ANSWER THE LATENCY QUESTION -------------------------
+    //
+    // TABLE 1 CANNOT, and its own control says so: on an idle pool a Lane::Normal push also lands on
+    // an awake worker instantly, so every arm measures the same thing and the control sits on top of
+    // the LowLatency rows. A latency lane has nothing to win when there is nothing to wait behind.
+    //
+    // So this one SATURATES THE FLOOR first and then measures dispatch. That is the case the lane
+    // exists for, the case stealing can cost something in, and the only configuration where
+    // LowLatency and Normal should diverge at all.
+    std::printf("\n  lane dispatch latency WITH THE FLOOR SATURATED -- the case the lane exists for\n");
+    std::printf("    K   steal  lane          p50      p90      p99   onK/onFloor\n");
+
+    struct CArm { size_t k; bool steal; Lane lane; const char* name; };
+    const CArm carms[] = {
+        { 2, true,  Lane::LowLatency, "LowLatency" },
+        { 2, false, Lane::LowLatency, "LowLatency" },
+        { 2, true,  Lane::Normal,     "Normal    " },   // <- must be MUCH worse, or the load missed
+    };
+    constexpr int kC = 3;
+    std::vector<double> c50[kC], c90[kC], c99[kC];
+    int cK[kC] = {}, cF[kC] = {};
+
+    for (int r = 0; r < reps; ++r) {
+        for (int a = 0; a < kC; ++a) {
+            TaskScheduler::SetIoHotLane(carms[a].k);
+            TaskScheduler::SetLaneIntake(true);
+            TaskScheduler::SetReservedStealing(carms[a].steal);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+            // BACKGROUND LOAD, pushed before the samples and left running. Enough tasks that every
+            // floor worker is inside a body when a sample arrives -- which is the whole point: the
+            // lane's value is being reachable when the floor is not.
+            // BOUNDED IN FLIGHT, and the first version was not -- it pushed 512 heavy tasks per
+            // round unconditionally, built a backlog of ~118,000 per worker, and the pool could not
+            // drain before teardown. A load generator that outruns the pool does not measure a busy
+            // floor, it measures an unbounded queue, and then hangs.
+            //
+            // The cap is the point: keep roughly a few tasks per worker outstanding, which is
+            // "every worker is inside a body" without "the queue grows forever".
+            std::atomic<bool> stop{ false };
+            const int cap = (int)sched.GetWorkerCount() * 3;
+            std::thread loader([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    while (g_bgOutstanding.load(std::memory_order_relaxed) < cap
+                           && !stop.load(std::memory_order_relaxed)) {
+                        Task* t = sched.CreateTask(&HeavyFloorBody, nullptr, Lane::Normal, TaskType::Native);
+                        if (!t) break;
+                        g_bgOutstanding.fetch_add(1, std::memory_order_relaxed);
+                        sched.Push(t);
+                    }
+                    std::this_thread::yield();
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));   // let it bite
+
+            g_onReserved.store(0); g_onFloor.store(0);
+            std::vector<long long> v;
+            LaneLatencyRun(sched, samples, carms[a].lane, v);
+
+            stop.store(true, std::memory_order_relaxed);
+            loader.join();
+            // DRAIN TO ZERO, not for a fixed 60 ms. A timed sleep was what let the previous version
+            // carry a backlog into the next arm and, eventually, into teardown -- where the pool
+            // failed to quiesce and dumped its state instead of finishing. Waiting on the counter
+            // means each arm starts from a genuinely idle floor, which is also the only way the
+            // arms are comparable to each other.
+            {
+                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                while (g_bgOutstanding.load(std::memory_order_relaxed) > 0
+                       && std::chrono::steady_clock::now() < dl)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+
+            if (v.empty()) continue;
+            c50[a].push_back(Pct(v, 0.50));
+            c90[a].push_back(Pct(v, 0.90));
+            c99[a].push_back(Pct(v, 0.99));
+            cK[a] = g_onReserved.load(); cF[a] = g_onFloor.load();
+        }
+    }
+    for (int a = 0; a < kC; ++a)
+        std::printf("   %2zu   %-6s %s  %7.2f  %7.2f  %7.2f   %d/%d\n",
+                    carms[a].k, carms[a].steal ? "on" : "off", carms[a].name,
+                    Median(c50[a]), Median(c90[a]), Median(c99[a]), cK[a], cF[a]);
+
+    std::printf("    ^ THE Normal ROW IS THE CONTROL AND IT MUST BE MUCH WORSE. If it is close to the\n"
+                "      LowLatency rows the background load did not saturate the floor, and this table\n"
+                "      is table 1 again with extra steps. The steal=on vs steal=off gap is what\n"
+                "      stealing COSTS -- weigh it against the ~3%% throughput it returns above.\n");
     return 0;
 }
