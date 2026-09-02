@@ -1093,6 +1093,13 @@ target_compile_features(SchedulerFiberDrainLiveTest PRIVATE cxx_std_17)
 # being weak, and the same stale-binary trap that has produced false results here before. VERIFY the
 # define reached the compiler (grep the generated .vcxproj) before believing a control that passes;
 # a PowerShell loop once expanded nothing and ran two "controls" against the unmodified build.
+# The DAG Fire() default-push control: removes the else arm, so dag_priority_node_test MUST time
+# out on the priority cases. Same PUBLIC-define reasoning as the holder controls below.
+if(JLIBSCHED_DAGFIRE_CTL)
+  target_compile_definitions(Scheduler PUBLIC JLIB_DAGFIRE_CTL_${JLIBSCHED_DAGFIRE_CTL}=1)
+  message(STATUS "JLib::Scheduler: NEGATIVE CONTROL DAGFIRE ${JLIBSCHED_DAGFIRE_CTL} -- dag_priority_node_test MUST fail")
+endif()
+
 if(JLIBSCHED_FIBERHOLDER_CTL)
   target_compile_definitions(Scheduler PUBLIC JLIB_FIBERHOLDER_CTL_${JLIBSCHED_FIBERHOLDER_CTL}=1)
   message(STATUS "JLib::Scheduler: NEGATIVE CONTROL ${JLIBSCHED_FIBERHOLDER_CTL} -- the matching test MUST fail")
@@ -1101,6 +1108,14 @@ endif()
 # THE PUBLIC JOB IS A FIBER. Asserts the BEHAVIOUR, not the type tag: a plain CreateTask must be
 # able to suspend and resume (illegal under the old Native default), and ParallelFor grains must
 # still take no fiber, or grain concurrency silently becomes bounded by the fiber pool.
+# A DAG NODE WITH AN EXPLICIT PRIORITY MUST RUN. Fire() dispatched on isMain/isFork/isLocal with
+# no else, and CreateNode sets isLocal = (priority == NONE) -- so any explicit priority stranded the
+# node: marked submitted, never pushed, dependents deadlocked. Reachable through public API and
+# invisible to a suite whose callers all take the default.
+add_executable(SchedulerDagPriorityNodeTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/dag_priority_node_test.cpp")
+target_link_libraries(SchedulerDagPriorityNodeTest PRIVATE Scheduler)
+target_compile_features(SchedulerDagPriorityNodeTest PRIVATE cxx_std_17)
+
 # THREE STACK CLASSES. Tiny and Deep default to 0 per worker (the 127 MB lesson), so a green suite
 # says nothing about them -- this is the only thing that turns them on. Asserts the class bound from
 # INSIDE the task, that poolIndex stays dense across classes (Event's waiter hash and

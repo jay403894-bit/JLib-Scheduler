@@ -477,5 +477,31 @@ void TaskDAG::Fire(TaskNode* node, TaskNode::Outcome outcome) {
         else
             scheduler.Push(node->cpuID, node->task);
     }
-
+    // ---- THE MISSING ARM. WITHOUT IT A NODE IS MARKED submitted AND NEVER PUSHED. ------------
+    //
+    // This was a PERMANENT HANG, not a stall, and it is reachable through ordinary public API:
+    //
+    //     node->isLocal = (priority == NONE);        // CreateNode, above
+    //     CreateNode(t, /*priority*/ 3)              // -> isLocal = 0
+    //
+    // and a node that is not main, not fork and not local fell off the end of this chain. Fire()
+    // had already done `submitted.exchange(true)`, so nothing will ever fire it again, its
+    // dependents' countdowns never reach zero, and WaitFor on the graph waits forever.
+    //
+    // CreateNode's DEFAULT priority is NONE, which is why every existing caller and test works and
+    // why this sat here undetected: the bug is not in the common path, it is in the parameter.
+    //
+    // PLAIN Push, NOT Push(cpuID, ...). cpuID defaults to NONE (255) for these nodes, so pinning to
+    // it would aim at a worker that does not exist. A node with a priority and no affinity is
+    // exactly "run this anywhere", which is what the ordinary push means.
+    //
+    // NOTE THAT `priority` ITSELF DOES NOTHING ELSE -- it is written by CreateNode and read by no
+    // one. So today passing a priority only ever COST you the node. Left in place rather than
+    // removed: making it mean something (hiPri, say) is a design decision, and deleting a public
+    // parameter is a separate change from fixing the hang it causes.
+#if !defined(JLIB_DAGFIRE_CTL_NO_DEFAULT_PUSH)
+    else {
+        scheduler.Push(node->task);
+    }
+#endif  // CONTROL: restore the missing arm -- dag_priority_node_test MUST then time out.
 }
