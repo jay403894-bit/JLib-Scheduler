@@ -21,11 +21,25 @@
 # fiber-wait path is NOT, and it is the code this reproducer stresses hardest.
 name: Race hunt (macOS arm64)
 
+# THE NIGHTLY IS OFF WHILE THE REPOSITORY IS PRIVATE, and the arithmetic is the whole reason.
+# This job is macos-14 with a 45-minute timeout, and macOS bills at 10x -- so one full-length run is
+# ~450 billable minutes, about $7.20. Daily, that is roughly $200/month for a reproducer that exists
+# to sample a ~1-in-3 flake. It is the single most expensive thing in this repository by a wide
+# margin, and it was the actual cause of the Actions budget being tripped -- not ci.yml's seven jobs,
+# which were merely the more obvious suspect.
+#
+# NONE OF THIS APPLIES TO A PUBLIC REPOSITORY. Actions minutes are free on GitHub-hosted runners for
+# public repos, macOS included. If this repository goes public, restore the cron -- the reasoning
+# above is about billing and nothing else, and the sampling argument in the header is unchanged and
+# still correct.
+#
+# Until then: run it on demand while chasing something, which is when it is most useful anyway --
+# the Actions tab's "Run workflow" button, or `gh workflow run "Race hunt (macOS arm64)"`.
 on:
-  schedule:
-    # 07:00 UTC daily. Any time works; this one is deliberately not on the hour boundary that
-    # everyone else picks, since GitHub drops scheduled runs under load at popular times.
-    - cron: '17 7 * * *'
+  # schedule:
+  #   # 07:00 UTC daily. Any time works; this one is deliberately not on the hour boundary that
+  #   # everyone else picks, since GitHub drops scheduled runs under load at popular times.
+  #   - cron: '17 7 * * *'
   workflow_dispatch:      # so it can be run on demand while chasing something
 
 jobs:

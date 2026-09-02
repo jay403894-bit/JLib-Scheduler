@@ -5,15 +5,23 @@
 # matters more than it sounds: the worst bug of the AArch64 port was a stale file that a local
 # incremental build happily kept using and a fresh clone could never have produced.
 #
-# Free on GitHub-hosted runners for public repositories, including the ARM64 Linux ones.
+# ON DEMAND ONLY, and that is a billing decision rather than a preference.
+#
+# Actions minutes are free on GitHub-hosted runners for PUBLIC repositories. This repository is
+# private, so every job bills, and the multipliers are not flat: Linux 1x, Windows 2x, macOS 10x.
+# This matrix is seven jobs including macOS arm64 and two ABI harnesses -- so on `push` it charged
+# for seven jobs per commit, at a commit rate of dozens per day, and eventually tripped the account
+# spending limit. Every run after that point failed with "the job was not started because an Actions
+# budget is preventing further use", which looks exactly like a code failure on the badge and is not.
+#
+# So: run it deliberately, before a release or after touching anything platform-shaped -- the Actions
+# tab's "Run workflow" button, or `gh workflow run CI`. Restoring the push trigger is two lines, and
+# the thing to weigh before doing it is that macOS alone bills ten minutes per minute.
 
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:      # adds a "Run workflow" button on the Actions tab
+  workflow_dispatch:      # the "Run workflow" button on the Actions tab
 
 jobs:
   build:
