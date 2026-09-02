@@ -293,7 +293,12 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 			ApplyPowerThrottling(pt);
 		}
 		// ThreadLocalCache::Initialize clamps this to its MaxCapacity and floors it at 2.
-		localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity);
+		// ONE PER CLASS. The tiny and deep caches are harmless when their class count is 0 -- Pop
+		// refills from an empty queue, gets nothing, and AcquireFiber reports exhaustion for that
+		// class exactly as it would for any other shortage.
+		localCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Standard);
+		tinyCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Tiny);
+		deepCache.Initialize(&scheduler->GetGlobalPool(), fiberCacheCapacity, StackClass::Deep);
 		this->Worker();
 		});
 	nativeHandle = thread.native_handle();
@@ -863,10 +868,13 @@ Fiber* Thread::AcquireFiber(Task* task) {
 	//
 	// AND IT IS WHAT MAKES Fiber::creditors SAFE. A recycled fiber carrying a stale creditor bit
 	// would bill its next occupant's cleanup to a worker that never touched it.
-	Fiber* f = localCache.Pop();
+	// PICK THE CACHE BY THE TASK'S CLASS. A subscript, not a branch on the hot path: Standard is
+	// class 0 and is what every task asks for unless it says otherwise.
+	ThreadLocalCache<>& cache = CacheFor(task ? task->stackClass : StackClass::Standard);
+	Fiber* f = cache.Pop();
 	if (f) { f->ResetForReuse(); return f; }
 
-	f = localCache.Pop();
+	f = cache.Pop();
 	if (f) f->ResetForReuse();
 
 	if (!f) {
@@ -903,7 +911,9 @@ Fiber* Thread::AcquireFiber(Task* task) {
 }
 
 void Thread::ReleaseFiber(Fiber* f) {
-	localCache.Push(f);
+	// HOME BY THE FIBER'S OWN CLASS, not the current task's -- the fiber knows where it came from
+	// and a released fiber may well be a different class from whatever runs next.
+	CacheFor(f->stackClass).Push(f);
 }
 
 uint32_t Thread::FastRand() {

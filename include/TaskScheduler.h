@@ -2375,6 +2375,13 @@ namespace JLib {
 		// committed ~127 MB up front). Add a second class back when a workload needs one.
 		static void SetFiberBudget(size_t fibersPerWorker);
 		static size_t StandardFibersPerWorker();
+		// Tiny (8 KiB usable, for I/O continuations) and Deep (508 KiB, for deep recursion).
+		// BOTH DEFAULT TO 0 -- see the note at their definition; a nonzero default commits memory
+		// at startup for every program whether or not it binds one. Set before Init().
+		static void   SetTinyFibersPerWorker(size_t n);
+		static size_t TinyFibersPerWorker();
+		static void   SetDeepFibersPerWorker(size_t n);
+		static size_t DeepFibersPerWorker();
 
 		// ---- MIGRATABLE FIBERS: the mode switch, and it is ONE PREDICATE, not two schedulers -----
 		//

@@ -6,21 +6,47 @@
 
 using namespace JLib;
 
-GlobalFiberPool::GlobalFiberPool(size_t standardCount)
-	: standardArena(standardCount * kStandardStackSize),
-	availableFibers(standardCount),
-	size(standardCount) // Initialize queue with total capacity
+GlobalFiberPool::GlobalFiberPool(size_t tinyCount, size_t standardCount, size_t deepCount)
 {
-	standardFibers.reserve(standardCount);
-	for (size_t i = 0; i < standardCount; ++i) {
-		void* stackMem = standardArena.AllocateStack(kStandardStackSize);
-		if (!stackMem) throw std::runtime_error("Failed to allocate stack");
+	// ORDER IS Standard, Tiny, Deep, and poolIndex runs DENSE ACROSS ALL THREE. Standard first so
+	// the common class keeps the low indices it has always had -- every consumer that indexes by
+	// poolIndex (FiberRegistry's table, Event's waiter index, HazardDomain's fiber rows) sees one
+	// unbroken range and needed no change at all.
+	const StackClass order[kClassCount] =
+		{ StackClass::Standard, StackClass::Tiny, StackClass::Deep };
+	const size_t counts[kClassCount] = { standardCount, tinyCount, deepCount };
 
-		standardFibers.emplace_back();
-		Fiber& f = standardFibers.back();
-		f.stackBase = stackMem;
-		f.stackSize = kStandardStackSize;
-		f.poolIndex = i;                        // one dense range, [0, standardCount)
+	size = 0;
+	size_t nextIndex = 0;
+
+	for (size_t k = 0; k < kClassCount; ++k) {
+		const StackClass cls = order[k];
+		const size_t n       = counts[k];
+		const size_t ci      = (size_t)cls;
+		classCount[ci] = (unsigned int)n;
+		size += (unsigned int)n;
+		if (n == 0) continue;                   // NO ARENA AT ALL for an empty class -- a zero-count
+		                                        // class must not reserve address space either.
+
+		const size_t region = RegionFor(cls);
+		arenas[ci] = new FiberStackArena(n * region);
+		fibers[ci].reserve(n);
+
+		for (size_t i = 0; i < n; ++i) {
+			void* stackMem = arenas[ci]->AllocateStack(region);
+			if (!stackMem) throw std::runtime_error("Failed to allocate stack");
+
+			fibers[ci].emplace_back();
+			Fiber& f = fibers[ci].back();
+			f.stackBase  = stackMem;
+			// STACK SIZE IS THE REGION, NOT THE USABLE FIGURE. Fiber::Init computes the stack TOP as
+			// stackBase + stackSize, and the region base is what AllocateStack returned -- the guard
+			// page is at the bottom, so the top is the far end of the whole region. Subtracting the
+			// guard here would move the top down a page and waste it; the guard protects by being
+			// unbacked at the LOW end, which is where a downward-growing stack runs into it.
+			f.stackSize  = region;
+			f.stackClass = cls;
+			f.poolIndex  = nextIndex++;         // dense across classes
 
 		// TSAN: ONE HANDLE PER FIBER, MADE HERE AND NEVER DESTROYED -- which matches the fibers
 		// themselves, since the pool reserves and leaks them. Without this every switch into this
@@ -37,16 +63,15 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount)
 		// enter and leave are always on the same thread and the THREAD's slot is correct. See
 		// CurrentEpochSlot in Thread.h.
 
-		// Push into the lock-free queue instead of a vector
-		availableFibers.enqueue(&f);
+			// Into ITS OWN class's free queue. One shared queue would hand a Deep asker a 64 KB
+			// stack, which is the failure the classes exist to prevent.
+			availableFibers[ci].enqueue(&f);
+		}
 	}
-
-	// A SECOND LOOP BUILT A 512 KB "HEAVY" CLASS HERE AND IS GONE. Nothing requested it -- see the
-	// note in the header -- and it committed ~127 MB on a 31-worker pool while it waited.
 }
-GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount)
+GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount, size_t tinyCount, size_t deepCount)
 {
-	return new GlobalFiberPool(standardCount);
+	return new GlobalFiberPool(tinyCount, standardCount, deepCount);
 }
 
 
@@ -64,18 +89,18 @@ GlobalFiberPool* GlobalFiberPool::Create(size_t standardCount)
 //
 // try_dequeue_bulk does the whole thing in one call with no allocation. The queue always had the
 // entry point; we were just not using it.
-size_t GlobalFiberPool::StealInto(Fiber** dest, size_t maxCount) {
+size_t GlobalFiberPool::StealInto(Fiber** dest, size_t maxCount, StackClass c) {
 	if (maxCount == 0) return 0;
-	return availableFibers.try_dequeue_bulk(dest, maxCount);
+	return availableFibers[(size_t)c].try_dequeue_bulk(dest, maxCount);
 }
 
 // KEPT, AND NOW A WRAPPER RATHER THAN THE IMPLEMENTATION. It is public on GlobalFiberPool, so it
 // stays; but having the allocating version be the one that does the work meant the hot path
 // inherited the allocation. One implementation now, and it is the one without the vector.
-std::vector<Fiber*> GlobalFiberPool::StealBatch(size_t count)
+std::vector<Fiber*> GlobalFiberPool::StealBatch(size_t count, StackClass c)
 {
 	std::vector<Fiber*> batch(count);
-	const size_t got = StealInto(batch.data(), count);
+	const size_t got = StealInto(batch.data(), count, c);
 	batch.resize(got);
 	return batch;
 }
@@ -94,8 +119,22 @@ void GlobalFiberPool::ReturnBatch(Fiber** fibers, size_t count) {
 	// worker, so the two cannot be interleaved into one enqueue-per-fiber loop and still be one
 	// bulk call -- but they do not need to be: every fiber here is already ours. Same reasoning as
 	// the refill above, and the same saving.
-	for (size_t i = 0; i < count; ++i) fibers[i]->ResetForReuse();
-	availableFibers.enqueue_bulk(fibers, count);
+	// ROUTED BY THE FIBER'S OWN CLASS, one bulk call per class present in the batch. A batch is
+	// almost always single-class -- a worker's cache holds one class -- so the common case is one
+	// scrub loop and one enqueue_bulk, exactly as before. The grouping exists so a mixed batch
+	// cannot file a 512 KB stack into the Tiny queue, which would hand it to an I/O continuation
+	// and quietly consume the class the whole design is trying to keep cheap.
+	Fiber* grouped[kClassCount][64];
+	size_t n[kClassCount] = {};
+	for (size_t i = 0; i < count; ++i) {
+		Fiber* f = fibers[i];
+		f->ResetForReuse();
+		const size_t ci = (size_t)f->stackClass;
+		grouped[ci][n[ci]++] = f;
+		if (n[ci] == 64) { availableFibers[ci].enqueue_bulk(grouped[ci], 64); n[ci] = 0; }
+	}
+	for (size_t ci = 0; ci < kClassCount; ++ci)
+		if (n[ci]) availableFibers[ci].enqueue_bulk(grouped[ci], n[ci]);
 }
 
 void GlobalFiberPool::FiberEntryWrapper()
@@ -123,6 +162,7 @@ size_t GlobalFiberPool::AvailableCount() const
 {
 
 	std::lock_guard<std::mutex> lock(poolMutex);
-	return availableFibers.size_approx();
-
+	size_t n = 0;
+	for (size_t ci = 0; ci < kClassCount; ++ci) n += availableFibers[ci].size_approx();
+	return n;
 }

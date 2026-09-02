@@ -4426,7 +4426,9 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	size_t standardFiberCount = coreCount * StandardFibersPerWorker();
 
 	// GlobalFiberPool now owns all fibers and stack allocation
-	globalPool = GlobalFiberPool::Create(standardFiberCount);
+	globalPool = GlobalFiberPool::Create(standardFiberCount,
+	                                     coreCount * TinyFibersPerWorker(),
+	                                     coreCount * DeepFibersPerWorker());
 	// THE REGISTRY'S ADDRESS TABLE, BUILT ONCE THE POOL EXISTS. Without it the cleanup chain's
 	// final hop has no pool to return the fiber to and would drop it -- a leaked fiber rather than
 	// a visible failure. Built here rather than lazily so the failure cannot be first observed at
@@ -5584,6 +5586,21 @@ void TaskScheduler::SetFiberBudget(size_t fibersPerWorker) {
 	g_standardFibersPerWorker = fibersPerWorker;
 }
 size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWorker; }
+
+// ---- TINY AND DEEP DEFAULT TO ZERO, AND THAT IS THE 127 MB LESSON ---------------------------
+//
+// The heavy stack class was deleted once already, and not for being a bad idea: it committed
+// 31 x 8 x 512 KB while NOTHING asked for it. AllocateStack commits and the pool builds every
+// fiber up front, so any nonzero default here is a bill every program pays at startup whether or
+// not it ever binds one.
+//
+// So the classes exist and cost nothing until a caller says how many it wants. Set before Init.
+static size_t g_tinyFibersPerWorker = 0;
+static size_t g_deepFibersPerWorker = 0;
+void   TaskScheduler::SetTinyFibersPerWorker(size_t n) { g_tinyFibersPerWorker = n; }
+size_t TaskScheduler::TinyFibersPerWorker()            { return g_tinyFibersPerWorker; }
+void   TaskScheduler::SetDeepFibersPerWorker(size_t n) { g_deepFibersPerWorker = n; }
+size_t TaskScheduler::DeepFibersPerWorker()            { return g_deepFibersPerWorker; }
 
 // DEFAULT false -- pinned, which is what every release through 5.0 shipped. Migration is opt-in
 // rather than the new default because it changes a contract users already build against, and a

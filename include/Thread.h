@@ -666,7 +666,19 @@ namespace JLib {
         void RecruitForLiveRange(long long bodyNs);
 
         TaskScheduler* scheduler;
-        ThreadLocalCache<> localCache;
+        // ONE CACHE PER STACK CLASS. Indexed by (size_t)StackClass, so AcquireFiber picks with a
+        // subscript rather than a branch. Empty classes cost an unused 256-pointer array each,
+        // which is the price of not making the common path ask which class it is.
+        ThreadLocalCache<> localCache;                  // Standard -- name kept, callers unchanged
+        ThreadLocalCache<> tinyCache;
+        ThreadLocalCache<> deepCache;
+        ThreadLocalCache<>& CacheFor(StackClass c) {
+            switch (c) {
+                case StackClass::Tiny: return tinyCache;
+                case StackClass::Deep: return deepCache;
+                default:               return localCache;
+            }
+        }
         static thread_local Thread* instance;
 
         // Set by MarkQueuedWork() (see its comment) whenever THIS worker's own inbox/deque

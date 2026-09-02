@@ -1101,6 +1101,14 @@ endif()
 # THE PUBLIC JOB IS A FIBER. Asserts the BEHAVIOUR, not the type tag: a plain CreateTask must be
 # able to suspend and resume (illegal under the old Native default), and ParallelFor grains must
 # still take no fiber, or grain concurrency silently becomes bounded by the fiber pool.
+# THREE STACK CLASSES. Tiny and Deep default to 0 per worker (the 127 MB lesson), so a green suite
+# says nothing about them -- this is the only thing that turns them on. Asserts the class bound from
+# INSIDE the task, that poolIndex stays dense across classes (Event's waiter hash and
+# FiberRegistry's table both depend on it), and that a released fiber goes home to its own class.
+add_executable(SchedulerStackClassesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/stack_classes_test.cpp")
+target_link_libraries(SchedulerStackClassesTest PRIVATE Scheduler)
+target_compile_features(SchedulerStackClassesTest PRIVATE cxx_std_17)
+
 # EPOCH RECLAMATION ACTUALLY FREES. Nothing asserted this before, which was survivable while a
 # global queue meant any reclaimer drained every retirement. Per-thread bags mean only the OWNER
 # drains its own, so a green suite no longer implies memory comes back. Carries its own negative

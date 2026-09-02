@@ -44,6 +44,30 @@ namespace JLib {
     //             alternative is racy.
     enum class TaskType : uint8_t { Native, Fiber, Coroutine };
 
+    // ---- WHICH STACK A FIBER TASK WANTS --------------------------------------------------------
+    //
+    // THREE CLASSES, AND THE REASON THERE ARE THREE IS NOT SYMMETRY:
+    //
+    //   Standard  64 KB. What everything gets unless it says otherwise.
+    //
+    //   Tiny      An I/O continuation does almost nothing: it wakes, reads a completion, and
+    //             finishes. Giving it 64 KB is what makes a fiber-per-pending-operation
+    //             unaffordable -- and that unaffordability is the whole reason the C++20 coroutine
+    //             layer exists. Make the stack small enough and Event::Wait on a fiber replaces
+    //             co_await, which keeps the project buildable as C++17.
+    //
+    //   Deep      512 KB. NEWLY NECESSARY, and it is a direct consequence of the public job
+    //             becoming a fiber: work that recurses deeply used to run as a Native task on the
+    //             OS thread's megabyte-plus stack. Now it gets 64 KB with a guard page under it,
+    //             so what used to be slow-but-fine is a fault.
+    //
+    // GUARD PAGE ARITHMETIC MATTERS HERE. FiberStackArena leaves the lowest page of every region
+    // unbacked, so USABLE depth is one page less than the class size and a class must be larger
+    // than a page or AllocateStack refuses outright. "4 KB of stack" means an 8 KB region.
+    //
+    // Standard is 0 so a zero-initialised Task asks for what it used to get.
+    enum class StackClass : uint8_t { Standard = 0, Tiny = 1, Deep = 2 };
+
     // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). FULLY ORTHOGONAL to hiPri by
     // design: hiPri is QUEUE ORDER (drained/stolen first) and NOTHING ELSE; placement is governed SOLELY
     // by this field -- priority never implies a core class (a loPri P-core task and a hiPri E-core task
@@ -112,12 +136,21 @@ namespace JLib {
     //                 than CreateTask (the MPSC queues' stub_, TaskDAG's nodes) never set it and
     //                 keep paying the call, so a missed set can only ever be slow, never wrong. The
     //                 inverse default would make an oversight leak captures silently.
+//   stackClass    which fiber stack this task needs. Two bits for three classes; see StackClass.
+//                 THE FLAG BLOCK NOW SPILLS PAST ONE BYTE (7 bits -> 9) AND sizeof(Task) IS
+//                 UNCHANGED, because the byte after it was padding to the 16-byte alignment. That
+//                 is exactly the slack the header note below describes, so this is spending it
+//                 rather than growing the task. A requiredSize bit lived here once and was removed
+//                 with the heavy stack class; this is not that field returning by accident -- it
+//                 has a reader (Thread::AcquireFiber) from the day it lands, which is precisely
+//                 what the old one never had.
 #define JLIB_TASK_FLAG_FIELDS            \
         uint8_t   hiPri         : 1;     \
         TaskType  type          : 2;     \
         uint8_t   priorityBoost : 1;     \
         CorePref  corePref      : 2;     \
-        uint8_t   trivialDtor   : 1;
+        uint8_t   trivialDtor   : 1;     \
+        StackClass stackClass   : 2;
 
     struct alignas(16) Task {
         using Func = void(*)(void*);
@@ -247,12 +280,14 @@ namespace JLib {
         Task()
             : fn(nullptr), data(nullptr), assignedFiber(nullptr), next(nullptr),
               hiPri(0), type(TaskType::Native),
-              priorityBoost(0), corePref(CorePref::Default), trivialDtor(0) { ; }
+              priorityBoost(0), corePref(CorePref::Default), trivialDtor(0),
+              stackClass(StackClass::Standard) { ; }
         Task(Func f, void* d = nullptr, uint8_t hipri = false)
             // hipri is a uint8_t taking any value; normalize rather than truncate into one bit.
             : fn(f), data(d), assignedFiber(nullptr), next(nullptr),
               hiPri(hipri ? 1 : 0), type(TaskType::Native),
-              priorityBoost(0), corePref(CorePref::Default), trivialDtor(0) {
+              priorityBoost(0), corePref(CorePref::Default), trivialDtor(0),
+              stackClass(StackClass::Standard) {
         }
         virtual ~Task() {
 
@@ -303,8 +338,15 @@ namespace JLib {
         // were padding before the packing too. So the cache-line assert above cannot see this
         // failure and it needs its own.
         struct TaskFlagPacking { JLIB_TASK_FLAG_FIELDS };
-        static_assert(sizeof(TaskFlagPacking) == 1,
-                      "Task's six flags must pack into a single byte -- see the flag block in Task");
+        // TWO BYTES NOW, NOT ONE, and the guard keeps its teeth. The block was 7 bits; stackClass
+        // took it to 9, which genuinely needs a second byte -- and sizeof(Task) is unchanged because
+        // the byte after it was already padding to the 16-byte alignment.
+        //
+        // WHAT THIS STILL CATCHES is the failure it was written for: a compiler that declines to pack
+        // differently-typed bitfields into shared allocation units gives each field its own byte,
+        // which is SEVEN here and still fails. Loosening it to <= would have thrown that away.
+        static_assert(sizeof(TaskFlagPacking) == 2,
+                      "Task's seven flags must pack into two bytes -- see the flag block in Task");
 
         // The bit layout of that block, as an actual observation rather than an assumption.
         //
@@ -337,6 +379,7 @@ namespace JLib {
             probe([](TaskFlagPacking& f) { f.priorityBoost = 1; });
             probe([](TaskFlagPacking& f) { f.corePref      = CorePref::Wide; });
             probe([](TaskFlagPacking& f) { f.trivialDtor   = 1; });
+            probe([](TaskFlagPacking& f) { f.stackClass    = StackClass::Deep; });
             return h;
         }
     }

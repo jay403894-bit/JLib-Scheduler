@@ -19,8 +19,14 @@ namespace JLib {
         size_t activeCapacity = 0;
         size_t count = 0;
         GlobalFiberPool* globalPool = nullptr;
+        // WHICH CLASS THIS CACHE HOLDS. A cache is single-class by construction -- a worker keeps
+        // one per class -- so the refill below can ask for the right stacks and the spill routes
+        // home correctly without inspecting each fiber.
+        StackClass cls = StackClass::Standard;
 
-        void Initialize(GlobalFiberPool* pool, size_t runtimeCapacity) {
+        void Initialize(GlobalFiberPool* pool, size_t runtimeCapacity,
+                        StackClass c = StackClass::Standard) {
+            cls = c;
             activeCapacity = (runtimeCapacity <= MaxCapacity) ? runtimeCapacity : MaxCapacity;
             if (activeCapacity < 2) activeCapacity = 2; // need room to return a half + keep f
             globalPool = pool;
@@ -43,7 +49,7 @@ namespace JLib {
             if (count == 0 && globalPool) {
                 // Refill from the global pool, bounded by our capacity so we never
                 // overrun localFibers.
-                size_t got = globalPool->StealInto(localFibers, activeCapacity);
+                size_t got = globalPool->StealInto(localFibers, activeCapacity, cls);
                 count = got;
             }
             if (count == 0) return nullptr;

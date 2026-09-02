@@ -23,6 +23,10 @@ namespace JLib {
 		uint64_t id;
 		void* stackBase;
 		size_t stackSize;
+		// WHICH CLASS THIS FIBER BELONGS TO. Recorded rather than inferred from stackSize so
+		// ReturnBatch can route it home in one load, and so a future class with a coincidentally
+		// equal size cannot be misfiled.
+		StackClass stackClass = StackClass::Standard;
 		// DENSE, STABLE index into the global fiber pool: standard fibers occupy [0, standardCount),
 		// heavy fibers follow. The pool is leaked and its vectors are reserve()d so they never
 		// reallocate, so this is fixed for the life of the program.
