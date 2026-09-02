@@ -4423,12 +4423,29 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	unsigned int coreCount = num_workers;
 	if (coreCount == 0) coreCount = 4; // Fallback
 
-	size_t standardFiberCount = coreCount * StandardFibersPerWorker();
+	// ---- BUDGET BY BAND, NOT UNIFORMLY -------------------------------------------------------
+	//
+	// K workers serve the I/O lane and want TINY stacks; compute workers run ordinary tasks and want
+	// normal ones. Provisioning every worker for the worst thing any worker might do is what made
+	// this 1984 fibers and ~124 MB committed at startup.
+	//
+	// K IS READ BEFORE ClampHotWorkersToPool BELOW, so it is the REQUESTED value clamped to the pool
+	// by hand here. Clamping the other way round would size the pool from a K that the pool's own
+	// size had already limited -- circular, and it would silently under-provision tiny stacks on a
+	// machine small enough for the clamp to bite.
+	const size_t kBand   = (g_hotWorkersRequested.load(std::memory_order_relaxed) < coreCount)
+	                     ? g_hotWorkersRequested.load(std::memory_order_relaxed) : coreCount;
+	// AT LEAST ONE COMPUTE WORKER'S WORTH. With every worker reserved the compute count is 0, and a
+	// pool with no normal fibers cannot run an ordinary Fiber task at all -- including the ones a K
+	// worker picks up when its lane inbox is empty, which it is allowed and expected to do.
+	const size_t compute = (coreCount > kBand) ? (coreCount - kBand) : 1;
+
+	size_t standardFiberCount = compute * NormalFibersPerComputeWorker();
 
 	// GlobalFiberPool now owns all fibers and stack allocation
 	globalPool = GlobalFiberPool::Create(standardFiberCount,
-	                                     coreCount * TinyFibersPerWorker(),
-	                                     coreCount * DeepFibersPerWorker());
+	                                     kBand   * TinyFibersPerKWorker(),
+	                                     compute * DeepFibersPerComputeWorker());
 	// THE REGISTRY'S ADDRESS TABLE, BUILT ONCE THE POOL EXISTS. Without it the cleanup chain's
 	// final hop has no pool to return the fiber to and would drop it -- a leaked fiber rather than
 	// a visible failure. Built here rather than lazily so the failure cannot be first observed at
@@ -5582,10 +5599,66 @@ static size_t g_standardFibersPerWorker = 64;
 // ONE PARAMETER, because there is one stack class. This took (standard, heavy); the heavy class is
 // gone -- see GlobalFiberPool -- and a second argument that silently did nothing would be the same
 // trap Task::requiredSize was.
-void TaskScheduler::SetFiberBudget(size_t fibersPerWorker) {
-	g_standardFibersPerWorker = fibersPerWorker;
+// ---- THE BUDGET IS PER BAND, BECAUSE THE BANDS DO DIFFERENT JOBS ----------------------------
+//
+// A flat count per worker provisioned every worker for the worst thing any worker might do. The
+// bands are not interchangeable:
+//
+//   COMPUTE workers run ordinary tasks       -> normal stacks, and the occasional deep one
+//   K (reserved) workers serve the I/O lane   -> TINY stacks, and essentially nothing else
+//
+// SIZE AGAINST PEAK-LIVE, NOT WORST CASE. This is the same correction the slab took (176 MB -> 4 MB):
+// 64 normal per worker is 1984 fibers and ~124 MB committed at startup on a 31-worker box, sized for
+// a peak that assumed every worker might have 64 tasks suspended at once. Four is what a worker
+// actually holds blocked in the workloads here.
+//
+// THESE ARE POOL TOTALS AND CACHE PREFILL, NOT A PARTITION. A K worker that steals ordinary work
+// still gets a normal fiber -- from the global queue rather than its own cache. Exhaustion is
+// global and is a SPIN, not a failure: AcquireFiber returns null, the task is requeued, and the
+// warning in Thread.cpp names this lever by name.
+//
+// AND THE TRADE IS REAL: 124 total normal fibers is reachable where 1984 was not. A graph with 200
+// simultaneously-blocked nodes now spins on acquisition. That is the number to raise if a workload
+// ever reports the exhaustion warning.
+// 64, NOT 4, AND THE REASON IS MEASURED RATHER THAN CAUTIOUS.
+//
+// 4 per compute worker is 124 fibers on a 31-worker box and it DEADLOCKS dag_cancel_test. Not a
+// stall -- the exhaustion warning in Thread.cpp already described the exact shape: "if the tasks
+// holding the fibers are waiting on work that cannot get a fiber because they are holding them all,
+// nothing progresses again."
+//
+// AND THAT IS NOT A NUMBER PROBLEM, IT IS A SHAPE PROBLEM. How many nodes a DAG blocks at once is a
+// property of the GRAPH, not of the core count, so no per-worker constant bounds it. 64 was never a
+// considered figure either -- it was just large enough to hide this.
+//
+// THE REAL FIX IS THE ONE THE SLAB ALREADY TOOK: grow on exhaustion instead of failing, which took
+// it from 176 MB to 4 MB while removing the failure mode rather than papering over it. The fiber
+// pool is still in the slab.s pre-fix state -- oversized so exhaustion is unreachable. Until it
+// grows, this stays where it was.
+static size_t g_normalPerComputeWorker = 64;
+static size_t g_tinyPerKWorker         = 16;
+// DEEP IS THE ONE WHERE PER-WORKER SCALING IS QUESTIONABLE, and it is worth saying so rather than
+// hiding it in a default. "How many deeply-recursive tasks are in flight" is a property of the
+// APPLICATION, not of the core count -- and at 512 KB apiece, 1 per worker is ~15.5 MB committed on
+// a 31-worker box for a class that may never be bound. That is the heavy class's original mistake
+// in miniature. Kept per-worker because it is the simple thing to reason about; revisit it against a
+// real workload rather than against this comment.
+static size_t g_deepPerComputeWorker   = 0;   // OPT-IN. See the header.
+
+void TaskScheduler::SetFiberBudget(size_t normalPerComputeWorker,
+                                   size_t tinyPerKWorker,
+                                   size_t deepPerComputeWorker) {
+	g_normalPerComputeWorker = normalPerComputeWorker;
+	g_tinyPerKWorker         = tinyPerKWorker;
+	g_deepPerComputeWorker   = deepPerComputeWorker;
+	// Kept in step so the old single-argument meaning (and StandardFibersPerWorker's readers) still
+	// report something true rather than a stale 64.
+	g_standardFibersPerWorker = normalPerComputeWorker;
 }
-size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWorker; }
+size_t TaskScheduler::StandardFibersPerWorker() { return g_normalPerComputeWorker; }
+size_t TaskScheduler::NormalFibersPerComputeWorker() { return g_normalPerComputeWorker; }
+size_t TaskScheduler::TinyFibersPerKWorker()         { return g_tinyPerKWorker; }
+size_t TaskScheduler::DeepFibersPerComputeWorker()   { return g_deepPerComputeWorker; }
 
 // ---- TINY AND DEEP DEFAULT TO ZERO, AND THAT IS THE 127 MB LESSON ---------------------------
 //
@@ -5595,12 +5668,6 @@ size_t TaskScheduler::StandardFibersPerWorker() { return g_standardFibersPerWork
 // not it ever binds one.
 //
 // So the classes exist and cost nothing until a caller says how many it wants. Set before Init.
-static size_t g_tinyFibersPerWorker = 0;
-static size_t g_deepFibersPerWorker = 0;
-void   TaskScheduler::SetTinyFibersPerWorker(size_t n) { g_tinyFibersPerWorker = n; }
-size_t TaskScheduler::TinyFibersPerWorker()            { return g_tinyFibersPerWorker; }
-void   TaskScheduler::SetDeepFibersPerWorker(size_t n) { g_deepFibersPerWorker = n; }
-size_t TaskScheduler::DeepFibersPerWorker()            { return g_deepFibersPerWorker; }
 
 // DEFAULT false -- pinned, which is what every release through 5.0 shipped. Migration is opt-in
 // rather than the new default because it changes a contract users already build against, and a

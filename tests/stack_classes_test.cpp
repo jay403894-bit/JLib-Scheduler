@@ -38,8 +38,14 @@ static void Check(bool c, const char* what) {
     if (!c) ++g_failures;
 }
 
-static constexpr size_t kTinyPerWorker = 4;
-static constexpr size_t kDeepPerWorker = 2;
+// K WORKERS ARE WHERE TINY FIBERS LIVE, so the test must set K or the tiny count is zero
+// and every assertion below it is vacuous. That is the band budget working as designed, and it is
+// exactly the kind of thing a test can fail to notice: with K=0 the pool builds no tiny stacks at
+// all and a Tiny task would spin on acquisition rather than report anything.
+static constexpr size_t kHotWorkers    = 2;
+static constexpr size_t kTinyPerK      = 8;
+static constexpr size_t kNormalPerCompute = 4;
+static constexpr size_t kDeepPerCompute   = 2;
 
 // What the fiber bound to this task actually is. Read from inside the body, which is the only place
 // the answer reflects routing rather than intent.
@@ -72,8 +78,13 @@ int main() {
     std::printf("=== stack classes: tiny / standard / deep ===\n");
 
     // MUST precede Init -- the pool builds every fiber up front.
-    TaskScheduler::SetTinyFibersPerWorker(kTinyPerWorker);
-    TaskScheduler::SetDeepFibersPerWorker(kDeepPerWorker);
+    // SetHotWorkers, NOT SetReservedCores -- two different things, and confusing them is what made
+    // the first run of this test build ZERO tiny fibers and then HANG waiting for one.
+    // SetReservedCores holds cores back FROM the pool; K is a band WITHIN it, the workers that
+    // serve the I/O lane. Only K sizes the tiny class.
+    TaskScheduler::SetHotWorkers(kHotWorkers);
+    TaskScheduler::SetFiberBudget(kNormalPerCompute, kTinyPerK, kDeepPerCompute);
+
     TaskScheduler::Init(4);
     auto& sched = TaskScheduler::Instance();
     auto& pool  = sched.GetGlobalPool();
@@ -83,8 +94,19 @@ int main() {
                 page, pool.CountOf(StackClass::Tiny), pool.CountOf(StackClass::Standard),
                 pool.CountOf(StackClass::Deep), pool.TotalCount());
 
-    Check(pool.CountOf(StackClass::Tiny) > 0 && pool.CountOf(StackClass::Deep) > 0,
+    const bool provisioned = pool.CountOf(StackClass::Tiny) > 0 && pool.CountOf(StackClass::Deep) > 0;
+    Check(provisioned,
           "the pool actually built tiny and deep fibers (else everything below is vacuous)");
+    // BAIL, DO NOT CONTINUE. A task asking for a class the pool has none of does not fail -- it
+    // SPINS: AcquireFiber returns null, the task is requeued, and the worker tries again forever.
+    // The first run of this file did exactly that and had to be killed. A precondition that cannot
+    // be met is a reason to stop with a message, not to proceed into a hang.
+    if (!provisioned) {
+        std::printf("  REFUSING to continue: a Tiny or Deep task would SPIN on acquisition rather\n"
+                    "  than fail, so this test would hang instead of reporting.\n");
+        std::printf("=== FAILED (%d failures) ===\n", g_failures);
+        return 1;
+    }
 
     // ---- 1 + 4: the class asked for is the class bound, and usable meets the promise ----------
     {
@@ -136,7 +158,7 @@ int main() {
     // ONE TASK CANNOT SHOW THIS. Misfiling only surfaces once a fiber has been released and handed
     // out again, so this runs a sequence longer than the tiny class is deep.
     {
-        const size_t rounds = kTinyPerWorker * 4 + 8;
+        const size_t rounds = kTinyPerK * 4 + 8;
         size_t wrong = 0;
         for (size_t i = 0; i < rounds; ++i) {
             const Seen s = RunOne(sched, StackClass::Tiny);

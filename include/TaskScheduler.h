@@ -2373,15 +2373,24 @@ namespace JLib {
 		// reach it from outside the library. Call this before Init() instead.
 		// ONE STACK CLASS: the 512 KB "heavy" class was deleted (nothing ever requested it, and it
 		// committed ~127 MB up front). Add a second class back when a workload needs one.
-		static void SetFiberBudget(size_t fibersPerWorker);
+		// PER BAND, because the bands do different jobs: compute workers run ordinary tasks and want
+		// normal stacks, K (reserved) workers serve the I/O lane and want TINY ones. POOL TOTALS and
+		// cache prefill, NOT a partition -- a K worker that steals ordinary work still draws a normal
+		// fiber from the global queue, and exhaustion is global and is a SPIN rather than a failure.
+		//
+		// DEEP DEFAULTS TO 0: opt-in. At 512 KB apiece, 1 per worker is ~15.5 MB committed on a
+		// 31-worker box for a class that may never be bound -- the heavy class's original mistake in
+		// miniature. Set before Init().
+		static void SetFiberBudget(size_t normalPerComputeWorker = 64,
+		                           size_t tinyPerKWorker        = 16,
+		                           size_t deepPerComputeWorker  = 0);
+		static size_t NormalFibersPerComputeWorker();
+		static size_t TinyFibersPerKWorker();
+		static size_t DeepFibersPerComputeWorker();
 		static size_t StandardFibersPerWorker();
 		// Tiny (8 KiB usable, for I/O continuations) and Deep (508 KiB, for deep recursion).
 		// BOTH DEFAULT TO 0 -- see the note at their definition; a nonzero default commits memory
 		// at startup for every program whether or not it binds one. Set before Init().
-		static void   SetTinyFibersPerWorker(size_t n);
-		static size_t TinyFibersPerWorker();
-		static void   SetDeepFibersPerWorker(size_t n);
-		static size_t DeepFibersPerWorker();
 
 		// ---- MIGRATABLE FIBERS: the mode switch, and it is ONE PREDICATE, not two schedulers -----
 		//
