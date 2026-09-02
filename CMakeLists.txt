@@ -1201,3 +1201,10 @@ add_executable(SchedulerRuntimeBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/runtime_
 target_link_libraries(SchedulerRuntimeBench PRIVATE Scheduler)
 target_compile_features(SchedulerRuntimeBench PRIVATE cxx_std_17)
 set_target_properties(SchedulerRuntimeBench PROPERTIES OUTPUT_NAME runtime_bench)
+
+# COMPILES THE README'S EXAMPLES. Documentation that does not build is worse than none -- it costs a
+# reader their first hour and teaches them not to trust the rest of the page. This target exists so
+# the quick-start cannot rot silently; it is never run, only compiled.
+add_executable(SchedulerReadmeCheck "${CMAKE_CURRENT_SOURCE_DIR}/tests/readme_check.cpp")
+target_link_libraries(SchedulerReadmeCheck PRIVATE Scheduler)
+target_compile_features(SchedulerReadmeCheck PRIVATE cxx_std_17)
