@@ -1580,3 +1580,47 @@ from. A stranded backlog is a known possibility in that design.
 One of these hangs was found orphaned at **1187 CPU-seconds**, starving every other test in the run
 and making unrelated tests look flaky. When a suite result changes shape run to run, check for a
 leftover process BEFORE reading anything into the failures.
+
+## Thread-only epoch slots: 2016 participants -> 32
+
+`CurrentEpochSlot()` returned the running FIBER's slot, and `GlobalFiberPool` registered one EBR
+participant per fiber. `MinActiveEpoch` scans every participant on every reclaim attempt, so it
+walked `coreCount * StandardFibersPerWorker` of them. Measured on a 31-worker box:
+
+    before   MinActiveEpoch: 0.629 us per call over 2016 participant slots
+    after    MinActiveEpoch: 0.016 us per call over   32 participant slots
+
+**The fiber slot was never protecting the fiber.** It made an UNCHECKED violation harmless:
+suspending inside an EpochGuard is forbidden, and because the slot travelled with the fiber, doing
+it anyway was merely slow (the slot stayed announced, reclamation stalled, and it surfaced later as
+allocator exhaustion). A leak, not a crash -- which is exactly why nobody had to fix it.
+
+On thread-only slots the same violation is a USE-AFTER-FREE: enter announces thread A's slot, the
+fiber resumes on B, and the destructor clears B's slot -- which was never set -- un-announcing a
+live traversal on B and freeing its nodes underneath it.
+
+So this is the counted-epoch trade one level up, and it takes the same answer: **delete the
+insurance, enforce the rule.** `JLIB_EPOCH_CHECK_NO_GUARD` is now live in RELEASE and reads the SLOT
+rather than a depth counter -- `t_epochGuardDepth` and its ENTER/LEAVE macros are gone entirely, so
+even dev builds stop paying two thread_local ops per guard. Fibers and coroutines collapse into one
+check, because with one slot per thread it is one question.
+
+### OPEN: is running a task inside an EpochGuard legal?
+
+`TaskDAG::ForEachDependent` holds a guard while it FIRES dependents. A dependent that runs inline
+therefore reaches "fiber exit (task returned)" inside someone else's guard, having done nothing
+wrong -- `dag_external_test` hits this deterministically, 4/4.
+
+That makes the EXIT site ambiguous in a way the SUSPEND sites are not, and one slot read cannot
+separate them:
+
+    LEAKED   this task took a guard and never dropped it -> reclamation stalls from here on
+    NESTED   an outer traversal on this thread is still live -> nothing is wrong
+
+So the exit site warns ONCE and does not abort (`JLIB_EPOCH_CHECK_NO_GUARD_AT_EXIT`), while the
+suspend sites still abort, where the answer is unambiguous.
+
+**The real question is not settled.** If a dependent fired inside `ForEachDependent` ever SUSPENDS,
+the outer guard spans a migration and the ambiguity stops being benign -- it becomes the exact
+use-after-free the suspend check exists to prevent. Either dependents must not be fired inside the
+guard, or the walk must copy the edges first and drop the guard before firing. Not decided here.

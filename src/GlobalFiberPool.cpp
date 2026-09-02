@@ -28,10 +28,14 @@ GlobalFiberPool::GlobalFiberPool(size_t standardCount)
 		// thread, which misses real races and invents false ones. No-op without the sanitizer.
 		f.tsanFiber = tsan::CreateFiber();
 
-		// Register this fiber's EBR slot ONCE. Fibers live for the whole program (the
-		// pool is leaked, the vector is reserve()'d so it never reallocates), so the
-		// slot address is stable and never needs unregistering -- no lifetime trap.
-		EpochManager::Instance().RegisterParticipant(&f.localEpoch);
+		// NO PER-FIBER EPOCH SLOT. This registered &f.localEpoch as an EBR participant, which meant
+		// MinActiveEpoch scanned one slot PER FIBER on every reclaim attempt -- 2016 slots and
+		// 0.629 us per call on a 31-worker box, against 32 once only threads participate.
+		//
+		// The fiber slot existed so protection could survive a suspension. It never needed to:
+		// suspending inside an EpochGuard is forbidden and is now enforced in Release, so a guard's
+		// enter and leave are always on the same thread and the THREAD's slot is correct. See
+		// CurrentEpochSlot in Thread.h.
 
 		// Push into the lock-free queue instead of a vector
 		availableFibers.enqueue(&f);
@@ -109,7 +113,7 @@ void GlobalFiberPool::FiberEntryWrapper()
 	// epoch, and the fiber then goes back to the pool carrying it. ReturnBatch() already scrubs
 	// localEpoch to SIZE_MAX for exactly that reason -- this catches the CAUSE instead, since a
 	// guard that outlives its traversal is a bug wherever it happens.
-	JLIB_EPOCH_CHECK_NO_GUARD("fiber exit (task returned)");
+	JLIB_EPOCH_CHECK_NO_GUARD_AT_EXIT("fiber exit (task returned)");
 
 	Thread::TsanSwitchToScheduler();
 	ContextSwitch(&self->ctx, self->homeCtx);

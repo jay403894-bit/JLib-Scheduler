@@ -517,119 +517,140 @@ namespace JLib {
 // migration and thread-local and fiber-local agree. They diverge only in the case this exists to
 // catch, and they diverge in the direction that fires.
 //
-// DEBUG/DEVELOPMENT ONLY. Release builds carry neither the counter nor the checks, so this costs a
-// shipped binary nothing -- same policy as GetEvent's registry tripwire.
-#if defined(_DEBUG) || defined(JLIB_DEVELOPMENT)
+// ---- ENFORCED IN RELEASE, AND READ FROM THE SLOT ----------------------------------------------
+//
+// This was DEBUG/DEVELOPMENT ONLY, and that was affordable for exactly one reason: a fiber carried
+// its OWN epoch slot, so a fiber that suspended inside a guard was merely SLOW -- the slot stayed
+// announced, reclamation stalled, and it showed up much later as allocator exhaustion. A leak.
+//
+// ONCE EVERY READER USES THE THREAD SLOT, THAT SAME VIOLATION IS A USE-AFTER-FREE. Enter announces
+// thread A's slot; the fiber resumes on B and its destructor clears B's slot -- which was never set,
+// so a live traversal on B is un-announced and its nodes are freed underneath it. The fiber slot was
+// never protection for the fiber; it was insurance against this rule going unchecked.
+//
+// That is the identical trade counted epochs made for coroutines, one level up, and it gets the
+// identical answer: DELETE THE INSURANCE, ENFORCE THE RULE.
+//
+// IT READS THE SLOT, NOT A DEPTH COUNTER, and that is what makes it affordable to ship. The counter
+// cost two thread_local operations on EVERY guard -- the path measured at 2.52 billion guards/sec.
+// The slot is already there, and asking it costs ONE load AT A SUSPENSION, which is rare and
+// already expensive. So `t_epochGuardDepth` and its ENTER/LEAVE macros are gone entirely: dev builds
+// stop paying for them too.
+//
+// WHY THE READ IS SOUND. With one slot per thread, the only announcer of this thread's slot is
+// whatever is running on this thread. At a suspend point that is the caller. So "announced" means
+// "the caller holds a guard", with no false-positive path -- and fibers and coroutines collapse into
+// ONE check, because the thing being detected is the same for both.
+//
+// Not a defect peculiar to this design: bounded critical sections are what EBR IS, in the paper too.
+// A stalled participant stalls reclamation everywhere; hazard pointers dodge it by protecting
+// per-object and pay on every read. What fibers change is only how EASY the violation is to write,
+// because suspending is cheap and idiomatic here. The fix at any call site is always the same:
+// finish the traversal, drop the guard, then wait.
+//
+// IF THE TRAVERSAL GENUINELY MUST SPAN THE SUSPENSION, use a HazardGuard. Hazard cells are indexed
+// by the reader and survive a park by design; that is why both schemes exist.
 namespace JLib {
-	inline thread_local int t_epochGuardDepth = 0;
+	// TEST SEAM, narrow on purpose: it replaces what happens AFTER detection, never whether
+	// detection runs. A regression test cannot assert on a process that has already aborted.
+	using EpochSuspendViolationFn = void (*)();
+	inline std::atomic<EpochSuspendViolationFn> g_epochSuspendViolation{ nullptr };
+	inline void SetEpochSuspendViolationHandlerForTest(EpochSuspendViolationFn fn) {
+		g_epochSuspendViolation.store(fn, std::memory_order_relaxed);
+	}
 
 	// `where` names the suspend point, so the message says which call has to drop its guard first
 	// rather than leaving you to find it.
 	inline void EpochGuardSuspendCheck(const char* where) {
-		if (t_epochGuardDepth > 0) {
-			fprintf(stderr,
-				"[JLib::Scheduler] INVARIANT VIOLATED: fiber suspended inside an EpochGuard at %s "
-				"(depth %d). The fiber's epoch slot stays announced for the whole suspension, so "
-				"MinActiveEpoch() cannot advance and NOTHING retired from now on will ever be "
-				"reclaimed. This does not crash -- it leaks, and shows up much later as allocator "
-				"exhaustion. Fix: end the guarded traversal and let the EpochGuard destruct BEFORE "
-				"waiting.\n",
-				where, t_epochGuardDepth);
-			assert(false && "fiber suspended while holding an EpochGuard -- see stderr");
-		}
-	}
-
-	// THE COROUTINE CASE IS WORSE THAN THE FIBER CASE, and it is a separate message because the
-	// consequence is different in kind.
-	//
-	// A coroutine runs as a NATIVE task, so `Thread::currentFiber` is null and CurrentEpochSlot()
-	// falls through to the per-THREAD fallback slot. That is correct while the guarded region stays
-	// on one worker -- which it does, as long as nothing suspends inside it.
-	//
-	// Suspend inside a guard and the guard's ENTER and EXIT happen on DIFFERENT WORKERS, because a
-	// resumed coroutine goes wherever the scheduler puts it. Then:
-	//
-	//   * the entering worker's slot stays announced at that epoch FOREVER, so MinActiveEpoch()
-	//     never advances and nothing is ever reclaimed again -- the fiber failure, but permanent
-	//     rather than merely for the duration of the wait; and
-	//   * the destructor clears the RESUMING worker's slot, which it never set. If that worker was
-	//     mid-traversal in a guard of its own, that traversal is now un-announced and its nodes
-	//     become reclaimable underneath it. THAT IS A USE-AFTER-FREE, not a leak.
-	//
-	// The fiber version is a liveness bug because a fiber's slot travels with the fiber, so enter
-	// and exit always write the same place. A coroutine has no slot of its own, so they do not.
-	// ~EpochGuard already predicted this in its note about the shared per-thread fallback.
-	//
-	// THE FIX IS NOT TO GIVE COROUTINES SLOTS. That would legitimise suspending inside a guard, and
-	// a stalled participant stalls reclamation for everyone -- that is what EBR IS, in the paper as
-	// much as here. The invariant is the same for both: finish the traversal, drop the guard, then
-	// await.
-}
-#define JLIB_EPOCH_GUARD_ENTER()        (++JLib::t_epochGuardDepth)
-#define JLIB_EPOCH_GUARD_LEAVE()        (--JLib::t_epochGuardDepth)
-#define JLIB_EPOCH_CHECK_NO_GUARD(where) JLib::EpochGuardSuspendCheck(where)
-#else
-#define JLIB_EPOCH_GUARD_ENTER()        ((void)0)
-#define JLIB_EPOCH_GUARD_LEAVE()        ((void)0)
-#define JLIB_EPOCH_CHECK_NO_GUARD(where) ((void)0)
-#endif
-
-namespace JLib {
-	// ---- THE COROUTINE CHECK IS LIVE IN **RELEASE**, AND READS THE SLOT, NOT A COUNTER ----------
-	//
-	// This is the price of deleting counted epochs, and it is deliberately paid on the RARE event.
-	//
-	// The counted ring existed to survive a coroutine suspending inside a guard. That is forbidden,
-	// and the check for it used to sit behind !NDEBUG -- so in Release the rule was unenforced and
-	// the ring was the only thing standing between a violation and a use-after-free. Removing the
-	// ring without moving the check would have traded "slow but correct" for "silently wrong in the
-	// configuration that ships".
-	//
-	// IT CANNOT USE t_epochGuardDepth, because maintaining that counter costs two thread_local
-	// operations on EVERY guard -- the path measured at 2.52 billion guards/sec, and the one this
-	// whole removal exists to make cheaper. So it asks the SLOT instead: a coroutine has no slot of
-	// its own and borrows the worker's, so an announced thread slot at a co_await means this
-	// coroutine is inside a guard. ONE relaxed-ish load, at a suspension, which is rare and already
-	// expensive.
-	//
-	// NO FALSE POSITIVE PATH IS KNOWN, and the reasoning is: a coroutine task occupies its worker
-	// exclusively while running, the worker's own loop takes no epoch guards, and a suspended
-	// FIBER's guard lives in the fiber's slot rather than the thread's. If one is ever found, the
-	// fix is to narrow this check -- not to restore the ring.
-	// TEST SEAM, and a narrow one on purpose: it replaces what happens AFTER the violation is
-	// detected, never whether detection runs. The check itself is the thing paying for the counted
-	// ring's removal, so it must not be switchable off -- but a regression test cannot assert on a
-	// process that has already aborted. Default is abort.
-	using CoroSuspendViolationFn = void (*)();
-	inline std::atomic<CoroSuspendViolationFn> g_coroSuspendViolation{ nullptr };
-	inline void SetCoroSuspendViolationHandlerForTest(CoroSuspendViolationFn fn) {
-		g_coroSuspendViolation.store(fn, std::memory_order_relaxed);
-	}
-
-	inline void CoroEpochGuardSuspendCheck() {
 		std::atomic<size_t>* slot = EpochManager::Instance().ThreadSlot(thread_id);
 		if (!slot) return;
 		if (slot->load(std::memory_order_acquire) == SIZE_MAX) return;   // not announced: fine
-		if (CoroSuspendViolationFn h = g_coroSuspendViolation.load(std::memory_order_relaxed)) {
+		if (EpochSuspendViolationFn h = g_epochSuspendViolation.load(std::memory_order_relaxed)) {
 			h();
 			return;
 		}
 		fprintf(stderr,
-			"[JLib::Scheduler] INVARIANT VIOLATED: a coroutine suspended inside an EpochGuard.\n"
-			"  A coroutine has no epoch slot of its own -- it uses the WORKER's -- so this guard\n"
-			"  will exit on whichever worker resumes it. The entering worker stays announced\n"
-			"  forever (nothing is ever reclaimed again) and the resuming worker's slot is cleared\n"
-			"  without having been set, which can un-announce a live traversal and free nodes\n"
+			"[JLib::Scheduler] INVARIANT VIOLATED: suspended inside an EpochGuard at %s.\n"
+			"  Every reader uses its THREAD's epoch slot. This guard announced on the thread it\n"
+			"  started on, and will be destructed on whichever thread resumes it -- clearing a slot\n"
+			"  that was never set there, which un-announces a live traversal and frees nodes\n"
 			"  underneath it.\n"
-			"  Fix: end the guarded traversal and let the EpochGuard destruct BEFORE the co_await.\n"
-			"  If the traversal genuinely must span the suspension, use a HazardGuard -- hazard\n"
-			"  pointers support being held across a suspend; epochs do not, and that is why both\n"
-			"  schemes exist.\n");
+			"  Fix: end the guarded traversal and let the EpochGuard destruct BEFORE waiting.\n"
+			"  If it genuinely must span the suspension, use a HazardGuard -- hazard cells are\n"
+			"  indexed by the reader and survive a park; epochs do not, and that is why both\n"
+			"  schemes exist.\n",
+			where);
 		fflush(stderr);
 		std::abort();
 	}
 }
+// ENTER/LEAVE ARE NO-OPS EVERYWHERE NOW. The depth counter they maintained is gone; the check reads
+// the slot instead. Kept as macros so the guard bodies do not churn.
+#define JLIB_EPOCH_GUARD_ENTER()        ((void)0)
+#define JLIB_EPOCH_GUARD_LEAVE()        ((void)0)
+#define JLIB_EPOCH_CHECK_NO_GUARD(where) JLib::EpochGuardSuspendCheck(where)
+namespace JLib {
+	// ---- THE COROUTINE CHECK IS NOW THE SAME CHECK ------------------------------------------
+	//
+	// It had its own implementation while fibers carried per-fiber slots and coroutines borrowed the
+	// worker's: the two readers announced in different places, so "am I inside a guard" was a
+	// different question for each. With ONE SLOT PER THREAD it is the same question, and keeping two
+	// answers to it is how they drift.
+	//
+	// The separate name survives only so the call site in Coroutine.h still reads as the coroutine
+	// rule; the seam and the message are shared.
+	inline void CoroEpochGuardSuspendCheck() { EpochGuardSuspendCheck("co_await"); }
+
+	// ---- THE EXIT SITE IS AMBIGUOUS, SO IT WARNS RATHER THAN ABORTS ---------------------------
+	//
+	// A SUSPENSION inside a guard is unambiguously wrong: the guard announced on this thread and
+	// will be dropped on whichever thread resumes, which is a use-after-free. Abort.
+	//
+	// A TASK RETURNING with the slot announced is NOT the same thing, and a single slot read cannot
+	// tell the two cases apart:
+	//
+	//   LEAKED   -- this task took a guard and never dropped it. The thread stays announced,
+	//               MinActiveEpoch cannot advance, and nothing retired afterwards is ever
+	//               reclaimed. A leak, which is what this check has always said it was.
+	//   NESTED   -- an OUTER traversal on this same thread is still live and legitimately
+	//               announced. TaskDAG::ForEachDependent does exactly this: it holds a guard while
+	//               firing dependents, so a dependent that runs inline reaches fiber exit inside
+	//               someone else's guard, having done nothing wrong.
+	//
+	// dag_external_test hits the second case deterministically. Aborting on it would make a correct
+	// program die, which is worse than the leak being reported late -- so this reports once and
+	// keeps going, and the abort stays where the answer is unambiguous.
+	//
+	// THE UNDERLYING QUESTION IS NOT SETTLED: whether running a task inside an EpochGuard is legal
+	// at all. If that dependent SUSPENDS, the outer guard spans a migration and the ambiguity
+	// becomes the real bug. Recorded in design/NOTES.md rather than decided here.
+	inline std::atomic<bool> g_exitGuardWarned{ false };
+	inline void EpochGuardExitCheck(const char* where) {
+		std::atomic<size_t>* slot = EpochManager::Instance().ThreadSlot(thread_id);
+		if (!slot) return;
+		if (slot->load(std::memory_order_acquire) == SIZE_MAX) return;
+		bool expected = false;
+		if (!g_exitGuardWarned.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel, std::memory_order_relaxed))
+			return;                                  // once per process, not once per task
+		fprintf(stderr,
+			"[JLib::Scheduler] NOTE: a task returned at %s with this thread's epoch slot still\n"
+			"  announced. Either the task leaked an EpochGuard -- in which case reclamation stalls\n"
+			"  from here on -- or an OUTER guard on this thread is legitimately still live\n"
+			"  (TaskDAG::ForEachDependent holds one while it fires dependents). This warns once and\n"
+			"  does not abort, because those two cases are indistinguishable from one slot read.\n",
+			where);
+		fflush(stderr);
+	}
+
+	// Back-compat alias for the seam. One handler, because there is one check.
+	inline void SetCoroSuspendViolationHandlerForTest(EpochSuspendViolationFn fn) {
+		SetEpochSuspendViolationHandlerForTest(fn);
+	}
+}
 #define JLIB_EPOCH_CHECK_NO_GUARD_CORO() JLib::CoroEpochGuardSuspendCheck()
+// The ambiguous site -- see EpochGuardExitCheck. Warns once, never aborts.
+#define JLIB_EPOCH_CHECK_NO_GUARD_AT_EXIT(where) JLib::EpochGuardExitCheck(where)
 
 // ==================================================================================================
 // THE TWO MECHANISMS. NEITHER OF THESE IS THE ONE YOU WANT AT A CALL SITE.

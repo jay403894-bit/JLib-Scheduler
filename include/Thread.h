@@ -913,10 +913,22 @@ namespace JLib {
     // epoch concept and not a list one -- and TaskDAG needs it now that its dependent walk guards
     // itself instead of borrowing LockFreeList::for_each's guard. Epochs.h cannot host it: it
     // would have to include Fiber.h, which already includes Epochs.h. Thread.h already sees both.
+    // ---- ONE SLOT PER THREAD. NO FIBER SLOTS. ------------------------------------------------
+    //
+    // This used to return the running fiber's own slot, so protection travelled with the fiber
+    // across a suspension. That was insurance, not a feature: suspending inside an EpochGuard is
+    // forbidden (JLIB_EPOCH_CHECK_NO_GUARD, now enforced in RELEASE), so enter and leave always
+    // happen on the SAME thread and the thread's slot is always the right one.
+    //
+    // AND THE INSURANCE WAS EXPENSIVE. GlobalFiberPool registered a participant PER FIBER, so
+    // MinActiveEpoch -- which scans every participant on every reclaim attempt -- walked
+    // coreCount * StandardFibersPerWorker of them. Measured on a 31-worker box: 2016 slots,
+    // 0.629 us per call. Thread-only makes it 32 slots.
+    //
+    // THE FIBER SLOT WAS NEVER PROTECTING THE FIBER; it was making an unchecked violation harmless.
+    // Deleting it is only safe because the violation is now checked -- see the block above
+    // EpochGuardSuspendCheck for why that trade is the same one counted epochs made.
     inline std::atomic<size_t>* CurrentEpochSlot() {
-        if (Thread* w = Thread::GetCurrent())
-            if (Fiber* f = w->currentFiber)
-                return &f->localEpoch;
         return EpochManager::Instance().ThreadSlot(thread_id);
     }
 
