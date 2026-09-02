@@ -386,6 +386,27 @@ namespace JLib {
                     // queue behind a task already running there. Priority is ORDER, not isolation.
                     if (hotN == 0) { s.PushBatch(arr, n, 0, 64, hiPri); return; }
 
+                    // ---- LOPRI IS NEVER STEERED TO K. IT WOULD BE UNREACHABLE THERE. ------------
+                    //
+                    // A reserved worker NEVER READS ITS LOPRI INBOX -- Thread.cpp:2286, "that is the
+                    // invariant, not a preference", and it is guarded in the readers and in all
+                    // three park predicates. Inbox work is unstealable, so a loPri task aimed at a
+                    // K worker is not merely deprioritised: NOBODY can ever run it.
+                    //
+                    // The steering below predates that invariant and still aims every completion at
+                    // [0, hotN). A completion whose task is loPri -- which is the DEFAULT, since
+                    // CreateTask's `hipri` defaults to false -- therefore landed in a reserved
+                    // worker's loPri inbox and stayed there. Every worker then parks with work
+                    // outstanding: a permanent hang that reports as a lost wake. That is
+                    // io_c17_test, whose continuation is a plain default-priority task.
+                    //
+                    // THE FIX IS NOT TO LET K READ LOPRI. The reserved lane exists to be isolated,
+                    // and reserved_lopri_placement_test locks that. It is that ordinary work does
+                    // not belong on the lane in the first place -- K-steering is for LANE work, and
+                    // loPri completions are, by definition, not that. They go to the floor, which is
+                    // where PushBatch would have put them anyway.
+                    if (!hiPri) { s.PushBatch(arr, n, 0, 64, false); return; }
+
 
                     // Candidate hot workers, by queue index. Bounded by the hint's own width: past
                     // worker 64 no bit exists, so those are simply always candidates.

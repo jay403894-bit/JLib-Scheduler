@@ -1762,3 +1762,41 @@ Two things the controls caught that argument would not have:
    now suspends on an Event, which frees the worker while still holding the lock.
 
 `SpinThenHelp` is untouched and still used by the other primitives; only the mutex stopped calling it.
+
+## The whole I/O reactor was one routing guard, not a K rebuild (9-02)
+
+`IoC17Test` was red and `IoAsyncTest`/`IoSocketTest` hung. All three were filed as "pending the K
+worker rebuild" and the hangs had been bisected to a pre-existing commit. **All three were the same
+two-line routing bug, and the suite is now 52/52 with the reactor included.**
+
+The chain, because no single link looks wrong on its own:
+
+1. `CreateTask`'s `hipri` parameter defaults to **false**, so an ordinary continuation is LOPRI.
+2. The reactor routes by the task's own flag -- `if (resume->hiPri) batchHi[...] else batchLo[...]`.
+3. `EnableIoReactor(true)` implies `SetIoHotLane(1)`, so `hotN == 1`.
+4. `pushSteered` builds its candidate list from `[0, hotN)` **regardless of priority** and pushes
+   `PushBatch(..., cand + 1, 64, hiPri)` -- aiming the completion at worker 0, a RESERVED worker.
+5. **K never reads its loPri inbox.** Thread.cpp:2286, "that is the invariant, not a preference",
+   guarded in the readers and in all three park predicates.
+6. Inbox work is unstealable. So the completion is not deprioritised, it is UNREACHABLE. Every
+   worker parks with work outstanding: a permanent hang that reports as a lost wake.
+
+The steering predates the 8-31 invariant. When "K never reads loPri" shipped, the reactor was still
+aiming ordinary work at the lane, and nothing connected the two -- the invariant's own test
+(`reserved_lopri_placement_test`) proves K does not READ loPri, which is true and was never the
+question. Nothing tested that no one PUSHES loPri there.
+
+**The fix is not to let K read loPri.** Isolation is what the lane is for. It is that ordinary work
+never belonged on the lane: K-steering exists for LANE work, and a loPri completion is by definition
+not that, so it goes to the floor -- where `PushBatch` would have put it anyway.
+
+Two things worth keeping:
+
+- **A stale label cost real time.** The test asserted "created a plain Native continuation task". The
+  type was wrong (the default became Fiber) and, more importantly, the type was never the point --
+  `hipri = false` was. The label pointed the eye away from the only word that explained the failure.
+- **This is the third instance of one family.** `busy=1 + lo=1` (the DAG flake), `busy=1 + inbox`
+  (reproduced by accident in the mutex test's own holder), and now `parked + lo=1`. Every one is
+  work parked in an inbox nobody is permitted to drain, and every one presents as a lost wake.
+  When the dump says every worker is idle and the queue depth is not zero, look at WHO MAY READ
+  THAT QUEUE before looking at the wake path.

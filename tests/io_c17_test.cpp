@@ -61,11 +61,21 @@ int main() {
     st->done = &done;
 
     // The CONTINUATION -- the second half of a function that had to be split by hand.
-    JLib::Task* cont = sched.CreateTask([st] {
+    JLib::Task* cont = sched.CreateInternalTask([st] {
         st->done->store(st->result.Ok() && st->result.bytes == 256 ? 1 : 2,
                         std::memory_order_release);
     });
-    Check(cont != nullptr, "created a plain Native continuation task");
+    // CreateInternalTask, NOT CreateTask -- a continuation like this is the internal type by intent.
+    // It needs no fiber: it stores a result and returns, which is exactly the Native contract. The
+    // test used to say "a plain Native continuation task" while calling CreateTask, and that stopped
+    // being true silently when the everything-is-a-fiber change flipped CreateTask's default type to
+    // Fiber. The COMMENT stayed right and the CODE drifted, which is the harder direction to notice.
+    //
+    // DEFAULT PRIORITY is the other load-bearing property, and it is unchanged by this: `hipri`
+    // defaults to false either way, so this is a LOPRI task. A loPri task steered onto a reserved
+    // worker lands in an inbox K never reads -- unstealable -- and hangs the pool. That is what this
+    // test caught; the type was never the half that mattered.
+    Check(cont != nullptr, "created a plain internal (Native) continuation at DEFAULT priority");
 
     const bool immediate = io.SubmitRead(h, st->buf, 256, 0, &st->req, &st->result,
                                          cont, JLib::CancelToken{});
