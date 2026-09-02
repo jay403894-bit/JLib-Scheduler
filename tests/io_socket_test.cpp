@@ -73,12 +73,6 @@ int main() {
 
     JLib::TaskScheduler::EnableTimers(true);
     JLib::TaskScheduler::EnableIoReactor(true);
-    // WORKAROUND, NOT A PREFERENCE -- see design/NOTES.md. Requeue's migratable path pushes a
-    // resumption to a deque and returns Stealable WITHOUT advertising a steal hint, so no thief
-    // probes it. A floor owner rescans its own deque and finds it anyway; a RESERVED owner never
-    // reads loPri, so with K stealing the task is unreachable from both ends. 4 hangs in 6 without
-    // this line. Remove it when the stealable requeue advertises.
-    JLib::TaskScheduler::SetReservedStealing(false);
     JLib::TaskScheduler::Init(0);
     auto& sched = JLib::TaskScheduler::Instance();
     auto& io = JLib::IoReactor::Instance();

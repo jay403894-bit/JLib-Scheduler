@@ -2181,7 +2181,33 @@ provision a small deep count by default; fall back to Standard when the asked-fo
 CreateTask and return nullptr, which is loud and matches the slab's "grow rather than fail" lesson
 only partly. Worth deciding before anyone ships against the new parameter.
 
-## Reserved stealing vs fiber mode -- HALF FIXED (2026-09-02)
+## Reserved stealing vs fiber mode -- FIXED (2026-09-02)
+
+FIXED BY JAY IN ONE LINE, and the fix is smaller than any of the three this note proposed:
+Requeue now calls PushTarget instead of pushing to the current worker's deque. If the resumption
+is Lane::Normal it can never be placed at K, because PushTarget already masks [0,K) -- the same rule
+reserved_lopri_placement_test guards. The bug was never really about stealing or about hints; it was
+a SECOND PLACEMENT PATH that skipped the rules the first one enforces.
+
+io_socket_test with reserved stealing ON: 2 passes in 6 before, 8 in 8 after. Migration unaffected
+(203/256 resumed elsewhere; FLS 64/64, TLS 0/56).
+
+WHAT I HAD WRONG, worth keeping because the reasoning was plausible and still incorrect. I proposed
+advertising the requeue so thieves would find it. That would have re-bought a MEASURED regression:
+UpdateBacklogHint only advertises at depth >= kStealHintDepth, and its own note records what
+happened when shallow queues were advertised -- throughput 3.12 -> 1.24 M/s, kernel wakes
+169k -> 318k, floor never shed. A lone resumption is depth 1, so advertising it is exactly the case
+that was already tried and reverted. The bypassed placement was the defect; the missing
+advertisement was a symptom of pushing somewhere placement would never have chosen.
+
+The counting objection that justified the separate path is stale: `queuedTasks` is DERIVED by
+summing deque sizes now, and PushTarget's remaining side effects are inboxDepth (paired with the
+drain) and a diagnostic. Nothing accumulates per suspend/resume.
+
+The PINNED half stands on its own: a reserved worker still may not steal when fibers are pinned,
+since a pinned resume goes to its home worker by definition and no placement rule can rescue that.
+
+## Superseded: the half-fixed note (2026-09-02)
 
 Jay's rule, and it is sharper than any of the three options this note first listed:
 

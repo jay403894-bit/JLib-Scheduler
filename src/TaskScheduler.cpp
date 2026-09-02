@@ -6522,12 +6522,35 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// the redistribute path), which owns no deque. Those take the ordinary placement below rather
 	// than inventing a target.
 	if (!task->assignedFiber) JLIB_RQ_BUMP(g_rqNoFiber);
+	// ---- ONE PLACEMENT PATH. THE RESUMPTION GOES THROUGH PushTarget LIKE EVERYTHING ELSE. -----
+	//
+	// This used to be `LaneForCurrentThread()->push_bottom(task)`, returning Stealable. It pushed
+	// onto WHATEVER WORKER WAS RUNNING, and that is the bug: it skipped every placement rule
+	// PushTarget enforces. Specifically it skipped the reserved-band mask, so a reserved worker
+	// resuming a fiber parked the resumption in its OWN loPri deque -- the one queue in the pool
+	// whose owner is forbidden to read it.
+	//
+	// AND ADVERTISING IT WOULD NOT HAVE HELPED. UpdateBacklogHint only advertises at
+	// depth >= kStealHintDepth, and the note there records what happened when shallow queues were
+	// advertised: throughput 3.12 -> 1.24 M/s, kernel wakes 169k -> 318k, the floor never shed. A
+	// lone resumption is depth 1 by definition, so "Stealable" was a claim no thief could act on.
+	//
+	// PushTarget MASKS, MARKS AND NOTIFIES -- the three things the old line did not do -- and it is
+	// callable here without widening anything, because Requeue is a TaskScheduler member and
+	// PushTarget is a private one. No public surface changes.
+	//
+	// THE COUNTING OBJECTION IS STALE. The old comment below warned that going through PushTarget
+	// would "leak +1" per suspend/resume cycle. That counter is gone: `queuedTasks` in the pool
+	// dump is DERIVED by summing deque sizes, and PushTarget's remaining side effects are
+	// inboxDepth (paired with the drain's decrement) and a diagnostic. Nothing accumulates.
+	//
+	// MEASURED: io_socket_test with reserved stealing ON went from 2 passes in 6 to green.
 	if (FibersMigrate() && task->assignedFiber) {
-		if (TaskDeque* lane = LaneForCurrentThread()) {
-			if (lane->push_bottom(task)) { JLIB_RQ_BUMP(g_rqLane); return RequeueResult::Stealable; }
-			// push_bottom refuses only at the growth ceiling. Falling through to placement is
-			// better than dropping a resumed fiber, which would strand a live 64KB stack.
-		}
+		JLIB_RQ_BUMP(g_rqLane);
+		if (PushTarget(task)) return RequeueResult::Stealable;
+		// PushTarget returns false only for a null task, which cannot happen here -- but falling
+		// through to the ordinary placement below is still the right answer rather than dropping a
+		// resumed fiber, which would strand a live stack.
 	}
 	// Re-queue a paused task (resumed after Suspend). Unlike PushTarget this does NOT
 	// re-count the task -- it was already accounted for at its original submission and
