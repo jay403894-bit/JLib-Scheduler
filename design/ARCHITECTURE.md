@@ -106,8 +106,29 @@ corrupting a neighbour. Usable depth is therefore one page less than the region.
 | `Deep` | work that recurses past a standard stack. Opt-in, provisioned with a small floor. |
 
 **Stacks are never returned to the OS in steady state.** They circulate through the pools — mapped,
-committed and cache-warm — via a per-worker `ThreadLocalCache` per class, refilled from the global
-pool in batches rather than one at a time.
+committed and cache-warm. Nothing calls `VirtualFree` or `munmap` on a stack during normal operation.
+
+### Thread-local fiber caches
+
+**Every worker holds its own cache of fibers, one per stack class.** Acquiring a fiber is a pop from
+a structure only that worker touches; releasing one is a push back into the cache for the class the
+fiber belongs to. The global pool is consulted only on a miss.
+
+This is what keeps fiber acquisition off the contended path. A single global free-list would put
+every worker on one cache line for an operation that happens on *every task that can suspend* — the
+allocator would become the bottleneck the work-stealing exists to avoid.
+
+**Refill is a batch, not an item.** A cache that runs dry takes a run of fibers from the global pool
+in one operation, so the cost of touching shared state is amortised across many acquisitions rather
+than paid per fiber. The batch path writes straight into the cache's storage; an earlier version
+returned a `std::vector` and paid a heap allocation per refill.
+
+**The class travels with the fiber.** A released fiber goes back to the cache for *its own* class, so
+a `Tiny` stack cannot drift into the `Standard` pool and quietly shrink what a standard task gets.
+The per-class split is what makes three stack sizes safe to mix in one pool.
+
+**Caches are primed at startup** rather than filled lazily, so the first task on a cold worker does
+not pay for the pool.
 
 ---
 

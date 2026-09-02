@@ -27,9 +27,19 @@
 // been shut down seconds earlier was still tearing down in the background. Give the machine real
 // idle time first, and take any result you care about twice.
 //
-// WHAT THIS DELIBERATELY DOES NOT DO: it does not compare against other libraries. That belongs in
-// bench/compare/, where the isolation rules are enforced -- two schedulers in one process measure
-// each other's spinning, not their own throughput.
+// WHAT THIS DELIBERATELY DOES NOT DO: IT DOES NOT COMPARE AGAINST OTHER LIBRARIES, and that is a
+// position rather than an omission. A head-to-head implies a shared objective function, and
+// schedulers are not built for the same things -- this one trades throughput for call-graph
+// transparency and a bounded I/O tail, and a fork-join benchmark will say so as if it were a defect.
+// Publishing the table invites precisely the comparison the design does not make.
+//
+// The bench/compare/ tools still exist for sanity-checking a change against a known implementation,
+// which is a different use: a private control, not a claim. Their isolation rules matter for the
+// same reason -- two schedulers in one process measure each other's spinning, not their own work.
+//
+// EVERY ARM HERE COMPARES THIS RUNTIME AGAINST ITSELF: lane against floor, batch against single,
+// parallel against its own serial baseline, floor against parked. Those are comparisons a reader can
+// act on, because both sides are configurations they actually have.
 
 #include "TaskScheduler.h"
 #include "Thread.h"
