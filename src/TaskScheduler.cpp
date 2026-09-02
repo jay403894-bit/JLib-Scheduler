@@ -2757,6 +2757,30 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// somebody could ask for K=100, and hot workers 64..99 would never set a lane bit, so no sibling
 	// could ever find them buried -- hot->hot stealing simply absent for a third of the lane, with
 	// nothing reporting it. Clamping is the honest failure: K stops where the bitmap does.
+	// ---- K IS FROZEN AT {0, 1, 2}, AND THAT IS A POLICY RATHER THAN A LIMIT OF THE MECHANISM ----
+	//
+	// The bitmap clamp below is structural -- 64 is where stealHintLane physically stops naming
+	// workers. This one is a decision, and it is deliberately the tighter of the two.
+	//
+	// EVERY RESERVED THREAD COMES OFF THE FLOOR, where throughput lives: a lane ON the floor already
+	// measured 15-19x over no lane, and reservation on top of that buys a FLAT TAIL rather than more
+	// work done. So the band is a tail-latency instrument, and instruments do not scale by being
+	// pointed at more cores. Measured here at K=1 vs K=2 on a 256-completion burst, the second worker
+	// was the difference between a lane that holds and one that absorbs; a third has never been the
+	// thing that was short.
+	//
+	// THE COST IS NOT ONE CORE, IT IS THE CENSUS. main, the timer thread and one core per I/O
+	// completion thread are already reserved before the pool is sized (see the reserved count in
+	// Init). K=2 on top of that leaves an 8-core box with three floor workers, and a 4-core box with
+	// none. Letting K grow further is how a latency knob quietly becomes a throughput regression that
+	// only shows up on someone else's smaller machine.
+	//
+	// CLAMPED, NOT REFUSED, matching what this function already does everywhere else: asking for more
+	// than the mechanism will give you gets you what it will give you, and GetHotWorkers() reports
+	// the truth afterwards. A caller that needs to know checks it -- the same contract as the K+F
+	// clamp below, which also caps rather than errors.
+	if (eff > kMaxReservedWorkers) eff = kMaxReservedWorkers;
+
 	if (eff > 64) eff = 64;
 	// Clamped against the LIVE F inside the CAS -- see BandsSetKClamped. K may not grow into the
 	// floor or past the end of the pool, mirroring the refusal NoteFloorCrowding already makes on

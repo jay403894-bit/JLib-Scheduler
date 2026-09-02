@@ -535,6 +535,15 @@ namespace JLib {
 		// PARKED reserved worker pays the OS wake that reserving the core was meant to remove.
 		// Measured on a busy pool: p50 5.90 -> 2.00 us, p99 43.00 -> 6.30. That win belongs to the
 		// lane, not to everyone who calls SetHotWorkers.
+		// THE FROZEN CEILING ON K. Two reserved workers, and the third is not withheld because the
+		// mechanism cannot do it -- it is withheld because every reserved thread comes off the floor,
+		// which is where throughput lives, and because main plus the timer plus one core per I/O
+		// completion thread are ALREADY reserved before the pool is sized. K=2 on an 8-core box
+		// leaves three floor workers. Requests above this are CLAMPED, not refused; ask
+		// GetHotWorkers() for what you actually got. Revisit only with a measurement that says two
+		// was short, and see design/NOTES.md for the K=1 vs K=2 numbers that set it here.
+		static constexpr size_t kMaxReservedWorkers = 2;
+
 		static void   SetIoHotLane(size_t k);
 		// Re-applies the K clamp once workers exist; called by StartPool. See SetHotWorkers.
 		void ClampHotWorkersToPool();

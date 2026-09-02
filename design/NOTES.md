@@ -1877,3 +1877,37 @@ First run at K=1, 256 concurrent reads: `highWater=109 pushed=256 declined=241 d
 empty with all 256 correct. A non-zero `declined` is the mechanism WORKING, not a failure. But 241
 declines against 256 pushes says K=1 cannot absorb that arrival rate -- which is the number that
 makes K=2 the next thing to try. Depth depends on drain speed, so it is indicative, not a measurement.
+
+## FROZEN 5.0: two lanes, K in {0,1,2}, never-park K, adaptive F (9-02)
+
+**`Lane::Normal | Lane::LowLatency` replaces `bool hiPri`.** K is how many workers are bound to
+LowLatency; everything else stays on Normal and rides the adaptive floor.
+
+The bool lied in both directions, and both cost time on 9-02. It said PRIORITY, so a loPri task on a
+reserved worker read as *deprioritised* when it was **unreachable** -- K never reads its loPri inbox,
+inbox work is unstealable, and the pool deadlocked reporting a lost wake. It also reads as
+"important", which invites marking bulk work with it and funnelling volume onto K workers while the
+floor idles. `enum class`, so `if (lane)` -- which would read as "if it has a lane", true of every
+task -- does not compile.
+
+**K never parks, and that spin is the point.** Reservation alone measured p50 5.90 / p99 43.00 us;
+reservation plus never-park measured p50 2.00 / p99 6.30. A futex park costs ~5.5 us to get the core
+back, which is the entire budget a lane exists to protect. **`max(F, K)`, not `F + K`** -- K does not
+grow the floor, and nothing raises F because K exists.
+
+**Parking was never the hazard; being UNREADABLE was.** A parked reserved worker with LowLatency work
+waiting gets notified and wakes. An awake one holding work in a queue it will never read does not.
+Independent properties, and only the second is a correctness question.
+
+**K is clamped to 2.** Not a limit of the mechanism -- the bitmap reaches 64 -- a policy. Every
+reserved thread comes off the floor where throughput lives (a lane ON the floor already measured
+15-19x over no lane; reservation buys a flat TAIL, not more work done), and main + timer + one core
+per completion thread are already reserved before the pool is sized. K=2 leaves an 8-core box with
+three floor workers. Clamped rather than refused, matching the K+F clamp beside it.
+
+**Two adaptive radii on one pool is a new machine, not a knob.** A joint F/K controller is not
+revisited until the DAG cancel wake is boring. Adaptive K was already removed once (it never ramped,
+shed on quiet, and the policy acted as a ceiling); this is the same lesson written as a rule.
+
+More `Lane::` values only if two reserved classes genuinely fight over the band -- a 6.0 decision
+with evidence, not a speculative third enumerator now.
