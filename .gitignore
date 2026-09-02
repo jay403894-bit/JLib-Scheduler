@@ -60,3 +60,7 @@ Scheduler/x64/
 # Out-of-source build dirs. `build/` was already here; `bld/` was added when a locked `build/`
 # could not be removed, and its artifacts landed in a commit before this line existed.
 bld/
+
+# Pre-5.0 rewrite backup. Never built, never run, 24MB of stale duplicate source.
+# Removed from the repo in 5.0.1; kept out so it cannot drift back in.
+_REWRITE_BACKUP/
