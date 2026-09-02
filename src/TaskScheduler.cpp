@@ -538,8 +538,8 @@ void TaskScheduler::Init(size_t poolSize) {
 						// state you invoked it to read.
 						"[watchdog]  q%-2zu deque size=%-7zu cap=%-7zu | inbox lo=%s hi=%s rs=%s | parks=%u\n",
 						q, inst->deques[q]->size(), inst->deques[q]->capacity(),
-						inst->loPriInboxes[q]->empty()   ? "empty" : "HAS",
-						inst->hiPriInboxes[q]->empty()   ? "empty" : "HAS",
+						inst->normalInboxes[q]->empty()   ? "empty" : "HAS",
+						inst->laneInboxes[q]->empty()   ? "empty" : "HAS",
 						inst->resumedInboxes[q]->empty() ? "empty" : "HAS",
 						GetWorkerParkCount(q));
 					// The per-pass phase/pass/drain counters that used to print here are gone: they
@@ -574,7 +574,7 @@ TaskScheduler::~TaskScheduler() {
 	// MEMBERS DESTRUCT IN REVERSE DECLARATION ORDER, and this class declares the queues before the
 	// allocator:
 	//
-	//     deques, loPriInboxes, hiPriInboxes, resumedInboxes ...  then  taskAllocator
+	//     deques, normalInboxes, laneInboxes, resumedInboxes ...  then  taskAllocator
 	//
 	// so taskAllocator would be destroyed FIRST and the queue vectors after it. `~TaskMPSCQueue`
 	// ends with `alloc_->Free(stub_)` and `~TaskDeque` releases its ring, so every one of those --
@@ -592,8 +592,8 @@ TaskScheduler::~TaskScheduler() {
 	// frees into a live allocator already. Left alone rather than added for symmetry -- an
 	// unnecessary clear here would suggest the ordering is arbitrary when it is not.
 	resumedInboxes.clear();
-	hiPriInboxes.clear();
-	loPriInboxes.clear();
+	laneInboxes.clear();
+	normalInboxes.clear();
 	deques.clear();
 }
 bool TaskScheduler::PushMain(Task* task) {
@@ -831,22 +831,22 @@ void TaskScheduler::Join() {
 			for (size_t i = 0; i < workers.size() && idle; ++i) {
 				if (!workers[i]) continue;
 				if (workers[i]->busy.load(std::memory_order_acquire)) idle = false;
-				else if (!hiPriInboxes[i]->empty() || !loPriInboxes[i]->empty()
+				else if (!laneInboxes[i]->empty() || !normalInboxes[i]->empty()
 				         || !resumedInboxes[i]->empty()) idle = false;
 			}
 			// Every deque INCLUDING the non-worker lane, which is one past the workers and can hold
 			// work published by a bare thread that was helping.
 			for (size_t i = 0; i < deques.size() && idle; ++i)
 				// BOUNDED BY deques.size(), WHICH IS ONE LARGER than the inbox vectors -- loPri carries
-				// the extra non-worker lane and the inboxes do not. Indexing hiPriInboxes[i] here reads
+				// the extra non-worker lane and the inboxes do not. Indexing laneInboxes[i] here reads
 				// one past the end on the last iteration: an access violation in Release that Debug
 				// happened to survive, which is why every test crashed while the Debug build only
 				// reported a fiber stall.
 				// The lane term is the INBOX now -- there is no lane deque to ask. Its index guard
-				// is load-bearing, not defensive: hiPriInboxes is sized to the WORKERS and loPri
+				// is load-bearing, not defensive: laneInboxes is sized to the WORKERS and loPri
 				// has one extra entry for the non-worker lane, so the two run out at different i.
 				if (deques[i]->size() != 0
-				    || (i < hiPriInboxes.size() && !hiPriInboxes[i]->empty())) idle = false;
+				    || (i < laneInboxes.size() && !laneInboxes[i]->empty())) idle = false;
 
 			if (idle) {
 				if (++cleanPasses >= 2) { quiesced = true; break; }
@@ -1021,7 +1021,7 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 	// is in its yield window or walking back into parkGate after a grow-wake. Without `flr` there
 	// is no way to see that this worker entered the pass as a guest while the floor was growing
 	// underneath it, and without `tick` no way to see whether this pass took the yield arm at all.
-	printf("  q  state           queued lane flr tick busy run   inbox(hi/lo/rs)  deque(hi/lo)  phase\n");
+	printf("  q  state           queued lane flr tick busy run   inbox(lane/norm/rs) deque(lane/norm)  phase\n");
 	for (size_t i = 0; i < workers.size(); ++i) {
 		const auto s = workers[i]->GetDebugState();
 		// THESE MUST TRACK Thread::WorkerState. They did not: after the permit machine landed, slot
@@ -1051,15 +1051,15 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 			s.qIndex, st, (int)s.hasQueuedWork,
 			(int)s.laneWake, (int)s.onAwakeFloor, s.spinTick,
 			(int)s.busy, (int)s.running,
-			(int)!hiPriInboxes[i]->empty(), (int)!loPriInboxes[i]->empty(),
+			(int)!laneInboxes[i]->empty(), (int)!normalInboxes[i]->empty(),
 			(int)!resumedInboxes[i]->empty(),
-			(size_t)(hiPriInboxes[i]->empty() ? 0 : 1), deques[i]->size(),
+			(size_t)(laneInboxes[i]->empty() ? 0 : 1), deques[i]->size(),
 			WorkerPhaseOf((size_t)s.qIndex),
 			// The signature: parked, but holding work nobody else can take. `rs` belongs here more
 			// than either of the others -- a resumed fiber is pinned, so "nobody else can take it"
 			// is true of that queue by design rather than by accident of scheduling.
-			(s.workerState == 2 && (s.hasQueuedWork || !hiPriInboxes[i]->empty()
-				|| !loPriInboxes[i]->empty() || !resumedInboxes[i]->empty()))
+			(s.workerState == 2 && (s.hasQueuedWork || !laneInboxes[i]->empty()
+				|| !normalInboxes[i]->empty() || !resumedInboxes[i]->empty()))
 					? "   <-- SLEEPING WITH WORK"
 			: (g_lastPushTarget.load(std::memory_order_relaxed) == s.qIndex)
 					? "   <-- LAST PUSH TARGET" : "");
@@ -1067,7 +1067,7 @@ void TaskScheduler::DumpPoolState(const char* why) const {
 	if (nonWorkerLane < deques.size()) {
 		printf(" nw  %-14s   -      -    -   -     -/-           %zu/%zu%s\n",
 			nonWorkerLaneClaimed.load(std::memory_order_relaxed) ? "CLAIMED" : "free",
-			(size_t)0, deques[nonWorkerLane]->size(), "");   // hiPriInboxes has no non-worker lane
+			(size_t)0, deques[nonWorkerLane]->size(), "");   // laneInboxes has no non-worker lane
 	}
 	fflush(stdout);
 }
@@ -1669,7 +1669,7 @@ void TaskScheduler::RedistributeToOverflow(size_t ownerIdx, size_t count) {
 		const size_t target = k + baseF + (i % span);
 		if (target >= n || !workers[target]) { Requeue(t); continue; }
 
-		loPriInboxes[target]->push(t);
+		normalInboxes[target]->push(t);
 		workers[target]->inboxDepth.fetch_add(1, std::memory_order_relaxed);
 		NoteInboxPush(1);
 		workers[target]->MarkQueuedWork();
@@ -2937,8 +2937,8 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 			size_t moved = 0;
 			for (size_t i = loEnd; i < hiEnd && i < instance->workers.size(); ++i) {
 				Task* t = nullptr;
-				while (instance->loPriInboxes[i]->pop(t) && t) {
-					instance->loPriInboxes[firstCompute]->push(t);
+				while (instance->normalInboxes[i]->pop(t) && t) {
+					instance->normalInboxes[firstCompute]->push(t);
 					instance->workers[firstCompute]->inboxDepth.fetch_add(
 						1, std::memory_order_relaxed);
 					instance->workers[i]->inboxDepth.fetch_sub(1, std::memory_order_relaxed);
@@ -2991,7 +2991,7 @@ size_t TaskScheduler::GetHotWorkers() {
 	// K IS BEING REMOVED, AND THIS IS THE GATE THAT MAKES THE WHOLE LANE INERT FIRST.
 	//
 	// Returning 0 here turns off every consumer of K in one place, because they all reduce to this:
-	//   HiPriLaneActive()  -> false, so every push routes to loPriInboxes and lane gets nothing
+	//   HiPriLaneActive()  -> false, so every push routes to normalInboxes and lane gets nothing
 	//   PickNextWorker     -> the lane branch is `IsLowLatency(lane) && hotN`, and the ordinary branch's
 	//                         `idx < hotN` skip stops reserving workers 0..K-1
 	//   isReservedWorker        -> `GetHotWorkers() > qIndex` is false for every worker
@@ -4580,17 +4580,17 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	for (Thread* w : workers) delete w;
 	workers.clear();
 	deques.clear();
-	loPriInboxes.clear();
+	normalInboxes.clear();
 	resumedInboxes.clear();
 	stealHintLane.store(0, std::memory_order_relaxed);
-	hiPriInboxes.clear();
+	laneInboxes.clear();
 	workers.reserve(num_workers);
 	// +1 for the NON-WORKER LANE (see nonWorkerLane's declaration). Only the deques get it --
 	// inboxes stay worker-indexed, because nothing ever pushes to a
 	// non-worker's inbox or pins a core to it.
 	deques.reserve(num_workers + 1);
-	loPriInboxes.reserve(num_workers);
-	hiPriInboxes.reserve(num_workers);
+	normalInboxes.reserve(num_workers);
+	laneInboxes.reserve(num_workers);
 	resumedInboxes.reserve(num_workers);
 	// No park table here: each Thread owns its own park fiber, and `workers` is already the flat
 	// array indexed by worker id. See Thread::GetFiber.
@@ -4600,7 +4600,7 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// nothing actually called PushMain, which nothing did until real work started routing
 	// through it (TaskDAG::Fire's isMain branch): TaskMPSCQueue::append() then wrote through a
 	// garbage head_/prev pointer -> write access violation. One-time init, same as every other
-	// TaskMPSCQueue (see loPriInboxes/hiPriInboxes below).
+	// TaskMPSCQueue (see normalInboxes/laneInboxes below).
 	mainQ.init(&taskAllocator);
 
 	for (unsigned int i = 0; i < num_workers; ++i) {
@@ -4608,11 +4608,11 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		// ONE DEQUE PER WORKER, NOT TWO. The lane's Chase-Lev ring used to be allocated here
 		// alongside it -- 32,768 slots per worker, for a structure whose only purpose is letting
 		// OTHER threads steal, on a queue no other thread was ever allowed to touch.
-		loPriInboxes.push_back(std::make_unique<TaskMPSCQueue>());
-		hiPriInboxes.push_back(std::make_unique<TaskMPSCQueue>());
+		normalInboxes.push_back(std::make_unique<TaskMPSCQueue>());
+		laneInboxes.push_back(std::make_unique<TaskMPSCQueue>());
 		resumedInboxes.push_back(std::make_unique<TaskMPSCQueue>());
-		loPriInboxes[i]->init(&taskAllocator);
-		hiPriInboxes[i]->init(&taskAllocator);
+		normalInboxes[i]->init(&taskAllocator);
+		laneInboxes[i]->init(&taskAllocator);
 		// init() is not optional -- mainQ's missing one wrote through a garbage head_ pointer.
 		resumedInboxes[i]->init(&taskAllocator);
 		// Diagnostic identity, so a growth-ceiling abort names the queue instead of leaving the
@@ -5049,7 +5049,7 @@ void JLib::TaskScheduler::PushBatch(Task* tasks[], size_t count, uint8_t cpuaffi
 		// COLLAPSE WHEN THE LANE IS INACTIVE: at K=0 nobody probes lane, so a batch routed there
 		// would never run. Same rule as PushTarget and Requeue, asked of the same predicate.
 		const Lane useHi = (IsLowLatency(lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
-		(IsLowLatency(useHi) ? hiPriInboxes : loPriInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
+		(IsLowLatency(useHi) ? laneInboxes : normalInboxes)[chosen]->push_batch(tasks[first], tasks[first + len - 1]);
 		if (IsLowLatency(useHi)) SetHiPriHint((size_t)chosen);   // so a thief knows to probe this lane deque
 		// Without this the batch sits undiscovered if `chosen` is genuinely asleep: a worker's cv
 		// is private and nothing wakes it without a notify targeting it specifically.
@@ -6310,7 +6310,7 @@ bool TaskScheduler::PushTarget(Task* task, uint8_t cpuaffinity) {
 		// (4.0.1) there is no way for a worker to be unavailable, so the refusal path and the
 		// retry loops that danced around it are unreachable and removed. See SetReservedCores.
 
-		// AFFINITY DOES NOT DEMOTE. This branch pushed to loPriInboxes unconditionally, so
+		// AFFINITY DOES NOT DEMOTE. This branch pushed to normalInboxes unconditionally, so
 		// Push(affinity, hiPriTask) silently landed lane work on the ordinary deque -- the exact
 		// priority inversion PushBatch's submitRun refuses by name ("no caller could see" it), and a
 		// direct contradiction of the contract on Task::lane, which lists PushTarget among the paths
@@ -6324,7 +6324,7 @@ bool TaskScheduler::PushTarget(Task* task, uint8_t cpuaffinity) {
 		// task routed to the lane would never run at all -- collapsing to loPri is what makes lane
 		// free rather than dangerous when the lane is off.
 		const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
-		(IsLowLatency(useHi) ? hiPriInboxes : loPriInboxes)[idx]->push(task);
+		(IsLowLatency(useHi) ? laneInboxes : normalInboxes)[idx]->push(task);
 		if (IsLowLatency(useHi)) SetHiPriHint((size_t)idx);
 		// EVERY inbox enqueue accounts for depth, including this one. Missing it here is what made
 		// the growth gate dead in a long-running process: the drain decrements whatever it pops, so
@@ -6477,16 +6477,16 @@ bool TaskScheduler::PushTarget(Task* task, uint8_t cpuaffinity) {
 			// PUSH SIDE ONLY. Never from pop (the consumer draining is not evidence of pressure)
 			// and never on loPri (this is the K controller's input; loPri belongs to F).
 			// NoteLaneMiss(1) GOES HERE and is deliberately NOT wired yet -- the hook is
-			// `if (!hiPriInboxes[chosen]->empty()) NoteLaneMiss(1);` immediately before the
+			// `if (!laneInboxes[chosen]->empty()) NoteLaneMiss(1);` immediately before the
 			// push, asked of the MPSC being pushed to. It stays out until a bench with STATIC
 			// K is green, because it is the FAST promote input and arming a controller input
 			// while the static path is still being validated makes the two failures
 			// indistinguishable.
-			hiPriInboxes[chosen]->push(task);
+			laneInboxes[chosen]->push(task);
 			SetHiPriHint((size_t)chosen);
 		}
 		else
-			loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
+			normalInboxes[chosen]->push(task);   // collapsed: no lane, no server
 		// DEPTH, not just "is there anything". The growth rule needs to tell a 16-task wave queued
 		// behind two workers from a 6-node graph doing the same thing -- see NoteFloorCrowding.
 		workers[chosen]->inboxDepth.fetch_add(1, std::memory_order_relaxed);
@@ -6657,11 +6657,11 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 		// another is the exact pressure the K controller is meant to see, and on an I/O workload
 		// resumes are most of the lane's traffic. See the note at the PushTarget site.
 		// Same deferred hook as the PushTarget site above -- see the note there.
-		hiPriInboxes[chosen]->push(task);
+		laneInboxes[chosen]->push(task);
 		SetHiPriHint((size_t)chosen);
 	}
 	else
-		loPriInboxes[chosen]->push(task);   // collapsed: no lane, no server
+		normalInboxes[chosen]->push(task);   // collapsed: no lane, no server
 	workers[chosen]->inboxDepth.fetch_add(1, std::memory_order_relaxed);
 	NoteInboxPush(1);
 	workers[chosen]->MarkQueuedWork();
@@ -6778,7 +6778,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, Lane lane) {
 	// and a running task cannot be preempted.
 	//
 	// So lane now takes the same placement as everything else and keeps only the part that pays:
-	// queue ORDER. A lane task still lands in hiPriInboxes, is still drained before the worker's
+	// queue ORDER. A lane task still lands in laneInboxes, is still drained before the worker's
 	// own deque, and is still stolen before loPri -- it just is not aimed at two threads that are
 	// already busy.
 	//
@@ -6852,7 +6852,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, Lane lane) {
 		// "who may own ordinary work" depend on "how many cores stay off the park path". Those are
 		// different questions and GetAwakeFloorBase() only answers the second. With Fbase == 0 the
 		// mask never ran, the bitmap pick below returned an index in [0, K), and a CorePref::Default
-		// task was pushed to loPriInboxes[q < K] -- an inbox nobody may steal from and whose owner
+		// task was pushed to normalInboxes[q < K] -- an inbox nobody may steal from and whose owner
 		// will not drain it.
 		//
 		// AND THE RESULT IS A SPIN, NOT A STALL, which is why it does not look like the other bug.

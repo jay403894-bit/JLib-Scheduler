@@ -551,7 +551,7 @@ bool Thread::DrainOwnInboxesToDeques() {
 	// violation is reported by the diagnostic in Worker() instead of being quietly rehomed into a
 	// stealable deque by a path nobody would think to look at.
 	if ((size_t)qIndex >= TaskScheduler::GetHotWorkers())
-		drain(scheduler->loPriInboxes[qIndex].get(), scheduler->deques[qIndex].get(), false);
+		drain(scheduler->normalInboxes[qIndex].get(), scheduler->deques[qIndex].get(), false);
 	return moved;
 }
 
@@ -584,11 +584,11 @@ bool Thread::DrainOwnInboxesToDeques() {
 Task* Thread::TryTakeLaneTask(bool& relocated) {
 	relocated = false;
 	if (!scheduler || qIndex < 0) return nullptr;
-	if ((size_t)qIndex >= scheduler->hiPriInboxes.size()) return nullptr;
+	if ((size_t)qIndex >= scheduler->laneInboxes.size()) return nullptr;
 
 	Task* t = nullptr;
-	if (!scheduler->hiPriInboxes[qIndex]->pop(t) || !t) {
-		if (scheduler->hiPriInboxes[qIndex]->empty())
+	if (!scheduler->laneInboxes[qIndex]->pop(t) || !t) {
+		if (scheduler->laneInboxes[qIndex]->empty())
 			scheduler->ClearHiPriHint((size_t)qIndex);
 		return nullptr;
 	}
@@ -1413,10 +1413,10 @@ void Thread::Worker() {
 			if (task_to_run || isReservedWorker) return false;
 			JLIBSCHED_PHASE(qIndex, InboxDrain);
 			size_t count = 0;
-			while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count]))
+			while (count < BATCH_SIZE && scheduler->normalInboxes[qIndex]->pop(batch[count]))
 				++count;
 			TaskScheduler::NoteInboxDrain(count);   // no-op unless a submit limit is set
-			if (scheduler->loPriInboxes[qIndex]->empty())
+			if (scheduler->normalInboxes[qIndex]->empty())
 				inboxDepth.store(0, std::memory_order_relaxed);
 			else if (count)
 				inboxDepth.fetch_sub((int)count, std::memory_order_relaxed);
@@ -1555,7 +1555,7 @@ void Thread::Worker() {
 		// It does not mean the work is stranded. Every worker pops its own lane inbox in the search
 		// below, reserved or not, so this task WILL run here; what it means is that this worker is
 		// not the one maintaining that lane's hint bit, which is what the retirement below fixes.
-		const bool hiPriStray = !isReservedWorker && !scheduler->hiPriInboxes[qIndex]->empty();
+		const bool hiPriStray = !isReservedWorker && !scheduler->laneInboxes[qIndex]->empty();
 		// Read once per pass beside isReservedWorker: one relaxed load of a line the app touches only when
 		// it reconfigures. Gates every piece of adaptive-K bookkeeping, so static K -- the default --
 		// runs none of it.
@@ -1596,7 +1596,7 @@ void Thread::Worker() {
 				// counting it would mean walking it. That costs nothing here, because the lane
 				// hint has only ever been a presence BIT: every reader asks "is there lane work
 				// on q", never "how much". 0/1 answers that exactly.
-				const size_t laneDepth = scheduler->hiPriInboxes[qIndex]->empty() ? 0u : 1u;
+				const size_t laneDepth = scheduler->laneInboxes[qIndex]->empty() ? 0u : 1u;
 				scheduler->UpdateLaneHint((size_t)qIndex, laneDepth);
 				ownsLaneBit = true;   // while hot, this worker is the one maintaining its bit
 
@@ -1903,7 +1903,7 @@ void Thread::Worker() {
 			    && inboxDepth.load(std::memory_order_relaxed) >= (int)TaskScheduler::kStealHintDepth
 			    && scheduler->deques[qIndex]->size() < kDequeHeadroom) {
 				size_t got = 0;
-				while (got < kPublishAtMost && scheduler->loPriInboxes[qIndex]->pop(batch[got]))
+				while (got < kPublishAtMost && scheduler->normalInboxes[qIndex]->pop(batch[got]))
 					if (batch[got]) ++got;
 
 				size_t moved = 0;
@@ -2297,7 +2297,7 @@ void Thread::Worker() {
 			//
 			// THE NET WAS THE PROBLEM. A lane worker that stops to service bulk work is the exact
 			// thing reservation exists to prevent; it is reserved BECAUSE it is already behind. And
-			// as a reader of loPriInboxes[qIndex] it made the band's contract untestable: the three
+			// as a reader of normalInboxes[qIndex] it made the band's contract untestable: the three
 			// drain sites were `!isReservedWorker`, `!isReservedWorker` and this one, whose guard is
 			// the complement -- so "K never touches ordinary work" was true of the code everywhere
 			// except the one place that made it false. It also hid the placement bug it absorbed:
@@ -2315,7 +2315,7 @@ void Thread::Worker() {
 			// deliberately. Losing it loudly is worth more than a lane worker quietly doing bulk
 			// work forever, and a net that repairs the symptom guarantees nobody finds the writer.
 			// quiescent(), not empty(): a push mid-commit still counts as an occupant.
-			if (isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent()) {
+			if (isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent()) {
 				static std::atomic<unsigned> strayWarned{ 0 };
 				if (strayWarned.fetch_add(1, std::memory_order_relaxed) == 0)
 					std::fprintf(stderr,
@@ -2371,9 +2371,9 @@ void Thread::Worker() {
 			}
 
 			if (!task_to_run) {
-				JLIBSCHED_PHASE(qIndex, HiPri);
+				JLIBSCHED_PHASE(qIndex, Lane);
 				Task* hp = nullptr;
-				if (scheduler->hiPriInboxes[qIndex]->pop(hp) && hp) {
+				if (scheduler->laneInboxes[qIndex]->pop(hp) && hp) {
 					task_to_run = hp;
 					JLIBSCHED_STEAL_STAT(qIndex, fromHiInbox);
 					laneSourced = true;   // K controller input -- see laneSourced
@@ -2412,7 +2412,7 @@ void Thread::Worker() {
 					// COSTS ONE `empty()` LOAD when there is no backlog, which is the common case
 					// and the same load the staging block it replaced opened with. The peer scan
 					// runs only when a backlog exists and is at most K-1 relaxed loads, K <= 4.
-					if (!scheduler->hiPriInboxes[qIndex]->empty())
+					if (!scheduler->laneInboxes[qIndex]->empty())
 						TaskScheduler::NoteLaneStrand((size_t)qIndex);
 
 					continue;
@@ -2441,7 +2441,7 @@ void Thread::Worker() {
 				// arriving while this one is mid-body never joins the backlog in the first place.
 				// That is the producer-side half, it is cheaper, and it survives.
 
-				if (scheduler->hiPriInboxes[qIndex]->empty()) {
+				if (scheduler->laneInboxes[qIndex]->empty()) {
 					scheduler->ClearHiPriHint((size_t)qIndex);
 				}
 			}
@@ -2470,14 +2470,14 @@ void Thread::Worker() {
 				// THE INBOX FIRST -- oldest arrival, and the queue nobody else may drain.
 				//
 				// !isReservedWorker, LIKE EVERY OTHER READER OF THIS QUEUE. This was the FOURTH
-				// reader of loPriInboxes[qIndex] and the second one missing the guard: a reserved
+				// reader of normalInboxes[qIndex] and the second one missing the guard: a reserved
 				// worker that had yielded would pop ordinary work here and run it, which is the
 				// lane stopping to do bulk. The other three sites all carry the gate, so this one
 				// silently made the band's contract conditional on whether the worker had yielded
 				// on its previous pass -- which is not a distinction the contract knows about.
-				if (!isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent()) {
+				if (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent()) {
 					Task* fromInbox = nullptr;
-					if (scheduler->loPriInboxes[qIndex]->pop(fromInbox) && fromInbox) {
+					if (scheduler->normalInboxes[qIndex]->pop(fromInbox) && fromInbox) {
 						inboxDepth.fetch_sub(1, std::memory_order_relaxed);
 						task_to_run = fromInbox;
 						JLIBSCHED_STEAL_STAT(qIndex, fromLoInbox);
@@ -3206,7 +3206,7 @@ void Thread::Worker() {
 				|| (!scheduler->paused.load(std::memory_order_seq_cst)
 					&& (hasQueuedWork.load(std::memory_order_seq_cst)
 						|| laneWake.load(std::memory_order_seq_cst)
-						|| !scheduler->hiPriInboxes[qIndex]->quiescent()
+						|| !scheduler->laneInboxes[qIndex]->quiescent()
 						// THE SAME GATE THE DRAIN HAS. A predicate may only name a queue this pass
 						// would actually READ -- otherwise it is a hint that cannot be discharged,
 						// and the worker takes the `continue` below, skips the backoff, searches,
@@ -3215,7 +3215,7 @@ void Thread::Worker() {
 						// the drain sites now carry one gate between them, so the set the search
 						// covers and the set the recheck asks about are the same set by
 						// construction. See tests/verify/workerspin_model.c.
-						|| (!isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent())
+						|| (!isReservedWorker && !scheduler->normalInboxes[qIndex]->quiescent())
 						// PINNED RESUMES. Not optional and not merely a latency question: nobody
 						// else is permitted to drain this queue, so parking on a non-empty one is
 						// a permanent hang rather than a delay. Same reasoning as the loPri inbox
@@ -3675,7 +3675,7 @@ void Thread::Worker() {
 					// be caught here, or its wake is lost. Same inputs as the predicate above, so
 					// the two cannot disagree about what counts as work.
 					// THIS LIST MUST MATCH THE RECHECK ABOVE, TERM FOR TERM. It did not: the
-					// recheck tested hiPriInboxes and laneWake and this loop did not, so a lane
+					// recheck tested laneInboxes and laneWake and this loop did not, so a lane
 					// push -- or a lane wake -- could leave a worker blocked in WaitOnAddress with
 					// a NON-EMPTY inbox. Inboxes are not stealable, so nobody else can drain it and
 					// the task strands until something unrelated wakes that exact worker.
@@ -3729,11 +3729,11 @@ void Thread::Worker() {
 							    || !running.load(std::memory_order_acquire)
 							    || hasQueuedWork.load(std::memory_order_seq_cst)
 							    || laneWake.load(std::memory_order_seq_cst)
-							    || !scheduler->hiPriInboxes[qIndex]->quiescent()
+							    || !scheduler->laneInboxes[qIndex]->quiescent()
 							    // Gated, term for term with the recheck above -- K never reads
 							    // loPri, so K must never WAIT on it either.
 							    || (!isReservedWorker
-							        && !scheduler->loPriInboxes[qIndex]->quiescent())
+							        && !scheduler->normalInboxes[qIndex]->quiescent())
 							    || !scheduler->resumedInboxes[qIndex]->quiescent()
 							    // One legal consumer, same as the resume inbox above it.
 							    || FiberRegistry::Instance().HolderHasWork((size_t)qIndex)
@@ -3747,10 +3747,10 @@ void Thread::Worker() {
 					       && running.load(std::memory_order_acquire)
 					       && !hasQueuedWork.load(std::memory_order_seq_cst)
 					       && !laneWake.load(std::memory_order_seq_cst)
-					       && scheduler->hiPriInboxes[qIndex]->quiescent()
+					       && scheduler->laneInboxes[qIndex]->quiescent()
 					       // Gated, term for term with the recheck and the condvar predicate.
 					       && (isReservedWorker
-					           || scheduler->loPriInboxes[qIndex]->quiescent())
+					           || scheduler->normalInboxes[qIndex]->quiescent())
 					       && scheduler->resumedInboxes[qIndex]->quiescent()
 					       // Inverted like every other term here: keep spinning only while the
 					       // cleanup chain is EMPTY. One legal consumer, so parking on a full one

@@ -22,8 +22,8 @@
 // Members destruct in REVERSE declaration order, and in TaskScheduler that order is:
 //
 //     deques           (2287)   vector<unique_ptr<TaskDeque>>
-//     loPriInboxes     (2376)   \
-//     hiPriInboxes     (2377)    > vector<unique_ptr<TaskMPSCQueue>>
+//     normalInboxes     (2376)   \
+//     laneInboxes     (2377)    > vector<unique_ptr<TaskMPSCQueue>>
 //     resumedInboxes   (2401)   /
 //     taskAllocator    (2519)   owns the slab pools
 //     mainQ            (2935)   TaskMPSCQueue

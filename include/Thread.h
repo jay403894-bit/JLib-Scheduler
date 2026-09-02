@@ -91,7 +91,7 @@ namespace JLib {
     // stronger ordering would put a barrier in the hot loop to serve a diagnostic.
     enum class WorkerPhase : unsigned char {
         Start = 0,      // top of a pass, before any queue is consulted
-        HiPri,          // own reserved-lane inbox
+        Lane,           // own reserved-lane inbox
         Resumed,        // own pinned-resume inbox
         OwnDeque,       // own deque
         InboxDrain,     // own loPri inbox, the bulk drain
@@ -377,7 +377,7 @@ namespace JLib {
         // MUTUAL FRIENDSHIP, and both directions are load-bearing.
         //
         // TaskScheduler already declares `friend class Thread`, which is how Worker() reaches the
-        // queues -- scheduler->loPriInboxes[qIndex], scheduler->resumedInboxes[qIndex] and the rest.
+        // queues -- scheduler->normalInboxes[qIndex], scheduler->resumedInboxes[qIndex] and the rest.
         // This is the other half: the scheduler owns the thread table and drives shutdown across all
         // of it at once, so it needs this worker's state (running, workerState) without a named
         // accessor minted for every field it touches.

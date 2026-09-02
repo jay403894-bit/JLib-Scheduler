@@ -32,8 +32,8 @@
 //   fiction. src/Thread.cpp:3003 reads, in full:
 //
 //       hasQueuedWork || laneWake
-//           || !hiPriInboxes[qIndex]->quiescent()
-//           || !loPriInboxes[qIndex]->quiescent()
+//           || !laneInboxes[qIndex]->quiescent()
+//           || !normalInboxes[qIndex]->quiescent()
 //           || !resumedInboxes[qIndex]->quiescent()
 //
 //   and the search drains all three queues -- hiPri at 2252, resumed at 2375, loPri via
@@ -106,7 +106,7 @@ static _Atomic int g_parked;   /* the worker committed to sleep */
  * WHAT THIS BUILD DOES AND DOES NOT SHOW. It is mechanically identical to -DSEARCH_MISS, so it
  * proves nothing extra about the model. It exists to keep the configuration NAMED and red, so the
  * cost of the mask is written down somewhere that runs. THIS FILE CANNOT VERIFY THE C++ FIX -- no
- * model here reads PickNextWorker. Whether an ordinary push can still reach loPriInboxes[q < K] is
+ * model here reads PickNextWorker. Whether an ordinary push can still reach normalInboxes[q < K] is
  * a question for the source and for a runtime test, not for GenMC. */
 #ifdef PLACE_ON_RESERVED
   #ifndef SEARCH_MISS
@@ -165,7 +165,7 @@ static int search_would_find(void) {
 static int recheck_hint(void) {
     int h = atomic_load_explicit(&g_flag, OBSERVE) != 0;          /* hasQueuedWork || laneWake */
 #ifndef RECHECK_HINTS_ONLY
-    h = h || (atomic_load_explicit(&g_lopri, OBSERVE) != 0);      /* !loPriInboxes->quiescent() */
+    h = h || (atomic_load_explicit(&g_lopri, OBSERVE) != 0);      /* !normalInboxes->quiescent() */
 #endif
     return h;
 }
@@ -280,7 +280,7 @@ int main(void) {
    recheck that names a queue the search will not drain. That is not hypothetical:
 
        src/Thread.cpp:1319   drainOwnInbox: `if (task_to_run || reservedForHiPri) return false;`
-       src/Thread.cpp:3008   recheck:       `|| !loPriInboxes[qIndex]->quiescent()`   -- NO GUARD
+       src/Thread.cpp:3008   recheck:       `|| !normalInboxes[qIndex]->quiescent()`   -- NO GUARD
 
    A RESERVED worker does not drain its loPri inbox; the recheck still asks about it. If such a
    worker ever holds a loPri task, the recheck fires, the `continue` skips the backoff, the search
@@ -294,7 +294,7 @@ int main(void) {
      `if (const size_t baseF = GetAwakeFloorBase())`. The bitmap pick that consumes the mask sits
      AFTER that block and returns first. With the floor base at 0 the mask never ran, the pick
      returned an index in [0, K), and an ordinary CorePref::Default task was pushed to
-     loPriInboxes[q < K].
+     normalInboxes[q < K].
 
    The mask is now unconditional, immediately after the bitmap is built. `j < hotN` in the function's
    tail fallback always had the right test and was simply unreachable whenever the bitmap path
@@ -310,7 +310,7 @@ int main(void) {
 
    WHAT THIS FILE STILL CANNOT SAY: whether the fix holds. No model here reads PickNextWorker.
    -DPLACE_ON_RESERVED keeps the broken configuration named and red so the cost of the mask is
-   written down, but "can an ordinary push still reach loPriInboxes[q < K]" is a question for the
+   written down, but "can an ordinary push still reach normalInboxes[q < K]" is a question for the
    source and for a runtime test.
 
    NOT MODELLED: hiPri and resumed inboxes (their drains are unguarded, so they cannot produce the

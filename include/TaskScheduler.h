@@ -2947,7 +2947,7 @@ namespace JLib {
 		// THE WORK-STEALING DEQUES, one per worker plus one for the non-worker lane at the end.
 		// Named `loPri` until 5.0.1, which was a contrast with a `lane` array that no longer
 		// exists -- there is one deque per worker now, so the priority half of the name described
-		// nothing. Priority survives where it is still real: hiPriInboxes vs loPriInboxes.
+		// nothing. Priority survives where it is still real: laneInboxes vs normalInboxes.
 		//
 		// COMMENTS THROUGHOUT STILL SAY "loPri", and roughly a third of those mean the INBOX, which
 		// legitimately keeps that name. Sorting the two apart is a reading job rather than a rename,
@@ -3041,7 +3041,7 @@ namespace JLib {
 		TaskDeque* LaneForCurrentThread();
 		size_t LaneIndexForCurrentThread();
 		void RunLazyRange(int lo, int hi, LazyRangeState* st);
-		std::vector<std::unique_ptr<TaskMPSCQueue>> loPriInboxes;
+		std::vector<std::unique_ptr<TaskMPSCQueue>> normalInboxes;
 		// ---- THE SHARED LANE INTAKE. One queue, K consumers. ----------------------------------
 		//
 		// THE PROBLEM IT SOLVES IS REACHABILITY, NOT CAPACITY. A per-worker lane inbox is MPSC with
@@ -3066,7 +3066,7 @@ namespace JLib {
 		// scheduling decision here can reorder a stream against itself.
 		moodycamel::ConcurrentQueue<Task*> laneIntake;
 
-		std::vector<std::unique_ptr<TaskMPSCQueue>> hiPriInboxes;
+		std::vector<std::unique_ptr<TaskMPSCQueue>> laneInboxes;
 		// RESUMED FIBERS, ONE QUEUE PER WORKER, DRAINED ONLY BY ITS OWNER AND NEVER INTO A DEQUE.
 		//
 		// THE POINT IS THE "NEVER INTO A DEQUE" HALF. The other two inboxes drain into the owner's
@@ -3493,10 +3493,10 @@ namespace JLib {
 		// to drain) and it pins advertisedCount above zero pool-wide.
 		bool WorkerQueuesEmpty(size_t q) const noexcept {
 			if (q >= deques.size()) return true;
-			// hiPriInboxes is sized to the WORKERS only -- loPri has one extra for the non-worker
+			// laneInboxes is sized to the WORKERS only -- loPri has one extra for the non-worker
 			// lane, so guarding on deques.size() lets q index one past the end of the inboxes.
-			if (q >= hiPriInboxes.size()) return deques[q]->empty();
-			return deques[q]->empty() && hiPriInboxes[q]->empty();
+			if (q >= laneInboxes.size()) return deques[q]->empty();
+			return deques[q]->empty() && laneInboxes[q]->empty();
 		}
 		bool AnyStealAdvertised() const noexcept {
 			for (size_t w = 0; w < kHintWords; ++w)
