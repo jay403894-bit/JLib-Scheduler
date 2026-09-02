@@ -2475,3 +2475,33 @@ AND MY MECHANISM STORY WAS WRONG TWICE ALONG THE WAY, which is the part worth ke
 floor worker yields every idle pass -- it does not, the cadence is masked. Then I said removing the
 yield would collapse the tax -- it did not. Both were built by reading a branch's entrance without
 tracing it to its exit. The arms that killed them cost one constant each.
+
+## CORRECTED at reps=25: the yield cadence IS a lever, and every-pass is much worse
+
+The reps=5 smoke run said "flat across all three cadences". It was underpowered. At reps=25 on a
+quiet machine the ordering is monotonic and repeats at every length:
+
+    length        none      1/8 (default)   every pass
+    ~0.4 ms     +24.50%       +25.55%        +29.74%
+    ~4 ms       +18.82%       +23.77%        +32.56%
+    ~15 ms      +18.22%       +20.86%        +33.78%
+
+SAME ORDERING THREE TIMES. That is signal. So the tax splits into two mechanisms rather than one:
+
+  * ~18% IRREDUCIBLE OCCUPANCY -- present with ZERO yielding. Cores held and clocked; no cheaper
+    spin recovers it. This is the part the CpuRelax control pool always reproduced.
+  * ~2.6% the default cadence's syscall cost
+  * ~13% MORE for every-pass -- SwitchToThread enters the kernel even when it returns immediately,
+    and 31 workers doing that on every idle pass is real work.
+
+SO "WHY NOT YIELD ONCE PER PASS" IS ANSWERED BY MEASUREMENT: it costs ~13 points. The default of
+one-in-eight sits near the cheap end and the expensive end is clearly expensive.
+
+NOT RESOLVED: none vs the default. 18.22 vs 20.86 here, but the earlier quiet run had none HIGHER
+(20.46 vs 20.18). The sign flipped between runs, so those ~2.6 points are inside the noise. Only the
+every-pass arm is unambiguous.
+
+AND THE LESSON IS ABOUT SAMPLE COUNT, AGAIN. A five-rep smoke run produced a confident FLAT verdict
+that twenty-five reps overturned -- the same failure as the p99-over-fifteen-samples one, in a
+different costume. The bench prints its verdict from the data, which is what let the data change it;
+it would have been very easy to keep the tidy "occupancy explains everything" story instead.
