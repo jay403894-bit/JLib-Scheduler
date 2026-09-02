@@ -3544,26 +3544,22 @@ void Thread::Worker() {
 				//
 				// The probe count is a real cost and a real difference from the old loop, but it is
 				// a PROXY. Optimising it directly trades away the parallelism it was measuring.
-				// ---- THE PARK MECHANISM IS A FLAG, AND THE NO-KERNEL ARM WAS DEAD ---------
+				// ---- WHO IS ALLOWED TO ENTER THE KERNEL, AND WHY THE GATE IS THE FLOOR ----
 				//
-				// IdlePolicy::NoSleep had no callers left in this loop after the rewrite -- the
-				// enum, the CLI flag and the docs all still existed, and the loop parked regardless.
-				// So the one arm that avoids the kernel entirely was unreachable, which is also why
-				// no measurement of it could be produced when it was asked for.
+				// A futex park blocks the THREAD: the core goes back to the OS, and getting it back
+				// is a kernel round trip -- ~5.5us p50 on the reserved band (6.7 parked against 1.2
+				// spinning). An unparked worker never pays that, because a notify to it is a plain
+				// store its spin loop observes.
 				//
-				// WHAT THE TWO ARMS ACTUALLY DIFFER BY. A futex park blocks the THREAD: the core
-				// goes back to the OS and getting it back is a kernel round trip, measured at ~5.5
-				// us p50 on the reserved band (6.7 parked against 1.2 spinning). NoSleep never
-				// enters the kernel: the worker keeps its core and a notify is a store the spinning
-				// loop observes, which is nanoseconds.
+				// WHICH IS EXACTLY WHY THIS IS GATED ON onAwakeFloor AND NOT ON A POLICY. There used
+				// to be a pool-wide IdlePolicy::NoSleep that made this branch unreachable for EVERY
+				// worker; it was removed in 5.0 because it bought the store-instead-of-futex path at
+				// the price of holding every core for the whole run, which cost 23% to a real game's
+				// frame time (see the note in TaskScheduler.h). The floor buys the same path for a
+				// BOUNDED number of workers and gives the cores back when the burst ends.
 				//
-				// NEITHER IS FREE, which is why this is a policy and not a fix. A spinning worker
-				// holds a core against every other thread in the process -- including the producer,
-				// which is the bottleneck on a single-producer workload -- so the pool gets faster
-				// at dispatch and slower at everything else.
-				const bool noKernelPark =
-					TaskScheduler::GetIdlePolicy() == TaskScheduler::IdlePolicy::NoSleep;
-				if (advertisedCount == 0 && !onAwakeFloor && !noKernelPark) {
+				// So the rule here is simply: a floor worker keeps its core, everyone else parks.
+				if (advertisedCount == 0 && !onAwakeFloor) {
 					// Clear the awake bit BEFORE blocking so a producer stops choosing this worker
 					// and paying a wake for it. Setting it late is harmless; clearing it late is not.
 					// ---- DID THE FLOOR GROW OVER ME SINCE THE GATE READ IT? ------------------

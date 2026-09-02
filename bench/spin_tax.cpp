@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
-// WHAT AN IDLE NoSleep POOL COSTS EVERYONE ELSE.
+// WHAT AN IDLE SPINNING POOL COSTS EVERYONE ELSE.
 //
-// NoSleep trades CPU for wake latency: workers never park, so a push reaches a running thread
+// An unparked worker trades CPU for wake latency: it never parks, so a push reaches a running thread
 // instead of paying an OS wake (~85% of a measured 4.3us round trip). The bill arrives as a TAX ON
 // OTHER WORK -- in a real app, the main thread. Game01 measured that tax at ~3.5%.
+//
+// THIS USED TO MEASURE IdlePolicy::NoSleep, which spun the WHOLE pool and was removed in 5.0. The
+// awake floor is what holds workers unparked now, so the bench drives the floor instead. Same
+// question, and a more relevant one: the floor is on by default at 2, so this is a tax the library
+// charges rather than one an opt-in setting used to.
 //
 // The tax has two components and they are not the same thing:
 //
@@ -18,8 +23,8 @@
 // a fixed main-thread workload against three arms:
 //
 //   no pool      the floor -- what the work costs with the machine to itself
-//   hint off     idle NoSleep pool, workers spinning and probing (the old behaviour)
-//   hint on      idle NoSleep pool, workers spinning and reading one shared word
+//   hint off     idle spinning pool, workers spinning and probing (the old behaviour)
+//   hint on      idle spinning pool, workers spinning and reading one shared word
 //
 // tax = (arm - floor) / floor. The difference between the two pool arms is what the hint bought.
 //
@@ -74,7 +79,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // unbuffered: a fastfail must not swallow the trace
     g_buf.assign(kWorking, 1.0f);
 
-    std::printf("NoSleep tax -- what an IDLE spinning pool costs the main thread\n");
+    std::printf("spin tax -- what an IDLE unparked pool costs the main thread\n");
     std::printf("  workload: %zu floats, %d passes per sample, %d interleaved samples per arm\n\n",
                 kWorking, inner, reps);
 
@@ -84,7 +89,6 @@ int main(int argc, char** argv) {
     for (int r = 0; r < reps; ++r) floorS.push_back(RunWorkload(inner));
     const double floorMs = Median(floorS);
 
-    JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
     // THE POOL MUST NOT SATURATE THE MACHINE, and defaulting it to every core is what made this
     // bench blind. Measured 2026-08-28 on a 32-thread part with the old default (31 workers):
     //
@@ -106,8 +110,21 @@ int main(int argc, char** argv) {
     // Init is STATIC and must precede any Instance() call -- going through Instance() to reach it
     // fastfails before the pool exists, with no output if stdout is still buffered.
     JLib::TaskScheduler::Init(poolN);
-    std::printf("  pool: %d workers (machine has %u); the headroom is deliberate -- see the note above\n\n",
-                poolN, hw);
+
+    // THE WHOLE POOL IS HELD UNPARKED, which is what makes this an idle-SPIN measurement rather than
+    // a measurement of nothing. A floor as wide as the pool is the deliberate worst case: it is what
+    // IdlePolicy::NoSleep used to do, so the arms below stay comparable to every figure recorded in
+    // this file's history. The shipping default is 2, so a real app pays some fraction of what is
+    // printed here -- read the tax as a ceiling, not as the library's resting cost.
+    //
+    // AND IT MUST BE SET AFTER Init. SetAwakeFloor on a pool that does not exist yet has nothing to
+    // hold awake, and the arms would then measure a fully parked pool against no pool at all -- two
+    // configurations that are both free, reported as a clean 0% tax.
+    JLib::TaskScheduler::SetAwakeFloor((size_t)poolN);
+    JLib::TaskScheduler::SetAwakeFloorMax((size_t)poolN);
+
+    std::printf("  pool: %d workers (machine has %u), floor=%zu; the headroom is deliberate -- see the note above\n\n",
+                poolN, hw, JLib::TaskScheduler::GetAwakeFloor());
 
     // Nothing is ever submitted. Every worker is idle for the whole run, which is the configuration
     // under test -- an app whose pool is provisioned for bursts and quiet between them.
@@ -141,10 +158,10 @@ int main(int argc, char** argv) {
     const double taxOn  = 100.0 * (onMs  - floorMs) / floorMs;
 
     std::printf("  %-22s %8.2f ms\n", "no pool (floor)", floorMs);
-    std::printf("  %-22s %8.2f ms   tax %+6.2f%%\n", "NoSleep, hint OFF", offMs, taxOff);
-    std::printf("  %-22s %8.2f ms   tax %+6.2f%%\n", "NoSleep, hint ON",  onMs,  taxOn);
+    std::printf("  %-22s %8.2f ms   tax %+6.2f%%\n", "spinning, hint OFF", offMs, taxOff);
+    std::printf("  %-22s %8.2f ms   tax %+6.2f%%\n", "spinning, hint ON" ,  onMs,  taxOn);
     if (taxOff > 0.0)
-        std::printf("\n  the hint removes %.0f%% of the NoSleep tax (%.2f%% -> %.2f%%)\n",
+        std::printf("\n  the hint removes %.0f%% of the spin tax (%.2f%% -> %.2f%%)\n",
                     100.0 * (taxOff - taxOn) / taxOff, taxOff, taxOn);
 
     if (JLib::kStealStatsEnabled) {

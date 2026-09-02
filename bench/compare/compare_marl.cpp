@@ -152,7 +152,7 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
                 for (int i = 0; i < n; ++i) {
                     JLib::Task* t = jl.CreateTask(+[](void* p) {
                         g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kWorkIters), std::memory_order_relaxed);
-                    }, (void*)(intptr_t)i, false, g_jlType);
+                    }, (void*)(intptr_t)i, JLib::Lane::Normal, g_jlType);
                     if (!t) return;
                     t->waitGroup = &wg; jl.Push(t);
                 }
@@ -170,7 +170,7 @@ static void BenchThroughput(JLib::TaskScheduler& jl) {
                 for (int i = 0; i < n; ++i) {
                     batch[i] = jl.CreateTask(+[](void* p) {
                         g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kWorkIters), std::memory_order_relaxed);
-                    }, (void*)(intptr_t)i, false, g_jlType);
+                    }, (void*)(intptr_t)i, JLib::Lane::Normal, g_jlType);
                     if (!batch[i]) return;
                     batch[i]->waitGroup = &wg;
                 }
@@ -253,7 +253,7 @@ static void BenchLatency(JLib::TaskScheduler& jl) {
                 JLib::WaitGroup wg; wg.n.store(1, std::memory_order_relaxed);
                 JLib::Task* t = jl.CreateTask(+[](void*) {
                     g_sink.fetch_add(1, std::memory_order_relaxed);
-                }, nullptr, false, g_jlType);
+                }, nullptr, JLib::Lane::Normal, g_jlType);
                 if (!t) return;
                 t->waitGroup = &wg; jl.Push(t); jl.WaitFor(wg);
             }
@@ -577,7 +577,7 @@ static void BenchBlocking(JLib::TaskScheduler& jl) {
                                   NoteBlkWorker();
                                   g_sink.fetch_add(Spin((uint64_t)(intptr_t)p, kHeavyIters),
                                                    std::memory_order_relaxed);
-                              }, (void*)(intptr_t)i, false, g_jlType);
+                              }, (void*)(intptr_t)i, JLib::Lane::Normal, g_jlType);
                         if (!t) { printf("     JLib: CreateTask returned null\n"); return; }
                         t->waitGroup = &wg;
                         jl.Push(t);
@@ -930,8 +930,6 @@ int main(int argc, char** argv) {
         printf("note: nosleep implies --only=jlib; a spinning pool cannot share a process with\n"
                "      another scheduler being timed. Run --only=marl separately.\n\n");
     }
-    if (noSleep)
-        JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
 
     if (hot) {
         JLib::TaskScheduler::SetHotWorkers(hot);
@@ -947,6 +945,21 @@ int main(int argc, char** argv) {
 
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
     JLib::TaskScheduler::Init(pool);
+
+    // "nosleep" NOW MEANS "hold the pool unparked", via the awake floor. IdlePolicy::NoSleep was
+    // removed in 5.0; a floor as wide as the pool is what it used to do, so this arm still compares
+    // against marl and enkiTS the way every recorded figure did.
+    //
+    // AFTER Init, NEVER BEFORE. SetAwakeFloor clamps against the LIVE pool, so a pre-Init call
+    // silently resolves to 0 -- and the run would then print "nosleep" while measuring a fully
+    // parked pool. The resulting width is echoed for exactly that reason.
+    if (noSleep) {
+        JLib::TaskScheduler::SetAwakeFloor(JLib::TaskScheduler::Instance().GetWorkerCount());
+        JLib::TaskScheduler::SetAwakeFloorMax(JLib::TaskScheduler::Instance().GetWorkerCount());
+        printf("nosleep: awake floor held at %zu of %zu workers\n\n",
+               JLib::TaskScheduler::GetAwakeFloor(),
+               JLib::TaskScheduler::Instance().GetWorkerCount());
+    }
     // `fiberOnly` now selects the TASK TYPE only. Mode::FiberOnly was removed in 4.0.2 once it
     // became behaviourally identical to Default -- the pinning, the direct resume and the futex park
     // it was built for are unconditional now, and admitting Native was the last difference. The

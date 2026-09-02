@@ -308,8 +308,15 @@ int main(int argc, char** argv) {
     auto& io = JLib::IoReactor::Instance();
     io.InitSockets();
 
-    if (noSleep)
-        JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
+    // "nosleep" NOW MEANS "hold the pool unparked", via the awake floor -- IdlePolicy::NoSleep was
+    // removed in 5.0 and a pool-wide floor is what it used to do. Set AFTER Init (it is, above),
+    // because SetAwakeFloor clamps against the live pool and a pre-Init call resolves to 0.
+    if (noSleep) {
+        JLib::TaskScheduler::SetAwakeFloor(sched.GetWorkerCount());
+        JLib::TaskScheduler::SetAwakeFloorMax(sched.GetWorkerCount());
+        std::printf("nosleep: awake floor held at %zu of %zu workers\n",
+                    JLib::TaskScheduler::GetAwakeFloor(), sched.GetWorkerCount());
+    }
 
     std::printf("io_dispatch_latency -- %d samples, cold pause %dms, %u completion thread(s), "
                 "%zu workers, idle=%s, hot=%zu, hotRT=%d, hotPin=%d, hotExcl=%d\n\n", samples,

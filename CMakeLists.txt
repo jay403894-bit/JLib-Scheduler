@@ -553,7 +553,7 @@ if(WIN32 AND NOT JLIBSCHED_ARCH STREQUAL "aarch64")
     target_compile_features(SchedulerContextSwitchBench PRIVATE cxx_std_17)
 endif()
 
-# Measures what an IDLE NoSleep pool costs the main thread, and how much of that the steal hint
+# Measures what an IDLE SPINNING pool costs the main thread, and how much of that the steal hint
 # removes. Both arms run inside one process against one pool -- see the file header.
 add_executable(SchedulerEpochVsMutex "${CMAKE_CURRENT_SOURCE_DIR}/bench/epoch_vs_mutex.cpp")
 target_link_libraries(SchedulerEpochVsMutex PRIVATE Scheduler)
@@ -563,9 +563,9 @@ add_executable(SchedulerEpochMechBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/epoch_
 target_link_libraries(SchedulerEpochMechBench PRIVATE Scheduler)
 target_compile_features(SchedulerEpochMechBench PRIVATE cxx_std_17)
 
-add_executable(SchedulerNoSleepTax "${CMAKE_CURRENT_SOURCE_DIR}/bench/nosleep_tax.cpp")
-target_link_libraries(SchedulerNoSleepTax PRIVATE Scheduler)
-target_compile_features(SchedulerNoSleepTax PRIVATE cxx_std_17)
+add_executable(SchedulerSpinTax "${CMAKE_CURRENT_SOURCE_DIR}/bench/spin_tax.cpp")
+target_link_libraries(SchedulerSpinTax PRIVATE Scheduler)
+target_compile_features(SchedulerSpinTax PRIVATE cxx_std_17)
 
 # The lock primitives had no benchmark at all until 2.7.0 -- bench.cpp covers push/steal/ParallelFor
 # and never takes a SchedulerMutex. This one measures them, and it is what established that the

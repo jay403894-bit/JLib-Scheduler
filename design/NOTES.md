@@ -2052,3 +2052,52 @@ argument, and a rate only tells you how long you can ignore it.
 
 **If a join you can abandon is ever needed:** compose it from a primitive that HAS waiters -- wait on
 an Event the last task signals, and cancel the Event. The counter stays a counter.
+
+## A DAG frame loop must Tick on the main thread (2026-09-02)
+
+The reaper made reclamation a queued task and the README started saying "you do not have to call
+anything." That is true for most workloads and FALSE FOR TaskDAG, and the docs were one edit away
+from dropping the obligation entirely.
+
+Two facts combine:
+
+  * `TaskDAG` retires a node per node per frame, through `EpochManager::RetirePtr`.
+  * `RetirePtr` has NO threshold-triggered sweep. Epochs reclaim only when something calls `Tick()`.
+    (Hazards differ -- `Retire()` does self-trigger, which is why forgetting `Scan()` only reclaims
+    late instead of leaking.)
+
+And the reaper's only trigger is a FIBER DEATH. A DAG need not produce one: `CreateMainNode` REQUIRES
+`TaskType::Native` and fatals on `TaskType::Fiber`, and a Native task never binds a fiber to kill.
+
+So the DAG is a rate of retirement with no corresponding rate of reclamation -- the exact shape that
+grows without bound. The frame boundary is where it gets fixed, because that is a moment the app has
+and the library does not.
+
+WHY THIS IS WORTH WRITING DOWN. The reaper is a real improvement and it is easy to over-read: "the
+sweep is automatic now" is the natural summary and it silently drops a case. Anything that retires on
+a schedule but does not recycle fibers is in the same position as the DAG, so the question to ask of
+a future subsystem is not "does it retire" but "does it produce fiber deaths at the same rate".
+
+## Essentials must check Push's bool (2026-09-02)
+
+`Push` has always returned `bool` and three call sites in the library discarded it. Two of them had
+already incremented a WaitGroup:
+
+    RunCounted:    wg.n.fetch_add(1); t->waitGroup = &wg; Push(t);
+    ParallelFor:   (same shape, per lane)
+    QueueReclaim:  latches g_reclaimQueued, then pushes the sweep
+
+A dropped push in the first two does not lose a task -- it HANGS EVERY WaitFor ON THAT GROUP
+FOREVER, because the decrement lives in the completion of a task that was never queued. In the third
+it stops reclamation for the rest of the run, because the flag says a sweep is coming and none is.
+All three now undo their accounting on a false and let the natural trigger retry.
+
+HONEST STATUS: currently unreachable through a non-null task. `PushTarget` returns false only for
+null -- the inboxes are unbounded intrusive Vyukov MPSC queues whose push() cannot refuse, and the
+one fallible path (PushLaneIntake, moodycamel) already falls through to the floor on failure. So
+these are defensive today.
+
+WORTH WRITING ANYWAY. The cost is one cold predicted branch; the failure it prevents is a hang with
+no diagnostic. And the reachability is a property of TODAY's queues, not of the API -- the moment
+anything acquires a bounded queue or a teardown refusal, every one of these sites becomes live. A
+bool nobody reads is indistinguishable from a void return, which is how it got discarded three times.

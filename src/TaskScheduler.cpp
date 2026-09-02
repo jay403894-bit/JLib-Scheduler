@@ -1162,25 +1162,6 @@ static TaskScheduler::AffinityPolicy g_affinityPolicy = TaskScheduler::AffinityP
 void TaskScheduler::SetAffinityPolicy(AffinityPolicy p) { g_affinityPolicy = p; }
 TaskScheduler::AffinityPolicy TaskScheduler::GetAffinityPolicy() { return g_affinityPolicy; }
 
-// ATOMIC, and the reason is not tearing. This was a plain global read by every worker on every idle
-// pass, which made SetIdlePolicy safe ONLY before StartPool -- a constraint nothing documented and
-// nothing enforced. The practical failure of calling it on a running pool was not a torn read: a
-// non-atomic load of a global the compiler can prove is not modified inside the worker loop is free
-// to be HOISTED OUT of that loop, so a running worker could never observe the change at all.
-//
-// Relaxed is sufficient, deliberately. This is a HINT about how hard to look for work, never a
-// correctness input: the sleep predicate and the whole wake handshake are untouched, so a worker
-// reading a stale value spins one pass longer or parks one pass early, and BOTH are safe states.
-// No new lost-wakeup surface -- see tests/verify/sleepwake_model.c, which this does not affect.
-//
-// Note the two transitions are NOT symmetric, which matters to callers (see ScopedIdlePolicy):
-// NoSleep -> Sleep applies immediately, because spinning workers re-read this every pass. Sleep ->
-// NoSleep applies LAZILY, because parked workers are blocked in cv.wait and cannot see it until
-// something wakes them.
-static std::atomic<TaskScheduler::IdlePolicy> g_idlePolicy{ TaskScheduler::IdlePolicy::Sleep };
-void TaskScheduler::SetIdlePolicy(IdlePolicy p) { g_idlePolicy.store(p, std::memory_order_relaxed); }
-TaskScheduler::IdlePolicy TaskScheduler::GetIdlePolicy() { return g_idlePolicy.load(std::memory_order_relaxed); }
-
 // K-HOT. DEFAULT IS ZERO, and that is not timidity -- it is the same rule the I/O layer follows:
 // a job-system-only user must not pay for something they never asked for. A spinning core is a real
 // cost to every other thread in the process, so it is opt-in like the reactor is.
@@ -3318,7 +3299,11 @@ void TaskScheduler::RunCursorRange(int start, int end, int grain, std::function<
 		// remaining workers simply take what this one would have.
 		if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
 		t->waitGroup = &wg;
-		Push(t);
+		// SAME UNDO AS THE ARENA-EXHAUSTED BRANCH ABOVE, for the same reason: the count was raised
+		// before the push, so a push that misses leaves it raised and the ParallelFor never
+		// returns. The cursor is self-balancing, so dropping this lane costs parallelism and not
+		// work -- the remaining workers take what it would have.
+		if (!Push(t)) { wg.n.fetch_sub(1, std::memory_order_acq_rel); DestroyTask(t); }
 	}
 
 	// The caller pulls too, same as the flat path keeping chunk 0 for itself. It is blocked here
@@ -4855,7 +4840,20 @@ bool TaskScheduler::Push(Task* task) {
 void TaskScheduler::RunCounted(WaitGroup& wg, Task* t) {
 	wg.n.fetch_add(1, std::memory_order_relaxed);
 	t->waitGroup = &wg;
-	Push(t);
+
+	// THE COUNT IS INCREMENTED BEFORE THE PUSH, so a push that does not land must UNDO it. Nothing
+	// else can: the decrement lives in the task's own completion, and a task that was never queued
+	// never completes. Discarding Push's bool here does not lose a task, it hangs every WaitFor on
+	// this group FOREVER -- the worst consequence of a dropped push anywhere in the scheduler, and
+	// silent.
+	//
+	// Currently unreachable through a non-null task -- PushTarget returns false only for null, and
+	// the inboxes are unbounded intrusive queues that cannot refuse. Written anyway, because the
+	// cost is one cold branch and the failure it prevents is a hang with no diagnostic.
+	if (!Push(t)) {
+		wg.n.fetch_sub(1, std::memory_order_acq_rel);
+		DestroyTask(t);
+	}
 }
 
 // SPIN A LITTLE BEFORE GIVING THE CORE AWAY. Used by every BARE-THREAD wait loop.

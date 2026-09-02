@@ -374,123 +374,47 @@ namespace JLib {
 		static void           SetAffinityPolicy(AffinityPolicy p);
 		static AffinityPolicy GetAffinityPolicy();
 
-		// What an idle worker does when it has no local work and stole nothing. Set BEFORE Init().
+		// IdlePolicy WAS HERE, AND IT IS GONE. Sleep vs NoSleep -- park on the condition variable,
+		// or never park at all -- was the pool's only idle control from 1.2 through 5.0. It was
+		// removed because the awake floor is strictly better at the job NoSleep was doing, and
+		// keeping both meant shipping a public setting whose good configuration was "do not use it".
 		//
-		//   Sleep (default) -- park on the condition variable. Costs a kernel transition to wake,
-		//                      which is the single largest item in dispatch latency, and gives the
-		//                      core back to everything else on the machine.
-		//   NoSleep         -- never park while running. Lowest possible dispatch latency, and it
-		//                      holds every worker core permanently. Measured on the reference machine:
-		//                      4.1x on round-trip latency, 2.9x on the frame DAG, 3.1x on fork-join,
-		//                      5.2x on single-producer throughput. That is what a core each buys.
+		// WHAT NoSleep BOUGHT, so nobody re-derives it: it never entered the kernel, so a notify was
+		// a store a spinning worker observed rather than a ~5.5us futex round trip (6.7us parked
+		// against 1.2us spinning, p50, reserved band). That is real, and it is why the setting
+		// existed at all.
 		//
-		// THE DEFAULT IS Sleep AND SHOULD STAY THAT WAY for a library rather than an application.
-		// Spinning workers are a battery and thermal problem on the ARM64/Android target, where the
-		// throttling costs more clock than the wake latency ever costs in dispatch; they starve
-		// whatever else the host runs (an audio device thread, a render thread, Jolt through the
-		// JobSystem adapter); and they make the oversubscription policy incoherent, since that
-		// policy reserves a core per persistent busy thread and this would make EVERY worker one.
-		// WHICH ONE TO PICK, and do NOT decide this from the scheduler benchmarks. They make NoSleep
-		// look free, because in a scheduler benchmark the pool IS the workload: there is no render
-		// or audio thread for the spinning to tax, so the wake saving is all that shows up. Measured
-		// with an IDLE pool and a memory-bound main thread (31 workers, 2026-08-16):
+		// WHAT IT COST, which is why it loses. An idle spinning pool taxes every OTHER thread in the
+		// process, because the cost is core OCCUPANCY rather than cache traffic -- a control pool of
+		// pure CpuRelax threads touching no shared memory reproduced almost all of it. Synthetic
+		// (31 workers, idle pool, memory-bound main thread): 14.65 ms/frame parked against 15.17 ms
+		// spinning, +3.5%. Inside a real 2D game, where a render thread, GPU driver threads and
+		// audio are all competing for the cores the spinners hold: 383us against 462us, 23% WORSE.
+		// The synthetic figure understated the embedded cost by ~7x.
 		//
-		//     no pool at all   14.65 ms/frame        Sleep (parked)   14.65 ms   +0.0%
-		//     NoSleep          15.17 ms   +3.5%
+		// AND THE AWAKE FLOOR IS THE SAME BENEFIT WITHOUT THAT BILL. F workers stay unparked and
+		// absorb the wake, so the notify-is-a-store path is still there for the work that needs it,
+		// but the count is BOUNDED and it SHEDS when the burst ends -- which is exactly the half
+		// NoSleep could not do. NoSleep held every core for the whole run whether or not any work
+		// was coming; the floor holds a few, and only while they are earning it. K is the same
+		// bargain for the latency lane.
 		//
-		// An idle Sleep pool is FREE. Any spinning pool costs ~3.5% to every other thread in the
-		// process. And it is not the steal sweep doing it -- a control pool of pure CpuRelax threads
-		// touching NO shared memory reproduced almost all of it (15.15 ms), so the cost is core
-		// OCCUPANCY: all-core boost, SMT siblings, power budget. That also means there is no
-		// spin-loop optimisation to be had; the measured ceiling on cheapening the spin is 0.8%.
-		//
-		// The two effects scale with OPPOSITE things. NoSleep's benefit scales with how OFTEN the
-		// pool idles (wakes avoided); its cost scales with how LONG it idles. Break-even is roughly
-		// where 0.035 * idle_gap ~= one 4.6us wake, i.e. an idle gap near 130us. Order of magnitude
-		// only -- it assumes a single memory-bound victim thread -- but enough to decide with.
-		//
-		//   Sleep (the default, and the right answer for interactive apps): anything with a busy
-		//     main/render thread, anything sharing the machine, anything whose idle gaps are long.
-		//     A GAME IS THIS CASE, not the NoSleep case: a 60 FPS frame is 16,600us and even a
-		//     2000 FPS frame is 500us, both orders of magnitude past break-even. An earlier version
-		//     of this comment recommended NoSleep for a fullscreen game; that was wrong, and it was
-		//     wrong because it reasoned from the benchmark rather than from an embedded pool.
-		//   NoSleep: batch/offline work where the task graph is the entire program (asset bakes,
-		//     offline renders, simulation runs), tight pipelines with sub-100us idle gaps, or a
-		//     reserved-core deployment where the pool really does own the hardware.
-		//
-		// Pause() parks regardless of policy -- pausing means "stop using the CPU", and a policy
-		// that kept spinning through it would be ignoring the only thing Pause is for.
-		//
-		// NOT A TIMED WAIT, and the distinction matters: this changes how long a worker searches
-		// BEFORE parking, and the park itself stays an unconditional cv.wait. A lost wakeup still
-		// hangs, unconditionally and visibly, instead of being silently papered over by a timeout.
-		// It does make such a race rarer, which is a real debugging cost -- the 1.2.0 lost wakeup
-		// was only findable because it reproduced at ~25% on a slow runner.
-		// THERE IS DELIBERATELY NO MIDDLE SETTING. A SpinBriefly mode existed here, searching for a
-		// configurable number of microseconds before parking, on the classic spin-then-block
-		// reasoning that spinning for the cost of a block is 2-competitive. It was measured and it
-		// was WORSE THAN BOTH NEIGHBOURS, monotonically worse as the budget grew (frame DAG, µs per
-		// graph: Sleep 22.5 | brief@2 23.6 | brief@5 23.6 | brief@20 27.3 | brief@100 34.4 |
-		// NoSleep 7.8). The 2-competitive argument assumes spinning is free for everyone else, and
-		// with 31 workers it is not: spinners burn memory bandwidth and contend on steal CASes
-		// against the workers that actually have work, and then park anyway, paying the wake cost
-		// plus continuous park/unpark cv churn on top. Both extremes avoid one half of that; the
-		// middle gets both. Removed rather than kept as a trap for anyone expecting a compromise.
-		enum class IdlePolicy : uint8_t { Sleep = 0, NoSleep };
-		// SAFE TO CALL ON A RUNNING POOL as of 1.3.6 -- the backing store is atomic. It was not
-		// before: a plain global read inside the worker loop could be hoisted out of it, so a
-		// change might never be observed at all. That was undocumented, which made it a trap.
-		//
-		// IF YOU FLIP IT AT RUNTIME, RESTORE IT ON EVERY PATH. Leaking NoSleep on an exception or an
-		// early return does not fail loudly -- it silently taxes every other thread in the process
-		// for the rest of the run, at a cost measured below in real digits. A scoped RAII wrapper
-		// for this was written and then removed before it ever shipped in a release: measurement
-		// (also below) showed the phase-switching use case it was built for did not pay, and an
-		// unused public class is worse than a one-line discipline. If you find yourself flipping
-		// this in more than one place, write the guard locally rather than asking for it back.
-		//
-		// COST MODEL -- why the default is Sleep and why you should think hard before changing it.
-		// Measured 2026-08-16, 31 workers, IDLE pool, memory-bound main thread:
-		//     no pool at all   14.65 ms/frame       Sleep (parked)  14.65 ms   +0.0%
-		//     NoSleep          15.17 ms  +3.5%
-		// An idle Sleep pool is FREE. An idle NoSleep pool taxes every OTHER thread in the process.
-		// The cost is core OCCUPANCY, not cache traffic: a control pool of pure CpuRelax threads
-		// touching no shared memory reproduced almost all of it -- which also means there is no
-		// spin-loop optimisation to be had (measured ceiling 0.8%). The tax is therefore
-		// proportional to IDLE TIME, not to work done.
-		//
-		// AND THAT 3.5% IS A LOWER BOUND, NOT THE NUMBER. Re-measured inside a real 2D game
-		// (5-node frame DAG, vsync off, 600 frames after 120 warm-up, two interleaved rounds,
-		// median frame time):
-		//     Sleep    383.3 / 374.1 us            NoSleep  462.0 / 464.9 us   <- 23% WORSE
-		// A game has the render thread, GPU driver threads and audio all competing, and spinning
-		// workers land on them at exactly the latency-sensitive moments. The synthetic figure
-		// understated the real cost by ~7x.
-		//
-		// WHY THERE IS NO ADAPTIVE MODE, since it is the obvious next idea (proposed and rejected
-		// 2026-08-17). Switching automatically on queue depth / steal rate / suspension rate / DAG
-		// pressure / idle ratio fails for two reasons that no amount of tuning fixes. First, the
-		// controller cannot observe its own cost function: the tax lands on the RENDER thread and
-		// every available signal is scheduler-internal, so it would converge on NoSleep in exactly
-		// the cases measured as losing. Second, the signals are anti-correlated with the decision --
-		// they describe the PRESENT, the decision needs the NEXT idle gap, and in a frame workload a
-		// heavy burst is precisely what precedes a long idle tail. It would be most confident right
-		// before it was most wrong. Keeping a small number of workers hot instead was also dropped:
-		// permanent cost, intermittent benefit, and the cost is proportional to the hot count while
-		// the benefit is sub-proportional (the other workers still wake cold).
-		static void       SetIdlePolicy(IdlePolicy p);
+		// A SpinBriefly middle setting was also measured and was worse than BOTH neighbours,
+		// monotonically worse as the budget grew (frame DAG, us/graph: Sleep 22.5 | brief@2 23.6 |
+		// brief@20 27.3 | brief@100 34.4). The 2-competitive spin-then-block argument assumes
+		// spinning is free for everyone else, and at 31 workers it is not. So there is no middle to
+		// restore either -- the floor IS the middle, and it is a controller rather than a constant.
 		// Runtime kill switch for the bulk steal hint, so its value can be measured against an A/A
 		// control inside ONE process. Diagnostic: shipping code should leave it on.
 		static inline std::atomic<bool> stealHintOn{ true };
 		static void SetStealHint(bool on) noexcept { stealHintOn.store(on, std::memory_order_relaxed); }
-		static IdlePolicy GetIdlePolicy();
 
-		// K-HOT: keep the first K workers from ever parking, while the rest obey IdlePolicy.
+		// K-HOT: keep the first K workers from ever parking, while the rest park normally.
 		//
-		// The bounded-cost middle between Sleep and NoSleep. NoSleep's penalty lands in p90 and
-		// scales with how many cores spin, so a handful of hot workers is a different trade from
-		// spinning the whole pool. A hot worker also costs a PUSHER nothing: it never advertises
+		// The bounded version of what IdlePolicy::NoSleep used to do pool-wide (see the note above
+		// for why that setting is gone). The spin penalty scales with how many cores spin, so a
+		// handful of hot workers is a different trade from spinning all thirty-one of them. A hot
+		// worker also costs a PUSHER nothing: it never advertises
 		// WS_GOING_TO_SLEEP, so pushes to it take the awake-preference skip instead of a notify.
 		//
 		// DEFAULT 0 -- off. A spinning core taxes every other thread in the process, so this is
@@ -2077,7 +2001,7 @@ namespace JLib {
 		// PushFork was REMOVED in 1.3.4 -- use Push. It placed a child on the CALLING worker, on the
 		// theory that the parent was about to WaitFor and free that core, so the child would run
 		// warm on the parent's data. Measurement killed both halves of that: the win was one
-		// avoided worker WAKE (~5us, gone entirely under IdlePolicy::NoSleep) and not locality at
+		// avoided worker WAKE (~5us, and absent entirely on an unparked worker) and not locality at
 		// all -- a control child sharing NO data with its parent saved just as much. Against that,
 		// it was 1.5x-4.6x SLOWER for any fork-join-shaped spawn, worst on small trees. To place a
 		// task on a known worker, Push(cpu_affinity, task) -- one-based, 0 meaning round-robin.

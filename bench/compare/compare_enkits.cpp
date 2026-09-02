@@ -650,8 +650,6 @@ int main(int argc, char** argv) {
         printf("note: nosleep implies --only=jlib; a spinning pool cannot share a process with\n"
                "      another scheduler being timed. Run --only=enki separately for its column.\n\n");
     }
-    if (noSleep)
-        JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
 
     JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::None);
     // ONLY THE LIBRARY BEING MEASURED KEEPS RUNNING THREADS. That is the whole point of --only:
@@ -665,6 +663,21 @@ int main(int argc, char** argv) {
     // benchmark: the singleton must exist for Instance() to be valid, and the benchmarks that do
     // not touch it are already gated.
     JLib::TaskScheduler::Init(pool);
+
+    // "nosleep" NOW MEANS "hold the pool unparked", via the awake floor. IdlePolicy::NoSleep was
+    // removed in 5.0; a floor as wide as the pool is what it used to do, so this arm still compares
+    // against marl and enkiTS the way every recorded figure did.
+    //
+    // AFTER Init, NEVER BEFORE. SetAwakeFloor clamps against the LIVE pool, so a pre-Init call
+    // silently resolves to 0 -- and the run would then print "nosleep" while measuring a fully
+    // parked pool. The resulting width is echoed for exactly that reason.
+    if (noSleep) {
+        JLib::TaskScheduler::SetAwakeFloor(JLib::TaskScheduler::Instance().GetWorkerCount());
+        JLib::TaskScheduler::SetAwakeFloorMax(JLib::TaskScheduler::Instance().GetWorkerCount());
+        printf("nosleep: awake floor held at %zu of %zu workers\n\n",
+               JLib::TaskScheduler::GetAwakeFloor(),
+               JLib::TaskScheduler::Instance().GetWorkerCount());
+    }
     JLib::TaskScheduler& jl = JLib::TaskScheduler::Instance();
     if (!g_doJ) JLib::detail::TeardownForTesting(jl);
 

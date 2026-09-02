@@ -469,14 +469,63 @@ namespace JLib {
 			ReleasePendingDebts();
 			// CLEARED LAST, after all three: clearing earlier would let a second sweep queue while
 			// this one is still walking, which is the burst the flag exists to collapse.
-			g_reclaimQueued.store(false, std::memory_order_release);
+			//
+			// SEQ_CST, PAIRED WITH THE LOAD BELOW, and both are load-bearing -- see the re-check.
+			g_reclaimQueued.store(false, std::memory_order_seq_cst);
+
+			// ---- THE LAST FIBER'S DEBTS HAVE NO SECOND TRIGGER ---------------------------
+			//
+			// ReleasePendingDebts says a racing producer "is swept by the next pass", and that is
+			// true exactly when a next pass happens. FIBER DEATH IS THE ONLY TRIGGER, so the final
+			// death in a run has no successor, and this is a lost wake in the classic shape:
+			//
+			//   1. this task drains the stack with its exchange(nullptr)
+			//   2. the last dying fiber pushes its debts
+			//   3. it calls QueueReclaim, finds the flag STILL SET, and queues nothing
+			//   4. we clear the flag -- and nothing will ever set it again
+			//
+			// Its debts are then never released. MEASURED at 199 of 200 fibers released, once in
+			// roughly eight runs of fiber_debt_test; rare because the window is one exchange wide,
+			// and permanent when it lands.
+			//
+			// THE RE-CHECK CLOSES IT, and the ordering is the whole fix. Producer does
+			// push-then-CAS; we do clear-then-load. With both sides sequentially consistent every
+			// interleaving is covered: a producer that pushed before our drain was swept; one that
+			// pushed after the drain but before the clear fails its CAS and is caught by the load
+			// here; one that pushes after the clear wins its CAS and queues its own sweep. Release
+			// on the store alone is NOT enough -- StoreLoad is the one reordering acquire/release
+			// does not forbid, so the load could be hoisted above the clear and see an empty stack
+			// that the producer is about to fill.
+			if (g_pendingDebts.load(std::memory_order_seq_cst) != nullptr)
+				QueueReclaim();
 		}, Lane::Normal);
 
 		// ALLOCATION CAN FAIL ON A DEATH PATH, which is exactly where it is least welcome. Dropping
 		// the sweep is safe -- the bag simply stays full and the next fiber death queues another --
 		// so this releases the flag rather than leaving it latched forever.
 		if (!t) { g_reclaimQueued.store(false, std::memory_order_release); return; }
-		s->Push(t);
+
+		// ---- A DROPPED PUSH MUST NOT LATCH THE FLAG FOREVER --------------------------------
+		//
+		// Push's bool is checked rather than discarded, and this is the caller that most needs to:
+		// the flag says "a sweep is coming", so believing a push that did not land stops
+		// reclamation for the REST OF THE RUN -- the same permanent-loss shape as the lost wake
+		// below, reached a different way.
+		//
+		// RELEASING THE FLAG IS THE RETRY. There is no useful immediate retry here: this runs on a
+		// fiber death path where the reason a push failed would still be true a nanosecond later.
+		// Clearing the flag hands the retry to the next fiber death, which is the trigger the whole
+		// scheme is built on, and the debts stay on the stack meanwhile rather than being lost.
+		//
+		// TODAY THIS IS DEFENSIVE, and deliberately so. PushTarget returns false only for a null
+		// task -- the inboxes are intrusive Vyukov MPSC queues, unbounded, whose push() cannot fail
+		// -- so the branch is currently unreachable through a non-null task. It costs one predicted
+		// branch on a cold path, and it means the day Push acquires a real failure mode (a bounded
+		// queue, a refusal during teardown) this essential retries instead of silently stopping.
+		if (!s->Push(t)) {
+			g_reclaimQueued.store(false, std::memory_order_release);
+			return;
+		}
 	}
 
 	bool FiberRegistry::AdvanceCleanup(Fiber* f) {

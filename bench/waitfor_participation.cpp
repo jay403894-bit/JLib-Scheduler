@@ -25,7 +25,7 @@
 // do on a normally-launched process. The MAIN-PARK rows have no such dependency: a spin is a spin.
 //
 // THE ARMS DIFFER IN EXACTLY ONE THING EACH, and all five run in one process, interleaved, because
-// SetIdlePolicy and SetHotWorkers are both runtime settings. No cross-build comparison anywhere.
+// the awake floor and SetHotWorkers are both runtime settings. No cross-build comparison anywhere.
 
 #include <windows.h>
 
@@ -131,7 +131,9 @@ int main(int argc, char** argv) {
                     eco ? "ON -- THROTTLED, the K rows are meaningless" : (gotQos ? "off" : "unknown"));
     }
 
-    JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::Sleep);
+    // (This used to pin IdlePolicy::Sleep explicitly. That enum is gone in 5.0 and the library
+    // default is an awake floor of 2, which is the same configuration these rows were measured
+    // under -- Sleep never overrode the floor. Nothing to state, so nothing is stated.)
     JLib::TaskScheduler::SetHotThreadPolicy(JLib::TaskScheduler::HotThreadPolicy::Elevated);
     JLib::TaskScheduler::Init(0);
 

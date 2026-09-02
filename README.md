@@ -244,6 +244,12 @@ affinity policy, with the observed range in brackets. **The two columns are one 
 two idle policies**, not two products -- `Sleep` parks idle workers and is the default, `NoSleep`
 keeps them searching.
 
+> **`NoSleep` was removed in 5.0**, so this column is history rather than a configuration you can
+> select. It bought the store-instead-of-futex wake path by holding every worker core for the whole
+> run, which cost 23% to a real game's frame time. The awake floor buys the same path for a
+> *bounded* number of workers and gives the cores back when the burst ends -- so the mechanism
+> survives, priced honestly, and the numbers below are the ceiling it was measured against.
+
 | | `Sleep` (default) | `NoSleep` | |
 |---|---|---|---|
 | Task enqueue → dequeue latency | 4.6 µs <br><sub>[4.28-4.72]</sub> | **1.0 µs** <br><sub>[0.94-2.8]</sub> | 4.6x |
@@ -1176,9 +1182,14 @@ to see whether your workload reaches it.
 
 ### Garbage collection is a task, and you do not schedule it
 
-**You do not have to call anything.** The reaper queues reclamation as an ordinary task on fiber
-death, rate-limited to one sweep in flight. `SetSelfReclaim` and `SetSelfScan` are gone, and so is
-the obligation they implied.
+**For most workloads you do not have to call anything.** The reaper queues reclamation as an ordinary
+task on fiber death, rate-limited to one sweep in flight. `SetSelfReclaim` and `SetSelfScan` are
+gone, and so is the obligation they implied.
+
+**The exception is `TaskDAG`, which does require a `Tick()` on your thread** — it retires a node per
+frame and can produce no fiber deaths to trigger a sweep with. That case is
+[below](#if-you-use-taskdag-tick-on-the-main-thread), and it is the one place this section's headline
+does not hold.
 
 Three designs were tried and the first two were wrong:
 
@@ -1262,6 +1273,28 @@ The first row is the one to act on. `Retire` still runs its own threshold-trigge
 forgetting `Scan()` costs you timeliness rather than memory, and
 `HazardDomain::Instance().OrphanedRetired()` is how you would notice if a thread exited holding a
 bag. Forgetting `Tick()` is the one that actually leaks.
+
+#### If you use `TaskDAG`, tick on the main thread
+
+**This is the one case where the queued sweep is not enough, and it is not an optimisation.** The
+loop above is optional for most workloads and required for this one:
+
+```cpp
+while (running) {
+    dag.Execute();
+    JLib::EpochManager::Instance().Tick();   // REQUIRED for a DAG frame loop
+}
+```
+
+Two facts combine into it. `TaskDAG` **retires a node per node per frame** — every node goes into the
+epoch bag through `RetirePtr` — and unlike the hazard path, `RetirePtr` has **no threshold-triggered
+sweep of its own**: epochs reclaim only when something calls `Tick()`. The reaper's only trigger is a
+**fiber death**, and a DAG need not produce any — main nodes are required to be `TaskType::Native`,
+which never binds a fiber at all.
+
+So a DAG frame loop can retire steadily and trigger nothing, which is the shape that grows without
+bound: a rate of retirement with no corresponding rate of reclamation. The frame boundary is the
+right place to fix it, because that is the moment you have and the library does not.
 
 The second row is a caveat rather than a recommendation. **The 3x p99 figure above is the epoch
 result and has not been reproduced for hazards** -- the hazard bag is smaller and sweeps less often,

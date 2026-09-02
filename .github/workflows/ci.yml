@@ -134,13 +134,11 @@ jobs:
         run: ./${{ matrix.prims }}
         shell: bash
 
-      # Same suite again under IdlePolicy::NoSleep. That policy changes the worker's park path --
-      # the exact code the 1.2.0 lost wakeup lived in -- so running the existing blocking cases
-      # under it is worth far more than a bespoke test would be. Cheap: the suite is seconds, and
-      # it carries its own watchdog, so a regression here fails fast instead of hanging the job.
-      - name: Run primitives test under NoSleep
-        run: ./${{ matrix.prims }} nosleep
-        shell: bash
+      # A second pass under IdlePolicy::NoSleep used to run here. That policy is gone in 5.0, and
+      # with it the second park path this step existed to cover -- the argument is now accepted and
+      # ignored, so keeping the step would have run the same suite twice and reported it as
+      # coverage. The live park-policy transition it was really guarding (a flip landing mid
+      # handshake) is asserted directly by the awake-floor case inside the suite above.
 
       # Third mode: worker self-triggered reclamation OFF -- how an application that ticks
       # EpochManager from its own idle path runs. Exercises the branch where RetirePtr skips its
@@ -452,13 +450,10 @@ jobs:
         run: ./build/bin/Release/SchedulerPrimitivesTest.exe
         shell: bash
 
-      - name: Run primitives test under NoSleep
-        run: ./build/bin/Release/SchedulerPrimitivesTest.exe nosleep
-        shell: bash
-
-      - name: Run primitives test with self-reclaim disabled
-        run: ./build/bin/Release/SchedulerPrimitivesTest.exe
-        shell: bash
+      # TWO MORE INVOCATIONS OF THE SAME BINARY USED TO FOLLOW, one per IdlePolicy and one with
+      # self-reclaim disabled. Both settings are gone, both arguments are now accepted-and-ignored,
+      # and both steps had therefore become bit-identical re-runs of the line above -- three green
+      # checks describing one execution. Removed rather than left as coverage theatre.
 
       - name: Run fiber budget test (SetFiberBudget wiring)
         run: ./build/bin/Release/SchedulerFiberBudgetTest.exe

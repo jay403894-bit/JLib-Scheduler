@@ -288,11 +288,11 @@ static void TestPushBatchSpread(JLib::TaskScheduler& sched) {
           "every task in a spread PushBatch ran exactly once");
 }
 
-// Pass "nosleep" to run the ENTIRE suite under IdlePolicy::NoSleep. Reusing every existing case
-// under both policies beats writing one bespoke NoSleep test: the policy changes the worker's park
-// path, which is exactly where the 1.2.0 lost wakeup lived, and the cases that would expose a
-// regression there are the blocking ones already written -- contention, the semaphore handoff, and
-// the spin-help deadlock guard. CI runs this binary twice, once per policy.
+// THIS SUITE USED TO RUN TWICE, once per IdlePolicy, and the reasoning was sound while there were
+// two policies: the setting changed the worker's park path -- exactly where the 1.2.0 lost wakeup
+// lived -- and the cases that would expose a regression there are the blocking ones already written,
+// so a second pass cost nothing to author. With IdlePolicy gone there is one park path, and the
+// transition risk it was covering is now tested directly by the live-floor-flip case below.
 
 // ---- 8. THE FIBER CAP: more tasks blocked at once than there are fibers -----------------------
 //
@@ -385,18 +385,19 @@ static int FiberContentionIters() {
 }
 static const int kFiberContentionIters = FiberContentionIters();
 
-// Changing IdlePolicy on a RUNNING pool -- allowed as of 1.3.6, and previously a data race.
+// Changing the park policy on a RUNNING pool. The setting has changed identity -- IdlePolicy until
+// 5.0, the awake floor now -- but the risk has not.
 //
-// The real risk being tested is a lost wakeup at the transition. Flipping to NoSleep while workers
-// are parked, and to Sleep while they are spinning, moves the whole pool across the park/wake
+// The real risk being tested is a lost wakeup at the transition. Widening the floor while workers
+// are parked, and collapsing it while they are spinning, moves the pool across the park/wake
 // handshake repeatedly and under load. If any of those transitions could strand a task, this hangs
 // and the watchdog reports it -- which is the correct outcome, and the reason this does not simply
 // assert on a counter and return.
 //
 // Deliberately NOT asserting that workers actually stopped parking: that is unobservable from
 // outside without instrumentation that would perturb the thing being measured. What is asserted is
-// the property that matters -- every task completes across every transition -- plus that the scoped
-// guard restores exactly, including nested.
+// the property that matters -- every task completes across every transition, and the setting is
+// exactly where it started afterwards.
 // ParallelFor: EXACTLY-ONCE coverage, which is the only property slice-stealing can plausibly get
 // wrong. A cursor hands out [lo, lo+grain) to whichever worker asks next, so the failure modes are
 // an element visited twice (two workers got overlapping slices) or never (the tail was dropped by
@@ -532,22 +533,27 @@ static void TestCursorRangeFallback(JLib::TaskScheduler& sched) {
         std::printf("      missed %d, wrong-count %d\n", missed, wrong);
 }
 
+// THE PARK POLICY CHANGES UNDER A LIVE POOL AND MUST STRAND NOTHING.
+//
+// This used to flip IdlePolicy between Sleep and NoSleep. That setting was removed in 5.0, but the
+// PROPOSITION it guarded outlived it: a worker decides whether to enter the kernel by reading a
+// value another thread can change mid-handshake, and a flip landing between "I decided to park" and
+// "I parked" is precisely where a task goes missing. The awake floor is the setting that owns that
+// decision now -- floor 0 means everyone may park, a wide floor means the first F may not -- so the
+// test is repointed at it rather than deleted with the enum.
 static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
-    std::printf("IdlePolicy change on a live pool\n");
+    std::printf("awake-floor change on a live pool\n");
 
-    using IP = JLib::TaskScheduler::IdlePolicy;
-    const IP entry = JLib::TaskScheduler::GetIdlePolicy();
+    const size_t entry = JLib::TaskScheduler::GetAwakeFloor();
 
-    Check(JLib::TaskScheduler::GetIdlePolicy() == entry, "GetIdlePolicy round-trips");
-
-    // Hammer the transition with work in flight. Each round parks or unparks the pool while tasks
-    // are being pushed, so the flip lands in the middle of the handshake rather than between quiet
-    // periods.
+    // Hammer the transition with work in flight. Each round widens or collapses the floor while
+    // tasks are being pushed, so the flip lands in the middle of the handshake rather than between
+    // quiet periods.
     constexpr int kRounds = 40;
     constexpr int kPerRound = 64;
     std::atomic<int> ran{ 0 };
     for (int r = 0; r < kRounds; ++r) {
-        JLib::TaskScheduler::SetIdlePolicy((r & 1) ? IP::NoSleep : IP::Sleep);
+        JLib::TaskScheduler::SetAwakeFloor((r & 1) ? 2u : 0u);
         JLib::WaitGroup wg;
         wg.n.store(kPerRound, std::memory_order_relaxed);
         for (int i = 0; i < kPerRound; ++i) {
@@ -559,16 +565,15 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
         }
         sched.WaitFor(wg);    // hangs here if a transition ever stranded one
     }
-    // Restore explicitly. There is no RAII guard for this by design (see SetIdlePolicy's comment),
-    // so the discipline it used to enforce is now the caller's -- including this test's, and a run
-    // that left NoSleep set would silently tax every case after it.
-    JLib::TaskScheduler::SetIdlePolicy(entry);
+    // Restore explicitly -- a run that left a wide floor set would spin cores through every case
+    // after this one and quietly change what they measure.
+    JLib::TaskScheduler::SetAwakeFloor(entry);
 
     Check(ran.load(std::memory_order_relaxed) <= kRounds * kPerRound, "no task ran twice");
-    std::printf("  %d tasks across %d policy flips on a live pool          %s\n",
+    std::printf("  %d tasks across %d floor flips on a live pool           %s\n",
                 ran.load(std::memory_order_relaxed), kRounds,
                 ran.load(std::memory_order_relaxed) > 0 ? "ok" : "NOTHING RAN");
-    Check(JLib::TaskScheduler::GetIdlePolicy() == entry, "policy restored after the loop");
+    Check(JLib::TaskScheduler::GetAwakeFloor() == entry, "floor restored after the loop");
 }
 
 static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
@@ -975,7 +980,13 @@ static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
 
 
 int main(int argc, char** argv) {
-    const bool noSleep = (argc > 1) && std::strcmp(argv[1], "nosleep") == 0;
+    // The "nosleep" arm is gone with IdlePolicy. It ran the whole suite with every worker forbidden
+    // to park -- a genuinely different park path, and worth a second pass while it existed. The
+    // awake floor covers the same ground now and is exercised by the live-flip case below, so there
+    // is no second configuration left to run the suite under. Accepted and ignored, like
+    // "noreclaim" below, so an existing invocation does not fail.
+    if (argc > 1 && std::strcmp(argv[1], "nosleep") == 0)
+        std::printf("note: 'nosleep' is gone with IdlePolicy -- argument ignored\n");
     // The "noreclaim" arm is gone with the flag it set. It ran the whole suite with worker
     // self-triggered reclamation disabled -- which is now the ONLY way the pool runs, so the arm has
     // become the default and there is nothing left to contrast it against. Every retire path in
@@ -985,8 +996,7 @@ int main(int argc, char** argv) {
     // no longer selects anything.
     if (argc > 1 && std::strcmp(argv[1], "noreclaim") == 0)
         std::printf("note: 'noreclaim' is now the only mode -- argument ignored\n");
-    std::printf("idle policy: %s\n\n", noSleep ? "nosleep" : "sleep");
-    // 30s default, overridable via JLIB_TEST_WATCHDOG_SECS. Raising it is what lets a high-iteration
+        // 30s default, overridable via JLIB_TEST_WATCHDOG_SECS. Raising it is what lets a high-iteration
     // reproducer distinguish SLOW from STUCK: if the run completes in 60s it was merely slow, and if
     // it never completes it is a hang no matter how long you wait.
     int watchdogSecs = 30;
@@ -994,9 +1004,8 @@ int main(int argc, char** argv) {
         const int v = std::atoi(w);
         if (v > 0) watchdogSecs = v;
     }
-    StartWatchdog(watchdogSecs, noSleep ? "primitives test (nosleep)" : "primitives test");
+    StartWatchdog(watchdogSecs, "primitives test");
 
-    if (noSleep) JLib::TaskScheduler::SetIdlePolicy(JLib::TaskScheduler::IdlePolicy::NoSleep);
     JLib::TaskScheduler::Init(4);
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
