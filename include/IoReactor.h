@@ -286,44 +286,6 @@ namespace JLib {
     IoLockStats ReadIoLockStats() noexcept;
     void        ResetIoLockStats() noexcept;
 
-    // ---- THE REACTOR'S BACKLOG IS THE GLOBAL QUEUE FOR I/O, SO IT IS ALWAYS MEASURABLE ---------
-    //
-    // Lane completions do not go straight to a worker. They queue in the completion thread's own
-    // FIFO backlog and drain into a reserved worker via PushIO, which may REFUSE when every K worker
-    // is buried. That makes depth here the answer to "is the lane keeping up", not an internal
-    // detail -- so unlike IoLockStats these counters are compiled in unconditionally.
-    //
-    // READ highWater, NOT depth, TO ANSWER THAT QUESTION. `depth` sampled from another thread is
-    // almost always zero even when the backlog spikes hard between samples; the high-water mark is
-    // the only thing that survives the gap. `declined` over `pushed` is the pressure ratio: near
-    // zero means the lane absorbs completions as fast as they arrive, and a climbing ratio means K
-    // is the bottleneck and wants to be wider.
-    //
-    // A NON-ZERO declined IS NOT AN ERROR. It means the mechanism engaged and held a completion
-    // instead of dumping it on a buried worker, which is the entire point. Sustained growth in
-    // highWater is the thing to worry about.
-    struct IoBacklogStats {
-        std::uint64_t depth     = 0;   // current, refreshed after each drain pass
-        std::uint64_t highWater = 0;   // deepest the backlog has ever been
-        std::uint64_t pushed    = 0;   // completions PushIO accepted onto the lane
-        std::uint64_t declined  = 0;   // drain passes that stopped because the lane was full
-        std::uint64_t drains    = 0;   // drain passes attempted
-    };
-    IoBacklogStats ReadIoBacklogStats() noexcept;
-    void           ResetIoBacklogStats() noexcept;
-
-    namespace detail {
-        // DEFINED IN IoShared.cpp, WHICH EVERY PLATFORM COMPILES -- not in the Windows backend that
-        // writes them. ReadIoLockStats above is defined only under _WIN32 and gets away with it
-        // because nothing portable calls it; anything a TEST reads has to link on a platform with no
-        // reactor too, where these correctly read zero.
-        extern std::atomic<std::uint64_t> g_blDepth;
-        extern std::atomic<std::uint64_t> g_blHigh;
-        extern std::atomic<std::uint64_t> g_blPushed;
-        extern std::atomic<std::uint64_t> g_blDeclined;
-        extern std::atomic<std::uint64_t> g_blDrains;
-    }
-
     class IoReactor {
     public:
         static IoReactor& Instance();

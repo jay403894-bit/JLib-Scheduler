@@ -24,13 +24,8 @@
 #include <thread>
 #include <vector>
 #include <chrono>
-#include <atomic>
-#include <deque>       // the completion thread's backlog -- see Worker()
 
 namespace JLib {
-
-    // Backlog telemetry lives in IoShared.cpp -- every platform compiles that, and a test reading
-    // these has to link where there is no reactor. Declared in IoReactor.h; written here.
 
 #if defined(JLIBSCHED_IO_LOCK_STATS)
     namespace detail {
@@ -279,11 +274,6 @@ namespace JLib {
         // not the idle p50.
         static constexpr std::size_t kBatch = 32;
 
-        // How long the completion thread waits on the port when it is HOLDING a backlog PushIO
-        // refused. Only reached while every reserved worker is buried. See the three-case timeout in
-        // Worker() for why this is finite rather than zero.
-        static constexpr DWORD kBacklogRetryMs = 1;
-
         void Run() {
             // THE PRODUCER HALF of the same knob the hot workers read. Elevating the consumer alone
             // would just move the preemption: a hot worker at priority 15 waiting on a completion
@@ -316,54 +306,6 @@ namespace JLib {
 #if defined(JLIBSCHED_IO_LOCK_STATS)
             IoResult* outHi[kBatch]; IoResult* outLo[kBatch];
 #endif
-
-            // ---- THE REACTOR OWNS ITS BACKLOG, AND THE BACKLOG IS A GLOBAL QUEUE ---------------
-            //
-            // Lane completions no longer go straight out. They land here first, and drain one at a
-            // time into a reserved worker that will actually take one. PushIO is the only Push that
-            // may REFUSE -- when every K worker is buried it returns false, and the completion stays
-            // here instead of being dumped onto a worker where it would sit behind a handler.
-            //
-            // FIFO, NOT LIFO, and that is the one behavioural choice in this structure. An item in
-            // here has ALREADY waited on the wire. LIFO would serve the newest completion first and
-            // let the oldest starve without bound under sustained load, which is the opposite of
-            // what a reserved lane is for -- reservation buys a flat tail. The usual argument for
-            // LIFO is cache locality and it does not apply: the completion is handed to a DIFFERENT
-            // thread, so the buffer is cold either way. push_back / pop_front.
-            //
-            // SINGLE-THREADED BY CONSTRUCTION. One completion thread owns this deque; nothing else
-            // touches it. No lock, no atomics on the container.
-            //
-            // INSTRUMENTED BECAUSE IT IS NOW THE GLOBAL QUEUE. Depth here is not an implementation
-            // detail -- it is the answer to "is the lane keeping up". A backlog that grows without
-            // bound means K cannot drain as fast as the OS completes, and the high-water mark is the
-            // only way to see that after the fact; instantaneous depth read at the wrong moment says
-            // nothing. `declined` over `pushed` is the pressure ratio: near zero means the lane is
-            // idle enough, climbing means K is the bottleneck and wants to be wider.
-            std::deque<Task*> backlog;
-
-            // Drain as much of the backlog as the lane will take, oldest first. STOPS ON THE FIRST
-            // REFUSAL rather than trying the rest: PushIO already rotated across every reserved
-            // worker before returning false, so a second item would ask the same question and get
-            // the same answer. Trying anyway would turn one refusal into a scan per item.
-            const auto DrainBacklog = [&]() {
-                if (backlog.empty()) return;
-                detail::g_blDrains.fetch_add(1, std::memory_order_relaxed);
-                while (!backlog.empty()) {
-                    Task* t = backlog.front();
-                    if (!TaskScheduler::Instance().PushIO(t)) {
-                        detail::g_blDeclined.fetch_add(1, std::memory_order_relaxed);
-                        break;                       // lane is full; keep the rest for next pass
-                    }
-                    backlog.pop_front();
-                    detail::g_blPushed.fetch_add(1, std::memory_order_relaxed);
-                }
-                const std::uint64_t d = static_cast<std::uint64_t>(backlog.size());
-                detail::g_blDepth.store(d, std::memory_order_relaxed);
-                std::uint64_t hi = detail::g_blHigh.load(std::memory_order_relaxed);
-                while (d > hi && !detail::g_blHigh.compare_exchange_weak(
-                                     hi, d, std::memory_order_relaxed)) {}
-            };
 
             std::size_t steer = 0;   // rotates completions across the hot set; see Flush
             const auto Flush = [&](Task** hi, std::size_t& nh, Task** lo, std::size_t& nl) {
@@ -492,18 +434,7 @@ namespace JLib {
                         ++w;
                     }
                 };
-                // LANE WORK GOES THROUGH THE BACKLOG; ordinary work does not.
-                //
-                // hiPri completions are lane work by definition, so they queue here and drain into a
-                // reserved worker that will take one. loPri completions are NOT lane work and never
-                // belonged on the lane -- they keep going straight to the floor, which is both where
-                // PushBatch would have put them and the fix for the hang that steering them at K
-                // used to cause. Routing them through the backlog would make an ordinary completion
-                // wait on K's availability for no reason.
-                for (std::size_t i = 0; i < nh; ++i) backlog.push_back(hi[i]);
-                nh = 0;
-                DrainBacklog();
-
+                pushSteered(hi, nh, true);  nh = 0;
                 pushSteered(lo, nl, false); nl = 0;
             };
 
@@ -516,25 +447,8 @@ namespace JLib {
                 // poll with a zero timeout: anything else ready RIGHT NOW joins this batch, and the
                 // moment the port is empty the batch goes out. No timer, no delay -- coalescing that
                 // waits would trade tail latency for tail latency.
-                // A HELD BACKLOG MUST NOT WAIT ON THE PORT FOREVER, and must not spin either.
-                //
-                // Three cases, not two. With a batch collected the poll stays at ZERO -- unchanged,
-                // and it is what keeps coalescing free. With nothing collected but the backlog
-                // holding completions PushIO refused, INFINITE would be a deadlock in slow motion:
-                // those tasks would sit until some UNRELATED I/O event happened to wake this thread.
-                // A short finite wait retries the drain instead.
-                //
-                // FINITE, NOT ZERO, and the reason is this thread's priority. The completion thread
-                // runs at TIME_CRITICAL under the hot-thread policy, so a zero-timeout retry loop
-                // against a lane that stays buried is a hard spin at priority 15 against the very
-                // workers it is waiting for -- it would preempt the threads that have to drain the
-                // lane before it can make progress. 1 ms costs at most a thousand wakes a second,
-                // and only while K is saturated, which is already a degraded state.
-                const bool holding = !backlog.empty();
                 const BOOL ok = (nHi == 0 && nLo == 0)
-                    ? (holding
-                        ? GetQueuedCompletionStatus(port, &bytes, &key, &ov, kBacklogRetryMs)
-                        : GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE))
+                    ? GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)
                     : GetQueuedCompletionStatus(port, &bytes, &key, &ov, 0);
 
 #if defined(JLIBSCHED_IO_LOCK_STATS)
@@ -567,30 +481,13 @@ namespace JLib {
                     // empty poll, after which no I/O ever completes again. Silently: the reactor is
                     // simply gone and every operation hangs forever.
                     if (!ok) {
-                        if (::GetLastError() == WAIT_TIMEOUT) {
-                            // THE RETRY ITSELF. This is the only path a held backlog gets drained on
-                            // when no new completion arrives -- without it the short timeout above
-                            // would just wake, find nothing, and sleep again with the tasks still
-                            // here. Cheap and correct when the backlog is empty: one deque check.
-                            DrainBacklog();
-                            continue;
-                        }
+                        if (::GetLastError() == WAIT_TIMEOUT) continue;
                         return;
                     }
                     if (stopping.load(std::memory_order_acquire) && total.load(std::memory_order_acquire) == 0) {
                         // Cascade the exit: one more wake-up so the next thread also sees it. Stop
                         // posts one per thread, and this makes the shutdown robust if a thread
                         // consumed a wake-up while work was still draining.
-                        // NOTHING MAY BE LEFT HOLDING. A completion still in the backlog at exit is a
-                        // task nobody will ever run, and every waiter behind it hangs forever. K may
-                        // be permanently buried at this point -- or gone -- so this does NOT go
-                        // through PushIO: it goes to the floor unconditionally, which is always
-                        // drainable. Correctness at shutdown outranks lane placement.
-                        for (Task* t : backlog)
-                            if (t) TaskScheduler::Instance().Push(t);
-                        backlog.clear();
-                        detail::g_blDepth.store(0, std::memory_order_relaxed);
-
                         ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
                         return;
                     }
@@ -655,14 +552,6 @@ namespace JLib {
                 if (lastOne || ((nHi || nLo) && stopping.load(std::memory_order_acquire)))
                     Flush(batchHi, nHi, batchLo, nLo);
                 if (lastOne) {
-                    // Same rule as the other exit: the Flush above may have left completions HELD
-                    // because PushIO refused, and this thread is about to stop looking at them.
-                    // Straight to the floor, which is always drainable.
-                    for (Task* t : backlog)
-                        if (t) TaskScheduler::Instance().Push(t);
-                    backlog.clear();
-                    detail::g_blDepth.store(0, std::memory_order_relaxed);
-
                     ::PostQueuedCompletionStatus(port, 0, 0, nullptr);
                     return;
                 }

@@ -5071,25 +5071,31 @@ bool TaskScheduler::PushIO(Task* task) noexcept {
 	if (!task->hiPri) return false;
 
 	const size_t k = GetHotWorkers();
-	if (k == 0) return false;                       // no lane at all
+	if (k == 0) return false;                       // no lane at all -- caller uses the floor
 
-	// ONE atomic load, not K per-worker queries. Bit w == worker w is advertising a lane backlog at
-	// or past kLaneStealDepth. Past worker 64 no bit exists and the worker reads as available, which
-	// is the safe direction: a spurious accept is a queued completion, a spurious refuse would be a
-	// completion the reactor holds for no reason.
-	const unsigned long long buried = LaneBacklogMask();
-
-	// ROTATE THE START, so a steady stream does not pile on worker 0 while 1..K-1 idle. Relaxed: the
-	// only requirement is that successive calls differ, not that they agree with any other thread.
+	// BUSY IS NOT A REASON TO REFUSE, and getting that wrong cost 250 ms per burst.
+	//
+	// An earlier version skipped any worker whose LaneBacklogMask bit was set -- "buried" past
+	// kLaneStealDepth -- and made the reactor hold the completion when every K worker was. That
+	// conflated two unrelated things:
+	//
+	//   UNREACHABLE  a loPri task on K. Genuinely fatal: K never reads its loPri inbox, inbox work
+	//                is unstealable, and the pool deadlocks. Still refused, above.
+	//   BUSY         a hiPri task aimed at a K worker that is already working. COMPLETELY FINE. The
+	//                inbox is a queue; K reads its hiPri inbox; the task drains in order at worker
+	//                speed. Queueing was never the problem.
+	//
+	// Refusing on the second turned the backlog from backpressure into a load balancer that paid a
+	// retry per decision. Measured at K=1: mean residency 190-534 ms and a 1.3-2.1 s wall clock for
+	// a burst that takes 15-22 ms when the completions are simply pushed. See design/NOTES.md.
+	//
+	// ROTATE THE START so a steady stream spreads across the band instead of piling on worker 0.
+	// Relaxed: successive calls need to differ, never to agree with another thread.
 	const size_t start = ioSteer_.fetch_add(1, std::memory_order_relaxed) % k;
+	const size_t w     = start;
 
-	for (size_t i = 0; i < k; ++i) {
-		const size_t w = (start + i) % k;
-		if (w < 64 && (buried & (1ull << w))) continue;         // buried: do not aim here
-		// affinity is 1-BASED -- 0 means "no preference" -- so worker w is w + 1.
-		if (Push(static_cast<uint8_t>(1 + w), task)) return true;
-	}
-	return false;                                   // every reserved worker is buried
+	// affinity is 1-BASED -- 0 means "no preference" -- so worker w is w + 1.
+	return Push(static_cast<uint8_t>(1 + w), task);
 }
 
 void TaskScheduler::WaitOnEventArmed(Event& event, const std::function<void()>& arm) {
