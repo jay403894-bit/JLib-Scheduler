@@ -122,10 +122,13 @@ static void BenchDispatch(JLib::TaskScheduler& sched, int reps) {
     // a park, which is a kernel round trip that has nothing to do with steady-state dispatch.
     for (int i = 0; i < 200; ++i) { Samples junk; one(JLib::Lane::Normal, junk); one(JLib::Lane::LowLatency, junk); }
 
+    std::printf("  %d rounds: ", reps);
     for (int r = 0; r < reps; ++r) {
         if (r & 1) { one(JLib::Lane::Normal, normal);  one(JLib::Lane::LowLatency, lane); }
         else       { one(JLib::Lane::LowLatency, lane); one(JLib::Lane::Normal, normal); }
+        std::printf("."); std::fflush(stdout);
     }
+    std::printf("\n");
 
     std::printf("  (K=%zu reserved worker(s); with K=0 the two arms are the same code path)\n\n", K);
     Row("Lane::Normal   (floor)", normal, "us");
@@ -201,10 +204,13 @@ static void BenchThroughput(JLib::TaskScheduler& sched, int reps) {
     runSingle(); runBatch();   // warm-up, discarded
     single.v.clear(); batched.v.clear();
 
+    std::printf("  %d rounds x 20k tasks: ", reps);
     for (int r = 0; r < reps; ++r) {
         if (r & 1) { runSingle(); runBatch(); }
         else       { runBatch();  runSingle(); }
+        std::printf("."); std::fflush(stdout);
     }
+    std::printf("\n\n");
 
     Row("Push, one at a time", single, "M/s");
     Row("PushBatch (chunk 256)", batched, "M/s");
@@ -230,11 +236,26 @@ static void BenchFiberSuspend(JLib::TaskScheduler& sched, int reps) {
 
     constexpr int kFibers = 64;
     Samples s;
+    bool stalled = false;
 
-    auto round = [&] {
+    // NEVER yield() IN A WAIT LOOP HERE, and this is measured rather than stylistic. On Windows
+    // std::this_thread::yield() is SwitchToThread(), which hands the core to another READY thread --
+    // and with a pool of spinning workers there are always plenty, so this thread goes to the back
+    // of the run queue waiting for something that has usually already happened. That is the 664us
+    // round trip this project already diagnosed once. A short sleep gives the core back to the OS
+    // instead of volunteering it to the pool.
+    auto waitUntil = [](auto pred, int budgetMs) {
+        const auto dl = Clock::now() + std::chrono::milliseconds(budgetMs);
+        while (!pred() && Clock::now() < dl)
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        return pred();
+    };
+
+    auto round = [&](bool record) -> bool {
         JLib::Event& gate = sched.GetEvent("rtbench_gate");
         std::atomic<int> parked{ 0 }, done{ 0 };
         JLib::WaitGroup wg;
+        int made = 0;
         wg.n.store(kFibers, std::memory_order_relaxed);
 
         for (int i = 0; i < kFibers; ++i) {
@@ -246,26 +267,75 @@ static void BenchFiberSuspend(JLib::TaskScheduler& sched, int reps) {
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
+            ++made;
         }
 
         // EVERYONE PARKS BEFORE ANYONE IS RELEASED. Timing from the signal is what isolates the
         // resume: if fibers were still arriving, this would time the spawn as well.
-        while (parked.load(std::memory_order_acquire) < kFibers)
-            std::this_thread::yield();
+        //
+        // BOUNDED, BECAUSE A BENCHMARK MUST NOT ANSWER FAILURE WITH SILENCE. The first version of
+        // this section spun here forever, so a fiber that never parked was indistinguishable from a
+        // section that was merely slow -- and "is it hung or is it working?" is not a question a
+        // benchmark should make its reader ask.
+        if (!waitUntil([&] { return parked.load(std::memory_order_acquire) >= made; }, 10000)) {
+            std::printf("  STALLED: only %d of %d fibers parked. The pool could not supply fibers --\n"
+                        "           see SetFiberBudget (normalPerComputeWorker).\n",
+                        parked.load(), made);
+            return false;
+        }
 
+        // ---- THE TIMED WINDOW SPINS. IT MUST NOT SLEEP, AND THAT IS MEASURED. --------------
+        //
+        // The first version of this polled with sleep_for(200us) and reported 250 us per resume
+        // against 0.78 us for the same code timed properly -- a 320x error, entirely instrument.
+        // std::this_thread::sleep_for honours the SYSTEM TIMER GRANULARITY on Windows, which is
+        // ~1-15 ms unless someone has called timeBeginPeriod, so a "200 microsecond" poll is
+        // nothing of the kind and the sleep dominates the thing being measured.
+        //
+        // Nor may it yield(): that is SwitchToThread, which hands the core to the pool and puts
+        // this thread behind every spinning worker (the 664 us round trip this project already
+        // diagnosed). So the timed wait is a tight spin with a deadline -- accurate at this
+        // duration, ~50 us of one core, and still incapable of hanging.
         const auto t0 = Clock::now();
         gate.SignalAll();
-        sched.WaitFor(wg);
-        s.add(UsSince(t0) / (double)kFibers);   // per fiber
+
+        const auto hardDeadline = t0 + std::chrono::seconds(10);
+        while (done.load(std::memory_order_acquire) < made) {
+            JLib::platform::CpuRelax();
+            if (Clock::now() > hardDeadline) {
+                std::printf("  STALLED: %d of %d fibers resumed after SignalAll. This is a LOST WAKE,\n"
+                            "           not a slow one -- please report it with the config banner above.\n",
+                            done.load(), made);
+                return false;
+            }
+        }
+        const double us = UsSince(t0);
+        sched.WaitFor(wg);   // safe now: every body has already finished
+        if (record) s.add(us / (double)made);
+        return true;
     };
 
-    round(); s.v.clear();                        // warm-up
-    for (int r = 0; r < reps; ++r) round();
+    if (!round(false)) { stalled = true; }        // warm-up, discarded
+    // PROGRESS, so "slow" and "stuck" look different from outside. Without it a long section and a
+    // hung one produce the same thing on a terminal: nothing.
+    std::printf("  %d fibers x %d rounds: ", kFibers, reps);
+    for (int r = 0; r < reps && !stalled; ++r) {
+        if (!round(true)) { stalled = true; break; }
+        std::printf("."); std::fflush(stdout);
+    }
+    std::printf("\n\n");
+
+    if (stalled) {
+        std::printf("  SECTION ABANDONED -- the rows below would be a statement about a stall.\n");
+        return;
+    }
 
     Row("resume, per fiber", s, "us");
     std::printf("  %-34s %9.2f us   p99\n", "resume p99", s.pct(0.99));
     std::printf("\n  %d fibers released by one SignalAll, so this includes the wake storm -- which is\n"
-                "  the realistic shape (an I/O burst or a frame boundary), not a single sleeper.\n", kFibers);
+                "  the realistic shape (an I/O burst or a frame boundary), not a single sleeper.\n"
+                "  A round is bounded at 10s; anything slower is reported as a stall rather than\n"
+                "  waited on, so this section cannot hang the run.\n", kFibers);
 }
 
 // ---------------------------------------------------------------------------------------------
