@@ -45,13 +45,14 @@ reserved worker takes from other workers' deques — because a deque exists to b
 band that never steals is two cores the pool paid for and does not get. Taking work is always safe:
 the thief is the one running it, so nothing can be stranded by the act of claiming it.
 
-**THE TWO FIBER MODES DO NOT HAVE THE SAME INVARIANT.** They are different promises, not two
-implementations of one, and stealing is safe under each for a *different* reason:
+**THE TWO FIBER MODES ARE TWO STRICT POLICIES, AND THEIR INVARIANTS DIFFER.** Not two arrangements
+of one guarantee — different rules about *who may resume a fiber, when and where* — which is why
+stealing is safe under each for a *different* reason:
 
 | | `Migrate` | `Pin` |
 |---|---|---|
-| the promise | resumes **promptly**, on whichever worker is free | resumes on **its home worker**, whichever that costs |
-| what it gives up | `thread_local` across a suspend | promptness — it waits for one specific worker |
+| who may resume it | **any worker** — near a free-for-all | **exactly one**, the worker it was bound to |
+| the exchange | gives up safe `thread_local` | buys safe `thread_local`, pays in promptness |
 | where a resumption goes | ordinary placement, which masks `[0,K)` | that worker's **resume inbox**, never a deque |
 | why K may steal | the resumption is on the floor, reachable by anyone | **stealing is not resumes** — a steal takes fresh work off a deque; a resume is delivered to one consumer that reads it |
 
@@ -222,15 +223,22 @@ mistaken for a participant.
 
 ## 8. Fiber mode: Migrate or Pin
 
-**This is a choice of INVARIANT, not a tuning knob.** Each mode promises something the other does not,
-and the thing it gives up is the other one's promise:
+**These are two strict policies about WHO MAY RESUME A FIBER — when, where, and why.** Not a tuning
+knob, and not two ways of arranging the same thing. Everything else about each mode follows from its
+permission rule.
 
-- **`Migrate`** (default) — *a suspended fiber resumes promptly, on whichever worker is free.* The
-  runtime does **not** promise the same worker, so `thread_local` written before a suspension point
-  is not the same object after it. It does not crash; you get the resuming worker's copy.
-- **`Pin`** — *a suspended fiber resumes on the worker it was bound to, and nowhere else.* That makes
-  `thread_local` valid across a wait, and gives up promptness: if the home worker is busy the fiber
-  waits for **that** worker while others sit free. This is marl's contract.
+- **`Migrate`** (default) — **near enough a free-for-all.** Any worker may resume the fiber. Ordinary
+  placement decides where the resumption lands, a thief may take it from there, and it will run on
+  whichever worker is free. The fiber's stack goes wherever it is needed.
+- **`Pin`** — **exactly one worker may ever resume it.** The resumption is delivered to that worker's
+  resume inbox and no other queue; no thief can take it, and no placement decision applies. This is
+  marl's contract.
+
+**The exchange is TLS.** The free-for-all is what makes `thread_local` unsafe: a value written before
+a suspension point belongs to a thread the fiber may no longer be on, and the failure is silent —
+you get the resuming worker's copy, a plausible value rather than a fault. Pinning buys that back by
+forbidding everyone else, and pays for it in promptness: a fiber whose one permitted worker is busy
+waits for it while other cores sit free.
 
 Migration is the better default because the thing it gives up has a replacement and the thing it buys
 does not — `FiberLocal<T>` moves the *state* off the thread, whereas nothing recovers a core you are
