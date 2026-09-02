@@ -179,7 +179,7 @@ int main() {
 
     // PINNED FIRST, so the control is measured before the thing it controls for -- and so a failure
     // in the control is not explained away by whatever the other arm did to the pool.
-    TaskScheduler::SetMigratableFibers(false);
+    TaskScheduler::SetFiberMode(FiberMode::Pin);
     TaskScheduler::Init(8);
     TaskScheduler& sched = TaskScheduler::Instance();
     
@@ -212,10 +212,10 @@ int main() {
                     pinned.completed, kTasks);
         return 1;
     }
-    TaskScheduler::SetMigratableFibers(true);
+    TaskScheduler::SetFiberMode(FiberMode::Migrate);
 
-    std::printf("  MigratableFibers() reports: %s\n",
-                TaskScheduler::MigratableFibers() ? "TRUE" : "FALSE");
+    std::printf("  FibersMigrate() reports: %s\n",
+                TaskScheduler::FibersMigrate() ? "TRUE" : "FALSE");
     const Arm mig = RunArm(sched, "migratable", "gate_migratable");
     Check(mig.completed == kTasks, "migratable: every task completed -- migration lost nothing");
     Check(mig.suspended > 0,       "migratable: tasks actually suspended and resumed");

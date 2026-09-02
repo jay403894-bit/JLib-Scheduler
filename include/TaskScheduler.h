@@ -2506,8 +2506,15 @@ namespace JLib {
 		//
 		// MUST BE SET BEFORE Init(). Flipping it under a live pool would strand fibers under the
 		// rule they were bound with while new ones follow the other.
-		static void SetMigratableFibers(bool on);
-		static bool MigratableFibers();
+		// FiberMode::Migrate (default) or FiberMode::Pin -- see the enum in Task.h for the contract
+		// and for why this is not a bool. MUST BE SET BEFORE Init(): flipping it under a live pool
+		// would strand fibers under the rule they were bound with while new ones follow the other.
+		static void      SetFiberMode(FiberMode m);
+		static FiberMode GetFiberMode();
+
+		// The predicate the routing actually asks. Spelled out rather than left as a bool setter, so
+		// a call site reads as a question about the mode instead of about a flag.
+		static bool FibersMigrate() { return GetFiberMode() == FiberMode::Migrate; }
 
 		// ---- FIBER-LOCAL STORAGE: use this where you would have used thread_local -------------
 		//

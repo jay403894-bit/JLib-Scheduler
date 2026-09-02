@@ -319,9 +319,23 @@ void TaskScheduler::EnableIoReactor(bool on, unsigned completionThreads) noexcep
 	// That is not a once-at-startup cost: any idle gap re-arms it, so bursty traffic pays it per
 	// burst, which is exactly the shape network traffic has.
 	//
-	// K=1, NOT MORE. One reserved worker was measured to give the whole of the p50 win -- for one
-	// core, not the pool -- and a second is a second core that never sleeps. If an application
-	// wants a wider lane it says so with SetIoHotLane(k), and the check below leaves it alone.
+	// K=2, AND THE MEASUREMENT MOVED THIS UP FROM 1. It used to read "one reserved worker gives the
+	// whole of the p50 win, and a second is a second core that never sleeps" -- true of the p50 and
+	// wrong about what the lane is for.
+	//
+	// The tail is the reason a lane exists, and one worker does not carry it. Measured on a
+	// 256-completion burst at K=1: the lane spent essentially the whole run holding, 241 declines
+	// against 256 pushes, backlog 109 deep. At K=2 that fell to ~19 declines and a depth of ~27, and
+	// one run absorbed the burst without holding at all. A single reserved worker is one body away
+	// from having no lane, and a completion arriving during that body waits for it.
+	//
+	// SO OPTING INTO THE REACTOR COSTS TWO CORES, and that is stated rather than hidden: the census
+	// already takes main, the timer thread and one per completion thread before the pool is sized,
+	// so this is a real charge on a small box. It is also why K is CLAMPED at 2 -- see
+	// kMaxReservedWorkers, and the note there about every reserved thread coming off the floor.
+	//
+	// An application that wants otherwise says so with SetIoHotLane(k), and the check below leaves
+	// it alone.
 	//
 	// A DEFAULT, NOT AN OVERRIDE. Only applied when nobody has asked for a lane already: an app
 	// that called SetIoHotLane(4) or armed a range before enabling the reactor must not be quietly
@@ -331,7 +345,7 @@ void TaskScheduler::EnableIoReactor(bool on, unsigned completionThreads) noexcep
 		// K is static, so "did anyone ask for a lane" is one question, not two. This used to also
 		// consult the armed RANGE, which no longer exists.
 		if (GetHotWorkers() == 0)
-			SetIoHotLane(1);
+			SetIoHotLane(kMaxReservedWorkers);   // 2 -- see the note above
 	}
 }
 bool TaskScheduler::IoReactorEnabled() noexcept { return g_reserveIoCore; }
@@ -696,11 +710,33 @@ void TaskScheduler::Join() {
 	// BEFORE THE PRIMITIVE DRAIN BELOW, because these tasks are work that unwinding may be waiting
 	// on, and after the service threads stopped above, so nothing refills it behind us.
 	{
+		// CLOSE THE INTAKE BEFORE DRAINING IT, or this loop never terminates.
+		//
+		// These are Lane::LowLatency tasks, and PushTarget routes LowLatency work INTO the intake --
+		// so taking one out and pushing it back put it straight where it came from. TakeLaneIntake
+		// then found it again. An infinite loop inside Join, reachable by any shutdown with a
+		// non-empty intake.
+		//
+		// Found by chasing a hang in the lane_intake_wake NEGATIVE CONTROL, which strands 400 tasks
+		// by design and so reaches this every time. The bug was NOT confined to that control: it is
+		// live in any teardown where the band had not drained, and the only reason it is rare is
+		// that the intake is usually empty by the time Join runs.
+		//
+		// Turning the flag off makes PushTarget fall through to ordinary placement, which is exactly
+		// right here: the reserved band is stopping, so the intake has no consumers left and the
+		// floor is the only queue anyone will still drain.
+		// SAVED AND RESTORED, because this flag is process-wide and Join/Init cycles are supported.
+		// Leaving it off would silently disable the intake on the next Init, and would clobber the
+		// setting for anyone using it as the A/B arm it exists to be.
+		const bool intakeWasOn = LaneIntakeEnabled();
+		SetLaneIntake(false);
+
 		size_t rescued = 0;
 		while (Task* t = TakeLaneIntake()) {
 			PushTarget(t, 0);
 			++rescued;
 		}
+		SetLaneIntake(intakeWasOn);
 		if (rescued) {
 			fprintf(stderr, "[JLib::Scheduler] teardown: moved %zu queued I/O completion(s) from the\n"
 			                "  shared lane intake to the floor. Not an error -- the reserved band was\n"
@@ -5950,9 +5986,9 @@ bool TaskScheduler::PushBatchWide() noexcept { return g_pushBatchWide.load(std::
 // THE TRADE IS thread_local, and it is the only one. Pinned mode is what makes a TLS value read
 // before a suspension point still valid after it; migratable gives that up SILENTLY, handing back
 // whatever the resuming worker has. An application that keeps state in thread_local across a suspend
-// wants SetMigratableFibers(false) before Init(). See the README.
-static std::atomic<bool> g_migratableFibers{ true };
-void TaskScheduler::SetMigratableFibers(bool on) {
+// wants SetFiberMode(FiberMode::Pin) before Init(). See the README.
+static std::atomic<FiberMode> g_fiberMode{ FiberMode::Migrate };
+void TaskScheduler::SetFiberMode(FiberMode m) {
 	// THE CREDITOR MASK MUST COVER EVERY ADDRESSABLE WORKER. If it does not, NoteCreditor refuses a
 	// high-numbered worker -- correctly, since wrapping would bill the wrong one -- and that
 	// worker's cleanup is dropped instead. Silent, and only on machines wide enough to reach the
@@ -5964,7 +6000,7 @@ void TaskScheduler::SetMigratableFibers(bool on) {
 	// ACCESS it (private). A member function body is both.
 	static_assert(Fiber::kCreditorWords * 64 >= kMaxHintQueues,
 		"Fiber::kCreditorWords is too narrow for kMaxHintQueues workers.");
-	g_migratableFibers.store(on, std::memory_order_relaxed);
+	g_fiberMode.store(m, std::memory_order_relaxed);
 }
 
 bool TaskScheduler::PushResume(size_t worker, Task* task) {
@@ -5996,7 +6032,7 @@ bool TaskScheduler::NotifyHolder(size_t worker) {
 	return true;
 }
 
-bool TaskScheduler::MigratableFibers() { return g_migratableFibers.load(std::memory_order_relaxed); }
+FiberMode TaskScheduler::GetFiberMode() { return g_fiberMode.load(std::memory_order_relaxed); }
 
 // ---- FIBER-LOCAL STORAGE ----------------------------------------------------------------------
 //
@@ -6463,7 +6499,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// the redistribute path), which owns no deque. Those take the ordinary placement below rather
 	// than inventing a target.
 	if (!task->assignedFiber) JLIB_RQ_BUMP(g_rqNoFiber);
-	if (MigratableFibers() && task->assignedFiber) {
+	if (FibersMigrate() && task->assignedFiber) {
 		if (TaskDeque* lane = LaneForCurrentThread()) {
 			if (lane->push_bottom(task)) { JLIB_RQ_BUMP(g_rqLane); return RequeueResult::Stealable; }
 			// push_bottom refuses only at the growth ceiling. Falling through to placement is
@@ -6506,7 +6542,7 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 		// A BARE THREAD CANNOT DO BETTER THAN THAT. Chase-Lev allows push_bottom from the OWNER
 		// only, so a non-worker physically may not publish onto a worker's deque; the inbox hop is
 		// the legal route.
-		if (!MigratableFibers()) if (Fiber* f = task->assignedFiber) {
+		if (!FibersMigrate()) if (Fiber* f = task->assignedFiber) {
 			const size_t home = f->homeWorker;
 			// SIZE_MAX is "not bound", which a task holding a fiber should never be. Falling through
 			// to the ordinary path is the safe answer rather than indexing on it: unpinned routing

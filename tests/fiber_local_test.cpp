@@ -73,11 +73,11 @@ int main() {
     std::printf("=== fiber-local storage survives migration; thread_local does not ===\n");
 
     // Explicit rather than relying on the default, so this file states the mode it is about.
-    JLib::TaskScheduler::SetMigratableFibers(true);
+    JLib::TaskScheduler::SetFiberMode(JLib::FiberMode::Migrate);
     JLib::TaskScheduler::Init(8);
     auto& sched = JLib::TaskScheduler::Instance();
 
-    Check(JLib::TaskScheduler::MigratableFibers(), "migratable mode is on (else nothing can migrate)");
+    Check(JLib::TaskScheduler::FibersMigrate(), "migratable mode is on (else nothing can migrate)");
 
     std::vector<Rec> recs(kFibers);
     std::atomic<int> started{ 0 }, finished{ 0 };

@@ -110,6 +110,30 @@ namespace JLib {
     // floor always drains, and a task that should have been LowLatency is slow rather than stuck.
     enum class Lane : uint8_t { Normal = 0, LowLatency = 1 };
 
+    // ---- WHERE A SUSPENDED FIBER MAY RESUME. Replaces `bool migratable`. --------------------
+    //
+    //   Migrate   (DEFAULT) a resumed fiber continues on WHICHEVER WORKER IS FREE. This is what a
+    //             fiber task library is for -- it is the only reason to have a pool rather than a
+    //             thread per job -- and it is what the library already paid for: address-routed
+    //             frees, a global epoch participant list, fiber-indexed hazard cells.
+    //   Pin       a fiber resumes ONLY on the worker it was bound to. marl's contract. TLS is safe
+    //             because the fiber never moves; what you give up is resume-anywhere, so a fiber
+    //             whose home worker is busy waits for that worker rather than taking the next free
+    //             one.
+    //
+    // THE TRADE IS `thread_local` AND NOTHING ELSE. Under Migrate a TLS value read before a
+    // suspension point is not necessarily the same value after it -- you get the resuming worker's
+    // copy, SILENTLY. Use FiberLocal<T> (FiberRegistry.h) for anything that must survive a wait; it
+    // is attached to the fiber and correct in both modes. Pin is for when the state is not yours --
+    // a library you cannot audit keeping its own thread_local across a wait.
+    //
+    // AN ENUM RATHER THAN A BOOL because `SetMigratableFibers(false)` at a call site says nothing
+    // about what false means, and the two modes are a real choice rather than a feature toggle.
+    // Same reasoning that turned `bool hiPri` into Lane and `bool noFiber` into TaskType.
+    //
+    // Migrate is 0 so the default is the zero value, matching Lane::Normal and StackClass::Standard.
+    enum class FiberMode : uint8_t { Migrate = 0, Pin = 1 };
+
     // Spelled out rather than left to `lane ? ... : ...`, because an enum class deliberately has no
     // conversion to bool and adding one would put the old ambiguity straight back: `if (lane)` reads
     // as "if it has a lane", which is true of every task. Both names say which lane they mean.
