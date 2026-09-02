@@ -1,31 +1,24 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Joshua Makler. Part of JLib -- see LICENSE at the repository root.
 //
-// SLOTS vs COUNTED EPOCHS: the measurement that decides whether counted epochs should REPLACE the
-// participant scan or merely sit beside it for coroutines.
+// EPOCH MECHANISM COSTS: the guard, and the reclamation scan.
 //
-// THE TRADE IS NOT OBVIOUS IN EITHER DIRECTION, which is the whole reason this exists:
+// THIS WAS A SLOTS-vs-COUNTED COMPARISON and counted epochs are gone, so the comparison is gone with
+// them. What survives is the pair of absolute numbers, which is what any change to reclamation has
+// to be read against:
 //
-//   slots     guard: two UNCONTENDED stores (the reader owns its slot)
-//             reclaim: O(participants) -- every fiber slot and every thread slot, and the fiber
-//             pool is sized per core, so this grows with the machine
+//   1. GUARDS PER SECOND under contention -- the hot path. Two UNCONTENDED stores per guard,
+//      because the reader owns its slot.
+//   2. RECLAIM SCAN COST -- MinActiveEpoch is O(participants): every fiber slot AND every thread
+//      slot, and the fiber pool is sized per core, so this grows with the machine.
 //
-//   counted   guard: two RMWs on a line EVERY reader in that epoch shares
-//             reclaim: O(kEpochSlots) -- eight loads, regardless of machine size
+// READ THEM AS A RATIO, NOT AS TWO FACTS. Guards fire on every traversal; reclamation fires on a
+// Tick. A hot-path regression is paid orders of magnitude more often than a scan saving is earned,
+// and the same arithmetic decides whether moving the RETIRE path off its global queue is a win or a
+// wash -- retire fires on a REMOVE, which is rarer still.
 //
-// So replacing slots with counters moves cost from a cold, amortised, batched path onto EVERY
-// lock-free operation. Which way that nets out depends entirely on the guard-to-reclaim ratio, and
-// that is an empirical question about the workload rather than a design argument.
-//
-// TWO NUMBERS, because they can point opposite ways and the conclusion needs both:
-//
-//   1. GUARDS PER SECOND under contention -- the hot path, and the one counted epochs can lose
-//      badly, since a shared counter is exactly the cache line a per-reader slot exists to avoid.
-//   2. RECLAIM SCAN COST -- the cold path, and the one slots lose, since the participant list is
-//      thousands of entries on a real pool.
-//
-// ARMS INTERLEAVE per repetition. Measuring one mechanism to completion and then the other is how a
-// thermal drift becomes a result, which this project has already been caught by once.
+// REPETITIONS INTERLEAVE. Measuring one arm to completion and then another is how thermal drift
+// becomes a result, which this project has already been caught by once.
 
 #include "TaskScheduler.h"
 #include "Epochs.h"
@@ -54,14 +47,6 @@ void HammerSlots() {
     g_guards.fetch_add(n, std::memory_order_relaxed);
 }
 
-void HammerCounted() {
-    long long n = 0;
-    while (!g_stop.load(std::memory_order_relaxed)) {
-        for (int i = 0; i < 64; ++i) { CountedEpochGuard g; }
-        n += 64;
-    }
-    g_guards.fetch_add(n, std::memory_order_relaxed);
-}
 
 double GuardsPerSec(void (*fn)(), int workers, int ms) {
     g_guards.store(0); g_stop.store(false);
@@ -94,22 +79,17 @@ int main(int argc, char** argv) {
                 workers, ms, reps);
 
     // ---- 1. the hot path ------------------------------------------------------------------------
-    std::vector<double> slots, counted;
-    for (int r = 0; r < reps; ++r) {
-        slots.push_back(GuardsPerSec(&HammerSlots, workers, ms));
-        counted.push_back(GuardsPerSec(&HammerCounted, workers, ms));
-    }
-    const double s = Median(slots), c = Median(counted);
-    std::printf("  guards/sec, %d threads hammering:\n", workers);
-    std::printf("    slots    %12.0f\n", s);
-    std::printf("    counted  %12.0f   (%.2fx %s)\n", c, (c > s ? c / s : s / c),
-                c > s ? "faster" : "SLOWER");
+    std::vector<double> slots;
+    for (int r = 0; r < reps; ++r) slots.push_back(GuardsPerSec(&HammerSlots, workers, ms));
+    const double s = Median(slots);
+    std::printf("  guards/sec, %d threads hammering: %12.0f\n", workers, s);
 
     // ---- 2. the cold path -----------------------------------------------------------------------
     //
-    // MinActiveEpoch scans participants AND the ring, so this times both together -- the point is
-    // the absolute cost against how often it runs, not a clean split. The participant count is
-    // printed because it is what a counted-only scheme would delete.
+    // THE REASON THIS FILE SURVIVED THE COUNTED-EPOCH REMOVAL. The comparison it was built for is
+    // gone, but this number is not: MinActiveEpoch is O(participants) -- every fiber slot and every
+    // thread slot -- and the fiber pool is sized per core, so the scan grows with the machine. It is
+    // the cost that any change to the retire path has to be read against.
     {
         constexpr int kCalls = 20000;
         const auto t0 = std::chrono::steady_clock::now();
@@ -118,15 +98,15 @@ int main(int argc, char** argv) {
         (void)sink;
         const double us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - t0).count() / kCalls;
-        std::printf("\n  MinActiveEpoch: %.3f us per call (%d participant slots + %zu ring slots)\n",
-                    us, em.ParticipantCount(), JLib::EpochManager::kEpochSlots);
-        std::printf("    a counted-only scheme would scan %zu instead of %d.\n",
-                    JLib::EpochManager::kEpochSlots, em.ParticipantCount());
+        std::printf("\n  MinActiveEpoch: %.3f us per call over %d participant slots\n",
+                    us, em.ParticipantCount());
     }
 
     std::printf("\n  READ THEM TOGETHER. Guards outnumber reclaims by a wide margin in every\n"
                 "  workload here -- TaskDAG takes a guard per node walk and reclaims on Tick --\n"
-                "  so a hot-path regression is paid far more often than the scan saving is.\n");
+                "  so a hot-path regression is paid far more often than a scan saving is.\n"
+                "  That ratio is also what decides whether moving the RETIRE path off the global\n"
+                "  queue is a win or a wash: retire fires on a remove, guards fire on a traversal.\n");
 
     JLib::detail::TeardownForTesting(sched);
     return 0;

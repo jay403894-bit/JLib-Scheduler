@@ -972,14 +972,14 @@ namespace JLib {
     // ------------------------------------------------------------------------------------------
     class EpochGuard {
     public:
-        EpochGuard() {
-            if (OnCoroutineTask() || EpochManager::ForceCountedEpochs()) counted_.emplace();
-            else                                                        slotted_.emplace(CurrentEpochSlot());
-        }
+        // ONE MECHANISM, SO NO CHOICE LEFT TO MAKE. This used to branch on OnCoroutineTask() and
+        // route coroutines through a counted guard -- a TLS read, a null check and a task-type load
+        // on EVERY guard, on the path measured at 2.52 billion guards/sec. The counted ring is gone
+        // (see Epochs.h), so this is one slot guard and the branch with it.
+        EpochGuard() : slotted_(CurrentEpochSlot()) {}
         EpochGuard(const EpochGuard&) = delete;
         EpochGuard& operator=(const EpochGuard&) = delete;
     private:
-        std::optional<CountedEpochGuard> counted_;
-        std::optional<SlotEpochGuard>    slotted_;
+        SlotEpochGuard slotted_;
     };
 };

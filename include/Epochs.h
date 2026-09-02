@@ -71,36 +71,33 @@ namespace JLib {
 		};
 		std::vector<ThreadEpoch*> threadEpochs;
 
-		// The counted-epoch ring, SHARDED. NOT registered as `participants` -- these are not slots
-		// and the scan reads them separately, which is what keeps the participant vector frozen and
-		// its lock-free read valid.
+		// ---- THE COUNTED-EPOCH RING WAS HERE, AND IS GONE ---------------------------------------
 		//
-		// SHARDED BECAUSE ONE COUNTER PER EPOCH IS A CACHE LINE EVERY READER FIGHTS OVER, which is
-		// exactly the ping-pong a per-reader slot exists to avoid. Measured unsharded at 40.9M
-		// guards/sec against slots' 2.52 BILLION -- 61x, and essentially all of it contention rather
-		// than the RMW itself. Sharding by thread turns a contended line into a private one.
+		// It existed for ONE caller: a coroutine, which has no epoch slot of its own. The counter
+		// was sharded so enter and leave need not use the same shard, which is what let a guard
+		// survive a coroutine migrating mid-traversal.
 		//
-		// ENTER AND LEAVE NEED NOT USE THE SAME SHARD, which is what makes this work for a coroutine
-		// that migrates. Enter on worker A (+1 on A's shard), resume on worker B, leave (-1 on B's
-		// shard): A sits at +1, B at -1, and the SUM -- the only thing anybody reads -- is correctly
-		// zero. Individual shards going negative is not a bug, it is the mechanism. The token
-		// therefore carries only the epoch, never a shard.
-		struct alignas(platform::kCacheLine) EpochCounter { std::atomic<int> n{ 0 }; };
-		static constexpr size_t kEpochShards = 32;      // power of two; covers a large pool
-		EpochCounter epochCounters[8][kEpochShards];    // [kEpochSlots][shards]
-
-		// Which shard this thread uses. Only ever an optimisation for contention -- correctness does
-		// not depend on a reader picking the same one twice, per the note above.
-		static size_t ShardOf() { return thread_id & (kEpochShards - 1); }
-
-		// Sum one ring slot across its shards. Cold path only (the gate and MinActiveEpoch); the
-		// whole point is that readers never do this.
-		int RingTotal(size_t ring) const {
-			int total = 0;
-			for (size_t s = 0; s < kEpochShards; ++s)
-				total += epochCounters[ring][s].n.load(std::memory_order_seq_cst);
-			return total;
-		}
+		// REMOVED BECAUSE IT INSURED AGAINST A RULE THE CODE ALREADY FORBIDS. Suspending inside an
+		// EpochGuard is an invariant violation for coroutines exactly as it is for fibers -- see
+		// CoroEpochGuardSuspendCheck, which asserts on it. The ring was the net under a rule that is
+		// checked, and it was not free:
+		//
+		//   * EVERY guard paid a branch plus OnCoroutineTask() -- a TLS read, a null check and a
+		//     task-type load -- to decide which mechanism to use. On the path measured at 2.52
+		//     BILLION guards/sec, that is the whole cost.
+		//   * MinActiveEpoch summed 8 ring slots x 32 shards = 256 seq_cst loads per reclaim.
+		//   * AdvanceEpoch could REFUSE, because the gate would not enter an occupied slot. Slot
+		//     readers never needed that gate: they announce their epoch and the min over them is
+		//     exact. So advancement is now an unconditional CAS and reclamation cannot stall on it.
+		//
+		// WHAT PAYS FOR IT: the coroutine suspend check moved OUT of the dev-only block into
+		// Release. The rare event (a co_await) carries the cost instead of the hot one (a guard),
+		// and it now fires in the configuration where the bug would actually ship. Coroutines that
+		// genuinely need reclamation across a suspend use HAZARD POINTERS, which support it by
+		// design -- that is why both schemes exist.
+		//
+		// The 61x figure that justified sharding was about counted-vs-counted (unsharded 40.9M
+		// guards/sec against slots' 2.52 billion). It was never an argument for having the ring.
 
 		EpochManager() = default;
 	public:
@@ -128,33 +125,10 @@ namespace JLib {
 			// so a Meyers-singleton destructor would run at static teardown while a
 			// worker still calls Enter/LeaveEpoch -> threadEpochs[tid] freed -> read AV.
 			// Leaking the manager lets the OS reclaim it at process exit instead.
-			// Diagnostic: route every reader through the counted path, for the mechanism comparison.
-			// Env rather than an API because it must be decided before any guard is taken.
-			// ---- NOT std::getenv, AND THIS IS A PUBLIC HEADER ---------------------------------
 			//
-			// MSVC flags getenv as C4996, and a consumer that compiles with warnings-as-errors --
-			// which is the default for a project that cares -- then cannot include this header at
-			// all. The library's own translation units can silence it locally; an application
-			// cannot be asked to. Found by building Game01 against the library rather than by
-			// building the library, which is the only way this class of defect surfaces.
-			//
-			// _dupenv_s allocates, so the result is freed. The POSIX arm keeps getenv, where it is
-			// not deprecated and the returned pointer is not owned.
-			static bool once = [] {
-#if defined(_MSC_VER)
-				char* e = nullptr;
-				size_t len = 0;
-				if (_dupenv_s(&e, &len, "JLIB_FORCE_COUNTED") == 0 && e) {
-					if (e[0] == '1') forceCounted.store(true, std::memory_order_relaxed);
-					free(e);
-				}
-#else
-				const char* e = std::getenv("JLIB_FORCE_COUNTED");
-				if (e && e[0] == '1') forceCounted.store(true, std::memory_order_relaxed);
-#endif
-				return true;
-			}();
-			(void)once;
+			// THE JLIB_FORCE_COUNTED ENV READ WAS HERE and went with counted epochs. It existed to
+			// route every reader through the counted path for the mechanism comparison; with one
+			// mechanism there is nothing to compare against and nothing to force.
 			static EpochManager* mgr = new EpochManager();
 			return *mgr;
 		}
@@ -346,21 +320,11 @@ namespace JLib {
 				if (e != SIZE_MAX && e < minEpoch) minEpoch = e;
 			}
 
-			// AND THE COUNTED READERS. Two mechanisms are live at once -- slots for fibers and bare
-			// threads, counters for coroutines -- and reclamation must respect BOTH, so this is a
-			// minimum over their union. Getting this wrong in the safe direction stalls reclamation;
-			// getting it wrong the other way frees memory a coroutine is still reading.
-			//
-			// ATTRIBUTING A COUNTER TO AN EPOCH is what the advance gate buys. Because advancement
-			// refuses to enter an occupied slot, at most kEpochSlots epochs are live, so each ring
-			// slot corresponds to exactly ONE epoch in [cur - kEpochSlots + 1, cur] and a nonzero
-			// count can be pinned to it. Without the gate this arithmetic is a lie -- see the model.
-			const size_t cur = globalEpoch.load(std::memory_order_acquire);
-			for (size_t k = 0; k < kEpochSlots; ++k) {
-				if (RingTotal(k) == 0) continue;
-				const size_t e = cur - ((cur - k) & (kEpochSlots - 1));   // the live epoch for slot k
-				if (e < minEpoch) minEpoch = e;
-			}
+			// ONE MECHANISM, SO ONE SCAN. A second loop over the counted-epoch ring lived here and
+			// cost 8 slots x 32 shards = 256 seq_cst loads on every reclaim attempt. With counted
+			// epochs gone there is exactly one class of reader and the minimum over the participant
+			// slots is exact -- a slot reader ANNOUNCES the epoch it entered, so nothing has to be
+			// inferred from a ring position.
 			return minEpoch;
 		}
 	
@@ -466,47 +430,25 @@ namespace JLib {
 		//   enforces it: construct, then traverse. If a call site ever cannot, restore the
 		//   re-validation (load, increment, re-load, retry) rather than reasoning about the case.
 	public:
-		static constexpr size_t kEpochSlots = 8;               // power of two: the modulo is a mask
-		static size_t EpochRing(size_t e) { return e & (kEpochSlots - 1); }
-
-		// DIAGNOSTIC: route EVERY reader through the counted path, not just coroutines, so the two
-		// mechanisms can be benchmarked against each other in one process. This is the measurement
-		// that decides whether counted epochs should REPLACE the slot scan or merely sit beside it.
+		// ---- THE ADVANCE GATE WENT WITH THE RING, AND THAT IS NOT A WEAKENING -------------------
 		//
-		// The tradeoff is not obvious in either direction. Slots cost two uncontended stores per
-		// guard and an O(participants) scan per reclamation -- ~2,000 loads on a 31-worker box with
-		// a full fiber pool. Counters cost two RMWs on a SHARED line per guard and an O(kEpochSlots)
-		// scan. So replacing one moves cost from a cold amortised path onto every lock-free
-		// operation, and which way that nets out depends entirely on the guard-to-reclaim ratio.
-		static inline std::atomic<bool> forceCounted{ false };
-		static void SetForceCountedEpochs(bool on) { forceCounted.store(on, std::memory_order_relaxed); }
-		static bool ForceCountedEpochs() { return forceCounted.load(std::memory_order_relaxed); }
-
-		// Returns the epoch entered; pass it back to LeaveCounted unchanged.
-	public:
-		size_t EnterCounted() {
-			const size_t e = globalEpoch.load(std::memory_order_seq_cst);
-			epochCounters[EpochRing(e)][ShardOf()].n.fetch_add(1, std::memory_order_seq_cst);
-			return e;
-		}
-		void LeaveCounted(size_t token) {
-			epochCounters[EpochRing(token)][ShardOf()].n.fetch_sub(1, std::memory_order_seq_cst);
-		}
-
-		// GATED, and GenMC proves the gate is necessary -- removing it is the one control that
-		// FAILS. Advancing into an occupied ring slot makes that slot ambiguous: a reader parked
-		// kEpochSlots epochs back becomes indistinguishable from one entering now, and the reclaimer
-		// attributes its count to the wrong epoch. Refusing to advance keeps every live slot mapped
-		// to exactly one epoch, at the price of stalling reclamation while somebody is parked --
-		// which is a LEAK, bounded by the park, and precisely what a parked fiber already costs.
+		// This used to refuse to advance into an OCCUPIED ring slot, and GenMC proved the gate
+		// necessary -- removing it was the one control that FAILED. But what it protected was the
+		// ring's ARITHMETIC: a counted reader's slot position had to map to exactly one epoch, and
+		// advancing into an occupied slot made a reader parked kEpochSlots epochs back
+		// indistinguishable from one entering now.
 		//
-		// Returns false when it declined. Nothing needs to care; Tick simply does not advance this
-		// time, which is the stall doing its job.
+		// A SLOT READER ANNOUNCES ITS EPOCH DIRECTLY. Nothing is inferred from a position, so there
+		// is nothing for an ambiguous slot to corrupt, and the minimum over the participants is
+		// exact however far the global epoch has run ahead. The gate was never protecting them.
+		//
+		// AND IT COST SOMETHING REAL: advancement could DECLINE, which stalls reclamation for as
+		// long as anybody is parked -- a bounded leak, but one that existed only to keep the ring
+		// honest. Now it is an unconditional CAS and the only way it returns false is losing a race
+		// to another advancer, which is not a stall.
 		bool AdvanceEpoch() {
 			size_t e = globalEpoch.load(std::memory_order_acquire);
-			const size_t next = e + 1;
-			if (RingTotal(EpochRing(next)) != 0) return false;
-			return globalEpoch.compare_exchange_strong(e, next, std::memory_order_seq_cst,
+			return globalEpoch.compare_exchange_strong(e, e + 1, std::memory_order_seq_cst,
 			                                           std::memory_order_relaxed);
 		}
 
@@ -622,31 +564,72 @@ namespace JLib {
 	// a stalled participant stalls reclamation for everyone -- that is what EBR IS, in the paper as
 	// much as here. The invariant is the same for both: finish the traversal, drop the guard, then
 	// await.
-	inline void CoroEpochGuardSuspendCheck() {
-		if (t_epochGuardDepth > 0) {
-			fprintf(stderr,
-				"[JLib::Scheduler] INVARIANT VIOLATED: a coroutine suspended inside an EpochGuard "
-				"(depth %d). A coroutine has no epoch slot of its own -- it uses the WORKER's -- so "
-				"this guard will exit on whichever worker resumes it. The entering worker stays "
-				"announced forever (nothing is ever reclaimed again) and the resuming worker's slot "
-				"is cleared without having been set, which can un-announce a live traversal and free "
-				"nodes underneath it. Fix: end the guarded traversal and let the EpochGuard destruct "
-				"BEFORE the co_await.\n",
-				t_epochGuardDepth);
-			assert(false && "coroutine suspended while holding an EpochGuard -- see stderr");
-		}
-	}
 }
 #define JLIB_EPOCH_GUARD_ENTER()        (++JLib::t_epochGuardDepth)
 #define JLIB_EPOCH_GUARD_LEAVE()        (--JLib::t_epochGuardDepth)
 #define JLIB_EPOCH_CHECK_NO_GUARD(where) JLib::EpochGuardSuspendCheck(where)
-#define JLIB_EPOCH_CHECK_NO_GUARD_CORO() JLib::CoroEpochGuardSuspendCheck()
 #else
 #define JLIB_EPOCH_GUARD_ENTER()        ((void)0)
 #define JLIB_EPOCH_GUARD_LEAVE()        ((void)0)
 #define JLIB_EPOCH_CHECK_NO_GUARD(where) ((void)0)
-#define JLIB_EPOCH_CHECK_NO_GUARD_CORO() ((void)0)
 #endif
+
+namespace JLib {
+	// ---- THE COROUTINE CHECK IS LIVE IN **RELEASE**, AND READS THE SLOT, NOT A COUNTER ----------
+	//
+	// This is the price of deleting counted epochs, and it is deliberately paid on the RARE event.
+	//
+	// The counted ring existed to survive a coroutine suspending inside a guard. That is forbidden,
+	// and the check for it used to sit behind !NDEBUG -- so in Release the rule was unenforced and
+	// the ring was the only thing standing between a violation and a use-after-free. Removing the
+	// ring without moving the check would have traded "slow but correct" for "silently wrong in the
+	// configuration that ships".
+	//
+	// IT CANNOT USE t_epochGuardDepth, because maintaining that counter costs two thread_local
+	// operations on EVERY guard -- the path measured at 2.52 billion guards/sec, and the one this
+	// whole removal exists to make cheaper. So it asks the SLOT instead: a coroutine has no slot of
+	// its own and borrows the worker's, so an announced thread slot at a co_await means this
+	// coroutine is inside a guard. ONE relaxed-ish load, at a suspension, which is rare and already
+	// expensive.
+	//
+	// NO FALSE POSITIVE PATH IS KNOWN, and the reasoning is: a coroutine task occupies its worker
+	// exclusively while running, the worker's own loop takes no epoch guards, and a suspended
+	// FIBER's guard lives in the fiber's slot rather than the thread's. If one is ever found, the
+	// fix is to narrow this check -- not to restore the ring.
+	// TEST SEAM, and a narrow one on purpose: it replaces what happens AFTER the violation is
+	// detected, never whether detection runs. The check itself is the thing paying for the counted
+	// ring's removal, so it must not be switchable off -- but a regression test cannot assert on a
+	// process that has already aborted. Default is abort.
+	using CoroSuspendViolationFn = void (*)();
+	inline std::atomic<CoroSuspendViolationFn> g_coroSuspendViolation{ nullptr };
+	inline void SetCoroSuspendViolationHandlerForTest(CoroSuspendViolationFn fn) {
+		g_coroSuspendViolation.store(fn, std::memory_order_relaxed);
+	}
+
+	inline void CoroEpochGuardSuspendCheck() {
+		std::atomic<size_t>* slot = EpochManager::Instance().ThreadSlot(thread_id);
+		if (!slot) return;
+		if (slot->load(std::memory_order_acquire) == SIZE_MAX) return;   // not announced: fine
+		if (CoroSuspendViolationFn h = g_coroSuspendViolation.load(std::memory_order_relaxed)) {
+			h();
+			return;
+		}
+		fprintf(stderr,
+			"[JLib::Scheduler] INVARIANT VIOLATED: a coroutine suspended inside an EpochGuard.\n"
+			"  A coroutine has no epoch slot of its own -- it uses the WORKER's -- so this guard\n"
+			"  will exit on whichever worker resumes it. The entering worker stays announced\n"
+			"  forever (nothing is ever reclaimed again) and the resuming worker's slot is cleared\n"
+			"  without having been set, which can un-announce a live traversal and free nodes\n"
+			"  underneath it.\n"
+			"  Fix: end the guarded traversal and let the EpochGuard destruct BEFORE the co_await.\n"
+			"  If the traversal genuinely must span the suspension, use a HazardGuard -- hazard\n"
+			"  pointers support being held across a suspend; epochs do not, and that is why both\n"
+			"  schemes exist.\n");
+		fflush(stderr);
+		std::abort();
+	}
+}
+#define JLIB_EPOCH_CHECK_NO_GUARD_CORO() JLib::CoroEpochGuardSuspendCheck()
 
 // ==================================================================================================
 // THE TWO MECHANISMS. NEITHER OF THESE IS THE ONE YOU WANT AT A CALL SITE.
@@ -666,25 +649,15 @@ namespace JLib {
 // that measures one against the other, for instance).
 // ==================================================================================================
 
-// THE COUNTED GUARD -- for a reader with no stable slot, i.e. a coroutine. Announces by
-// incrementing the current epoch's counter rather than by writing a slot, so the protection travels
-// with the token in the coroutine's own frame and survives a suspension and a migration.
+// THE COUNTED GUARD WAS HERE. It announced by incrementing an epoch's counter rather than writing a
+// slot, so protection travelled in a token in the coroutine's own frame and survived a migration.
+// Removed with the ring: it insured against suspending inside a guard, which
+// CoroEpochGuardSuspendCheck already forbids and now asserts in RELEASE as well as dev builds. A
+// coroutine that genuinely needs reclamation across a suspend uses hazard pointers, which support
+// it by design.
 //
-// Constructing this on a FIBER would work but is pure loss -- a fiber already owns a slot, and a
-// counter is contended where a slot is not.
-struct CountedEpochGuard {
-	size_t token;
-
-	CountedEpochGuard() : token(JLib::EpochManager::Instance().EnterCounted()) {
-		JLIB_EPOCH_GUARD_ENTER();
-	}
-	~CountedEpochGuard() {
-		JLib::EpochManager::Instance().LeaveCounted(token);
-		JLIB_EPOCH_GUARD_LEAVE();
-	}
-	CountedEpochGuard(const CountedEpochGuard&) = delete;
-	CountedEpochGuard& operator=(const CountedEpochGuard&) = delete;
-};
+// THERE IS NOW ONE MECHANISM, so this file no longer owns a choice and Thread.h's EpochGuard no
+// longer makes one -- it is an alias for the slot guard over CurrentEpochSlot().
 
 // THE SLOT GUARD -- for a reader that owns a stable slot for the guard's whole life: a fiber, or a
 // bare thread. Two uncontended stores, which is why it stays the default for those. Named

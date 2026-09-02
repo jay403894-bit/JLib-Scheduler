@@ -206,7 +206,14 @@ int main(int argc, char** argv) {
         // guard lands on the same row without anything looking nested at all.
         if (std::strcmp(mode, "nested-worker-row") == 0) {
             WaitGroup wg;
-            auto* t = sched.CreateTask([] {
+            // CreateInternalTask == Native, and it is REQUIRED here rather than incidental. This
+            // case is about the WORKER ROW, and only a Native task uses one -- a fiber task gets a
+            // reader row indexed by Fiber::poolIndex, which is exactly what the fiber-park case
+            // below relies on. It used to say CreateTask and got Native by DEFAULT; when the public
+            // default became Fiber the task quietly moved to a fiber row, the "second guard on the
+            // same row" collision stopped being possible, and the abort this asserts never fired.
+            // The test reported it honestly (heldOff=0), which is the only reason it was noticed.
+            auto* t = sched.CreateInternalTask([] {
                 HazardGuard outer;
                 Node* n = outer.Protect(0, g_head);
 
