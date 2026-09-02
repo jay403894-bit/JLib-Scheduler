@@ -274,8 +274,14 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
         // name. The Windows side steers across the hot set here; that is deliberately NOT copied
         // yet, because steering wants the same measurement the Windows one got and this path has
         // never been run.
-        if (nHi) { s.PushBatch(batchHi, nHi, 0, 64, true);  nHi = 0; }
-        if (nLo) { s.PushBatch(batchLo, nLo, 0, 64, false); nLo = 0; }
+        // Lane, not bool. `true`/`false` here stopped compiling when Lane replaced hiPri -- and it
+        // went unnoticed because nothing on Windows builds this file, which is the whole reason the
+        // rename swept the identifiers and missed the literals. The Windows reactor's equivalent
+        // routes Normal completions to the FLOOR rather than the lane (a Normal task on a reserved
+        // worker is unreachable, not merely deprioritised); this backend keeps its existing shape
+        // until the Linux lane path is measured, so the change here is the type and nothing else.
+        if (nHi) { s.PushBatch(batchHi, nHi, 0, 64, Lane::LowLatency); nHi = 0; }
+        if (nLo) { s.PushBatch(batchLo, nLo, 0, 64, Lane::Normal);     nLo = 0; }
     };
 
     for (;;) {
