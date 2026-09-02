@@ -21,6 +21,7 @@
 // the pointee is usually still allocated -- so it corrupts quietly instead of faulting.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 #include "Thread.h"
 #include "Fiber.h"
 #include "FiberRegistry.h"
@@ -68,6 +69,116 @@ struct Rec {
     bool  done         = false;
 };
 
+// ---- FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS ---------------------------------------
+//
+// One spelling for every task body -- not a lambda, and not a captureless one either, so there is
+// never a per-site judgement about which form is safe here. A fiber's stack is a PLACE: register
+// state mapped to memory, kept intact across a suspension. A closure is a VALUE the worker loop
+// frees the instant the body returns. A fiber handed a closure that then parks either resumes into
+// a dead frame or never dies and never returns its row, and because SlabPool is append-only and a
+// released slot stays mapped holding its old bytes, neither shows up where it was caused.
+// ---- STATE THE BODIES NEED, HOISTED TO FILE SCOPE ------------------------------------------
+//
+// Owned/Alloc/s_live and the typed FiberLocal handle were declared inside main. They are up here
+// now for one reason: a named body cannot see a function-local type, and named bodies are the
+// rule. They are still test-private (static / internal linkage) and nothing outside this file
+// can reach them.
+static std::atomic<int> s_freed{ 0 };
+static std::atomic<int> s_borrowedFreed{ 0 };
+struct Owned { int magic; };
+
+// Deliberately not `new`/`delete`: the whole reason the hook takes a void* is that the allocator
+// is the caller's business.
+struct Alloc {
+    static void* Get()                { return std::malloc(sizeof(Owned)); }
+    static void  Free(void* p)        { s_freed.fetch_add(1, std::memory_order_relaxed); std::free(p); }
+    static void  NeverCalled(void*)   { s_borrowedFreed.fetch_add(1, std::memory_order_relaxed); }
+};
+static Owned s_live{ 0xABCD };
+
+struct Scratch { int magic; };
+static JLib::FiberLocal<Scratch> g_tls = JLib::MakeFiberLocal<Scratch>();
+
+struct MigrateCtx {
+    Rec*              rec;
+    JLib::Event*      gate;
+    std::atomic<int>* started;
+    std::atomic<int>* finished;
+};
+static void MigrateBody(void* p) {
+    auto& c = *static_cast<MigrateCtx*>(p);
+    Rec* r = c.rec;
+    JLib::Thread* th = JLib::Thread::GetCurrent();
+    r->workerBefore = th ? th->qIndex : -1;
+
+    // Both stores happen HERE, on the pre-suspend worker.
+    JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) = r->sentinel;
+    TlsSet(r->sentinel);
+
+    c.started->fetch_add(1, std::memory_order_release);
+    JLib::TaskScheduler::Instance().WaitOnEvent(*c.gate);
+
+    // ...and both loads happen here, wherever we resumed.
+    JLib::Thread* th2 = JLib::Thread::GetCurrent();
+    r->workerAfter = th2 ? th2->qIndex : -1;
+    r->flsAfter    = JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel);
+    r->tlsAfter    = TlsGet();
+    r->done        = true;
+    c.finished->fetch_add(1, std::memory_order_release);
+}
+
+struct ScrubCtx { std::atomic<int>* ran; std::atomic<int>* flagged; };
+// The BORROWED-slot arm. Writes an owning pointer into one slot and a pointer to a live object
+// into another that has no deleter, then checks the next occupant of this fiber sees neither.
+static void BorrowSlotBody(void* p) {
+    auto& c = *static_cast<ScrubCtx*>(p);
+    if (JLib::TaskScheduler::FiberLocal(kOwning) != nullptr ||
+        JLib::TaskScheduler::FiberLocal(kBorrowed) != nullptr)
+        c.flagged->fetch_add(1, std::memory_order_relaxed);
+    JLib::TaskScheduler::FiberLocal(kOwning)   = Alloc::Get();   // owning
+    JLib::TaskScheduler::FiberLocal(kBorrowed) = &s_live;        // BORROWED
+    c.ran->fetch_add(1, std::memory_order_release);
+}
+
+// The typed FiberLocal<T> arm. Every slot it reports into arrives as a pointer, so the body names
+// exactly what it touches.
+struct TypedCtx {
+    Scratch*          obj;
+    int*              idBefore;
+    int*              idAfter;
+    int*              wBefore;
+    int*              wAfter;
+    int*              gotMagic;
+    JLib::Event*      gate;
+    std::atomic<int>* started;
+    std::atomic<int>* done;
+};
+static void TypedFlsBody(void* p) {
+    auto& c = *static_cast<TypedCtx*>(p);
+    JLib::Thread* th = JLib::Thread::GetCurrent();
+    *c.wBefore  = th ? th->qIndex : -1;
+    *c.idBefore = (int)JLib::FiberRegistry::GetID();
+
+    g_tls.set(c.obj);
+    c.started->fetch_add(1, std::memory_order_release);
+    JLib::TaskScheduler::Instance().WaitOnEvent(*c.gate);
+
+    JLib::Thread* th2 = JLib::Thread::GetCurrent();
+    *c.wAfter  = th2 ? th2->qIndex : -1;
+    *c.idAfter = (int)JLib::FiberRegistry::GetID();
+    *c.gotMagic = g_tls ? g_tls->magic : -1;    // operator bool + operator->
+    c.done->fetch_add(1, std::memory_order_release);
+}
+
+static void ScrubSlotBody(void* p) {
+    auto& c = *static_cast<ScrubCtx*>(p);
+    if (JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) != nullptr)
+        c.flagged->fetch_add(1, std::memory_order_relaxed);
+    // Leave a value behind for whoever gets this fiber next.
+    JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) = (void*)(uintptr_t)0xDEAD;
+    c.ran->fetch_add(1, std::memory_order_release);
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== fiber-local storage survives migration; thread_local does not ===\n");
@@ -83,29 +194,18 @@ int main() {
     std::atomic<int> started{ 0 }, finished{ 0 };
     JLib::Event& gate = sched.GetEvent("fiber_local_gate");
 
+    // PER-ITERATION CAPTURE (`r` differs each time), so the bodies get storage that outlives the
+    // loop and the wait. reserve() is load-bearing: MakeCtxTask is handed &ctxs[i], and a
+    // reallocation would move contexts already handed out from under their fibers.
+    std::vector<MigrateCtx> ctxs;
+    ctxs.reserve(kFibers);
+
     for (int i = 0; i < kFibers; ++i) {
         Rec* r = &recs[i];
         r->sentinel = (void*)(uintptr_t)(0xF1BE0000u + (unsigned)i);
 
-        auto* t = sched.CreateTask([r, &gate, &started, &finished] {
-            JLib::Thread* th = JLib::Thread::GetCurrent();
-            r->workerBefore = th ? th->qIndex : -1;
-
-            // Both stores happen HERE, on the pre-suspend worker.
-            JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) = r->sentinel;
-            TlsSet(r->sentinel);
-
-            started.fetch_add(1, std::memory_order_release);
-            JLib::TaskScheduler::Instance().WaitOnEvent(gate);
-
-            // ...and both loads happen here, wherever we resumed.
-            JLib::Thread* th2 = JLib::Thread::GetCurrent();
-            r->workerAfter = th2 ? th2->qIndex : -1;
-            r->flsAfter    = JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel);
-            r->tlsAfter    = TlsGet();
-            r->done        = true;
-            finished.fetch_add(1, std::memory_order_release);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        ctxs.push_back(MigrateCtx{ r, &gate, &started, &finished });
+        auto* t = JLibTest::MakeCtxTask(sched, &MigrateBody, &ctxs[i]);
         if (t) sched.Push(t);
     }
 
@@ -162,14 +262,10 @@ int main() {
         std::atomic<int> dirty{ 0 };
         const int kRounds = 200;
 
+        // Outside the loop: the task points at this body, and nothing is joined per iteration.
+        ScrubCtx sctx{ &ran, &dirty };
         for (int i = 0; i < kRounds; ++i) {
-            auto* t = sched.CreateTask([&ran, &dirty] {
-                if (JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) != nullptr)
-                    dirty.fetch_add(1, std::memory_order_relaxed);
-                // Leave a value behind for whoever gets this fiber next.
-                JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) = (void*)(uintptr_t)0xDEAD;
-                ran.fetch_add(1, std::memory_order_release);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &ScrubSlotBody, &sctx);
             if (t) sched.Push(t);
         }
 
@@ -196,17 +292,6 @@ int main() {
     // corrupt every program that parks a borrowed pointer in a slot. Slot 1 is never given a
     // deleter, is handed a pointer to a live object, and must come back untouched.
     {
-        static std::atomic<int> s_freed{ 0 };
-        static std::atomic<int> s_borrowedFreed{ 0 };
-        struct Owned { int magic; };
-
-        // Deliberately not `new`/`delete`: the whole reason the hook takes a void* is that the
-        // allocator is the caller's business.
-        struct Alloc {
-            static void* Get()        { return std::malloc(sizeof(Owned)); }
-            static void  Free(void* p) { s_freed.fetch_add(1, std::memory_order_relaxed); std::free(p); }
-            static void  NeverCalled(void* )   { s_borrowedFreed.fetch_add(1, std::memory_order_relaxed); }
-        };
         (void)&Alloc::NeverCalled;   // referenced only to keep the intent visible
 
         // SLOTS NO EARLIER ARM TOUCHED, and this is the test obeying the rule SetSlotDeleter
@@ -220,20 +305,14 @@ int main() {
         reg.SetSlotDeleter(kOwning, &Alloc::Free);
         // kBorrowed gets NO deleter on purpose. It is the control.
 
-        static Owned s_live{ 0xABCD };
         std::atomic<int> ran{ 0 };
         std::atomic<int> sawStale{ 0 };
         const int kRounds = 150;
 
+        // Outside the loop, for the same reason as the round above.
+        ScrubCtx bctx{ &ran, &sawStale };
         for (int i = 0; i < kRounds; ++i) {
-            auto* t = sched.CreateTask([&ran, &sawStale] {
-                if (JLib::TaskScheduler::FiberLocal(kOwning) != nullptr ||
-                    JLib::TaskScheduler::FiberLocal(kBorrowed) != nullptr)
-                    sawStale.fetch_add(1, std::memory_order_relaxed);
-                JLib::TaskScheduler::FiberLocal(kOwning)   = Alloc::Get();   // owning
-                JLib::TaskScheduler::FiberLocal(kBorrowed) = &s_live;        // BORROWED
-                ran.fetch_add(1, std::memory_order_release);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &BorrowSlotBody, &bctx);
             if (t) sched.Push(t);
         }
 
@@ -266,14 +345,12 @@ int main() {
     // registry identity is what every table indexes by, so an id that changed under a migration
     // would silently mis-address the cleanup chain and the hazard cells both.
     {
-        struct Scratch { int magic; };
-        static JLib::FiberLocal<Scratch> tls = JLib::MakeFiberLocal<Scratch>();
-        Check(tls.slot != JLib::FiberRegistry::kNoSlot, "FlsAlloc handed out a slot");
+        Check(g_tls.slot != JLib::FiberRegistry::kNoSlot, "FlsAlloc handed out a slot");
 
         // A SECOND ALLOCATION MUST DIFFER. One counter handing the same index to two callers is the
         // failure that would make two unrelated subsystems silently share storage.
         auto other = JLib::MakeFiberLocal<Scratch>();
-        Check(other.slot != tls.slot, "a second FlsAlloc returned a DIFFERENT slot");
+        Check(other.slot != g_tls.slot, "a second FlsAlloc returned a DIFFERENT slot");
 
         constexpr int kN = 48;
         std::vector<Scratch> objs(kN);
@@ -283,24 +360,16 @@ int main() {
         std::atomic<int> started{ 0 }, done{ 0 };
         JLib::Event& gate2 = sched.GetEvent("fiber_local_typed_gate");
 
+        // Per-iteration state again -- same pattern, same reason. See the first loop in this file:
+        // one context per fiber, in a reserved vector that outlives the wait.
+        std::vector<TypedCtx> tctxs;
+        tctxs.reserve(kN);
+
         for (int i = 0; i < kN; ++i) {
             objs[i].magic = 0x5A00 + i;
-            auto* t = sched.CreateTask([i, &objs, &idBefore, &idAfter, &wBefore, &wAfter,
-                                        &gotMagic, &gate2, &started, &done] {
-                JLib::Thread* th = JLib::Thread::GetCurrent();
-                wBefore[i]  = th ? th->qIndex : -1;
-                idBefore[i] = (int)JLib::FiberRegistry::GetID();
-
-                tls.set(&objs[i]);
-                started.fetch_add(1, std::memory_order_release);
-                JLib::TaskScheduler::Instance().WaitOnEvent(gate2);
-
-                JLib::Thread* th2 = JLib::Thread::GetCurrent();
-                wAfter[i]  = th2 ? th2->qIndex : -1;
-                idAfter[i] = (int)JLib::FiberRegistry::GetID();
-                gotMagic[i] = tls ? tls->magic : -1;    // operator bool + operator->
-                done.fetch_add(1, std::memory_order_release);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            tctxs.push_back(TypedCtx{ &objs[i], &idBefore[i], &idAfter[i], &wBefore[i],
+                                      &wAfter[i], &gotMagic[i], &gate2, &started, &done });
+            auto* t = JLibTest::MakeCtxTask(sched, &TypedFlsBody, &tctxs[i]);
             if (t) sched.Push(t);
         }
 

@@ -388,6 +388,45 @@ namespace JLib {
         friend class TaskScheduler;
 
     public:
+        // ================= THE FIBER ROW INVARIANT, COUNTED RATHER THAN ASSERTED =============
+        //
+        // EVERY AcquireFiber MUST HAVE EXACTLY ONE RECYCLE. A row is a leased stack plus its FLS
+        // slots, creditor list and retire bag, and the ONLY teardown is the recycle that follows
+        // FiberStatus::DEAD: tagged deleters run, the context is destroyed, the stack returns to
+        // the magazine, the slot is freed. A fiber that never reaches DEAD is not slow -- it is a
+        // PERMANENT --budget. The row is never FREE again, the reaper never runs for it, and
+        // everything attached to it is lost rather than reclaimed.
+        //
+        // WHY THIS IS A COUNTER AND NOT A TEST. A test says "not under these conditions". This
+        // class of bug works perfectly until the moment it does not, and the failure surfaces
+        // somewhere else entirely -- as I/O stalling on AcquireFiber, or as a lost wakeup, because
+        // a stranded row looks identical to both from outside. The only durable answer is for the
+        // runtime to notice, in every application that runs it, including the future change that
+        // breaks the invariant.
+        //
+        // The same shape the epoch manager already uses for "retired 100,000 pointers and Tick()
+        // has never run": count the two halves, and say so loudly when they diverge.
+        //
+        // DEV BUILDS ONLY. These sit on the fiber acquisition path, which is on every task that can
+        // suspend, so a shipping build must not pay for them. The MEMBERS are unconditional so
+        // sizeof(Thread) does not depend on the including translation unit's flags -- the same trap
+        // EpochManager documents for devRetiredNeverSwept -- and only the CODE is conditional.
+        std::atomic<std::uint64_t> fiberAcquires{ 0 };
+        std::atomic<std::uint64_t> fiberRecycles{ 0 };
+
+        // THE BALANCE IS POOL-WIDE, NEVER PER-WORKER, and getting that wrong would make the whole
+        // instrument lie. In Migrate mode the worker that calls AcquireFiber is frequently NOT the
+        // worker that runs the fiber to DEAD -- that is what migration IS -- so an individual
+        // worker's acquires and recycles are not expected to match and routinely will not. Only the
+        // sum over every worker is conserved. TaskScheduler::OutstandingFiberRows() does that sum;
+        // these two accessors exist so it can, and so a report can name which worker is which.
+        std::uint64_t FiberAcquireCount() const noexcept {
+            return fiberAcquires.load(std::memory_order_relaxed);
+        }
+        std::uint64_t FiberRecycleCount() const noexcept {
+            return fiberRecycles.load(std::memory_order_relaxed);
+        }
+
         // ---- WHAT ONE PUSH TOUCHES ON THIS OBJECT ------------------------------------------
         //
         // PushTarget writes three fields on the worker it selected -- inboxDepth, hasQueuedWork and

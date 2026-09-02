@@ -40,7 +40,7 @@ cmake_minimum_required(VERSION 3.21)
 # What forces the major is Join() leaving the public surface. It advertised a teardown that could be
 # followed by a restart, and no such restart ever existed (Init() throws on a non-null instance,
 # StartPool is private). Removing an API that never worked is still removing an API.
-set(JLIBSCHED_VERSION "5.0.0")
+set(JLIBSCHED_VERSION "5.0.1")
 
 # Steal-path instrumentation. OFF by design: the counters live in the steal loop, which is precisely
 # where contention is being investigated, so leaving them in a shipping build would tax the thing
@@ -1134,6 +1134,11 @@ add_executable(SchedulerEverythingIsAFiberTest "${CMAKE_CURRENT_SOURCE_DIR}/test
 target_link_libraries(SchedulerEverythingIsAFiberTest PRIVATE Scheduler)
 target_compile_features(SchedulerEverythingIsAFiberTest PRIVATE cxx_std_17)
 
+# NEGATIVE CONTROL for the fiber-row-balance teardown check -- see tests/row_probe.cpp.
+add_executable(SchedulerRowProbe "${CMAKE_CURRENT_SOURCE_DIR}/tests/row_probe.cpp")
+target_link_libraries(SchedulerRowProbe PRIVATE Scheduler)
+target_compile_features(SchedulerRowProbe PRIVATE cxx_std_17)
+
 # THREAD LAYOUT: how many cache lines one Push touches on the consumer's Thread. Prints the offsets
 # rather than reasoning about them from source order -- see the test header.
 add_executable(SchedulerThreadLayoutTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/thread_layout_test.cpp")
@@ -1208,3 +1213,16 @@ set_target_properties(SchedulerRuntimeBench PROPERTIES OUTPUT_NAME runtime_bench
 add_executable(SchedulerReadmeCheck "${CMAKE_CURRENT_SOURCE_DIR}/tests/readme_check.cpp")
 target_link_libraries(SchedulerReadmeCheck PRIVATE Scheduler)
 target_compile_features(SchedulerReadmeCheck PRIVATE cxx_std_17)
+
+# Does a lambda task's by-value capture survive a suspension? See the file header -- it exists
+# because tracing a branch is not the same as watching it fail when the answer is wrong.
+add_executable(SchedulerLambdaCaptureTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/lambda_capture_suspend_test.cpp")
+target_link_libraries(SchedulerLambdaCaptureTest PRIVATE Scheduler)
+target_compile_features(SchedulerLambdaCaptureTest PRIVATE cxx_std_17)
+
+# Every AcquireFiber must have exactly one DEAD and one recycle. This drives many times the fiber
+# budget through SUSPENDING lambda tasks and checks the rows come back -- a stranded row cannot hide
+# behind a generous pool, it exhausts one. See the file header.
+add_executable(SchedulerFiberRowLifecycleTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_row_lifecycle_test.cpp")
+target_link_libraries(SchedulerFiberRowLifecycleTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberRowLifecycleTest PRIVATE cxx_std_17)

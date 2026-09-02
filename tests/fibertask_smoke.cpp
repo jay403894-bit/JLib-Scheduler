@@ -7,8 +7,8 @@
 //   clang++ -std=c++17 -O1 -g -I include tests/fibertask_smoke.cpp build/libScheduler.a -o smoke
 //   ./smoke ; echo "exit $?"
 //
-// WHY THIS EXISTS: every other section of the bench uses CreateTask(+[](void*){}, nullptr), the
-// function-pointer overload, which defaults to TaskType::Native and never touches a fiber. Only
+// WHY THIS EXISTS: every other section of the bench uses CreateTask(&EmptyBody, nullptr) -- the
+// function-pointer overload with a named body -- which is Native and never touches a fiber. Only
 // fork-join passes TaskType::Fiber, so it is the FIRST code in the whole bench to exercise
 // Fiber::Init, the switch-in, FiberEntryWrapper, and the suspend path -- all of which are new on
 // AArch64. The bench conflates all four; this separates them into two stages.

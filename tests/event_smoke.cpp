@@ -17,6 +17,7 @@
 //   3. Signalling an event nobody is waiting on, and one that has already been drained -- both
 //      must be no-ops rather than faults.
 #include <TaskScheduler.h>   // brings WaitGroup, Event and DirectEvent with it
+#include "fiber_body.h"
 #include <cstdio>
 #include <atomic>
 #include <thread>
@@ -26,6 +27,18 @@
 
 static std::atomic<int> g_resumed{ 0 };
 static std::atomic<int> g_entered{ 0 };
+
+// A NAMED BODY, NOT A LAMBDA. A fiber's stack is register state mapped to memory; a closure is a
+// value the worker loop frees when the body returns. A fiber handed a closure that then parks
+// either resumes into a dead frame or never dies and never gives its row back. The event name
+// arrives through the context, which lives on the caller's stack for the whole round.
+struct EventCtx { JLib::TaskScheduler* s; const char* name; };
+static void EventWaitBody(void* p) {
+    auto& c = *static_cast<EventCtx*>(p);
+    g_entered.fetch_add(1, std::memory_order_relaxed);
+    c.s->WaitOnEvent(c.name);
+    g_resumed.fetch_add(1, std::memory_order_relaxed);
+}
 
 // usage: event_smoke [rounds] [waiters] [poolSize]
 //
@@ -65,13 +78,12 @@ int main(int argc, char** argv) {
 
         JLib::WaitGroup wg;
         wg.n.fetch_add(kWaitersArg, std::memory_order_relaxed);
+        // One context for all kWaitersArg fibers -- nothing varies per waiter -- declared outside
+        // the loop so it outlives the WaitFor at the end of the round.
+        EventCtx ctx{ &sched, name };
         for (int i = 0; i < kWaitersArg; ++i) {
             // These suspend, so they need a fiber under them.
-            JLib::Task* t = sched.CreateTask([&sched, name] {
-                g_entered.fetch_add(1, std::memory_order_relaxed);
-                sched.WaitOnEvent(name);
-                g_resumed.fetch_add(1, std::memory_order_relaxed);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            JLib::Task* t = JLibTest::MakeCtxTask(sched, &EventWaitBody, &ctx);
             if (!t) { printf("FAIL: CreateTask returned null (round %d)\n", round); return 1; }
             t->waitGroup = &wg;
             sched.Push(t);

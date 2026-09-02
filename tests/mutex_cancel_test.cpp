@@ -13,6 +13,7 @@
 // which made it the structural reason parked work leaks at teardown.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 
 #include <atomic>
 #include <chrono>
@@ -20,6 +21,29 @@
 #include <thread>
 
 using namespace JLib;
+
+// ---- FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS -------------------------------------
+//
+// Not lambdas. A fiber's stack is a PLACE -- register state mapped to memory -- and keeping it
+// intact across a suspension is what this runtime is for. A closure is a VALUE the worker loop
+// owns: the task frame is freed the moment the body returns. Give a fiber a closure and either
+// the frame is gone when it resumes, or the fiber never dies and the frame is never freed.
+// Neither surfaces where it was caused, because SlabPool is append-only and a released slot
+// stays mapped holding its old bytes. So: named body, state in a struct the caller declares.
+struct LockCtx {
+    JLib::SchedulerMutex* m;
+    std::atomic<bool>*    parked;      // optional
+    std::atomic<int>*     result;      // optional -- the raw WaitResult
+    std::atomic<bool>*    done;
+};
+static void LockCancelBody(void* p) {
+    auto& c = *static_cast<LockCtx*>(p);
+    if (c.parked) c.parked->store(true, std::memory_order_release);
+    const WaitResult r = c.m->LockCancellable();
+    if (c.result) c.result->store((int)r, std::memory_order_release);
+    if (r == WaitResult::Ok) c.m->Unlock();       // only unlock if we actually got it
+    c.done->store(true, std::memory_order_release);
+}
 
 static int  g_failures = 0;
 static void Check(bool ok, const char* what) {
@@ -44,13 +68,8 @@ int main() {
 
         WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
-        Task* t = sched.CreateTask([&]() {
-            parked.store(true, std::memory_order_release);
-            const WaitResult r = m.LockCancellable();
-            result.store((int)r, std::memory_order_release);
-            if (r == WaitResult::Ok) m.Unlock();      // only unlock if we actually got it
-            done.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        LockCtx ctx{ &m, &parked, &result, &done };
+        Task* t = JLibTest::MakeCtxTask(sched, &LockCancelBody, &ctx);
         t->cancelToken = scope.Token().Raw();      // LockCancellable reads the TASK's token
         t->waitGroup = &wg;
         sched.Push(t);
@@ -89,11 +108,8 @@ int main() {
 
         WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
-        Task* t = sched.CreateTask([&]() {
-            const WaitResult r = m.LockCancellable();
-            if (r == WaitResult::Ok) m.Unlock();
-            bystanderDone.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        LockCtx ctx{ &m, nullptr, nullptr, &bystanderDone };
+        Task* t = JLibTest::MakeCtxTask(sched, &LockCancelBody, &ctx);
         t->cancelToken = bystanderScope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);

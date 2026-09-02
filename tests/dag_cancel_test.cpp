@@ -15,6 +15,7 @@
 //      invisible in every behavioural check, so it is measured against a small slab instead.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 #include "TaskDAG.h"
 
 #include <new>
@@ -39,6 +40,220 @@ static bool WaitUntil(std::atomic<int>& v, int want, int ms = 4000) {
         std::this_thread::yield();
     }
     return true;
+}
+
+
+// ================= FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS ==========================
+//
+// Twenty-six lambdas used to live inline in main. They are gone, and not for tidiness.
+//
+// A fiber's stack is a PLACE -- register state mapped to memory -- and keeping it intact across a
+// suspension is what this runtime exists to do. A closure is a VALUE the worker loop owns: the task
+// frame is freed the moment the body returns. Hand a fiber a closure and one of two things happens
+// when it parks -- the frame is gone when it resumes, or the fiber never dies and the frame is
+// never freed. Corruption or leak. Neither surfaces where it was caused, because SlabPool is
+// append-only and a released slot stays mapped still holding its old bytes.
+//
+// Passing the closure's ADDRESS was tried and is not a fix: it moves the lifetime from something
+// the compiler checks to something a reviewer must notice.
+//
+// SO: named bodies, state in a struct the caller declares where its scope is visible. Twenty-six
+// call sites use TWELVE bodies, because most of them differed only in which counters they bumped --
+// which the capture list had been hiding by welding each body to its own scope.
+//
+// NULLABLE COUNTERS ARE DELIBERATE. Several arms care about only one outcome: the kept-scope arm
+// counts acquisitions and not cancellations, the doomed-scope arm the reverse. A null pointer says
+// "this arm does not ask" instead of forcing a caller to declare a counter it will never read.
+
+// Nine arms. A cancellable semaphore wait, reporting whichever outcomes the arm cares about.
+struct SemWaitCtx {
+    JLib::SchedulerSemaphore* sem;
+    std::atomic<int>* parked;
+    std::atomic<int>* cancelled;
+    std::atomic<int>* acquired;
+};
+static void SemWaitBody(void* p) {
+    auto& c = *static_cast<SemWaitCtx*>(p);
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_relaxed);
+    if (c.sem->WaitCancellable() == JLib::WaitResult::Cancelled) {
+        if (c.cancelled) c.cancelled->fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (c.acquired) c.acquired->fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// The UNCANCELLABLE spelling, which is a different assertion and so a different body: a plain
+// Wait() under a cancelled scope must still be served rather than ejected.
+struct SemPlainCtx {
+    JLib::SchedulerSemaphore* sem;
+    std::atomic<int>* parked;
+    std::atomic<int>* acquired;
+};
+static void SemPlainBody(void* p) {
+    auto& c = *static_cast<SemPlainCtx*>(p);
+    c.parked->fetch_add(1, std::memory_order_relaxed);
+    c.sem->Wait();                                     // NOT the cancellable spelling
+    c.acquired->fetch_add(1, std::memory_order_relaxed);
+}
+
+// Cancels its OWN scope and then waits -- the already-cancelled-when-the-wait-begins case.
+struct SemSelfCancelCtx {
+    JLib::CancelScope*        scope;
+    JLib::SchedulerSemaphore* sem;
+    std::atomic<int>*         result;
+};
+static void SemSelfCancelBody(void* p) {
+    auto& c = *static_cast<SemSelfCancelCtx*>(p);
+    c.scope->Cancel();                                 // now running, and now cancelled
+    c.result->store(c.sem->WaitCancellable() == JLib::WaitResult::Cancelled ? 1 : 0,
+                    std::memory_order_release);
+}
+
+struct CvCtx {
+    JLib::SchedulerMutex*             m;
+    JLib::SchedulerConditionVariable* cv;
+    std::atomic<int>* parked;
+    std::atomic<int>* cancelled;
+    std::atomic<int>* woke;
+};
+static void CvCancelBody(void* p) {
+    auto& c = *static_cast<CvCtx*>(p);
+    c.m->Lock();
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_relaxed);
+    const JLib::WaitResult r = c.cv->WaitCancellable(*c.m);
+    if (r == JLib::WaitResult::Cancelled) { if (c.cancelled) c.cancelled->fetch_add(1, std::memory_order_relaxed); }
+    else                                  { if (c.woke)      c.woke->fetch_add(1, std::memory_order_relaxed); }
+    c.m->Unlock();          // UNCONDITIONAL -- the whole point of the invariant
+}
+static void CvPlainBody(void* p) {
+    auto& c = *static_cast<CvCtx*>(p);
+    c.m->Lock();
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_relaxed);
+    c.cv->Wait(*c.m);                                  // NOT the cancellable spelling
+    if (c.woke) c.woke->fetch_add(1, std::memory_order_relaxed);
+    c.m->Unlock();
+}
+
+struct LockCtx {
+    JLib::SchedulerMutex* m;
+    std::atomic<int>* started;
+    std::atomic<int>* cancelled;
+    std::atomic<int>* ok;
+};
+static void LockCancelBody(void* p) {
+    auto& c = *static_cast<LockCtx*>(p);
+    if (c.started) c.started->fetch_add(1, std::memory_order_release);
+    if (c.m->LockCancellable() == JLib::WaitResult::Cancelled) {
+        if (c.cancelled) c.cancelled->fetch_add(1, std::memory_order_relaxed);
+        return;                       // NOT holding the lock -- must not Unlock
+    }
+    if (c.ok) c.ok->fetch_add(1, std::memory_order_relaxed);
+    c.m->Unlock();
+}
+static void LockPlainBody(void* p) {
+    auto& c = *static_cast<LockCtx*>(p);
+    c.m->Lock();                      // unscoped, not cancellable, must be served
+    if (c.ok) c.ok->fetch_add(1, std::memory_order_relaxed);
+    c.m->Unlock();
+}
+
+// Holds the mutex for the whole section so the waiters queue behind it.
+struct HolderCtx {
+    JLib::SchedulerMutex* m;
+    std::atomic<bool>*    in;
+    std::atomic<bool>*    release;
+};
+static void HolderBody(void* p) {
+    auto& c = *static_cast<HolderCtx*>(p);
+    c.m->Lock();
+    c.in->store(true, std::memory_order_release);
+    // CoYield, NOT std::this_thread::yield. This spins for the whole test, and this_thread::yield
+    // gives away the OS thread while KEEPING the fiber -- so the worker stays inside a task body for
+    // the duration and anything placed in its inbox is unreachable, because an inbox has exactly one
+    // legal consumer. Measured: one of the four waiters queued behind it never started, ~1 run in 4.
+    // CoYield hands the fiber back to its worker each pass, so the worker keeps draining while the
+    // mutex stays held -- which is what this section is actually about.
+    while (!c.release->load(std::memory_order_acquire)) JLib::Thread::CoYield();
+    c.m->Unlock();
+}
+
+// Holds the mutex across an EVENT wait, so the lock stays held while this fiber is suspended.
+struct HoldOnEventCtx {
+    JLib::TaskScheduler*  s;
+    JLib::SchedulerMutex* m;
+    JLib::Event*          hold;
+    std::atomic<bool>*    parked;
+};
+static void HoldOnEventBody(void* p) {
+    auto& c = *static_cast<HoldOnEventCtx*>(p);
+    c.m->Lock();
+    c.parked->store(true, std::memory_order_release);
+    c.s->WaitOnEvent(*c.hold);
+    c.m->Unlock();
+}
+
+struct EnterThenLockCtx {
+    JLib::SchedulerMutex* m;
+    std::atomic<bool>*    entered;
+    std::atomic<int>*     reachedEnd;
+};
+static void EnterThenLockBody(void* p) {
+    auto& c = *static_cast<EnterThenLockCtx*>(p);
+    // MARK ENTRY BEFORE BLOCKING. Task::started is set at PICKUP, before the body runs, so by the
+    // time this line executes the task is already past the point where DiscardIfCancelled may throw
+    // it away. Observing this is therefore sufficient to establish the precondition -- the remaining
+    // gap before it actually parks in the mutex is covered by started == 1, which routes a cancel
+    // through the RESUME path.
+    c.entered->store(true, std::memory_order_release);
+    if (c.m->LockCancellable() == JLib::WaitResult::Ok) c.m->Unlock();
+    // Reached either way. If the resume had been discarded, this never runs and the WaitFor hangs --
+    // which is the failure the caller's check exists to catch.
+    c.reachedEnd->fetch_add(1, std::memory_order_relaxed);
+}
+
+// The unwind-path arm: cancel your own scope, then show that a cancellable lock refuses while a
+// plain one still serves the cleanup.
+struct UnwindLockCtx {
+    JLib::CancelScope*    scope;
+    JLib::SchedulerMutex* m;
+    std::atomic<int>*     refused;
+    std::atomic<int>*     gotIt;
+    std::atomic<int>*     cleanedUp;
+};
+static void UnwindLockBody(void* p) {
+    auto& c = *static_cast<UnwindLockCtx*>(p);
+    c.scope->Cancel();          // now we are on an unwind path, and the token is cancelled
+
+    // Nobody holds this mutex. Try_Lock would succeed right now.
+    if (c.m->LockCancellable() == JLib::WaitResult::Cancelled) c.refused->fetch_add(1, std::memory_order_relaxed);
+    else { c.gotIt->fetch_add(1, std::memory_order_relaxed); c.m->Unlock(); }
+
+    // What the unwind must actually use. Plain Lock() cannot fail, so the release happens.
+    c.m->Lock();
+    c.cleanedUp->fetch_add(1, std::memory_order_relaxed);
+    c.m->Unlock();
+}
+
+struct EventCtx {
+    JLib::TaskScheduler* s;
+    JLib::Event*         ev;
+    std::atomic<int>*    parked;
+    std::atomic<int>*    cancelled;
+    std::atomic<int>*    normal;
+};
+static void EventWaitBody(void* p) {
+    auto& c = *static_cast<EventCtx*>(p);
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_relaxed);
+    c.s->WaitOnEvent(*c.ev);
+}
+static void EventCancelBody(void* p) {
+    auto& c = *static_cast<EventCtx*>(p);
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_relaxed);
+    if (c.s->WaitOnEventCancellable(*c.ev) == JLib::WaitResult::Cancelled) {
+        if (c.cancelled) c.cancelled->fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (c.normal) c.normal->fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 int main() {
@@ -323,15 +538,10 @@ int main() {
         JLib::WaitGroup wg;
 
         constexpr int kN = 4;
+        SemWaitCtx ctx{ &sem, &parked, &cancelled, &acquired };
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_relaxed);
-                if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                    cancelled.fetch_add(1, std::memory_order_relaxed);
-                else
-                    acquired.fetch_add(1, std::memory_order_relaxed);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -379,16 +589,10 @@ int main() {
         JLib::WaitGroup wg;
 
         constexpr int kN = 4;
+        CvCtx ctx{ &m, &cv, &parked, &cancelled, &woke };
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                m.Lock();
-                parked.fetch_add(1, std::memory_order_relaxed);
-                const JLib::WaitResult r = cv.WaitCancellable(m);
-                if (r == JLib::WaitResult::Cancelled) cancelled.fetch_add(1, std::memory_order_relaxed);
-                else                                  woke.fetch_add(1, std::memory_order_relaxed);
-                m.Unlock();          // UNCONDITIONAL -- the whole point of the invariant
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &CvCancelBody, &ctx);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -422,13 +626,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            m.Lock();
-            parked.fetch_add(1, std::memory_order_relaxed);
-            cv.Wait(m);                                   // NOT the cancellable spelling
-            woke.fetch_add(1, std::memory_order_relaxed);
-            m.Unlock();
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        CvCtx ctx{ &m, &cv, &parked, nullptr, &woke };
+        auto* t = JLibTest::MakeCtxTask(sched, &CvPlainBody, &ctx);
         t->cancelToken = scope.Token().Raw();             // cancelled scope, uncancellable wait
         t->waitGroup = &wg;
         sched.Push(t);
@@ -455,13 +654,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            m.Lock();
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (cv.WaitCancellable(m) == JLib::WaitResult::Ok)
-                ok.fetch_add(1, std::memory_order_relaxed);
-            m.Unlock();
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        CvCtx ctx{ &m, &cv, &parked, nullptr, &ok };
+        auto* t = JLibTest::MakeCtxTask(sched, &CvCancelBody, &ctx);
         t->waitGroup = &wg;                                // no scope at all
         sched.Push(t);
 
@@ -482,15 +676,10 @@ int main() {
         JLib::WaitGroup wg;
 
         constexpr int kN = 4;
+        SemWaitCtx ctx{ &sem, &parked, &cancelled, &acquired };
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_relaxed);
-                if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                    cancelled.fetch_add(1, std::memory_order_relaxed);
-                else
-                    acquired.fetch_add(1, std::memory_order_relaxed);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
@@ -518,11 +707,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            sem.Wait();                                   // NOT the cancellable spelling
-            acquired.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemPlainCtx ctx{ &sem, &parked, &acquired };
+        auto* t = JLibTest::MakeCtxTask(sched, &SemPlainBody, &ctx);
         t->cancelToken = scope.Token().Raw();             // cancelled scope, uncancellable wait
         t->waitGroup = &wg;
         sched.Push(t);
@@ -549,20 +735,14 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(2, std::memory_order_relaxed);
 
-        auto* a = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                doomedCancelled.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx doomedCtx{ &sem, &parked, &doomedCancelled, nullptr };
+        auto* a = JLibTest::MakeCtxTask(sched, &SemWaitBody, &doomedCtx);
         a->cancelToken = doomed.Token().Raw();
         a->waitGroup = &wg;
         sched.Push(a);
 
-        auto* b = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Ok)
-                keptAcquired.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx keptCtx{ &sem, &parked, nullptr, &keptAcquired };
+        auto* b = JLibTest::MakeCtxTask(sched, &SemWaitBody, &keptCtx);
         b->cancelToken = kept.Token().Raw();
         b->waitGroup = &wg;
         sched.Push(b);
@@ -594,11 +774,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            scope.Cancel();                               // now running, and now cancelled
-            result.store(sem.WaitCancellable() == JLib::WaitResult::Cancelled ? 1 : 0,
-                         std::memory_order_release);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemSelfCancelCtx ctx{ &scope, &sem, &result };
+        auto* t = JLibTest::MakeCtxTask(sched, &SemSelfCancelBody, &ctx);
         t->cancelToken = scope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);
@@ -616,10 +793,8 @@ int main() {
         std::atomic<int> ok{ 0 };
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        auto* t = sched.CreateTask([&] {
-            if (sem.WaitCancellable() == JLib::WaitResult::Ok)
-                ok.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx ctx{ &sem, nullptr, nullptr, &ok };
+        auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
         t->waitGroup = &wg;                                // NO cancel token at all
         sched.Push(t);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -642,19 +817,8 @@ int main() {
 
         // A holder that keeps the lock until told, so the waiters below genuinely park.
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        auto* ht = sched.CreateTask([&] {
-            m.Lock();
-            holderIn.store(true, std::memory_order_release);
-            // CoYield, NOT std::this_thread::yield. This spins for the whole test, and
-            // this_thread::yield gives away the OS thread while KEEPING the fiber -- so the worker
-            // stays inside a task body for the duration and anything placed in its inbox is
-            // unreachable, because an inbox has exactly one legal consumer. Measured: one of the
-            // four waiters queued behind it never started, ~1 run in 4. CoYield hands the fiber
-            // back to its worker each pass, so the worker keeps draining while the mutex stays
-            // held -- which is what this section is actually about.
-            while (!holderRelease.load(std::memory_order_acquire)) JLib::Thread::CoYield();
-            m.Unlock();
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        HolderCtx hctx{ &m, &holderIn, &holderRelease };
+        auto* ht = JLibTest::MakeCtxTask(sched, &HolderBody, &hctx);
         ht->waitGroup = &wg;
         sched.Push(ht);
 
@@ -664,28 +828,18 @@ int main() {
         Check(holderIn.load(), "holder acquired the lock");
 
         // Four scoped waiters that will be cancelled, and one unscoped that must still get the lock.
+        LockCtx lctx{ &m, &startedWaits, &cancelledWaits, &okWaits };
         for (int i = 0; i < 4; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                startedWaits.fetch_add(1, std::memory_order_release);
-                if (m.LockCancellable() == JLib::WaitResult::Cancelled) {
-                    cancelledWaits.fetch_add(1, std::memory_order_relaxed);
-                    return;                       // NOT holding the lock -- must not Unlock
-                }
-                okWaits.fetch_add(1, std::memory_order_relaxed);
-                m.Unlock();
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &LockCancelBody, &lctx);
             t->cancelToken = scope.Token().Raw();
             t->waitGroup = &wg;
             sched.Push(t);
         }
 
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        auto* keep = sched.CreateTask([&] {
-            m.Lock();                              // unscoped, not cancellable, must be served
-            okWaits.fetch_add(1, std::memory_order_relaxed);
-            m.Unlock();
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        LockCtx keepCtx{ &m, nullptr, nullptr, &okWaits };
+        auto* keep = JLibTest::MakeCtxTask(sched, &LockPlainBody, &keepCtx);
         keep->waitGroup = &wg;
         sched.Push(keep);
 
@@ -735,14 +889,10 @@ int main() {
         JLib::SchedulerMutex m;
         JLib::WaitGroup wg;
         std::atomic<int> got{ 0 };
+        LockCtx lctx{ &m, nullptr, nullptr, &got };
         for (int i = 0; i < 8; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                if (m.LockCancellable() == JLib::WaitResult::Ok) {
-                    got.fetch_add(1, std::memory_order_relaxed);
-                    m.Unlock();
-                }
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &LockCancelBody, &lctx);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -823,12 +973,8 @@ int main() {
 
         // Holder keeps the lock so the task below genuinely parks in the waiter queue.
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        auto* ht = sched.CreateTask([&] {
-            m.Lock();
-            parked.store(true, std::memory_order_release);
-            sched.WaitOnEvent(hold);
-            m.Unlock();
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        HoldOnEventCtx hctx{ &sched, &m, &hold, &parked };
+        auto* ht = JLibTest::MakeCtxTask(sched, &HoldOnEventBody, &hctx);
         ht->waitGroup = &wg;
         sched.Push(ht);
 
@@ -837,18 +983,8 @@ int main() {
                std::chrono::steady_clock::now() < d) std::this_thread::yield();
 
         wg.n.fetch_add(1, std::memory_order_relaxed);
-        auto* t = sched.CreateTask([&] {
-            // MARK ENTRY BEFORE BLOCKING. Task::started is set at PICKUP, before the body runs, so
-            // by the time this line executes the task is already past the point where
-            // DiscardIfCancelled may throw it away. Observing this is therefore sufficient to
-            // establish the precondition -- the remaining gap before it actually parks in the
-            // mutex is covered by started == 1, which routes a cancel through the RESUME path.
-            entered.store(true, std::memory_order_release);
-            if (m.LockCancellable() == JLib::WaitResult::Ok) m.Unlock();
-            // Reached either way. If the resume had been discarded, this never runs and the
-            // WaitFor below hangs -- which is the failure this check exists to catch.
-            reachedEnd.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        EnterThenLockCtx ectx{ &m, &entered, &reachedEnd };
+        auto* t = JLibTest::MakeCtxTask(sched, &EnterThenLockBody, &ectx);
         t->cancelToken = scope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);
@@ -898,13 +1034,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                cancelled.fetch_add(1, std::memory_order_relaxed);
-            else
-                acquired.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx ctx{ &sem, &parked, &cancelled, &acquired };
+        auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
         t->waitGroup = &wg;                       // deliberately no cancelToken
         sched.Push(t);
 
@@ -935,13 +1066,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                cancelled.fetch_add(1, std::memory_order_relaxed);
-            else
-                acquired.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx ctx{ &sem, &parked, &cancelled, &acquired };
+        auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
         t->cancelToken = op.Token().Raw();          // the INNER scope only
         t->waitGroup = &wg;
         sched.Push(t);
@@ -978,15 +1104,10 @@ int main() {
         JLib::WaitGroup wg;
 
         constexpr int kN = 4;
+        SemWaitCtx ctx{ &sem, &parked, &cancelled, &acquired };
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_relaxed);
-                if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                    cancelled.fetch_add(1, std::memory_order_relaxed);
-                else
-                    acquired.fetch_add(1, std::memory_order_relaxed);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
             t->cancelToken = op.Token().Raw();      // the INNERMOST scope
             t->waitGroup = &wg;
             sched.Push(t);
@@ -1018,20 +1139,14 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(2, std::memory_order_relaxed);
 
-        auto* a = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                leftCancelled.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx leftCtx{ &sem, &parked, &leftCancelled, nullptr };
+        auto* a = JLibTest::MakeCtxTask(sched, &SemWaitBody, &leftCtx);
         a->cancelToken = left.Token().Raw();
         a->waitGroup = &wg;
         sched.Push(a);
 
-        auto* b = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Ok)
-                rightAcquired.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        SemWaitCtx rightCtx{ &sem, &parked, nullptr, &rightAcquired };
+        auto* b = JLibTest::MakeCtxTask(sched, &SemWaitBody, &rightCtx);
         b->cancelToken = right.Token().Raw();
         b->waitGroup = &wg;
         sched.Push(b);
@@ -1069,18 +1184,8 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            scope.Cancel();          // now we are on an unwind path, and the token is cancelled
-
-            // Nobody holds this mutex. Try_Lock would succeed right now.
-            if (m.LockCancellable() == JLib::WaitResult::Cancelled) refused.fetch_add(1, std::memory_order_relaxed);
-            else { gotIt.fetch_add(1, std::memory_order_relaxed); m.Unlock(); }
-
-            // What the unwind must actually use. Plain Lock() cannot fail, so the release happens.
-            m.Lock();
-            cleanedUp.fetch_add(1, std::memory_order_relaxed);
-            m.Unlock();
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        UnwindLockCtx uctx{ &scope, &m, &refused, &gotIt, &cleanedUp };
+        auto* t = JLibTest::MakeCtxTask(sched, &UnwindLockBody, &uctx);
         t->cancelToken = scope.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);
@@ -1320,8 +1425,8 @@ int main() {
         {
             JLib::WaitGroup warm;
             warm.n.fetch_add(1, std::memory_order_relaxed);
-            auto* w = sched.CreateTask([&] { sched.WaitOnEvent(ev); },
-                                       JLib::Lane::Normal, JLib::TaskType::Fiber);
+            EventCtx wctx{ &sched, &ev, nullptr, nullptr, nullptr };
+            auto* w = JLibTest::MakeCtxTask(sched, &EventWaitBody, &wctx);
             w->waitGroup = &warm;
             sched.Push(w);
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -1332,12 +1437,10 @@ int main() {
         const long long base = alloc->LiveCount();
         const long long smallBase = alloc->SmallLiveCount();
 
+        EventCtx ctx{ &sched, &ev, &parked, nullptr, nullptr };
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_relaxed);
-                sched.WaitOnEvent(ev);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &EventWaitBody, &ctx);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -1362,15 +1465,10 @@ int main() {
         // Large enough that 16 buckets must hold several entries each -- at kN=6 no two keys would
         // share a bucket and the collision path would go untested.
         const int kN = 128;
+        EventCtx ctx{ &sched, &ev, &parked, &cancelled, &normal };
         for (int i = 0; i < kN; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_relaxed);
-                if (sched.WaitOnEventCancellable(ev) == JLib::WaitResult::Cancelled)
-                    cancelled.fetch_add(1, std::memory_order_relaxed);
-                else
-                    normal.fetch_add(1, std::memory_order_relaxed);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &EventCancelBody, &ctx);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -1398,13 +1496,10 @@ int main() {
         auto& ev = sched.GetEvent("normal-wait-probe");
         std::atomic<int> ok{ 0 }, parked{ 0 };
         JLib::WaitGroup wg;
+        EventCtx ctx{ &sched, &ev, &parked, nullptr, &ok };
         for (int i = 0; i < 4; ++i) {
             wg.n.fetch_add(1, std::memory_order_relaxed);
-            auto* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_relaxed);
-                if (sched.WaitOnEventCancellable(ev) == JLib::WaitResult::Ok)
-                    ok.fetch_add(1, std::memory_order_relaxed);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &EventCancelBody, &ctx);
             t->waitGroup = &wg;
             sched.Push(t);
         }

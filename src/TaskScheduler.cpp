@@ -368,6 +368,31 @@ bool TaskScheduler::ReserveIoCore() noexcept { return IoReactorEnabled(); }
 // HIGH-WATER vs PEAK-LIVE vs CONFIGURED are three different numbers and conflating them is what made
 // the first version of this report useless. Size against PEAK-LIVE: `resident` equals capacity in a
 // non-lazy build, because Prefault touches every slot at construction.
+// See the declaration. The data form of what SlabUsageString formats.
+TaskAllocator::Usage TaskScheduler::SlabUsage() {
+	if (!instance) return TaskAllocator::Usage{};
+	return instance->taskAllocator.UsageProfile();
+}
+
+// See the declaration for why this sum is the only meaningful form of the number, and for why the
+// resting value is the worker count rather than zero.
+std::uint64_t TaskScheduler::OutstandingFiberRows() noexcept {
+	if (!instance) return 0;
+	std::uint64_t acq = 0, rec = 0;
+	for (Thread* w : instance->workers) {
+		if (!w) continue;
+		acq += w->FiberAcquireCount();
+		rec += w->FiberRecycleCount();
+	}
+	// SATURATING, not wrapping. The two counters are read one worker at a time while the pool may
+	// still be running, so a recycle can be observed whose acquire was read a moment too early.
+	// That transient reads as rec > acq, and an unsigned subtraction would turn it into 1.8e19 and
+	// look like catastrophic leakage rather than the sampling skew it is. Callers are told to read
+	// this when the pool is QUIET, where the skew cannot occur; this clamp is so a caller who reads
+	// it anyway gets a number that is merely uninformative instead of alarming.
+	return acq > rec ? acq - rec : 0;
+}
+
 std::string TaskScheduler::SlabUsageString(const char* label) {
 	char line[256];
 	std::string out;
@@ -905,6 +930,47 @@ void TaskScheduler::Join() {
 	// thread-affine release on the wrong thread, which is the entire bug the routing exists to
 	// prevent. What makes it legal is that the owner provably no longer exists.
 	FiberRegistry::Instance().DrainAllForTeardown();
+
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+	// ---- THE FIBER ROW BALANCE, CHECKED AT THE ONE MOMENT IT CAN BE ------------------------
+	//
+	// EVERY WORKER HAS STOPPED AND NOTHING WILL ACQUIRE OR RECYCLE AGAIN, so this is the only
+	// point in the process where the sum is stable and its expected value is known. A row still
+	// outstanding here is a fiber that suspended and will never reach DEAD: its stack, FLS slots,
+	// creditor list and retire bag are unreachable, and nothing later in the process will notice.
+	//
+	// WHY A REPORT AND NOT AN ASSERT. This runs during teardown -- often static destruction -- and
+	// aborting there replaces a leak the process was about to exit past with a crash in the least
+	// debuggable phase there is. Printing names the condition, and a test can call
+	// OutstandingFiberRows() itself and fail on it, which is what fiber_row_slab_test does.
+	//
+	// THE EXPECTED VALUE IS ZERO, AND THAT WAS MEASURED RATHER THAN ASSUMED. The first version of
+	// this check allowed one row per worker, on the reasoning that each worker leases a row to park
+	// on and holds it for life. tests/row_probe.cpp says otherwise: a settled four-worker pool
+	// reports 0 outstanding, so the park path does not go through AcquireFiber and the allowance
+	// was pure slack -- it would have hidden a leak of up to one row per worker.
+	//
+	// The same probe is the negative control for the counters themselves: its strand arm parks
+	// three fibers and the sum reads exactly 3, so a nonzero reading here is a real stranded row
+	// and not an artefact of the accounting.
+	{
+		std::uint64_t acq = 0, rec = 0;
+		for (Thread* w : workers) { if (w) { acq += w->FiberAcquireCount(); rec += w->FiberRecycleCount(); } }
+		const std::uint64_t outstanding = acq > rec ? acq - rec : 0;
+		if (outstanding > 0) {
+			std::printf("[JLib::Scheduler] FIBER ROW LEAK at teardown: %llu rows acquired, %llu "
+			            "recycled, %llu outstanding (expected 0).\n"
+			            "  Every AcquireFiber must reach FiberStatus::DEAD exactly once -- that is\n"
+			            "  the only path that runs the tagged deleters, destroys the context, returns\n"
+			            "  the stack to the magazine and frees the slot. %llu fiber(s) suspended and\n"
+			            "  were never resumed to completion, so their stacks are gone for the life of\n"
+			            "  the process and the budget they came out of never recovered.\n"
+			            "  Look for a task that parks on a row nothing owns the completion of.\n",
+			            (unsigned long long)acq, (unsigned long long)rec,
+			            (unsigned long long)outstanding, (unsigned long long)outstanding);
+		}
+	}
+#endif
 
 	{
 		poolMutex.lock();

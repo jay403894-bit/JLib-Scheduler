@@ -42,6 +42,7 @@
 // act on, because both sides are configurations they actually have.
 
 #include "TaskScheduler.h"
+#include "../tests/fiber_body.h"
 #include "Thread.h"
 #include "platform.h"
 
@@ -74,6 +75,17 @@ struct Samples {
     double lo() { std::sort(v.begin(), v.end()); return v.empty() ? 0.0 : v.front(); }
     double hi() { std::sort(v.begin(), v.end()); return v.empty() ? 0.0 : v.back(); }
 };
+
+// The park-on-a-gate fiber body: a named function plus an explicit context. Not a lambda -- a
+// fiber's stack is a place, while a closure is a value the worker loop frees when the body returns,
+// so a fiber given one that then parks resumes into a dead frame or never dies.
+struct GateCtx { JLib::Event* gate; std::atomic<int>* parked; std::atomic<int>* done; };
+static void GateWaitBody(void* p) {
+    auto& c = *static_cast<GateCtx*>(p);
+    c.parked->fetch_add(1, std::memory_order_release);
+    JLib::TaskScheduler::Instance().WaitOnEvent(*c.gate);
+    c.done->fetch_add(1, std::memory_order_release);
+}
 
 static double UsSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
@@ -120,7 +132,7 @@ static void BenchDispatch(JLib::TaskScheduler& sched, int reps) {
         wg.n.store(1, std::memory_order_relaxed);
         const auto t0 = Clock::now();
         JLib::Task* t = sched.CreateTask([&ran] { ran.store(true, std::memory_order_release); },
-                                         ln, JLib::TaskType::Native);
+                                         ln);
         if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -200,7 +212,7 @@ static void BenchThroughput(JLib::TaskScheduler& sched, int reps) {
         wg.n.store(kPerRep, std::memory_order_relaxed);
         const auto t0 = Clock::now();
         for (int i = 0; i < kPerRep; ++i) {
-            JLib::Task* t = sched.CreateTask([] {}, JLib::Lane::Normal, JLib::TaskType::Native);
+            JLib::Task* t = sched.CreateTask([] {}, JLib::Lane::Normal);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -221,7 +233,7 @@ static void BenchThroughput(JLib::TaskScheduler& sched, int reps) {
             buf.clear();
             const int want = std::min<int>(kChunk, kPerRep - made);
             for (int i = 0; i < want; ++i) {
-                JLib::Task* t = sched.CreateTask([] {}, JLib::Lane::Normal, JLib::TaskType::Native);
+                JLib::Task* t = sched.CreateTask([] {}, JLib::Lane::Normal);
                 if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
                 t->waitGroup = &wg;
                 buf.push_back(t);
@@ -290,12 +302,11 @@ static void BenchFiberSuspend(JLib::TaskScheduler& sched, int reps) {
         int made = 0;
         wg.n.store(kFibers, std::memory_order_relaxed);
 
+        // One context for all kFibers -- nothing varies per fiber -- declared outside the loop so
+        // it outlives every task pointing at it.
+        GateCtx gctx{ &gate, &parked, &done };
         for (int i = 0; i < kFibers; ++i) {
-            JLib::Task* t = sched.CreateTask([&] {
-                parked.fetch_add(1, std::memory_order_release);
-                JLib::TaskScheduler::Instance().WaitOnEvent(gate);
-                done.fetch_add(1, std::memory_order_release);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            JLib::Task* t = JLibTest::MakeCtxTask(sched, &GateWaitBody, &gctx);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);

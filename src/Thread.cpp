@@ -873,7 +873,13 @@ Fiber* Thread::AcquireFiber(Task* task) {
 	// class 0 and is what every task asks for unless it says otherwise.
 	ThreadLocalCache<>& cache = CacheFor(task ? task->stackClass : StackClass::Standard);
 	Fiber* f = cache.Pop();
-	if (f) { f->ResetForReuse(); return f; }
+	if (f) {
+		f->ResetForReuse();
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+		fiberAcquires.fetch_add(1, std::memory_order_relaxed);   // see OutstandingFiberRows
+#endif
+		return f;
+	}
 
 	f = cache.Pop();
 	if (f) f->ResetForReuse();
@@ -929,6 +935,13 @@ Fiber* Thread::AcquireFiber(Task* task) {
 			             "whichever budget you raised last. This warning prints once.\n";
 		}
 	}
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+	// THE SECOND EXIT, and it counts only when a row was actually handed out. `f` is null here on
+	// exhaustion -- the task is requeued and will ask again -- so counting unconditionally would
+	// charge an acquire for a fiber nobody got and make the balance drift on the one path where the
+	// pool is already under stress.
+	if (f) fiberAcquires.fetch_add(1, std::memory_order_relaxed);
+#endif
 	return f;
 }
 
@@ -1061,6 +1074,13 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 		//
 		// So the common path is unchanged and stays unchanged: one relaxed load of a word this
 		// thread just finished running on, then ReleaseFiber exactly as before.
+#if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
+		// THE OTHER HALF OF THE ROW INVARIANT. Counted HERE, inside the DEAD branch, because this is
+		// the only teardown a row has -- whether it goes home directly or through the creditor
+		// chain, this is the point past which the row is no longer this task's. An acquire without
+		// a matching arrival here is a stranded stack.
+		fiberRecycles.fetch_add(1, std::memory_order_relaxed);
+#endif
 		if (f->OwesCleanup()) FiberRegistry::Instance().AdvanceCleanup(f);
 		else                  ReleaseFiber(f);
 

@@ -65,6 +65,247 @@ static std::atomic<int> g_acceptStatus{ -1 }, g_connectStatus{ -1 };
 static std::atomic<int> g_recvStatus{ -1 }, g_recvBytes{ -1 }, g_sendBytes{ -1 };
 static char g_rxbuf[256];
 
+// ================= FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS =========================
+//
+// Every arm below used to be a lambda. They are not, and the reason is not style.
+//
+// A fiber's stack is a PLACE -- register state mapped to memory -- and preserving it across a
+// suspension is what this runtime is for. A closure is a VALUE whose lifetime the worker loop owns:
+// the task frame is freed as soon as the body returns. Give a fiber a closure to run and one of two
+// things happens when it parks -- the frame is gone when it resumes, or the fiber never dies and
+// the frame is never freed. Corruption or leak, and neither surfaces where it was caused, because
+// SlabPool is append-only and a released slot stays mapped holding its old bytes.
+//
+// Passing the closure's ADDRESS was tried and is not a fix: it relocates the lifetime from
+// something the compiler checks to something a reviewer has to notice, and in one pass over this
+// file it produced seven sites where the body would have died while its fiber was still parked.
+//
+// SO: named bodies, and the state arrives in a struct the caller declares where its scope is
+// visible. The pleasant side effect is that the bodies COLLAPSED -- three identical recv closures
+// with different captures became one RecvBody, and six acceptor-pool closures became one.
+//
+// WHAT IS NOT IN THESE STRUCTS: IoRequest and IoResult. Those are locals inside each body, which
+// puts them on the FIBER'S stack -- the storage that survives the wait by design, and the whole
+// reason a fiber can be written to look synchronous.
+
+struct AcceptCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       listener, pending;
+    JLib::IoAcceptBuffer* addrs;
+    std::atomic<int>*    status;
+    JLib::CancelToken    tok;
+};
+static void AcceptBody(void* p) {
+    auto& c = *static_cast<AcceptCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::Accept(*c.s, c.listener, c.pending, c.addrs, req, out, c.tok);
+    c.status->store(static_cast<int>(r.status), std::memory_order_release);
+}
+
+struct ConnectCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       sk;
+    sockaddr_in*         target;
+    std::atomic<int>*    status;
+};
+static void ConnectBody(void* p) {
+    auto& c = *static_cast<ConnectCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::Connect(*c.s, c.sk, c.target, sizeof(sockaddr_in), req, out);
+    c.status->store(static_cast<int>(r.status), std::memory_order_release);
+}
+
+// Three arms shared this exact shape and differed only in the socket. `buf` is a POINTER rather
+// than the body reaching for g_rxbuf directly: a body that names what it touches can be read
+// without hunting for globals, and the caller decides which storage this run writes into.
+struct RecvCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       sk;
+    char*                buf;
+    std::uint32_t        len;
+    std::atomic<int>*    status;
+    std::atomic<int>*    bytes;
+};
+static void RecvBody(void* p) {
+    auto& c = *static_cast<RecvCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::Recv(*c.s, c.sk, c.buf, c.len, req, out);
+    c.status->store(static_cast<int>(r.status), std::memory_order_release);
+    c.bytes->store(static_cast<int>(r.bytes), std::memory_order_release);
+}
+
+struct SendCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       sk;
+    const void*          data;
+    std::uint32_t        len;
+    std::atomic<int>*    bytes;
+};
+static void SendBody(void* p) {
+    auto& c = *static_cast<SendCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::Send(*c.s, c.sk, c.data, c.len, req, out);
+    c.bytes->store(static_cast<int>(r.bytes), std::memory_order_release);
+}
+
+// `status` and `bytes` are both OPTIONAL here -- the over-limit arm cares only about the status and
+// the scatter arm only about the byte count. Null means "not asked for" rather than forcing a
+// caller to supply a counter it will not read.
+struct SendVCtx {
+    JLib::TaskScheduler*  s;
+    JLib::IoSocket        sk;
+    const JLib::IoBuffer* v;
+    std::uint32_t         n;
+    std::atomic<int>*     bytes;
+    std::atomic<int>*     status;
+};
+static void SendVBody(void* p) {
+    auto& c = *static_cast<SendVCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::SendV(*c.s, c.sk, c.v, c.n, req, out);
+    if (c.bytes)  c.bytes->store(static_cast<int>(r.bytes), std::memory_order_release);
+    if (c.status) c.status->store(static_cast<int>(r.status), std::memory_order_release);
+}
+
+struct RecvFromCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       sk;
+    char*                buf;
+    std::uint32_t        len;
+    JLib::IoAddress*     from;
+    std::atomic<int>*    status;
+    std::atomic<int>*    bytes;
+};
+static void RecvFromBody(void* p) {
+    auto& c = *static_cast<RecvFromCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::RecvFrom(*c.s, c.sk, c.buf, c.len, c.from, req, out);
+    c.status->store(static_cast<int>(r.status), std::memory_order_release);
+    c.bytes->store(static_cast<int>(r.bytes), std::memory_order_release);
+}
+
+struct SendToCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       sk;
+    const void*          data;
+    std::uint32_t        len;
+    sockaddr_in*         dest;
+    std::atomic<int>*    bytes;
+};
+static void SendToBody(void* p) {
+    auto& c = *static_cast<SendToCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::SendTo(*c.s, c.sk, c.data, c.len, c.dest, sizeof(sockaddr_in),
+                                         req, out);
+    c.bytes->store(static_cast<int>(r.bytes), std::memory_order_release);
+}
+
+// SIX ACCEPTOR-POOL ARMS COLLAPSED INTO ONE. They differed in which counters they bumped and which
+// cancellation scope they ran under -- all context, none of it structure. `woke` and `got` are
+// optional for the same reason as SendVCtx's.
+//
+// THE WAITER STAYS A LOCAL, and that is the point of the whole design: IoAcceptWaiter lives on this
+// FIBER'S stack, alive for exactly the wait, nothing allocated. The coroutine version put it in the
+// frame; a fiber's stack is the same storage with no language feature involved.
+struct AcceptPoolCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoAcceptor*    acc;
+    JLib::CancelToken    tok;
+    std::atomic<int>*    woke;
+    std::atomic<int>*    got;
+};
+static void AcceptPoolBody(void* p) {
+    auto& c = *static_cast<AcceptPoolCtx*>(p);
+    JLib::IoAcceptWaiter w{};
+    const JLib::IoSocket s = Fib::Accept(*c.s, *c.acc, w, c.tok);
+    if (c.woke) c.woke->fetch_add(1, std::memory_order_relaxed);
+    if (s != 0) {
+        if (c.got) c.got->fetch_add(1, std::memory_order_relaxed);
+        ::closesocket(static_cast<SOCKET>(s));
+    }
+}
+
+// THE TWO CONCURRENT-WRITER ARMS. These vary per fiber -- each writer owns a different payload --
+// so the caller keeps an ARRAY of contexts rather than one shared struct. That array is a plain
+// vector of PODs whose scope is the section, which is easier to reason about than the vector of
+// closures it replaces: no reserve() subtlety, because nothing holds a pointer into it that a
+// reallocation could invalidate... except that SpawnFiber does, so it still must be reserved. Said
+// plainly at the call site rather than left to be rediscovered.
+struct WriterCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoStream*      stream;
+    const char*          payload;
+    std::uint32_t        half;
+};
+static void WriterBody(void* p) {
+    auto& c = *static_cast<WriterCtx*>(p);
+    // Both halves carry the SAME letter, so a frame whose halves disagree -- or whose bytes are not
+    // all one letter -- is proof that two sends interleaved.
+    const JLib::IoBuffer v[2] = {
+        { (void*)c.payload,           c.half },
+        { (void*)(c.payload + c.half), c.half },
+    };
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    Fib::SendV(*c.s, *c.stream, v, 2, req, out);
+}
+
+struct SenderCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoStream*      stream;
+    const char*          payload;
+    std::uint32_t        len;
+};
+static void SenderBody(void* p) {
+    auto& c = *static_cast<SenderCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    Fib::Send(*c.s, *c.stream, c.payload, c.len, req, out);
+}
+
+// The reuse-reconnect client: connect, disconnect with TF_REUSE_SOCKET, connect again. The longest
+// body in the file and the one that most wants to be a named function -- it has three phases, three
+// result slots and a comment per step.
+struct ReuseClientCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket       sk;
+    sockaddr_in*         tgt;
+    sockaddr_in*         tgt2;
+    std::atomic<int>*    phase1;
+    std::atomic<int>*    disc;
+    std::atomic<int>*    phase2;
+};
+static void ReuseClientBody(void* p) {
+    auto& c = *static_cast<ReuseClientCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+
+    JLib::IoResult r = Fib::Connect(*c.s, c.sk, c.tgt, sizeof(sockaddr_in), req, out);
+    std::printf("      [client] connect#1 status=%d err=%d\n", (int)r.status, (int)r.error);
+    c.phase1->store(static_cast<int>(r.status), std::memory_order_release);
+    if (r.status != JLib::IoStatus::Completed) return;
+
+    // Reuse: the socket is NOT reusable until this completes. Waited on, not fired-and-forgotten --
+    // issuing the next operation before the disconnect's completion is the classic version of this
+    // race.
+    //
+    // A FRESH IoRequest PER OPERATION. The coroutine frame gave each await its own; on a fiber the
+    // stack does the same, but only if it is re-initialised -- reusing a request the kernel has
+    // already written into is the shape of bug this file exists to prevent.
+    req = JLib::IoRequest{}; out = JLib::IoResult{};
+    r = Fib::Disconnect(*c.s, c.sk, true, req, out);
+    std::printf("      [client] disconnect status=%d err=%d\n", (int)r.status, (int)r.error);
+    c.disc->store(static_cast<int>(r.status), std::memory_order_release);
+    if (r.status != JLib::IoStatus::Completed) return;
+
+    // DO NOT RE-BIND. TF_REUSE_SOCKET returns the socket to an unconnected state but leaves it
+    // BOUND -- binding again is WSAEINVAL (10022), and the failed bind then takes the following
+    // ConnectEx down with it. A re-bind was added here while guessing at an earlier hang and was
+    // itself the bug; the sequence is disconnect, then connect.
+    std::printf("      [client] connecting again\n");
+    req = JLib::IoRequest{}; out = JLib::IoResult{};
+    r = Fib::Connect(*c.s, c.sk, c.tgt2, sizeof(sockaddr_in), req, out);
+    std::printf("      [client] connect#2 status=%d err=%d\n", (int)r.status, (int)r.error);
+    c.phase2->store(static_cast<int>(r.status), std::memory_order_release);
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -185,19 +426,13 @@ int main(int argc, char** argv) {
         // version put them in the frame; a fiber's stack does the same job and for the same reason
         // -- the kernel writes into both AFTER the submit returns, so they must outlive it. What
         // they must NOT be is a local of something that returns first.
-        Fib::SpawnFiber(sched, wg, [&sched, listener, accepted] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Accept(sched, listener, accepted, &addrs, req, out);
-            g_acceptStatus.store(static_cast<int>(r.status), std::memory_order_release);
-        });
+        AcceptCtx ac{ &sched, listener, accepted, &addrs, &g_acceptStatus, JLib::CancelToken{} };
+        Fib::SpawnFiber(sched, wg, &AcceptBody, &ac);
 
         static sockaddr_in target;
         target = addr;
-        Fib::SpawnFiber(sched, wg, [&sched, client] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Connect(sched, client, &target, sizeof target, req, out);
-            g_connectStatus.store(static_cast<int>(r.status), std::memory_order_release);
-        });
+        ConnectCtx cc{ &sched, client, &target, &g_connectStatus };
+        Fib::SpawnFiber(sched, wg, &ConnectBody, &cc);
 
         sched.WaitFor(wg);
         Check(g_acceptStatus.load() == static_cast<int>(JLib::IoStatus::Completed), "the accept completed");
@@ -224,19 +459,12 @@ int main(int argc, char** argv) {
         g_recvStatus.store(-1); g_recvBytes.store(-1); g_sendBytes.store(-1);
         JLib::WaitGroup wg;
 
-        Fib::SpawnFiber(sched, wg, [&sched, accepted] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Recv(sched, accepted, g_rxbuf, sizeof g_rxbuf, req, out);
-            g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
-            g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        RecvCtx rc{ &sched, accepted, g_rxbuf, sizeof g_rxbuf, &g_recvStatus, &g_recvBytes };
+        Fib::SpawnFiber(sched, wg, &RecvBody, &rc);
 
-        Fib::SpawnFiber(sched, wg, [&sched, client] {
-            static const char payload[] = "over the wire, asynchronously";
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Send(sched, client, payload, 29, req, out);
-            g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        static const char kPayload[] = "over the wire, asynchronously";
+        SendCtx sc{ &sched, client, kPayload, 29, &g_sendBytes };
+        Fib::SpawnFiber(sched, wg, &SendBody, &sc);
 
         sched.WaitFor(wg);
         Check(g_sendBytes.load() == 29, "the send reported the bytes it was given");
@@ -255,12 +483,8 @@ int main(int argc, char** argv) {
         g_recvStatus.store(-1); g_recvBytes.store(-1);
         JLib::WaitGroup wg;
 
-        Fib::SpawnFiber(sched, wg, [&sched, accepted] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Recv(sched, accepted, g_rxbuf, sizeof g_rxbuf, req, out);
-            g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
-            g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        RecvCtx rc2{ &sched, accepted, g_rxbuf, sizeof g_rxbuf, &g_recvStatus, &g_recvBytes };
+        Fib::SpawnFiber(sched, wg, &RecvBody, &rc2);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         ::shutdown(client, SD_SEND);
@@ -295,22 +519,16 @@ int main(int argc, char** argv) {
         g_recvStatus.store(-1); g_recvBytes.store(-1); g_sendBytes.store(-1);
         JLib::WaitGroup wg;
 
-        Fib::SpawnFiber(sched, wg, [&sched, accepted2] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Recv(sched, accepted2, g_rxbuf, sizeof g_rxbuf, req, out);
-            g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
-            g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        RecvCtx rc3{ &sched, accepted2, g_rxbuf, sizeof g_rxbuf, &g_recvStatus, &g_recvBytes };
+        Fib::SpawnFiber(sched, wg, &RecvBody, &rc3);
 
-        Fib::SpawnFiber(sched, wg, [&sched, client2] {
-            // Separate allocations, never concatenated anywhere.
-            static const char hdr[]  = "LEN=5|";
-            static const char body[] = "hello";
-            const JLib::IoBuffer v[2] = { { (void*)hdr, 6 }, { (void*)body, 5 } };
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::SendV(sched, client2, v, 2, req, out);
-            g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        // Separate allocations, never concatenated anywhere -- and declared HERE, in the caller,
+        // so the vector array outlives the send the way the fiber needs it to.
+        static const char hdr[]  = "LEN=5|";
+        static const char body[] = "hello";
+        const JLib::IoBuffer vec2[2] = { { (void*)hdr, 6 }, { (void*)body, 5 } };
+        SendVCtx sv{ &sched, client2, vec2, 2, &g_sendBytes, nullptr };
+        Fib::SpawnFiber(sched, wg, &SendVBody, &sv);
 
         sched.WaitFor(wg);
         Check(g_sendBytes.load() == 11, "the send reported both segments as one transfer");
@@ -326,15 +544,11 @@ int main(int argc, char** argv) {
         JLib::WaitGroup wg;
         static std::atomic<int> st{ -1 };
         st.store(-1);
-        Fib::SpawnFiber(sched, wg, [&sched, client2] {
-            static char scratch[8];
-            JLib::IoBuffer v[JLib::IoRequest::kMaxVectors + 1];
-            for (auto& b : v) { b.data = scratch; b.len = 1; }
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::SendV(sched, client2, v,
-                                                JLib::IoRequest::kMaxVectors + 1, req, out);
-            st.store(static_cast<int>(r.status), std::memory_order_release);
-        });
+        char scratch[8] = {};
+        JLib::IoBuffer over[JLib::IoRequest::kMaxVectors + 1];
+        for (auto& b : over) { b.data = scratch; b.len = 1; }
+        SendVCtx svOver{ &sched, client2, over, JLib::IoRequest::kMaxVectors + 1, nullptr, &st };
+        Fib::SpawnFiber(sched, wg, &SendVBody, &svOver);
         sched.WaitFor(wg);
         Check(st.load() == static_cast<int>(JLib::IoStatus::Failed),
               "more than kMaxVectors segments failed cleanly");
@@ -407,17 +621,21 @@ int main(int argc, char** argv) {
         });
 
         JLib::WaitGroup wg;
+        // THIS BODY VARIES PER ITERATION (it captures `i`), so one shared closure will not do -- and
+        // one declared inside the loop would be destroyed while its fiber was still sending. The
+        // bodies therefore get storage that outlives the loop AND the WaitFor.
+        //
+        // reserve() IS LOAD-BEARING, not a performance note: SpawnFiber is handed `&bodies.back()`,
+        // and a reallocation would move every closure already spawned out from under the fibers
+        // pointing at them. Reserving the final size up front means no reallocation happens.
+        // ONE CONTEXT PER WRITER, in an array whose scope covers the WaitFor below. reserve() is
+        // load-bearing: SpawnFiber is handed &writerCtx[i], and a reallocation would move contexts
+        // already handed out. Sizing it up front means no reallocation happens.
+        std::vector<WriterCtx> writerCtx;
+        writerCtx.reserve(kWriters);
         for (int i = 0; i < kWriters; ++i) {
-            Fib::SpawnFiber(sched, wg, [&, i] {
-                // Both halves carry the SAME letter, so a frame whose halves disagree -- or whose
-                // bytes are not all one letter -- is proof that two sends interleaved.
-                const JLib::IoBuffer v[2] = {
-                    { payload[i].data(),         kHalf },
-                    { payload[i].data() + kHalf, kHalf },
-                };
-                JLib::IoRequest req{}; JLib::IoResult out{};
-                Fib::SendV(sched, stream, v, 2, req, out);
-            });
+            writerCtx.push_back(WriterCtx{ &sched, &stream, payload[i].data(), (std::uint32_t)kHalf });
+            Fib::SpawnFiber(sched, wg, &WriterBody, &writerCtx[i]);
         }
         sched.WaitFor(wg);
         drain.join();
@@ -466,10 +684,28 @@ int main(int argc, char** argv) {
 
         static std::atomic<size_t> peakQueued{ 0 };
         peakQueued.store(0);
+        // ---- THE WATCHER COUNTS ITS OWN SAMPLES, AND THAT IS NOT BOOKKEEPING ------------------
+        //
+        // This is a SAMPLING instrument: a bare thread polling QueuedSends() while the fibers send.
+        // A peak of 0 therefore has two completely different meanings and the test could not tell
+        // them apart:
+        //
+        //   THE REAL FINDING    the sends never queued -- the chain handed them all to the kernel
+        //                       together, which is the regression this arm exists to catch.
+        //   THE INSTRUMENT MISS the watcher was starved and never ran during the window. On a busy
+        //                       box with 31 spinning workers this thread can go a whole millisecond
+        //                       without a slice, and the sends are gone by then.
+        //
+        // Observed: this reported peak 6-7 on eight consecutive runs and 0 exactly once, during a
+        // full-suite pass -- a distribution no real regression produces. Counting samples separates
+        // the two: a watcher that took thousands of samples and saw zero every time is evidence;
+        // one that took a handful is a thread that never got to look.
+        std::atomic<long long> samples{ 0 };
         std::atomic<bool> stop{ false };
         std::thread watch([&] {
             while (!stop.load(std::memory_order_acquire)) {
                 const size_t q = st5.QueuedSends();
+                samples.fetch_add(1, std::memory_order_relaxed);
                 size_t seen = peakQueued.load(std::memory_order_relaxed);
                 while (q > seen && !peakQueued.compare_exchange_weak(seen, q)) {}
                 std::this_thread::yield();
@@ -489,21 +725,40 @@ int main(int argc, char** argv) {
         });
 
         JLib::WaitGroup wg;
+        // Per-iteration capture, so the same treatment as the writer loop above: storage that
+        // outlives the WaitFor, reserved up front so `&back()` stays valid.
+        std::vector<SenderCtx> senderCtx;
+        senderCtx.reserve(kW);
         for (int i = 0; i < kW; ++i) {
-            Fib::SpawnFiber(sched, wg, [&, i] {
-                JLib::IoRequest req{}; JLib::IoResult out{};
-                Fib::Send(sched, st5, pay[i].data(), kSz, req, out);
-            });
+            senderCtx.push_back(SenderCtx{ &sched, &st5, pay[i].data(), (std::uint32_t)kSz });
+            Fib::SpawnFiber(sched, wg, &SenderBody, &senderCtx[i]);
         }
         sched.WaitFor(wg);
         stop.store(true, std::memory_order_release);
         watch.join();
         drain.join();
 
-        char m[144];
-        std::snprintf(m, sizeof m, "at least one send was queued behind another (peak depth %zu)",
-                      peakQueued.load());
-        Check(peakQueued.load() >= 1, m);
+        // THE THRESHOLD IS NOT A TUNING KNOB. Below it the watcher provably did not observe the
+        // window, so a peak of 0 carries no information and reporting it as a failure would be
+        // asserting something this run did not measure. Above it, a zero peak IS the finding.
+        // 200 is far below what an unstarved watcher takes (thousands in a few milliseconds) and
+        // far above what a starved one manages.
+        constexpr long long kMinSamples = 200;
+        const long long took = samples.load();
+        char m[200];
+        if (peakQueued.load() == 0 && took < kMinSamples) {
+            std::snprintf(m, sizeof m,
+                          "  SKIPPED: the queue-depth watcher took only %lld samples and never saw\n"
+                          "  the window. That is a starved sampler, not a scheduler result, so this\n"
+                          "  run reports nothing about send queueing rather than a false failure.\n",
+                          took);
+            std::printf("%s", m);
+        } else {
+            std::snprintf(m, sizeof m,
+                          "at least one send was queued behind another (peak depth %zu, %lld samples)",
+                          peakQueued.load(), took);
+            Check(peakQueued.load() >= 1, m);
+        }
         Check(got.load() == kW * kSz, "and every byte still arrived");
         Check(st5.QueuedSends() == 0, "the chain drained empty");
 
@@ -539,21 +794,14 @@ int main(int argc, char** argv) {
         g_recvBytes.store(-1);
         JLib::WaitGroup wg;
 
-        Fib::SpawnFiber(sched, wg, [&sched, a] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::RecvFrom(sched, a, g_rxbuf, sizeof g_rxbuf, &from, req, out);
-            g_recvStatus.store(static_cast<int>(r.status), std::memory_order_release);
-            g_recvBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        RecvFromCtx rf{ &sched, a, g_rxbuf, sizeof g_rxbuf, &from, &g_recvStatus, &g_recvBytes };
+        Fib::SpawnFiber(sched, wg, &RecvFromBody, &rf);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
-        Fib::SpawnFiber(sched, wg, [&sched, b] {
-            static const char dgram[] = "one datagram";
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::SendTo(sched, b, dgram, 12, &dest, sizeof dest, req, out);
-            g_sendBytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        });
+        static const char kDgram[] = "one datagram";
+        SendToCtx sd{ &sched, b, kDgram, 12, &dest, &g_sendBytes };
+        Fib::SpawnFiber(sched, wg, &SendToBody, &sd);
 
         sched.WaitFor(wg);
         Check(g_recvStatus.load() == static_cast<int>(JLib::IoStatus::Completed), "the datagram arrived");
@@ -621,18 +869,11 @@ int main(int argc, char** argv) {
         static std::atomic<int> taken{ 0 };
         taken.store(0);
         JLib::WaitGroup wg;
-        for (int i = 0; i < kConns; ++i) {
-            Fib::SpawnFiber(sched, wg, [&] {
-                // THE WAITER LIVES ON THIS FIBER'S STACK, which is the same storage the coroutine
-                // version gave it in the frame -- alive for exactly the wait, nothing allocated.
-                JLib::IoAcceptWaiter w{};
-                const JLib::IoSocket s = Fib::Accept(sched, acceptor, w);
-                if (s != 0) {
-                    taken.fetch_add(1, std::memory_order_relaxed);
-                    ::closesocket(static_cast<SOCKET>(s));
-                }
-            });
-        }
+        // ONE CONTEXT SHARED BY ALL kConns FIBERS -- nothing here varies per waiter -- and declared
+        // outside the loop so it outlives the WaitFor below.
+        AcceptPoolCtx apc{ &sched, &acceptor, JLib::CancelToken{}, nullptr, &taken };
+        for (int i = 0; i < kConns; ++i)
+            Fib::SpawnFiber(sched, wg, &AcceptPoolBody, &apc);
         sched.WaitFor(wg);
 
         std::snprintf(m, sizeof m, "all %d were handed to waiters (%d)", kConns, taken.load());
@@ -671,14 +912,10 @@ int main(int argc, char** argv) {
         JLib::WaitGroup wg;
 
         constexpr int kWaiters = 3;
-        for (int i = 0; i < kWaiters; ++i) {
-            Fib::SpawnFiber(sched, wg, [&] {
-                JLib::IoAcceptWaiter w{};
-                const JLib::IoSocket s = Fib::Accept(sched, acc2, w);
-                woke.fetch_add(1, std::memory_order_relaxed);
-                if (s != 0) { gotSocket.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
-            });
-        }
+        // Shared by all kWaiters, and outside the loop so it outlives their parked fibers.
+        AcceptPoolCtx apc2{ &sched, &acc2, JLib::CancelToken{}, &woke, &gotSocket };
+        for (int i = 0; i < kWaiters; ++i)
+            Fib::SpawnFiber(sched, wg, &AcceptPoolBody, &apc2);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         Check(woke.load() == 0, "all three are parked -- nobody has connected");
@@ -723,14 +960,11 @@ int main(int argc, char** argv) {
             woke.store(0); got.store(0);
             JLib::WaitGroup wg;
 
-            for (int i = 0; i < 3; ++i) {
-                Fib::SpawnFiber(sched, wg, [&, t = op.Token()] {
-                    JLib::IoAcceptWaiter w{};
-                    const JLib::IoSocket s = Fib::Accept(sched, acc3, w, t);
-                    woke.fetch_add(1, std::memory_order_relaxed);
-                    if (s != 0) { got.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
-                }, op.Token());
-            }
+            // One context for all three: op.Token() does not vary, and it must outlive the fibers
+            // parked on acc3.
+            AcceptPoolCtx apc3{ &sched, &acc3, op.Token(), &woke, &got };
+            for (int i = 0; i < 3; ++i)
+                Fib::SpawnFiber(sched, wg, &AcceptPoolBody, &apc3, op.Token());
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             Check(woke.load() == 0, "three waiters parked under a nested scope");
 
@@ -753,20 +987,13 @@ int main(int argc, char** argv) {
             deadGot.store(0); liveGot.store(0); deadWoke.store(0);
             JLib::WaitGroup wg;
 
-            Fib::SpawnFiber(sched, wg, [&, t = dead.Token()] {
-                JLib::IoAcceptWaiter w{};
-                const JLib::IoSocket s = Fib::Accept(sched, acc3, w, t);
-                deadWoke.fetch_add(1, std::memory_order_relaxed);
-                if (s != 0) { deadGot.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
-            }, dead.Token());
+            AcceptPoolCtx apcDead{ &sched, &acc3, dead.Token(), &deadWoke, &deadGot };
+            Fib::SpawnFiber(sched, wg, &AcceptPoolBody, &apcDead, dead.Token());
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-            Fib::SpawnFiber(sched, wg, [&, t = live.Token()] {
-                JLib::IoAcceptWaiter w{};
-                const JLib::IoSocket s = Fib::Accept(sched, acc3, w, t);
-                if (s != 0) { liveGot.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
-            }, live.Token());
+            AcceptPoolCtx apcLive{ &sched, &acc3, live.Token(), nullptr, &liveGot };
+            Fib::SpawnFiber(sched, wg, &AcceptPoolBody, &apcLive, live.Token());
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -815,12 +1042,8 @@ int main(int argc, char** argv) {
 
         const auto t0 = std::chrono::steady_clock::now();
         JLib::Deadline d(ms(120), op.Token(), JLib::EjectIoAcceptor, &acc4);
-        Fib::SpawnFiber(sched, wg, [&, t = op.Token()] {
-            JLib::IoAcceptWaiter w{};
-            const JLib::IoSocket s = Fib::Accept(sched, acc4, w, t);
-            woke.fetch_add(1, std::memory_order_relaxed);
-            if (s != 0) { got.fetch_add(1, std::memory_order_relaxed); ::closesocket((SOCKET)s); }
-        }, op.Token());
+        AcceptPoolCtx apc4{ &sched, &acc4, op.Token(), &woke, &got };
+        Fib::SpawnFiber(sched, wg, &AcceptPoolBody, &apc4, op.Token());
 
         sched.WaitFor(wg);
         const auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -903,38 +1126,9 @@ int main(int argc, char** argv) {
         // THE SEQUENTIAL ARM, and the one the port reads most naturally: three operations in a row
         // on one socket, each waiting for the last. `co_return` on a failed step becomes a plain
         // `return` -- the only structural change in the whole body.
-        Fib::SpawnFiber(sched, wg, [&sched, c4] {
-            const JLib::IoSocket s = static_cast<JLib::IoSocket>(c4);
-            JLib::IoRequest req{}; JLib::IoResult out{};
-
-            JLib::IoResult r = Fib::Connect(sched, s, &tgt, sizeof tgt, req, out);
-            std::printf("      [client] connect#1 status=%d err=%d\n", (int)r.status, (int)r.error);
-            phase1.store(static_cast<int>(r.status), std::memory_order_release);
-            if (r.status != JLib::IoStatus::Completed) return;
-
-            // Reuse: the socket is NOT reusable until this completes. Waited on, not fired-and-
-            // forgotten -- issuing the next operation before the disconnect's completion is the
-            // classic version of this race.
-            //
-            // A FRESH IoRequest PER OPERATION. The coroutine frame gave each await its own; on a
-            // fiber the stack does the same, but only if it is re-initialised -- reusing a request
-            // the kernel has already written into is the shape of bug this file exists to prevent.
-            req = JLib::IoRequest{}; out = JLib::IoResult{};
-            r = Fib::Disconnect(sched, s, true, req, out);
-            std::printf("      [client] disconnect status=%d err=%d\n", (int)r.status, (int)r.error);
-            disc.store(static_cast<int>(r.status), std::memory_order_release);
-            if (r.status != JLib::IoStatus::Completed) return;
-
-            // DO NOT RE-BIND. TF_REUSE_SOCKET returns the socket to an unconnected state but leaves
-            // it BOUND -- binding again is WSAEINVAL (10022), and the failed bind then takes the
-            // following ConnectEx down with it. A re-bind was added here while guessing at an
-            // earlier hang and was itself the bug; the sequence is disconnect, then connect.
-            std::printf("      [client] connecting again\n");
-            req = JLib::IoRequest{}; out = JLib::IoResult{};
-            r = Fib::Connect(sched, s, &tgt2, sizeof tgt2, req, out);
-            std::printf("      [client] connect#2 status=%d err=%d\n", (int)r.status, (int)r.error);
-            phase2.store(static_cast<int>(r.status), std::memory_order_release);
-        });
+        ReuseClientCtx rcc{ &sched, static_cast<JLib::IoSocket>(c4), &tgt, &tgt2,
+                            &phase1, &disc, &phase2 };
+        Fib::SpawnFiber(sched, wg, &ReuseClientBody, &rcc);
 
         // BOUNDED, with select. A bare blocking accept here hangs the whole suite if the second
         // connect never lands -- which is exactly what happened, and a test that hangs on failure
@@ -996,11 +1190,8 @@ int main(int argc, char** argv) {
         g_acceptStatus.store(-1);
         JLib::WaitGroup wg;
 
-        Fib::SpawnFiber(sched, wg, [&sched, listener, pending, t = op.Token()] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Accept(sched, listener, pending, &addrs2, req, out, t);
-            g_acceptStatus.store(static_cast<int>(r.status), std::memory_order_release);
-        }, op.Token());
+        AcceptCtx ac2{ &sched, listener, pending, &addrs2, &g_acceptStatus, op.Token() };
+        Fib::SpawnFiber(sched, wg, &AcceptBody, &ac2, op.Token());
 
         Check(WaitUntil([&] { return io.InFlight() == 1; }), "the accept is in flight");
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -1030,11 +1221,8 @@ int main(int argc, char** argv) {
 
         const auto t0 = std::chrono::steady_clock::now();
         JLib::Deadline d(ms(120), op.Token(), JLib::EjectIoReactor, &io);
-        Fib::SpawnFiber(sched, wg, [&sched, listener, pending, t = op.Token()] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Accept(sched, listener, pending, &addrs3, req, out, t);
-            g_acceptStatus.store(static_cast<int>(r.status), std::memory_order_release);
-        }, op.Token());
+        AcceptCtx ac3{ &sched, listener, pending, &addrs3, &g_acceptStatus, op.Token() };
+        Fib::SpawnFiber(sched, wg, &AcceptBody, &ac3, op.Token());
 
         sched.WaitFor(wg);
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -27,6 +27,9 @@
 // THE ARMS DIFFER IN EXACTLY ONE THING EACH, and all five run in one process, interleaved, because
 // the awake floor and SetHotWorkers are both runtime settings. No cross-build comparison anywhere.
 
+// A named task body -- one spelling for every task body in the tree.
+static void EmptyBody(void*);
+
 #include <windows.h>
 
 #include "TaskScheduler.h"
@@ -78,7 +81,7 @@ double TimeArm(const Arm& arm, int pings) {
         // lane is what routes to the LANE. Setting K without this was the mistake the first
         // version of this bench made: K hot workers serve the lane, so a generic Push cannot
         // reach them and K reads as doing nothing.
-        JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr, arm.lane ? JLib::Lane::LowLatency : JLib::Lane::Normal,
+        JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr, arm.lane ? JLib::Lane::LowLatency : JLib::Lane::Normal,
                                          arm.fiber ? JLib::TaskType::Fiber : JLib::TaskType::Native);
         t->waitGroup = &wg;
         sched.Push(t);
@@ -105,6 +108,9 @@ double TimeArm(const Arm& arm, int pings) {
 }
 
 } // namespace
+
+
+static void EmptyBody(void*) {}
 
 int main(int argc, char** argv) {
     int pings = 4000;

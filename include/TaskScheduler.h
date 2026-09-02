@@ -217,6 +217,15 @@ namespace JLib {
 	class TaskScheduler;
 
 	namespace detail {
+		// A false that DEPENDS on a template parameter, so a static_assert inside a template body
+		// fires only when that template is actually instantiated. `static_assert(false, ...)` in a
+		// template is ill-formed whether or not anything calls it; this is the standard workaround.
+		// Used by the poisoned CreateTask overload below to give a real explanation instead of
+		// "use of deleted function".
+		template<typename...> struct dependent_false : std::false_type {};
+	}
+
+	namespace detail {
 		// NOT PUBLIC API, AND NOT A RESTART. Tears the pool down mid-process: stops the service
 		// threads, drains every registered primitive so parked frames unwind, joins the workers.
 		// The pool does NOT come back -- Init() throws on a non-null instance and always has.
@@ -2363,6 +2372,35 @@ namespace JLib {
 
 		static void ReportSlabUsage(const char* label = "slab usage");
 
+		// THE SAME PROFILE ReportSlabUsage PRINTS, AS DATA. Everything above formats; a test or a
+		// budgeting tool needs the numbers, and parsing them back out of the string is not a
+		// reasonable thing to ask of a caller. peakLive is the field to size against; `extents`
+		// non-zero means the pool had to grow past its configuration, and `live` failing to return
+		// to its baseline after a workload finishes means slots went out and never came back.
+		//
+		// Returns a zeroed profile if the scheduler is not initialized, so a diagnostic that runs
+		// before Init or after teardown does not have to guard.
+		static TaskAllocator::Usage SlabUsage();
+
+		// ---- THE FIBER ROW BALANCE ----------------------------------------------------------
+		//
+		// Rows acquired minus rows recycled, SUMMED OVER EVERY WORKER, which is the only form of
+		// this number that means anything -- see Thread::FiberAcquireCount for why a per-worker
+		// difference is expected to be nonzero under migration.
+		//
+		// AT REST THIS IS THE PARK FIBERS AND NOTHING ELSE. Each worker leases one row to park on
+		// and holds it for its whole life, so the resting value is the worker count, not zero. What
+		// a caller wants is a DELTA: read it once when the pool is quiet, run the workload, let it
+		// go quiet again, and read it a second time. A workload that returns every row it took
+		// leaves the two readings equal. Any growth is a stranded stack -- a fiber that suspended
+		// and will never reach DEAD, so its slot, its FLS slots, its creditor list and its retire
+		// bag are gone for the life of the process.
+		//
+		// DEV BUILDS ONLY, in the sense that the counters behind it are only incremented when
+		// !NDEBUG or JLIB_DEVELOPMENT. In a shipping build this compiles and returns 0, because the
+		// increments are what cost, not the read.
+		static std::uint64_t OutstandingFiberRows() noexcept;
+
 		static void     SetReservedCores(unsigned n) noexcept;
 		static unsigned GetReservedCores() noexcept;
 		static bool ReserveIoCore() noexcept;
@@ -2848,10 +2886,57 @@ namespace JLib {
 		}
 
 
-		// Fiber by default, for the reasons on the raw overload above.
+		// ================= A LAMBDA TASK IS ALWAYS NATIVE. THIS IS THE ROW INVARIANT. ===========
+		//
+		// This overload took a `TaskType` and defaulted it to Fiber. It does not any more, and the
+		// removal is the point rather than a tidy-up -- a lambda body is structurally incapable of
+		// satisfying the contract a fiber row is leased under.
+		//
+		// WHAT A FIBER ROW IS. AcquireFiber leases a stack plus the FLS slots, creditor list and
+		// retire bag attached to it. The lease has exactly ONE teardown: the recycle that follows
+		// FiberStatus::DEAD, which runs the tagged deleters, destroys the context, returns the
+		// stack to the magazine and frees the slot. So the runtime's invariant is:
+		//
+		//     every AcquireFiber has exactly one DEAD and exactly one recycle.
+		//
+		// A row that does not reach DEAD is not late. It is a PERMANENT --budget: the stack never
+		// returns to the magazine, the reaper never runs for it, and everything hanging off it is
+		// unreachable for the life of the process.
+		//
+		// WHY A LAMBDA CANNOT HOLD UP THAT END. The closure is an object on the SLAB, and the task
+		// frame holding it is freed the moment the body returns -- tasks are recycled immediately,
+		// which is what makes the dispatch path cheap. So the frame's lifetime is owned by the
+		// worker loop, while the fiber's lifetime is owned by whoever eventually resumes it. Two
+		// owners, one object, and no single destructor that both agree on. While the body merely
+		// RUNS that costs nothing; the instant it SUSPENDS, the resumption is a promise made by
+		// something that is allowed to have gone away.
+		//
+		// AND IT DOES NOT FAIL WHERE IT IS WRONG. The slab is append-only and never releases an
+		// extent before the pool itself dies (see SlabPool), so a released slot stays MAPPED and
+		// usually still holds its old bytes. A short test suspends, resumes, reads its capture back
+		// intact and passes. The bill arrives somewhere else entirely -- as the slab refusing to
+		// clear on Reset, as a live count that never comes back to its baseline, as I/O stalling in
+		// AcquireFiber thousands of frames later, or as a completion writing into a stack the
+		// magazine has since handed to somebody else. That is why this is enforced at COMPILE time
+		// and not covered by a test: the test passes right up until the thing it was protecting
+		// against happens.
+		//
+		// WHAT TO USE INSTEAD, AND IT IS NOT A WORKAROUND. Anything that can wait -- an I/O
+		// continuation, a WaitGroup join, a Lock() that may contend -- takes the raw overload
+		// above: `void(*)(void*)` plus a context pointer that lives on the CALLER'S stack, or in
+		// something that outlives the wait. That form has one owner, and the fiber's own stack
+		// carries the body's locals across the suspension, which is the entire reason fibers exist
+		// here. tests/io_fiber_await.h is written this way and is the worked example.
+		//
+		// LAMBDAS REMAIN THE DEFAULT AND CORRECT SPELLING for the overwhelming majority of task
+		// bodies, which compute something and return. Those are one-shot, they never call
+		// AcquireFiber, and this change costs them nothing. A Native task that tries to wait anyway
+		// aborts with a named diagnostic (see SchedulerMutex::Lock) rather than stranding a row --
+		// so the failure is loud, immediate, and at the call site that caused it.
 		template<typename F>
-		auto CreateTask(F&& f, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber,
-		                CorePref corePref = CorePref::Default, StackClass stack = StackClass::Standard) {
+		auto CreateTask(F&& f, Lane lane = Lane::Normal, CorePref corePref = CorePref::Default,
+		                StackClass stack = StackClass::Standard) {
+			constexpr TaskType type = TaskType::Native;
 			using L = LambdaTask<std::decay_t<F>>;
 			// NO SIZE CEILING, as of 4.0.1. A capture larger than the biggest slot used to be a
 			// COMPILE ERROR, which made the task path stricter than the coroutine path for no reason
@@ -2891,13 +2976,35 @@ namespace JLib {
 			return t;
 		}
 
-		// Lambda form of CreateInternalTask -- see the raw overload for why these stay Native.
-		// ParallelFor's three leaf paths (flat chunks, cursor lanes, the lazy splitter) are the
-		// callers, and their bodies provably never wait.
+		// THE OLD SPELLING, POISONED WITH AN EXPLANATION. `CreateTask(lambda, lane, TaskType::...)`
+		// used to compile and, at TaskType::Fiber, used to hand a slab-owned closure a fiber row it
+		// could not be trusted to return. Deleting the overload silently would report "no matching
+		// function" and point the reader at the wrong thing; this reports the actual rule.
+		//
+		// It catches TaskType::Native too, which is deliberate -- Native is now what the lambda form
+		// always produces, so passing it is redundant rather than wrong, and one clear error beats
+		// two spellings of the same call.
+		template<typename F>
+		auto CreateTask(F&&, Lane, TaskType, CorePref = CorePref::Default,
+		                StackClass = StackClass::Standard) {
+			static_assert(detail::dependent_false<F>::value,
+				"A lambda task is always Native -- drop the TaskType argument. A lambda body lives "
+				"on the task slab and is freed as soon as it returns, so it cannot own a fiber row "
+				"across a suspension: every AcquireFiber must reach FiberStatus::DEAD exactly once, "
+				"and nothing guarantees that for a closure with two owners. If this task WAITS on "
+				"anything, use the raw overload -- CreateTask(void(*)(void*), void* ctx, lane, "
+				"TaskType::Fiber) -- with the context on the caller's stack. See the comment above "
+				"this overload, and tests/io_fiber_await.h for the worked pattern.");
+			return static_cast<LambdaTask<std::decay_t<F>>*>(nullptr);
+		}
+
+		// Lambda form of CreateInternalTask. Now identical in effect to CreateTask above -- kept
+		// because the NAME is the documentation at ParallelFor's three leaf call sites: it says
+		// "this body provably never waits" out loud, which is worth more than the one saved word.
 		template<typename F>
 		auto CreateInternalTask(F&& f, Lane lane = Lane::Normal, CorePref corePref = CorePref::Default,
 		                        StackClass stack = StackClass::Standard) {
-			return CreateTask(std::forward<F>(f), lane, TaskType::Native, corePref, stack);
+			return CreateTask(std::forward<F>(f), lane, corePref, stack);
 		}
 
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>

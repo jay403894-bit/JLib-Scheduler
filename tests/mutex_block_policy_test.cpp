@@ -18,6 +18,7 @@
 // correctly disbelieved instead of being read as success.
 
 #include "../include/TaskScheduler.h"
+#include "fiber_body.h"
 #include <cstdio>
 #include <atomic>
 #include <chrono>
@@ -62,6 +63,51 @@ static void BlockViolationHook() { g_hookFired.store(true, std::memory_order_rel
 
 static const int kHoldMs = 250;
 
+// ---- FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS ---------------------------------------
+//
+// One spelling for every task body: a named void(void*) plus a struct the caller declares. Not a
+// lambda and not a captureless one, so there is never a per-site judgement about which form is
+// safe. A fiber's stack is a PLACE -- register state mapped to memory -- while a closure is a
+// VALUE the worker loop frees when the body returns; a fiber given a closure that then parks
+// either resumes into a dead frame or never dies and never gives its row back.
+struct SleepHoldCtx {
+    SchedulerMutex*    m;
+    std::atomic<bool>* held;
+    std::atomic<bool>* done;     // optional
+    int                holdMs;
+};
+static void SleepHoldBody(void* p) {
+    auto& c = *static_cast<SleepHoldCtx*>(p);
+    c.m->Lock();
+    c.held->store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(c.holdMs));
+    c.m->Unlock();
+    if (c.done) c.done->store(true, std::memory_order_release);
+}
+
+struct TakeLockCtx { SchedulerMutex* m; std::atomic<bool>* got; };
+static void TakeLockBody(void* p) {
+    auto& c = *static_cast<TakeLockCtx*>(p);
+    c.m->Lock();
+    c.got->store(true, std::memory_order_release);
+    c.m->Unlock();
+}
+
+// Holds the mutex ACROSS an event wait, so the lock stays held while this fiber is suspended.
+struct HoldOnEventCtx {
+    TaskScheduler*     s;
+    SchedulerMutex*    m;
+    Event*             hold;
+    std::atomic<bool>* held;
+};
+static void HoldOnEventBody(void* p) {
+    auto& c = *static_cast<HoldOnEventCtx*>(p);
+    c.m->Lock();
+    c.held->store(true, std::memory_order_release);
+    c.s->WaitOnEvent(*c.hold);
+    c.m->Unlock();
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== SchedulerMutex: who may block, and what blocking costs ===\n");
@@ -94,13 +140,11 @@ int main() {
         std::atomic<bool> done{ false };
 
         // The holder is a FIBER, which is the only thing allowed to hold a lock across a sleep.
-        auto* holder = sched.CreateTask([&] {
-            m.Lock();
-            held.store(true, std::memory_order_release);
-            std::this_thread::sleep_for(std::chrono::milliseconds(kHoldMs));
-            m.Unlock();
-            done.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        // A NAMED body and a context on THIS stack. Not a lambda: a fiber's stack is a place, and a
+        // closure is a value the worker loop frees when the body returns -- a fiber handed one that
+        // then parks either resumes into a dead frame or never dies and never returns its row.
+        SleepHoldCtx ctx{ &m, &held, &done, kHoldMs };
+        auto* holder = JLibTest::MakeCtxTask(sched, &SleepHoldBody, &ctx);
         sched.Push(holder);
 
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
@@ -138,7 +182,7 @@ int main() {
             m.Lock();
             m.Unlock();
             ran.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, TaskType::Native);
+        }, JLib::Lane::Normal);
         sched.Push(t);
         while (!ran.load(std::memory_order_acquire)) std::this_thread::yield();
         Check(!g_hookFired.load(std::memory_order_acquire),
@@ -150,20 +194,13 @@ int main() {
         std::atomic<bool> held{ false }, got{ false };
         g_hookFired.store(false, std::memory_order_release);
 
-        auto* holder = sched.CreateTask([&] {
-            m.Lock();
-            held.store(true, std::memory_order_release);
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-            m.Unlock();
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        SleepHoldCtx hctx{ &m, &held, nullptr, 80 };
+        auto* holder = JLibTest::MakeCtxTask(sched, &SleepHoldBody, &hctx);
         sched.Push(holder);
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
 
-        auto* waiter = sched.CreateTask([&] {
-            m.Lock();
-            got.store(true, std::memory_order_release);
-            m.Unlock();
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        TakeLockCtx wctx{ &m, &got };
+        auto* waiter = JLibTest::MakeCtxTask(sched, &TakeLockBody, &wctx);
         sched.Push(waiter);
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -192,12 +229,8 @@ int main() {
         // Suspending on an Event frees the worker while still holding the lock, which is the state
         // the offender actually has to meet.
         Event& hold = sched.GetEvent("mutex_block_policy_hold");
-        auto* holder = sched.CreateTask([&] {
-            m.Lock();
-            held.store(true, std::memory_order_release);
-            sched.WaitOnEvent(hold);
-            m.Unlock();
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        HoldOnEventCtx ectx{ &sched, &m, &hold, &held };
+        auto* holder = JLibTest::MakeCtxTask(sched, &HoldOnEventBody, &ectx);
         sched.Push(holder);
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
 
@@ -210,7 +243,7 @@ int main() {
                 m.Unlock();
             }
             attempted.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, TaskType::Native);
+        }, JLib::Lane::Normal);
         sched.Push(offender);
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);

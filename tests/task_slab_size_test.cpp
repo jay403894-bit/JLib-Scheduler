@@ -25,6 +25,10 @@ static void Check(bool ok, const char* what) {
     if (!ok) ++failures;
 }
 
+// A named task body. Every task body in this tree is one -- not a lambda, and not a captureless
+// lambda either, so there is never a per-site judgement about which spelling is safe here.
+static void EmptyBody(void*) {}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("SetSlabSizes\n");
@@ -102,7 +106,7 @@ int main() {
     std::vector<JLib::Task*> held;
     size_t allocated = 0;
     for (size_t i = 0; i < kSlots + 100; ++i) {
-        JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+        JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
         if (!t) break;
         held.push_back(t);
         ++allocated;
@@ -132,7 +136,7 @@ int main() {
         std::vector<JLib::Task*> grown;
         size_t got = 0;
         for (size_t i = 0; i < capacity + 500; ++i) {
-            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
             if (!t) break;
             grown.push_back(t);
             ++got;

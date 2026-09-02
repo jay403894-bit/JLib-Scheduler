@@ -15,6 +15,7 @@
 // EARLY.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 #include "Timer.h"
 
 #include <atomic>
@@ -22,6 +23,23 @@
 #include <cstdio>
 #include <thread>
 #include <vector>
+
+// A named fiber body with an explicit context -- see the call site for why this is not a lambda.
+struct SemWaitCtx {
+    JLib::SchedulerSemaphore* sem;
+    std::atomic<int>* parked;
+    std::atomic<int>* cancelled;
+    std::atomic<int>* acquired;
+};
+static void SemWaitBody(void* p) {
+    auto& c = *static_cast<SemWaitCtx*>(p);
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_relaxed);
+    if (c.sem->WaitCancellable() == JLib::WaitResult::Cancelled) {
+        if (c.cancelled) c.cancelled->fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (c.acquired) c.acquired->fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 static int g_failures = 0;
 
@@ -132,13 +150,13 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.fetch_add(1, std::memory_order_relaxed);
 
-        auto* t = sched.CreateTask([&] {
-            parked.fetch_add(1, std::memory_order_relaxed);
-            if (sem.WaitCancellable() == JLib::WaitResult::Cancelled)
-                cancelled.fetch_add(1, std::memory_order_relaxed);
-            else
-                acquired.fetch_add(1, std::memory_order_relaxed);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        // A NAMED BODY AND AN EXPLICIT CONTEXT, not a lambda. A fiber's stack is a place -- register
+        // state mapped to memory -- and a closure is a value the worker loop frees when the body
+        // returns. Handing one to a fiber that parks means the frame is gone when it resumes, or the
+        // fiber never dies and the frame is never freed. `ctx` lives on this stack, which outlives
+        // the WaitFor below.
+        SemWaitCtx ctx{ &sem, &parked, &cancelled, &acquired };
+        auto* t = JLibTest::MakeCtxTask(sched, &SemWaitBody, &ctx);
         t->cancelToken = op.Token().Raw();
         t->waitGroup = &wg;
         sched.Push(t);

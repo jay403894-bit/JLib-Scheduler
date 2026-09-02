@@ -36,6 +36,7 @@
 // fail and demand that the reasoning above be revisited rather than silently invalidated.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 
 #include <atomic>
 #include <chrono>
@@ -56,6 +57,14 @@ std::atomic<int> g_unwoundMutexPlain{ 0 };
 std::atomic<int> g_unwoundSemCancellable{ 0 };
 std::atomic<int> g_unwoundSemPlain{ 0 };
 std::atomic<int> g_entered{ 0 };
+
+// The task entry for every arm below. Takes the arm's body as its CONTEXT -- see `spawn` in main
+// for why this carries no closure. Casting a function pointer through void* is conditionally
+// supported by the standard and is well defined on every platform this builds for (Win64, SysV).
+static void EnteredThenRun(void* p) {
+    g_entered.fetch_add(1, std::memory_order_release);
+    reinterpret_cast<void (*)()>(p)();
+}
 std::atomic<bool> g_tornDown{ false };
 
 // Lives on the parked fiber's stack. Its destructor is the whole assertion.
@@ -110,11 +119,19 @@ int main() {
     s_gate->Lock();                              // never unlocked, on purpose
     s_gatePlain->Lock();                         // never unlocked, on purpose
 
+    // NO CLOSURE AT ALL, and this file is why. The first conversion of this helper gave `spawn` a
+    // local lambda and handed the task its address -- and the lambda died when `spawn` RETURNED,
+    // while the fibers it launched stay parked on s_gate forever by design. It crashed on the first
+    // run, which is the good outcome: the pointer form makes the lifetime error visible instead of
+    // letting a slab-owned closure hide it until teardown.
+    //
+    // `body` is already a plain function pointer, so the task needs nothing else: the context IS
+    // the body, and the trampoline is a file-scope function with no state of its own. This is the
+    // purest form of the rule -- a fiber task is void(*)(void*) plus a context that outlives the
+    // wait, and here the context is code.
     auto spawn = [&sched](void (*body)()) {
-        Task* t = sched.CreateTask([body] {
-            g_entered.fetch_add(1, std::memory_order_release);
-            body();
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        Task* t = sched.CreateTask(&EnteredThenRun, reinterpret_cast<void*>(body),
+                                   JLib::Lane::Normal, TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned a task"); return; }
         sched.Push(t);
     };
@@ -176,13 +193,32 @@ int main() {
     Check(g_unwoundSemPlain.load(std::memory_order_acquire) == 0,
           "semaphore/plain Wait(): still parked -- nowhere to report Cancelled, BY POLICY");
 
-    // WHAT THAT COSTS, said out loud because teardown itself cannot say it. The quiescence loop
-    // reads `busy`, the three inboxes and the deques -- a frame parked on a primitive is in NONE of
-    // them, so these two abandoned frames read as a quiet pool and teardown returns without
-    // complaint. The leak has no runtime symptom beyond destructors that never ran.
-    std::printf("\n  By design, %d frame(s) were left parked and never unwound. Teardown cannot\n"
-                "  detect this: parked frames are invisible to the quiescence loop, so a pool\n"
-                "  that abandoned them still reports a clean shutdown.\n", 4);
+    // WHAT THAT COSTS. The quiescence loop reads `busy`, the three inboxes and the deques -- a
+    // frame parked on a primitive is in NONE of them, so these abandoned frames read as a quiet
+    // pool and teardown returns without complaint. Beyond destructors that never ran, the leak had
+    // no runtime symptom at all; the fiber-row balance below is what changed that.
+    // ---- AND THE FIBER-ROW BALANCE NOW SEES THEM, WHICH IT DID NOT USED TO ------------------
+    //
+    // This paragraph used to end "teardown cannot detect this". That is no longer true, and the
+    // correction is the point: a dev build prints
+    //
+    //     FIBER ROW LEAK at teardown: 10 rows acquired, 6 recycled, 4 outstanding
+    //
+    // right here, and the 4 is DERIVED INDEPENDENTLY of the 4 below. This file counts arms it
+    // deliberately left parked; the runtime counts AcquireFiber against recycle across every
+    // worker. Two instruments, no shared arithmetic, same answer -- which is the only kind of
+    // agreement worth anything.
+    //
+    // THE REPORT IS EXPECTED HERE AND IS NOT A FAILURE. Those four rows really are stranded, by
+    // the deliberate policy tested above: a plain Lock()/Wait() has nowhere to report Cancelled,
+    // so teardown leaves it parked rather than lying to it. The process is exiting, so the rows
+    // cost nothing further -- but the runtime is right to say so, and a build that stopped saying
+    // it would have lost the ability to catch the same shape when it is NOT by design.
+    std::printf("\n  By design, %d frame(s) were left parked and never unwound. The quiescence\n"
+                "  loop still cannot see them -- it reads busy, the inboxes and the deques, and a\n"
+                "  parked frame is in none of those -- but the fiber-row balance printed above\n"
+                "  reaches the same %d by a different route, so the condition is no longer silent.\n",
+                4, 4);
 
     std::printf("\n%s -- %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     return g_failures ? 1 : 0;

@@ -46,6 +46,25 @@
 namespace JLib {
 namespace testing {
 
+// ---- THE RESUME TASK IS A RAW fn/data TASK, NOT A LAMBDA -----------------------------------
+//
+// It used to be `CreateInternalTask([] { }, Lane::Normal)` -- an EMPTY lambda whose only purpose was
+// to exist so a WaitGroup could hang off it. That allocated a LambdaTask per I/O operation to hold
+// nothing, and taught the wrong idiom in the one file people will copy from.
+//
+// A raw `void(*)(void*)` needs no capture, no closure type and no per-operation lambda frame. The
+// body is genuinely empty: all the work is the WaitGroup decrement the worker performs on
+// completion, which is the ordinary Native completion path and not something this function has to
+// write.
+//
+// AND THE GENERAL RULE IT FOLLOWS, which is worth stating because it is easy to get backwards: state
+// that must survive a suspension belongs on the FIBER'S STACK -- a local inside the task body -- or
+// in storage you own and pass by pointer. Not in a capture. A capture lives in the task frame, which
+// is a different object with a different lifetime; the fiber's stack is the thing the whole runtime
+// exists to preserve across a wait. Note how every operation below declares its IoRequest and
+// IoResult as locals in the CALLER'S fiber rather than capturing them.
+inline void NoopResume(void*) noexcept {}
+
 // `submit` is any callable taking the resume Task* and returning Submit's bool.
 // Returns the IoResult the operation produced.
 template <typename SubmitFn>
@@ -74,7 +93,7 @@ inline IoResult Await(TaskScheduler& sched, SubmitFn&& submit, IoResult& out) {
     // ordinary fiber. The cost is that this path does not exercise StackClass::Tiny -- a floor
     // Native task is fiberless -- and that is the correct trade: the tiny stack is proven by
     // io_tiny_stack_test, where the completion is the whole work and has no fiber to wake.
-    Task* resume = sched.CreateInternalTask([] { }, Lane::Normal);
+    Task* resume = sched.CreateInternalTask(&NoopResume, nullptr, Lane::Normal);
     if (!resume) {
         out = IoResult{ IoStatus::Failed, 0, 0 };
         return out;
@@ -175,15 +194,51 @@ inline IoResult SendTo(TaskScheduler& s, IoSocket sk, const void* buf, std::uint
 // The replacement for `Spawn(coro(...), &wg)`. TaskType::Fiber is not optional here: the body
 // SUSPENDS inside Await, and a Native task has no context to switch away from -- it would fail-fast
 // with no message rather than wait.
+//
+// ---- IT TAKES A POINTER TO THE BODY, NOT THE BODY. THAT IS THE WHOLE DESIGN. ----------------
+//
+// This used to be `F&& body`, forwarded into CreateTask, which copied the closure onto the TASK
+// SLAB and asked for TaskType::Fiber. That combination is exactly the thing the runtime cannot
+// support, and it is worth being precise about why, because it works in a test every single time.
+//
+//   THE ROW. AcquireFiber leases a stack plus the FLS slots, creditor list and retire bag hanging
+//   off it. The lease has one teardown -- the recycle after FiberStatus::DEAD -- so the invariant
+//   is that every acquire reaches DEAD exactly once. A row that does not is a permanent --budget:
+//   the stack never returns to the magazine and the reaper never runs for it.
+//
+//   TWO OWNERS. A slab-allocated closure is owned by the worker loop, which frees the task frame
+//   as soon as the body returns. The fiber is owned by whoever resumes it. Those are different
+//   parties with no shared destructor. While the body merely runs, nothing is wrong. The moment it
+//   SUSPENDS, its continuation is a promise made by something entitled to have gone away.
+//
+//   AND THE FAILURE IS INVISIBLE. SlabPool is append-only and releases no extent before the pool
+//   itself dies, so a freed slot stays mapped and usually still holds its bytes. The suspend/resume
+//   round trip reads its capture back intact and the test passes -- while the bill accrues as a
+//   live count that never returns to baseline, a slab that cannot be cleared, or a completion
+//   writing into a stack the magazine has since reissued.
+//
+// SO THE CLOSURE LIVES ON THE CALLER'S STACK and the task carries a function pointer plus its
+// address. One owner. The frame the runtime allocates holds no captures at all, so freeing it when
+// the body returns is correct rather than merely survivable, and the row reaches DEAD on the
+// ordinary path.
+//
+//     auto body = [&sched, sock] { ...Await(sched, ...)... };   // caller's frame owns this
+//     Fib::SpawnFiber(sched, wg, &body);
+//     sched.WaitFor(wg);                                        // ...and outlives the wait
+//
+// THE ONE RULE AT THE CALL SITE: the caller must not leave the scope holding `body` until the
+// WaitGroup has completed. Every use here is the shape above -- spawn, then WaitFor in the same
+// function -- which satisfies it structurally rather than by discipline. A `body` declared inside
+// a loop must have the WaitFor inside that loop too.
+//
 // `tok` STAMPS THE TASK'S CANCELLATION SCOPE, which the coroutine version passed through Spawn's
 // trailing parameters. It has to be on the TASK and not only on the operation: cancelling a scope
 // must reach work that has already been dispatched and is running, and the token on the submit only
 // governs the I/O.
-template <typename F>
-inline void SpawnFiber(TaskScheduler& s, WaitGroup& wg, F&& body,
+inline void SpawnFiber(TaskScheduler& s, WaitGroup& wg, void (*body)(void*), void* ctx,
                        CancelToken tok = CancelToken{}) {
     wg.n.fetch_add(1, std::memory_order_relaxed);
-    Task* t = s.CreateTask(std::forward<F>(body), Lane::Normal, TaskType::Fiber);
+    Task* t = s.CreateTask(body, ctx, Lane::Normal, TaskType::Fiber);
     if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); return; }
     if (tok.Raw() != CancelToken::kNone) t->cancelToken = tok.Raw();
     t->waitGroup = &wg;
@@ -205,7 +260,7 @@ inline void AwaitVoid(TaskScheduler& sched, SubmitFn&& submit) {
     WaitGroup wg;
     wg.n.store(1, std::memory_order_relaxed);
 
-    Task* resume = sched.CreateInternalTask([] { }, Lane::Normal);   // FLOOR -- see Await's note
+    Task* resume = sched.CreateInternalTask(&NoopResume, nullptr, Lane::Normal);   // FLOOR -- see Await
     if (!resume) return;
     resume->waitGroup = &wg;
 

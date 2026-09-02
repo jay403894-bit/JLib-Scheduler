@@ -171,6 +171,22 @@ that trade as a defect.
 ```cpp
 #include <TaskScheduler.h>
 
+// A job that WAITS is a named function plus a context struct -- see the suspending section below
+// for why that is the only shape the runtime supports for one.
+struct WaiterCtx { JLib::Event* gate; std::atomic<bool>* ready; };
+
+static void WaiterBody(void* p) {
+    auto& c = *static_cast<WaiterCtx*>(p);
+    // ARMED, because Push-then-Signal is a race: the signal can arrive before this task has
+    // parked, and a plain WaitOnEvent would then wait for a wake that already happened. The arm
+    // callback runs after the task is registered as a waiter but before it sleeps, so re-checking
+    // the condition there closes the window.
+    JLib::TaskScheduler::Instance().WaitOnEventArmed(*c.gate, [&c] {
+        if (c.ready->load(std::memory_order_acquire)) c.gate->SignalAll();
+    });
+    /* resumes here, possibly on another worker */
+}
+
 int main() {
     JLib::TaskScheduler::Init();                       // 0 / omitted = size to the machine
     auto& sched = JLib::TaskScheduler::Instance();
@@ -179,7 +195,7 @@ int main() {
     JLib::WaitGroup wg;
     wg.n.store(1, std::memory_order_relaxed);
 
-    JLib::Task* t = sched.CreateTask([] { /* work */ });   // Fiber by default: it may wait
+    JLib::Task* t = sched.CreateTask([] { /* work */ });   // a lambda job: runs, returns, done
     t->waitGroup = &wg;
     sched.Push(t);
     sched.WaitFor(wg);
@@ -191,12 +207,31 @@ int main() {
     sched.ParallelFor(0, 1'000'000, 4096, body);       // grain optional; steals do the dividing
 
     // ---- suspending, from anywhere in the call graph -----------------------------------
+    //
+    // A JOB THAT WAITS IS NOT A LAMBDA. `CreateTask(lambda)` is always Native -- it runs and
+    // returns -- and the compiler will tell you so if you ask for anything else. A job that
+    // suspends takes the raw form: a `void(*)(void*)` plus a context that OUTLIVES THE WAIT.
+    //
+    // That is an ownership rule, not a style. A fiber leases a stack whose only teardown is the
+    // recycle after it finishes, so the runtime needs exactly one owner for that job's state. A
+    // closure on the task slab has two -- the worker loop frees the frame when the body returns,
+    // while the fiber belongs to whoever resumes it -- and nothing destroys it once. Keeping the
+    // state on the caller's stack, where you can see its scope, removes the second owner.
     JLib::Event& gate = sched.GetEvent("frame_ready");
-    sched.Push(sched.CreateTask([&] {
-        sched.WaitOnEvent(gate);                       // suspends the FIBER, frees the worker
-        /* resumes here, possibly on another worker */
-    }));
+    JLib::WaitGroup done;
+    done.n.store(1, std::memory_order_relaxed);
+
+    std::atomic<bool> ready{ false };
+    WaiterCtx ctx{ &gate, &ready };             // lives in THIS frame, which outlives the wait
+
+    JLib::Task* waiter = sched.CreateTask(&WaiterBody, &ctx,
+                                          JLib::Lane::Normal, JLib::TaskType::Fiber);
+    waiter->waitGroup = &done;
+    sched.Push(waiter);
+
+    ready.store(true, std::memory_order_release);
     gate.SignalAll();
+    sched.WaitFor(done);       // never leave a suspended fiber behind at exit
 }
 ```
 

@@ -66,6 +66,7 @@
 #include "Fiber.h"
 #include "Context.h"
 #include "TaskScheduler.h"   // section 2 only -- the raw table starts no pool
+#include "../tests/fiber_body.h"
 
 #include <algorithm>
 #include <atomic>
@@ -224,6 +225,17 @@ extern "C" unsigned char JLibCtxHasAvx;   // defined in src/win32/FiberInit.cpp
 
 std::atomic<long long> g_wakes{ 0 };
 PreFn volatile         g_schedPre = nullptr;
+// The park-loop fiber body: a named function plus an explicit context, like every task body in the
+// tree. See the call site for why this is not a lambda.
+struct ParkCtx { JLib::TaskScheduler* sched; JLib::Event* ev; long long iters; };
+static void ParkLoopBody(void* p) {
+    auto& c = *static_cast<ParkCtx*>(p);
+    for (long long i = 0; i < c.iters; ++i) {
+        g_schedPre();                 // park with upper YMM live, or not
+        c.sched->WaitOnEvent(*c.ev);
+        g_wakes.fetch_add(1, std::memory_order_release);
+    }
+}
 
 // Nanoseconds per suspend/resume round trip.
 double TimeSuspendResume(bool gateOn, PreFn pre, long long iters) {
@@ -237,13 +249,11 @@ double TimeSuspendResume(bool gateOn, PreFn pre, long long iters) {
     JLib::WaitGroup wg;
     wg.n.fetch_add(1, std::memory_order_relaxed);
 
-    auto* t = sched.CreateTask([&sched, &ev, iters] {
-        for (long long i = 0; i < iters; ++i) {
-            g_schedPre();                 // park with upper YMM live, or not
-            sched.WaitOnEvent(ev);
-            g_wakes.fetch_add(1, std::memory_order_release);
-        }
-    }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+    // A NAMED body and a context on THIS frame, which outlives the WaitFor below. Not a lambda: a
+    // fiber's stack is a place, and a closure is a value the worker loop frees when the body
+    // returns -- a fiber handed one that then parks resumes into a dead frame or never dies.
+    ParkCtx pctx{ &sched, &ev, iters };
+    auto* t = JLibTest::MakeCtxTask(sched, &ParkLoopBody, &pctx);
     if (!t) { std::fprintf(stderr, "CreateTask returned null\n"); std::exit(2); }
     t->waitGroup = &wg;
     sched.Push(t);

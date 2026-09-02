@@ -31,6 +31,102 @@ static void Check(bool c, const char* what) {
 
 static std::atomic<int> g_status{ -1 }, g_bytes{ -1 }, g_ran{ 0 };
 
+// ---- FIBER BODIES ARE NAMED FUNCTIONS WITH AN EXPLICIT CONTEXT ------------------------------
+//
+// Not lambdas, and not a pointer to one either. A fiber's stack is a PLACE -- register state
+// mapped to memory -- and the whole runtime exists to keep it intact across a suspension. A
+// closure is a value on the slab with a lifetime the worker loop controls. Handing a fiber a
+// closure to run means one of two things when it parks: the frame is gone when it resumes, or the
+// frame is never freed because the fiber never dies. Both are production failures, and neither
+// shows up where it is caused, because SlabPool is append-only and a freed slot stays mapped
+// holding its old bytes.
+//
+// Passing the closure's ADDRESS instead does not fix that -- it only moves the lifetime from
+// something the compiler checks to something the author has to remember. So the bodies here are
+// file-scope functions and the state they need is a struct the caller declares, where its scope is
+// visible at the declaration and the compiler can see the whole thing.
+//
+// Note what is NOT in the struct: IoRequest and IoResult. Those are locals inside the body, which
+// puts them on the FIBER'S stack -- the storage that survives the wait by design.
+//
+// AND THE READ BUFFER IS IN THE CONTEXT, not a file-scope static. The kernel writes into it after
+// SubmitRead returns, so it has to outlive the wait -- but "outlives the wait" is what the caller's
+// frame already gives it, and a static would additionally survive into the NEXT arm of this file
+// carrying the last read's bytes. That is the shape that makes a stale-data bug look like a pass.
+struct ReadCtx { JLib::TaskScheduler* s; HANDLE h; char buf[256]; };
+static void ReadBody(void* p) {
+    auto& c = *static_cast<ReadCtx*>(p);
+    g_ran.store(1, std::memory_order_release);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    // The raw reactor call, through Await -- the same path every ported arm takes.
+    const JLib::IoResult r = Fib::Await(*c.s, [&](JLib::Task* k) {
+        return JLib::IoReactor::Instance().SubmitRead(c.h, c.buf, 256, 0, &req, &out, k,
+                                                      JLib::CancelToken{});
+    }, out);
+    g_status.store(static_cast<int>(r.status), std::memory_order_release);
+    g_bytes.store(static_cast<int>(r.bytes), std::memory_order_release);
+    g_ran.store(2, std::memory_order_release);
+}
+
+// The accept and connect arms appear twice each (the reuse-reconnect section repeats them against a
+// second listener), so they are ONE body apiece with the differences in the context rather than four
+// near-identical closures. That is the ordinary benefit of naming a body: it becomes reusable.
+struct AcceptCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket lis, acc;
+    JLib::IoAcceptBuffer* ab;
+    std::atomic<int>* status;
+};
+static void AcceptBody(void* p) {
+    auto& c = *static_cast<AcceptCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};          // on the FIBER's stack, across the wait
+    const JLib::IoResult r = Fib::Accept(*c.s, c.lis, c.acc, c.ab, req, out);
+    c.status->store((int)r.status, std::memory_order_release);
+}
+
+struct ConnectCtx {
+    JLib::TaskScheduler* s;
+    JLib::IoSocket cli;
+    sockaddr_in* tgt;
+    std::atomic<int>* status;
+};
+static void ConnectBody(void* p) {
+    auto& c = *static_cast<ConnectCtx*>(p);
+    JLib::IoRequest req{}; JLib::IoResult out{};
+    const JLib::IoResult r = Fib::Connect(*c.s, c.cli, c.tgt, sizeof(sockaddr_in), req, out);
+    c.status->store((int)r.status, std::memory_order_release);
+}
+
+// Arm 4's body. Its counters are function-local statics in main, so they arrive through the context
+// as pointers -- which is the honest shape anyway: a body that names what it touches is a body whose
+// dependencies a reader can enumerate without reading it.
+struct PinArmCtx {
+    JLib::TaskScheduler* s;
+    JLib::Event* gate;
+    std::size_t K;
+    std::atomic<int>* ranOnReserved;
+    std::atomic<int>* parked;
+    std::atomic<int>* resumedOnReserved;
+    std::atomic<int>* ranTotal;
+};
+static void PinArmBody(void* p) {
+    auto& c = *static_cast<PinArmCtx*>(p);
+    JLib::Thread* pre = JLib::Thread::Current();
+    if (pre && (std::size_t)pre->qIndex < c.K)
+        c.ranOnReserved->fetch_add(1, std::memory_order_relaxed);
+
+    c.parked->fetch_add(1, std::memory_order_release);
+    c.s->WaitOnEvent(*c.gate);
+
+    // AFTER the suspension. In pinned mode this MUST be the same worker it started on -- that is
+    // what pinning means -- so a reserved start implies a reserved resume, and observing one is
+    // observing K draining its own resume inbox.
+    JLib::Thread* post = JLib::Thread::Current();
+    if (post && (std::size_t)post->qIndex < c.K)
+        c.resumedOnReserved->fetch_add(1, std::memory_order_relaxed);
+    c.ranTotal->fetch_add(1, std::memory_order_relaxed);
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -60,21 +156,10 @@ int main(int argc, char** argv) {
     Check(h != INVALID_HANDLE_VALUE && io.Register(h), "opened and registered");
     if (h == INVALID_HANDLE_VALUE) return 1;
 
-    static char buf[256];
     JLib::WaitGroup wg;
 
-    Fib::SpawnFiber(sched, wg, [&sched, h] {
-        g_ran.store(1, std::memory_order_release);
-        JLib::IoRequest req{}; JLib::IoResult out{};
-        // The raw reactor call, through Await -- the same path every ported arm takes.
-        const JLib::IoResult r = Fib::Await(sched, [&](JLib::Task* k) {
-            return JLib::IoReactor::Instance().SubmitRead(h, buf, 256, 0, &req, &out, k,
-                                                          JLib::CancelToken{});
-        }, out);
-        g_status.store(static_cast<int>(r.status), std::memory_order_release);
-        g_bytes.store(static_cast<int>(r.bytes), std::memory_order_release);
-        g_ran.store(2, std::memory_order_release);
-    });
+    ReadCtx rc{ &sched, h, {} };
+    Fib::SpawnFiber(sched, wg, &ReadBody, &rc);
 
     // BOUNDED, never a bare WaitFor. If the shim is broken this must FAIL rather than hang -- a
     // hang here would be the same non-answer io_socket_test just gave.
@@ -119,16 +204,10 @@ int main(int argc, char** argv) {
         static std::atomic<int> accDone{ -1 }, conDone{ -1 };
 
         JLib::WaitGroup wg2;
-        Fib::SpawnFiber(sched, wg2, [&sched, lis, acc] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Accept(sched, (JLib::IoSocket)lis, (JLib::IoSocket)acc, &ab, req, out);
-            accDone.store((int)r.status, std::memory_order_release);
-        });
-        Fib::SpawnFiber(sched, wg2, [&sched, cli] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Connect(sched, (JLib::IoSocket)cli, &tgt, sizeof tgt, req, out);
-            conDone.store((int)r.status, std::memory_order_release);
-        });
+        AcceptCtx  ac2{ &sched, (JLib::IoSocket)lis, (JLib::IoSocket)acc, &ab, &accDone };
+        ConnectCtx cc2{ &sched, (JLib::IoSocket)cli, &tgt, &conDone };
+        Fib::SpawnFiber(sched, wg2, &AcceptBody,  &ac2);
+        Fib::SpawnFiber(sched, wg2, &ConnectBody, &cc2);
 
         // BOUNDED. A bare WaitFor here would reproduce the hang instead of reporting it.
         const auto d2 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -184,16 +263,10 @@ int main(int argc, char** argv) {
         static std::atomic<int> acc3{ -1 }, con3{ -1 }, joined{ 0 };
 
         JLib::WaitGroup wg3;
-        Fib::SpawnFiber(sched, wg3, [&sched, lis, acc] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Accept(sched, (JLib::IoSocket)lis, (JLib::IoSocket)acc, &ab3, req, out);
-            acc3.store((int)r.status, std::memory_order_release);
-        });
-        Fib::SpawnFiber(sched, wg3, [&sched, cli] {
-            JLib::IoRequest req{}; JLib::IoResult out{};
-            const JLib::IoResult r = Fib::Connect(sched, (JLib::IoSocket)cli, &tgt3, sizeof tgt3, req, out);
-            con3.store((int)r.status, std::memory_order_release);
-        });
+        AcceptCtx  ac3{ &sched, (JLib::IoSocket)lis, (JLib::IoSocket)acc, &ab3, &acc3 };
+        ConnectCtx cc3{ &sched, (JLib::IoSocket)cli, &tgt3, &con3 };
+        Fib::SpawnFiber(sched, wg3, &AcceptBody,  &ac3);
+        Fib::SpawnFiber(sched, wg3, &ConnectBody, &cc3);
 
         // A WATCHDOG THREAD, because WaitFor has no deadline and this arm exists to survive its
         // failure. Without it a hang here is a hang of the whole file -- the same non-answer that
@@ -260,24 +333,14 @@ int main(int argc, char** argv) {
 
             JLib::Event& gate4 = sched.GetEvent("pin_arm4_gate");
 
-            for (int i = 0; i < kJobs; ++i) {
-                Fib::SpawnFiber(sched, wg4, [&sched, &gate4, K] {
-                    JLib::Thread* pre = JLib::Thread::Current();
-                    if (pre && (size_t)pre->qIndex < K)
-                        ranOnReserved.fetch_add(1, std::memory_order_relaxed);
-
-                    parked4.fetch_add(1, std::memory_order_release);
-                    sched.WaitOnEvent(gate4);
-
-                    // AFTER the suspension. In pinned mode this MUST be the same worker it started
-                    // on -- that is what pinning means -- so a reserved start implies a reserved
-                    // resume, and observing one is observing K draining its own resume inbox.
-                    JLib::Thread* post = JLib::Thread::Current();
-                    if (post && (size_t)post->qIndex < K)
-                        resumedOnReserved.fetch_add(1, std::memory_order_relaxed);
-                    ranTotal.fetch_add(1, std::memory_order_relaxed);
-                });
-            }
+            // DECLARED OUTSIDE THE LOOP, AND THAT IS REQUIRED. SpawnFiber takes a POINTER to the
+            // body -- the closure belongs to this frame, not to the task slab, which is what lets
+            // its state has to outlive the WaitFor below. Declared HERE rather than inside the
+            // spawn loop: a context scoped to the loop would be destroyed at the end of each
+            // iteration while its fiber was still parked on gate4.
+            PinArmCtx pc{ &sched, &gate4, K, &ranOnReserved, &parked4, &resumedOnReserved, &ranTotal };
+            for (int i = 0; i < kJobs; ++i)
+                Fib::SpawnFiber(sched, wg4, &PinArmBody, &pc);
 
             // Let them all park before releasing, so the resumes are a storm the band participates
             // in rather than a trickle it never sees.

@@ -44,6 +44,30 @@ using namespace JLib;
 static int g_failures = 0;
 static std::atomic<int> g_done{ 0 };
 
+// ---- NAMED TASK BODIES ---------------------------------------------------------------------
+//
+// One spelling everywhere: a named void(void*) plus, where it needs state, a context struct the
+// caller declares. A fiber's stack is a PLACE -- register state mapped to memory -- while a
+// closure is a VALUE the worker loop frees when the body returns, so the two cannot share an
+// owner. Captureless lambdas are excluded too: one form means no per-site judgement.
+static void DoneBody(void*) {
+    g_done.fetch_add(1, std::memory_order_release);
+}
+
+struct GateCtx {
+    std::atomic<int>*  arrived;
+    Event**            gate;
+    std::atomic<bool>* released;
+};
+static void ArmedGateBody(void* p) {
+    auto& c = *static_cast<GateCtx*>(p);
+    c.arrived->fetch_add(1, std::memory_order_release);
+    TaskScheduler::Instance().WaitOnEventArmed(**c.gate, [&c] {
+        if (c.released->load(std::memory_order_acquire)) (*c.gate)->SignalAll();
+    });
+    g_done.fetch_add(1, std::memory_order_release);
+}
+
 // Long enough that "slow" is excluded by orders of magnitude: a healthy round trip on this pool is
 // ~0.5 us, so a second is two million times that. Anything still outstanding here is not late.
 static constexpr int kDeadlineMs = 1000;
@@ -114,9 +138,7 @@ int main() {
         for (int r = 0; r < kRounds && g_failures == 0; ++r) {
             Settle();
             g_done.store(0, std::memory_order_release);
-            Task* t = sched.CreateTask(+[](void*) {
-                g_done.fetch_add(1, std::memory_order_release);
-            }, nullptr);
+            Task* t = sched.CreateTask(&DoneBody, nullptr);
             if (!t) { std::printf("  FAIL  CreateTask returned null\n"); ++g_failures; break; }
             sched.Push(t);
             if (!WaitPassively(1)) { Report("single", r, 1, g_done.load()); break; }
@@ -146,9 +168,7 @@ int main() {
             Settle();
             g_done.store(0, std::memory_order_release);
             for (int i = 0; i < kBurst; ++i) {
-                Task* t = sched.CreateTask(+[](void*) {
-                    g_done.fetch_add(1, std::memory_order_release);
-                }, nullptr);
+                Task* t = sched.CreateTask(&DoneBody, nullptr);
                 if (!t) { std::printf("  FAIL  CreateTask returned null\n"); ++g_failures; break; }
                 sched.Push(t);
             }
@@ -188,14 +208,13 @@ int main() {
             std::snprintf(name, sizeof name, "quiesce_gate_%d", r);
             gate = &sched.GetEvent(name);
 
+            // One context for all kWaiters -- nothing varies between them -- declared here so it
+            // outlives the round rather than dying at the end of an iteration.
+            GateCtx gctx{ &arrived, &gate, &released };
+
             for (int i = 0; i < kWaiters; ++i) {
-                Task* t = sched.CreateTask(+[](void*) {
-                    arrived.fetch_add(1, std::memory_order_release);
-                    TaskScheduler::Instance().WaitOnEventArmed(*gate, [] {
-                        if (released.load(std::memory_order_acquire)) gate->SignalAll();
-                    });
-                    g_done.fetch_add(1, std::memory_order_release);
-                }, nullptr, JLib::Lane::Normal, TaskType::Fiber);
+                Task* t = sched.CreateTask(&ArmedGateBody, &gctx,
+                                           JLib::Lane::Normal, TaskType::Fiber);
                 if (!t) { std::printf("  FAIL  CreateTask returned null\n"); ++g_failures; break; }
                 sched.Push(t);
             }

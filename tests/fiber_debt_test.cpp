@@ -21,6 +21,7 @@
 // the other cancelling it out.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 #include "Fiber.h"
 #include "Thread.h"
 
@@ -69,6 +70,47 @@ static void PoolFree(void* p) noexcept {
     std::free(p);
 }
 
+// ---- FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS ---------------------------------------
+//
+// One spelling for every task body -- not a lambda, and not a captureless one either, so there is
+// never a per-site judgement about which form is safe. A fiber's stack is a PLACE: register state
+// mapped to memory, kept intact across a suspension. A closure is a VALUE the worker loop frees
+// the moment the body returns. A fiber handed a closure that then parks either resumes into a dead
+// frame or never dies and never returns its row, and neither surfaces where it was caused because
+// SlabPool is append-only and a released slot stays mapped holding its old bytes.
+struct DebtCtx  { std::atomic<int>* ran; std::atomic<int>* registered; };
+struct DirtyCtx { std::atomic<int>* ran; std::atomic<int>* dirty; };
+
+static void ThreeDebtsBody(void* p) {
+    auto& c = *static_cast<DebtCtx*>(p);
+    // Three objects, three allocators, one fiber. This is the combination the list exists for --
+    // a single deleter slot could hold one of these.
+    auto* a = new NewOwned();
+    auto* b = (ArenaOwned*)std::malloc(sizeof(ArenaOwned));
+    auto* d = (PoolOwned*)std::malloc(sizeof(PoolOwned));
+    if (!b || !d) return;
+    b->debt = FiberDebt{}; b->magic = 0xB2;
+    d->debt = FiberDebt{}; d->magic = 0xC3;
+
+    int n = 0;
+    n += TaskScheduler::DeleteOnFiberDeath(a->debt, a)                     ? 1 : 0;
+    n += TaskScheduler::ReleaseOnFiberDeath(b->debt, b, &ArenaFree)        ? 1 : 0;
+    n += TaskScheduler::ReleaseOnFiberDeath(d->debt, d, &PoolFree)         ? 1 : 0;
+    c.registered->fetch_add(n, std::memory_order_relaxed);
+    c.ran->fetch_add(1, std::memory_order_release);
+}
+
+// Pure churn, to turn the pool over so the fibers above are RECYCLED and not merely finished.
+static void ChurnBody(void*) {}
+
+static void CleanSlotBody(void* p) {
+    auto& c = *static_cast<DirtyCtx*>(p);
+    Thread* th = Thread::GetCurrent();
+    if (th && th->currentFiber && th->currentFiber->debts != nullptr)
+        c.dirty->fetch_add(1, std::memory_order_relaxed);
+    c.ran->fetch_add(1, std::memory_order_release);
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== fiber debts: every kind released, each exactly once ===\n");
@@ -97,24 +139,11 @@ int main() {
         std::atomic<int> ran{ 0 };
         std::atomic<int> registered{ 0 };
 
+        // THE CONTEXT IS DECLARED OUTSIDE THE LOOP because it must outlive every task that points
+        // at it, and nothing here varies per iteration.
+        DebtCtx dctx{ &ran, &registered };
         for (int i = 0; i < kRounds; ++i) {
-            auto* t = sched.CreateTask([&ran, &registered] {
-                // Three objects, three allocators, one fiber. This is the combination the list
-                // exists for -- a single deleter slot could hold one of these.
-                auto* a = new NewOwned();
-                auto* b = (ArenaOwned*)std::malloc(sizeof(ArenaOwned));
-                auto* c = (PoolOwned*)std::malloc(sizeof(PoolOwned));
-                if (!b || !c) return;
-                b->debt = FiberDebt{}; b->magic = 0xB2;
-                c->debt = FiberDebt{}; c->magic = 0xC3;
-
-                int n = 0;
-                n += TaskScheduler::DeleteOnFiberDeath(a->debt, a)                     ? 1 : 0;
-                n += TaskScheduler::ReleaseOnFiberDeath(b->debt, b, &ArenaFree)        ? 1 : 0;
-                n += TaskScheduler::ReleaseOnFiberDeath(c->debt, c, &PoolFree)         ? 1 : 0;
-                registered.fetch_add(n, std::memory_order_relaxed);
-                ran.fetch_add(1, std::memory_order_release);
-            }, Lane::Normal, TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &ThreeDebtsBody, &dctx);
             if (t) sched.Push(t);
         }
 
@@ -127,7 +156,7 @@ int main() {
         // fiber sitting in a worker's cache has not been recycled yet, so push enough churn to turn
         // the pool over rather than sleeping and hoping.
         for (int i = 0; i < kRounds * 2; ++i) {
-            auto* t = sched.CreateTask([] {}, Lane::Normal, TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &ChurnBody, nullptr);
             if (t) sched.Push(t);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
@@ -159,13 +188,9 @@ int main() {
     // object the NEXT occupant never registered, at a time it does not expect.
     {
         std::atomic<int> ran{ 0 }, dirty{ 0 };
+        DirtyCtx cctx{ &ran, &dirty };
         for (int i = 0; i < 200; ++i) {
-            auto* t = sched.CreateTask([&ran, &dirty] {
-                Thread* th = Thread::GetCurrent();
-                if (th && th->currentFiber && th->currentFiber->debts != nullptr)
-                    dirty.fetch_add(1, std::memory_order_relaxed);
-                ran.fetch_add(1, std::memory_order_release);
-            }, Lane::Normal, TaskType::Fiber);
+            auto* t = JLibTest::MakeCtxTask(sched, &CleanSlotBody, &cctx);
             if (t) sched.Push(t);
         }
         const auto d = std::chrono::steady_clock::now() + std::chrono::seconds(10);

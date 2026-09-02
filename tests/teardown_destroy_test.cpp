@@ -45,6 +45,12 @@
 
 static std::atomic<int> g_ran{ 0 };
 
+// A named task body -- one spelling for every body in the tree, closures and captureless lambdas
+// alike excluded, so there is no per-site judgement about which form is safe.
+static void RanBody(void*) {
+    g_ran.fetch_add(1, std::memory_order_relaxed);
+}
+
 int main() {
     std::printf("teardown: destructors run for the first time\n");
 
@@ -60,9 +66,7 @@ int main() {
         JLib::WaitGroup wg;
         wg.n.store(kN, std::memory_order_relaxed);
         for (int i = 0; i < kN; ++i) {
-            JLib::Task* t = sched.CreateTask(+[](void*) {
-                g_ran.fetch_add(1, std::memory_order_relaxed);
-            }, nullptr);
+            JLib::Task* t = sched.CreateTask(&RanBody, nullptr);
             if (!t) { std::printf("  CreateTask returned null\n"); return 1; }
             t->waitGroup = &wg;
             sched.Push(t);

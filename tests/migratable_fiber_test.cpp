@@ -71,6 +71,35 @@ __declspec(noinline)
 #else
 __attribute__((noinline))
 #endif
+// A NAMED task body -- one spelling for every body in the tree, closures and captureless lambdas
+// alike excluded, so a reader never has to work out which form was safe at a given site.
+//
+// THE CONTEXT IS THE TASK INDEX, PASSED BY VALUE through the void*. Nothing is dereferenced, so
+// there is no storage whose lifetime could be got wrong; everything else this touches is file
+// scope. That is the cheapest correct shape a context can take and it is worth recognising: a
+// context does not have to be a struct, it has to be something that outlives the wait, and an
+// integer carried in the pointer trivially does.
+static int CurrentQ();
+static void MigrateProbeBody(void* p) {
+    const int idx = (int)(intptr_t)p;
+    g_before[idx].store(CurrentQ(), std::memory_order_relaxed);
+    // ARMED WAIT: if the release already happened we self-signal rather than parking forever.
+    // Same race-freedom the compare harness uses.
+    TaskScheduler::Instance().WaitOnEventArmed(*g_gate, [] {
+        if (g_released.load(std::memory_order_acquire)) g_gate->SignalAll();
+    });
+    g_after[idx].store(CurrentQ(), std::memory_order_relaxed);
+#if defined(JLIBSCHED_REQUEUE_TRACE)
+    // THE JOIN. Where the router SAID it sent me, read by the fiber that was sent, so the two ends
+    // finally refer to one task instead of two aggregates.
+    if (Thread* me = Thread::Current())
+        if (Fiber* mf = me->currentFiber)
+            g_sentTo[idx].store((int)(mf->lastPlacedOn == SIZE_MAX ? -1 : (int)mf->lastPlacedOn),
+                                std::memory_order_relaxed);
+#endif
+    g_ran.fetch_add(1, std::memory_order_relaxed);
+}
+
 static int CurrentQ() {
     Thread* w = Thread::Current();
     return w ? w->qIndex : -1;
@@ -92,26 +121,8 @@ static Arm RunArm(TaskScheduler& sched, const char* name, const char* gateName) 
     wg.n.store(kTasks, std::memory_order_relaxed);
 
     for (int i = 0; i < kTasks; ++i) {
-        Task* t = sched.CreateTask(+[](void* p) {
-            const int idx = (int)(intptr_t)p;
-            g_before[idx].store(CurrentQ(), std::memory_order_relaxed);
-            // ARMED WAIT: if the release already happened we self-signal rather than parking
-            // forever. Same race-freedom the compare harness uses.
-            TaskScheduler::Instance().WaitOnEventArmed(*g_gate, [] {
-                if (g_released.load(std::memory_order_acquire)) g_gate->SignalAll();
-            });
-            g_after[idx].store(CurrentQ(), std::memory_order_relaxed);
-#if defined(JLIBSCHED_REQUEUE_TRACE)
-            // THE JOIN. Where the router SAID it sent me, read by the fiber that was sent, so the
-            // two ends finally refer to one task instead of two aggregates.
-            if (Thread* me = Thread::Current())
-                if (Fiber* mf = me->currentFiber)
-                    g_sentTo[idx].store((int)(mf->lastPlacedOn == SIZE_MAX ? -1
-                                                                          : (int)mf->lastPlacedOn),
-                                        std::memory_order_relaxed);
-#endif
-            g_ran.fetch_add(1, std::memory_order_relaxed);
-        }, (void*)(intptr_t)i, JLib::Lane::Normal, TaskType::Fiber);
+        Task* t = sched.CreateTask(&MigrateProbeBody, (void*)(intptr_t)i,
+                                   JLib::Lane::Normal, TaskType::Fiber);
         if (!t) { std::printf("  %s: CreateTask returned null\n", name); return { -1, -1, -1 }; }
         t->waitGroup = &wg;
         sched.Push(t);

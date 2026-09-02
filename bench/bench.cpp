@@ -45,6 +45,7 @@
 // are still the flat ones; lean on those.
 #define NOMINMAX
 #include <TaskScheduler.h>
+#include "../tests/fiber_body.h"
 #include <TaskDAG.h>
 #include <Event.h>        // event/resume section
 #include <DirectEvent.h>  // event/resume section
@@ -79,6 +80,19 @@
 #include <utility>     // std::pair, returned by the measure helper
 
 using Clock = std::chrono::steady_clock;
+
+// ---- NAMED TASK BODIES ---------------------------------------------------------------
+//
+// One spelling for every task body in this tree: a named void(void*) plus, where it needs
+// state, a context struct the caller declares. Not a lambda, and not a captureless lambda
+// either -- one form means a reader never has to work out which was safe at a given site,
+// and this file is what someone reads to learn the API, so the shape it teaches matters.
+//
+// A fiber stack is a PLACE: register state mapped to memory, preserved across a suspension.
+// A closure is a VALUE the worker loop frees the moment the body returns. They cannot share
+// an owner, and the failure is silent -- SlabPool is append-only, so a released slot stays
+// mapped holding its old bytes and the corruption surfaces nowhere near its cause.
+static void EmptyBody(void*) {}
 static double MsBetween(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
@@ -426,7 +440,7 @@ static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
         wg.n.store(kThroughputTasks, std::memory_order_relaxed);
         auto t0 = Clock::now();
         for (int i = 0; i < kThroughputTasks; ++i) {
-            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -477,7 +491,7 @@ ProducerArg g_producerArgs[kProducers];
 static void ProducerBody(void* p) {
     auto* a = static_cast<ProducerArg*>(p);
     for (int i = 0; i < a->count; ++i) {
-        JLib::Task* t = a->sched->CreateTask(+[](void*) {}, nullptr);
+        JLib::Task* t = a->sched->CreateTask(&EmptyBody, nullptr);
         if (!t) { ++a->failed; a->wg->n.fetch_sub(1, std::memory_order_release); continue; }
         t->waitGroup = a->wg;
         a->sched->Push(t);
@@ -515,7 +529,7 @@ static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
         auto t0 = Clock::now();
         int made = 0;
         for (int i = 0; i < kThroughputTasks; ++i) {
-            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
             if (!t) { printf("throughput/batch: ERROR -- CreateTask returned null\n"); return; }
             t->waitGroup = &wg;
             chunk[made++] = t;
@@ -907,6 +921,32 @@ static inline long long NowNs() noexcept {
                Clock::now().time_since_epoch()).count();
 }
 
+// The dispatch-latency probe body. Named, like every task body here; everything it records is
+// file scope, so it needs no context.
+static void LatencyProbeBody(void*) {
+    g_bodyStartNs.store(NowNs(), std::memory_order_relaxed);
+    // Which worker picked this up? Thread::instance is the running worker's own TLS, so this is
+    // ground truth for placement, and it costs one relaxed increment.
+    g_bodyQ.store(JLib::Thread::Current() ? JLib::Thread::Current()->qIndex : -1,
+                  std::memory_order_relaxed);
+    // WHICH CORE the worker was on when it finally ran this. Paired with the waiter's own core
+    // below, this is the witness for "the waiter and the worker were sharing a timeslice" -- see
+    // the note at the report. One KUSER_SHARED_DATA read on Windows.
+    g_bodyCpu.store(JLib::platform::CurrentCpu(), std::memory_order_relaxed);
+    // THIS WORKER'S IDLE-PASS COUNT AT THE MOMENT IT PICKED THE TASK UP. Subtracting the sample
+    // taken before the push gives idle passes across the DISPATCH WINDOW only -- push issued ->
+    // body started. Sampling after WaitFor returns instead measures the whole trip, which includes
+    // every pass the worker took AFTER running the body, and a large number there says nothing at
+    // all. The first version of this did that.
+    g_bodyTick.store(JLib::Thread::Current() ? JLib::Thread::Current()->SpinTick() : 0u,
+                     std::memory_order_relaxed);
+    if (JLib::Thread::Current()) {
+        const int q = JLib::Thread::Current()->qIndex;
+        if (q >= 0 && q < 64) g_landedOn[q].fetch_add(1, std::memory_order_relaxed);
+    }
+    g_bodyEndNs.store(NowNs(), std::memory_order_relaxed);
+}
+
 static void BenchLatency(JLib::TaskScheduler& sched) {
     constexpr int kIters = 20'000;
 
@@ -1126,29 +1166,7 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // and is not where 50 us hides.
         g_bodyStartNs.store(0, std::memory_order_relaxed);
         g_bodyEndNs.store(0, std::memory_order_relaxed);
-        JLib::Task* t = sched.CreateTask(+[](void*) {
-            g_bodyStartNs.store(NowNs(), std::memory_order_relaxed);
-            // Which worker picked this up? Thread::instance is the running worker's own TLS, so
-            // this is ground truth for placement, and it costs one relaxed increment.
-            g_bodyQ.store(JLib::Thread::Current() ? JLib::Thread::Current()->qIndex : -1,
-                          std::memory_order_relaxed);
-            // WHICH CORE the worker was on when it finally ran this. Paired with the waiter's own
-            // core below, this is the witness for "the waiter and the worker were sharing a
-            // timeslice" -- see the note at the report. One KUSER_SHARED_DATA read on Windows.
-            g_bodyCpu.store(JLib::platform::CurrentCpu(), std::memory_order_relaxed);
-            // THIS WORKER'S IDLE-PASS COUNT AT THE MOMENT IT PICKED THE TASK UP. Subtracting the
-            // sample taken before the push gives idle passes across the DISPATCH WINDOW only --
-            // push issued -> body started. Sampling after WaitFor returns instead measures the
-            // whole trip, which includes every pass the worker took AFTER running the body, and a
-            // large number there says nothing at all. The first version of this did that.
-            g_bodyTick.store(JLib::Thread::Current() ? JLib::Thread::Current()->SpinTick() : 0u,
-                             std::memory_order_relaxed);
-            if (JLib::Thread::Current()) {
-                const int q = JLib::Thread::Current()->qIndex;
-                if (q >= 0 && q < 64) g_landedOn[q].fetch_add(1, std::memory_order_relaxed);
-            }
-            g_bodyEndNs.store(NowNs(), std::memory_order_relaxed);
-        }, nullptr);
+        JLib::Task* t = sched.CreateTask(&LatencyProbeBody, nullptr);
         t->waitGroup = &wg;
         const int64_t pushNs = JLib::kLatencyStatsEnabled
             ? std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()
@@ -1900,12 +1918,12 @@ static void BenchFrameDag(JLib::TaskScheduler& sched) {
             JLib::WaitGroup wg;
             wg.n.store(1, std::memory_order_relaxed);
 
-            auto* start = dag.CreateNode(sched.CreateTask(+[](void*) {}, nullptr));
-            auto* update = dag.CreateNode(sched.CreateTask(+[](void*) {}, nullptr));
-            auto* sprites = dag.CreateNode(sched.CreateTask(+[](void*) {}, nullptr));
-            auto* text = dag.CreateNode(sched.CreateTask(+[](void*) {}, nullptr));
-            auto* parts = dag.CreateNode(sched.CreateTask(+[](void*) {}, nullptr));
-            JLib::Task* presentTask = sched.CreateTask(+[](void*) {}, nullptr);
+            auto* start = dag.CreateNode(sched.CreateTask(&EmptyBody, nullptr));
+            auto* update = dag.CreateNode(sched.CreateTask(&EmptyBody, nullptr));
+            auto* sprites = dag.CreateNode(sched.CreateTask(&EmptyBody, nullptr));
+            auto* text = dag.CreateNode(sched.CreateTask(&EmptyBody, nullptr));
+            auto* parts = dag.CreateNode(sched.CreateTask(&EmptyBody, nullptr));
+            JLib::Task* presentTask = sched.CreateTask(&EmptyBody, nullptr);
             presentTask->waitGroup = &wg;
             auto* present = dag.CreateNode(presentTask);
 
@@ -2409,6 +2427,15 @@ static void BenchSplitPref(JLib::TaskScheduler& sched) {
 // PickNextWorker -- gated on `pref == CorePref::Default` -- so it is a CHEAPER push as well as a
 // wider one. On a producer-bound row that alone can be the whole effect. The kernel-wake counts
 // printed beside each arm separate them: unchanged means the win was the skipped placement work.
+// A synthetic per-task workload whose size arrives BY VALUE in the void*. No storage, so no
+// lifetime to get wrong.
+static void BatchWorkBody(void* p) {
+    const int w = (int)(intptr_t)p;
+    double acc = 0;
+    for (int k = 0; k < w; ++k) acc += (double)k * 1.000001;
+    g_sink.store(g_sink.load(std::memory_order_relaxed) + acc, std::memory_order_relaxed);
+}
+
 static void BenchBatchPref(JLib::TaskScheduler& sched) {
     printf("\nbatchpref    : does PushBatch want Wide? ratio = default_ms/wide_ms; >1.00 means Wide wins\n");
     printf("               arms ALTERNATE inside one loop -- the whole-run comparison of this was\n"
@@ -2452,14 +2479,8 @@ static void BenchBatchPref(JLib::TaskScheduler& sched) {
             int made = 0;
             for (int i = 0; i < c.n; ++i) {
                 JLib::Task* t = (c.work == 0)
-                    ? sched.CreateTask(+[](void*) {}, nullptr)
-                    : sched.CreateTask(+[](void* p) {
-                          const int w = (int)(intptr_t)p;
-                          double acc = 0;
-                          for (int k = 0; k < w; ++k) acc += (double)k * 1.000001;
-                          g_sink.store(g_sink.load(std::memory_order_relaxed) + acc,
-                                       std::memory_order_relaxed);
-                      }, (void*)(intptr_t)c.work);
+                    ? sched.CreateTask(&EmptyBody, nullptr)
+                    : sched.CreateTask(&BatchWorkBody, (void*)(intptr_t)c.work);
                 if (!t) return -1.0;
                 t->waitGroup = &wg;
                 chunk[(size_t)made++] = t;
@@ -2532,7 +2553,7 @@ static void SweepRequeueVsPushBatch(JLib::TaskScheduler& sched, const std::vecto
             wg.n.store(n, std::memory_order_relaxed);
             std::vector<JLib::Task*> tasks((size_t)n);
             for (int i = 0; i < n; ++i) {
-                tasks[i] = sched.CreateTask(+[](void*) {}, nullptr);
+                tasks[i] = sched.CreateTask(&EmptyBody, nullptr);
                 tasks[i]->waitGroup = &wg;
             }
             auto t0 = Clock::now();
@@ -2546,7 +2567,7 @@ static void SweepRequeueVsPushBatch(JLib::TaskScheduler& sched, const std::vecto
             wg.n.store(n, std::memory_order_relaxed);
             std::vector<JLib::Task*> tasks((size_t)n);
             for (int i = 0; i < n; ++i) {
-                tasks[i] = sched.CreateTask(+[](void*) {}, nullptr);
+                tasks[i] = sched.CreateTask(&EmptyBody, nullptr);
                 tasks[i]->waitGroup = &wg;
             }
             // minPerSegment=8: sized for THIS caller's batch sizes (<=256), not inherited from
@@ -2621,7 +2642,7 @@ static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
         for (int i = 0; i < kIters; ++i) {
             JLib::WaitGroup wg;
             wg.n.store(1, std::memory_order_relaxed);
-            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr, lane ? JLib::Lane::LowLatency : JLib::Lane::Normal);
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr, lane ? JLib::Lane::LowLatency : JLib::Lane::Normal);
             if (!t) return -1.0;
             t->waitGroup = &wg;
             sched.Push(t);
@@ -2720,14 +2741,46 @@ static void BenchLatencyHotCold(JLib::TaskScheduler& sched) {
 // a name per operation is an unbounded map and a lock convoy that shows up an hour into a run
 // looking exactly like a deadlock. That is what the pool round trip buys, and no latency number
 // here can show it.
+// FILE SCOPE so the named bodies above can see them. Still `static` -- internal linkage is
+// unchanged; only the scope moved, because a named task body cannot see a function local.
+static std::atomic<long long> s_resumeNs{ 0 };
+static std::atomic<JLib::DirectEvent*> s_direct{ nullptr };
+static std::atomic<int> s_armed{ 0 };
+static std::atomic<int> s_done{ 0 };
+
+// The two event-resume bodies. Both record into file-scope statics; the second takes the Event it
+// parks on as its context, which the caller owns for the whole measurement.
+static void DirectResumeBody(void*) {
+    auto& s = JLib::TaskScheduler::Instance();
+    s.WaitOnEventDirectArmed([](JLib::DirectEvent* e) {
+        s_direct.store(e, std::memory_order_release);
+        s_armed.store(1, std::memory_order_release);
+    });
+    s_resumeNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         Clock::now().time_since_epoch()).count(),
+                     std::memory_order_release);
+    s_done.store(1, std::memory_order_release);
+}
+
+static void NamedResumeBody(void* p) {
+    auto& s = JLib::TaskScheduler::Instance();
+    JLib::Event* e = (JLib::Event*)p;
+    s.WaitOnEventArmed(*e, [] { s_armed.fetch_add(1, std::memory_order_release); });
+    // FIRST WAITER TO WAKE WINS THE TIMESTAMP. With N waiters the interesting number is
+    // signal -> first resume; the tail of a SignalAll is a different question and is not what this
+    // row claims to measure.
+    long long expect = 0;
+    s_resumeNs.compare_exchange_strong(
+        expect,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count(),
+        std::memory_order_acq_rel);
+}
+
 static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm) {
     // Signal -> resume, measured inside the resumed task so no cross-thread clock comparison is
     // needed beyond one steady_clock, which is monotonic across threads on every target here.
     static std::atomic<long long> s_signalNs{ 0 };
-    static std::atomic<long long> s_resumeNs{ 0 };
-    static std::atomic<JLib::DirectEvent*> s_direct{ nullptr };
-    static std::atomic<int> s_armed{ 0 };
-    static std::atomic<int> s_done{ 0 };
 
     auto nowNs = [] {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2742,17 +2795,8 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
 
         JLib::WaitGroup wg;
         wg.n.store(1, std::memory_order_relaxed);
-        JLib::Task* t = sched.CreateTask(+[](void*) {
-            auto& s = JLib::TaskScheduler::Instance();
-            s.WaitOnEventDirectArmed([](JLib::DirectEvent* e) {
-                s_direct.store(e, std::memory_order_release);
-                s_armed.store(1, std::memory_order_release);
-            });
-            s_resumeNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 Clock::now().time_since_epoch()).count(),
-                             std::memory_order_release);
-            s_done.store(1, std::memory_order_release);
-        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        JLib::Task* t = sched.CreateTask(&DirectResumeBody, nullptr,
+                                         JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) return -1.0;
         t->waitGroup = &wg;
         sched.Push(t);
@@ -2782,20 +2826,8 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
         JLib::WaitGroup wg;
         wg.n.store(waiters, std::memory_order_relaxed);
         for (int i = 0; i < waiters; ++i) {
-            JLib::Task* t = sched.CreateTask(+[](void* p) {
-                auto& s = JLib::TaskScheduler::Instance();
-                JLib::Event* e = (JLib::Event*)p;
-                s.WaitOnEventArmed(*e, [] { s_armed.fetch_add(1, std::memory_order_release); });
-                // FIRST WAITER TO WAKE WINS THE TIMESTAMP. With N waiters the interesting number is
-                // signal -> first resume; the tail of a SignalAll is a different question and is not
-                // what this row claims to measure.
-                long long expect = 0;
-                s_resumeNs.compare_exchange_strong(
-                    expect,
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        Clock::now().time_since_epoch()).count(),
-                    std::memory_order_acq_rel);
-            }, &ev, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            JLib::Task* t = sched.CreateTask(&NamedResumeBody, &ev,
+                                             JLib::Lane::Normal, JLib::TaskType::Fiber);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_release); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -2897,6 +2929,16 @@ static void BenchEventResume(JLib::TaskScheduler& sched, bool includeSleepingArm
 //
 // MEASURED: completion -> job START, not job end. The body is trivial on purpose; what is being
 // timed is how long a completion waits for a worker to pick it up.
+// File scope, so PipeStartBody can see it -- see the note on the event statics above.
+static std::atomic<long long> s_startNs{ 0 };
+
+// Records only when the body actually started, into a file-scope static.
+static void PipeStartBody(void*) {
+    s_startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch()).count(),
+                    std::memory_order_release);
+}
+
 static void BenchIoPipe(JLib::TaskScheduler& sched) {
     const size_t K = JLib::TaskScheduler::GetHotWorkers();
     // Same rule as latency/hot: what matters is whether a lane push has somewhere to be steered,
@@ -2909,7 +2951,6 @@ static void BenchIoPipe(JLib::TaskScheduler& sched) {
     }
 
     constexpr int kOps = 4'000;
-    static std::atomic<long long> s_startNs{ 0 };
     std::vector<double> lat;
     lat.reserve(kOps);
 
@@ -2921,11 +2962,7 @@ static void BenchIoPipe(JLib::TaskScheduler& sched) {
         for (int i = 0; i < kOps; ++i) {
             JLib::WaitGroup wg;
             wg.n.store(1, std::memory_order_relaxed);
-            JLib::Task* t = sched.CreateTask(+[](void*) {
-                s_startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    Clock::now().time_since_epoch()).count(),
-                                std::memory_order_release);
-            }, nullptr, /*lane*/ JLib::Lane::LowLatency);
+            JLib::Task* t = sched.CreateTask(&PipeStartBody, nullptr, /*lane*/ JLib::Lane::LowLatency);
             if (!t) { continue; }
             t->waitGroup = &wg;
             s_startNs.store(0, std::memory_order_relaxed);
@@ -3016,6 +3053,32 @@ static constexpr size_t kIoOvlWindow = 8;   // > K on every configuration we shi
 // its way into a body. Zero on BOTH under a window this wide would mean neither reachability
 // mechanism ever fired, which is the interesting failure -- it would say the lane is being drained
 // by luck.
+// ONE SLOT PER IN-FLIGHT COMPLETION. The serial row could use a single static because exactly one
+// task existed at a time; with a window that would have every task racing to write the same cell
+// and the latencies would be nonsense. postNs is written by the producer just before its own Push,
+// startNs by the task itself, so the difference is per-completion.
+//
+// AT FILE SCOPE so the named body below can see it -- a task body is a named function here, not a
+// lambda, and a function-local type would be invisible to one.
+struct OverlapSlot {
+    std::atomic<long long> startNs;
+    long long              postNs;
+    unsigned long long     iters;    // this completion's own duration -- see the mix below
+};
+
+// The overlap workload. Its context is one OverlapSlot from an array the caller owns for the whole
+// measurement, so it outlives every completion pointing into it.
+static void OverlapSlotBody(void* p) {
+    OverlapSlot* s = (OverlapSlot*)p;
+    s->startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         Clock::now().time_since_epoch()).count(),
+                     std::memory_order_release);
+    unsigned long long x = 88172645463325252ull;
+    const unsigned long long n = s->iters;
+    for (unsigned long long i = 0; i < n; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
+    g_ioOverlapSink.fetch_add(x, std::memory_order_relaxed);
+}
+
 static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
     const size_t K = JLib::TaskScheduler::GetHotWorkers();
     if (!JLib::TaskScheduler::HiPriLaneActive()
@@ -3026,15 +3089,7 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
 
     constexpr int kOps = 4'000;
 
-    // ONE SLOT PER IN-FLIGHT COMPLETION. The serial row could use a single static because exactly
-    // one task existed at a time; with a window that would have every task racing to write the same
-    // cell and the latencies would be nonsense. postNs is written by the producer just before its
-    // own Push, startNs by the task itself, so the difference is per-completion.
-    struct Slot {
-        std::atomic<long long> startNs;
-        long long              postNs;
-        unsigned long long     iters;    // this completion's own duration -- see the mix below
-    };
+    using Slot = OverlapSlot;    // the type moved to file scope; see OverlapSlotBody above
 
     auto nowNs = [] {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3042,16 +3097,8 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
     };
 
     // The duration is PER TASK now, not a constant in the body. See the mix below.
-    auto body = +[](void* p) {
-        Slot* s = (Slot*)p;
-        s->startNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             Clock::now().time_since_epoch()).count(),
-                         std::memory_order_release);
-        unsigned long long x = 88172645463325252ull;
-        const unsigned long long n = s->iters;
-        for (unsigned long long i = 0; i < n; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; }
-        g_ioOverlapSink.fetch_add(x, std::memory_order_relaxed);
-    };
+    // OverlapSlotBody is the named body; its context is one Slot the caller owns for the whole run.
+    void (*body)(void*) = &OverlapSlotBody;
 
     // ---- WHY THE DURATION VARIES, AND WHY THE FIXED ARM IS STILL RUN ------------------------
     //
@@ -3774,7 +3821,7 @@ int main(int argc, char** argv) {
         JLib::WaitGroup wg;
         wg.n.store(10'000, std::memory_order_relaxed);
         for (int i = 0; i < 10'000; ++i) {
-            JLib::Task* t = sched.CreateTask(+[](void*) {}, nullptr);
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -3840,6 +3887,18 @@ int main(int argc, char** argv) {
 // ---------------------------------------------------------------- 5. recursive fork-join
 static std::atomic<int> fj_pushed{0}, fj_failed{0}, fj_executed{0};
 
+// The fork/join half's fiber body. A NAMED function and an explicit context, like every other task
+// body in the tree -- not a lambda, and not a captureless one, so there is no per-site judgement
+// about which form is safe. A fiber's stack is a place; a closure is a value the worker loop frees
+// when the body returns, and a fiber given one that then parks either resumes into a dead frame or
+// never dies and never returns its row.
+struct ForkCtx { JLib::TaskScheduler* sched; int start; int end; int baseCase; };
+static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end, int BASE_CASE);
+static void ForkBody(void* p) {
+    auto& c = *static_cast<ForkCtx*>(p);
+    RecursiveForkJoinImpl(*c.sched, c.start, c.end, c.baseCase);
+}
+
 static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end, int BASE_CASE) {
     if (end - start <= BASE_CASE) {
         // Leaf: simple compute work
@@ -3854,14 +3913,14 @@ static void RecursiveForkJoinImpl(JLib::TaskScheduler& sched, int start, int end
     int mid = start + (end - start) / 2;
     // TaskType::Fiber is the load-bearing argument: these tasks call WaitFor below, which SUSPENDS,
     // and only a fiber-backed task can suspend. It also makes this the only section of the bench
-    // that exercises a fiber at all -- every other one uses the fn-pointer overload, which
-    // defaults to TaskType::Native.
-    JLib::Task* left = sched.CreateTask([&sched, start, mid, BASE_CASE] {
-        RecursiveForkJoinImpl(sched, start, mid, BASE_CASE);
-    }, JLib::Lane::Normal, JLib::TaskType::Fiber);
-    JLib::Task* right = sched.CreateTask([&sched, mid, end, BASE_CASE] {
-        RecursiveForkJoinImpl(sched, mid, end, BASE_CASE);
-    }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+    // that exercises a fiber at all -- every other one uses the fn-pointer overload.
+    //
+    // THE CONTEXTS ARE LOCALS OF THIS FRAME, which is the recursion level that also does the
+    // WaitFor below -- so they outlive both halves by construction rather than by discipline.
+    ForkCtx lctx{ &sched, start, mid, BASE_CASE };
+    ForkCtx rctx{ &sched, mid,   end, BASE_CASE };
+    JLib::Task* left  = JLibTest::MakeCtxTask(sched, &ForkBody, &lctx);
+    JLib::Task* right = JLibTest::MakeCtxTask(sched, &ForkBody, &rctx);
 
     if (!left || !right) {
         printf("ERROR: CreateTask failed\n");
@@ -3903,6 +3962,7 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
     constexpr int kRuns = 3;
     double best = 1e300;
 
+    ForkCtx octx{ &sched, 0, kN, kBaseCase };
     for (int run = 0; run < kRuns; ++run) {
         fj_pushed.store(0);
         fj_failed.store(0);
@@ -3911,9 +3971,7 @@ static void BenchRecursiveForkJoin(JLib::TaskScheduler& sched) {
 
         // Wrap recursion in a task so it never blocks a main/worker thread
         JLib::WaitGroup wg;
-        JLib::Task* task = sched.CreateTask([&sched, kN, kBaseCase] {
-            RecursiveForkJoinImpl(sched, 0, kN, kBaseCase);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);  // suspends, so it needs a fiber
+        JLib::Task* task = JLibTest::MakeCtxTask(sched, &ForkBody, &octx);  // suspends, so it needs a fiber
 
         // RecursiveForkJoinImpl checks its two CreateTask results; this one never did, so an
         // exhausted allocator surfaced as a write through nullptr instead of a message.

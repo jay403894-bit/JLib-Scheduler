@@ -21,6 +21,7 @@
 // stopped testing anything and should be treated as broken rather than as good news.
 
 #include "TaskScheduler.h"
+#include "fiber_body.h"
 #include "Hazard.h"
 
 
@@ -68,6 +69,43 @@ namespace {
         std::atomic<bool>  readerRan{ false };
     };
 
+    // ---- THE FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXT --------------------------------
+    //
+    // Not lambdas, and not captureless ones either -- one spelling, so there is never a judgement
+    // call at a call site about which kind is safe here.
+    //
+    // A fiber's stack is a PLACE: register state mapped to memory, and the whole runtime exists to
+    // keep it intact across a suspension. A closure is a VALUE the worker loop owns -- the task
+    // frame is freed the instant the body returns. Give a fiber a closure and it either resumes
+    // into a dead frame or never dies and never returns its row, and neither shows up where it was
+    // caused, because SlabPool is append-only and a released slot stays mapped holding its bytes.
+    //
+    // `Shared` is the context and it lives in RunScenario's frame, which outlives the wait.
+    void ReaderBody(void* p) {
+        Shared& s = *static_cast<Shared*>(p);
+        HazardGuard g;
+        Node* n = g.Protect(0, s.head);
+        s.readerPublished.store(true, std::memory_order_release);
+
+        // THE PARK. The gate is held elsewhere, so this fiber suspends here and its worker goes off
+        // to run other things -- including, with worker-owned cells, other guards.
+        s.gate.Lock();
+        s.gate.Unlock();
+
+        // Resumed, possibly on a different worker. Was our node kept alive?
+        s.readerSawAlive.store(n->magic == kAlive, std::memory_order_release);
+        s.readerRan.store(true, std::memory_order_release);
+    }
+
+    // Needs no context: `local` is a fiber-STACK object, which is the storage this design is about.
+    void NoiseBody(void*) {
+        HazardGuard g;
+        Node local{};
+        g.Set(0, &local);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        g.Clear(0);
+    }
+
     // Returns true if the node survived the park.
     bool RunScenario(TaskScheduler& sched, bool forceWorkerCells, bool& outParked) {
         HazardDomain::ForceWorkerCellsForTest(forceWorkerCells);
@@ -87,20 +125,7 @@ namespace {
         // that migrates, so this is the context where cell ownership is load-bearing.
         WaitGroup wgReader;
         wgReader.n.store(1, std::memory_order_relaxed);
-        Task* reader = sched.CreateTask([&s]() {
-            HazardGuard g;
-            Node* n = g.Protect(0, s.head);
-            s.readerPublished.store(true, std::memory_order_release);
-
-            // THE PARK. The gate is held elsewhere, so this fiber suspends here and its worker goes
-            // off to run other things -- including, with worker-owned cells, other guards.
-            s.gate.Lock();
-            s.gate.Unlock();
-
-            // Resumed, possibly on a different worker. Was our node kept alive?
-            s.readerSawAlive.store(n->magic == kAlive, std::memory_order_release);
-            s.readerRan.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, TaskType::Fiber);
+        Task* reader = JLibTest::MakeCtxTask(sched, &ReaderBody, &s);
         reader->waitGroup = &wgReader;
         sched.Push(reader);
 
@@ -116,13 +141,7 @@ namespace {
         WaitGroup noiseWg;
         noiseWg.n.store(64, std::memory_order_relaxed);
         for (int i = 0; i < 64; ++i) {
-            Task* t = sched.CreateTask([]() {
-                HazardGuard g;
-                Node local{};
-                g.Set(0, &local);
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                g.Clear(0);
-            }, JLib::Lane::Normal, TaskType::Fiber);
+            Task* t = JLibTest::MakeCtxTask(sched, &NoiseBody, nullptr);
             t->waitGroup = &noiseWg;
             sched.Push(t);
         }

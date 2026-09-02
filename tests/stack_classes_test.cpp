@@ -61,11 +61,20 @@ static void RecordSelf() {
     g_seenClass.store((int)f->stackClass, std::memory_order_release);
 }
 
+// The task entry. A NAMED function, not a lambda of any kind -- one spelling for every body in
+// the suite. It needs no context: RecordSelf reads the CURRENT fiber, which is the thing under test.
+static void RecordSelfBody(void*) { RecordSelf(); }
+
 static Seen RunOne(TaskScheduler& sched, StackClass want) {
     g_seenSize.store(0); g_seenClass.store(-1);
     WaitGroup wg;
     wg.n.store(1, std::memory_order_relaxed);
-    Task* t = sched.CreateTask([] { RecordSelf(); });
+    // A FIBER TASK, EXPLICITLY -- the raw void(*)(void*) overload. A lambda task is Native, and a
+    // Native task on the floor binds NO FIBER AT ALL, so RecordSelf would report class -2 and
+    // every assertion below would be about a fiber that was never leased. That is exactly how this
+    // file failed when the lambda overload stopped producing fibers: not a wrong class, an absent
+    // one. RecordSelf takes no context, so nullptr is the honest argument.
+    Task* t = sched.CreateTask(&RecordSelfBody, nullptr, Lane::Normal, TaskType::Fiber);
     t->stackClass = want;
     t->waitGroup = &wg;
     sched.Push(t);

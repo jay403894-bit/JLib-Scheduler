@@ -14,6 +14,7 @@
 
 #define NOMINMAX
 #include <TaskScheduler.h>
+#include "fiber_body.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,43 @@ static int failures = 0;
 static void Check(bool ok, const char* what) {
     std::printf("  %-58s %s\n", what, ok ? "ok" : "FAILED");
     if (!ok) ++failures;
+}
+
+// ---- THE REMAINING TASK BODIES ---------------------------------------------------------------
+//
+// One spelling for every body in this file, closures and captureless lambdas alike excluded, so a
+// reader never has to decide which form was safe at a given site. Where a body needs state that
+// lives in a function, it arrives through a context struct the caller declares.
+struct PermitCtx { JLib::SchedulerSemaphore* sem; };
+static void PermitBody(void* p) {
+    JLib::SchedulerSemaphore::ScopedPermit g(*static_cast<PermitCtx*>(p)->sem);
+}
+
+struct CountCtx { std::atomic<int>* n; };
+static void CountBody(void* p) {
+    static_cast<CountCtx*>(p)->n->fetch_add(1, std::memory_order_relaxed);
+}
+
+// The event-park bodies. `armed` selects the self-signalling variant, which catches a release that
+// already landed instead of stranding the fiber -- the same shape the comparison harness uses.
+struct EvCtx {
+    JLib::Event**      ev;
+    std::atomic<int>*  entered;      // optional
+    std::atomic<int>*  finished;
+    std::atomic<bool>* released;     // non-null selects the ARMED wait
+};
+static void EventParkBody(void* p) {
+    auto& c = *static_cast<EvCtx*>(p);
+    JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
+    if (c.entered) c.entered->fetch_add(1, std::memory_order_relaxed);
+    if (c.released) {
+        s.WaitOnEventArmed(**c.ev, [&c] {
+            if (c.released->load(std::memory_order_acquire)) (*c.ev)->SignalAll();
+        });
+    } else {
+        s.WaitOnEvent(**c.ev);
+    }
+    c.finished->fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---- watchdog ---------------------------------------------------------------------------------
@@ -139,9 +177,8 @@ static void TestScopedPermit(JLib::TaskScheduler& sched) {
     // From a FIBER. Ownership is counted for bare threads only, because a fiber can acquire on one
     // worker and resume on another; a fiber must therefore leave the count alone entirely.
     JLib::WaitGroup wg; wg.n.store(1, std::memory_order_relaxed);
-    JLib::Task* t = sched.CreateTask(+[](void*) {
-        JLib::SchedulerSemaphore::ScopedPermit p(sem);
-    }, nullptr);
+    PermitCtx pctx{ &sem };
+    JLib::Task* t = sched.CreateTask(&PermitBody, &pctx);
     t->waitGroup = &wg; sched.Push(t);
     sched.WaitFor(wg);
     Check(sem.Try_Wait(), "permit intact after a task used ScopedPermit");
@@ -277,8 +314,9 @@ static void TestPushBatchSpread(JLib::TaskScheduler& sched) {
     JLib::WaitGroup wg;
     wg.n.store(kTasks, std::memory_order_relaxed);
     std::vector<JLib::Task*> ts(kTasks);
+    CountCtx rctx{ &ran };
     for (int i = 0; i < kTasks; ++i) {
-        ts[i] = sched.CreateTask(+[](void*) { ran.fetch_add(1, std::memory_order_relaxed); }, nullptr);
+        ts[i] = sched.CreateTask(&CountBody, &rctx);
         ts[i]->waitGroup = &wg;
     }
     sched.PushBatch(ts.data(), ts.size());
@@ -321,16 +359,12 @@ static void TestFiberCapOversubscribed(JLib::TaskScheduler& sched) {
 
     JLib::WaitGroup wg;
     wg.n.store(kBlocked, std::memory_order_relaxed);
+    // One context shared by all kBlocked fibers -- nothing varies between them -- and it lives in
+    // this frame, which does the WaitFor below. `released` non-null selects the ARMED wait.
+    EvCtx ectx{ &evp, nullptr, &finished, &released };
     for (int i = 0; i < kBlocked; ++i) {
-        JLib::Task* t = sched.CreateTask(+[](void*) {
-            JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
-            // Armed, so a release that already landed is caught by self-signalling rather than
-            // stranding this fiber -- the same shape the comparison harness uses.
-            s.WaitOnEventArmed(*evp, [] {
-                if (released.load(std::memory_order_acquire)) evp->SignalAll();
-            });
-            finished.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        JLib::Task* t = sched.CreateTask(&EventParkBody, &ectx,
+                                         JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null under fiber pressure"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -384,6 +418,61 @@ static int FiberContentionIters() {
     return 200;
 }
 static const int kFiberContentionIters = FiberContentionIters();
+
+struct ContendCtx {
+    JLib::SchedulerMutex* m;                  // null in the lock-free arm
+    std::atomic<int>* arrived;
+    std::atomic<int>* inside;
+    std::atomic<int>* maxSeen;
+    std::atomic<int>* counter;
+    bool              useLock;
+};
+
+static void ContendBody(void* p) {
+    auto& c = *static_cast<ContendCtx*>(p);
+    // Rendezvous: don't start until BOTH fibers are running, so the loops overlap instead of the
+    // first finishing before the second is scheduled. Bounded so a starved pool degrades to a
+    // weaker test rather than a hang.
+    // Bounded IN TIME, not in yields. A yield-count budget is not portable: a yield costs wildly
+    // different amounts across Windows, Linux and macOS QoS scheduling, so "1,000,000 yields" is a
+    // different timeout on every platform and unbounded on the slowest. A deadline is the same
+    // everywhere.
+    c.arrived->fetch_add(1, std::memory_order_acq_rel);
+    {
+        const auto rvDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (c.arrived->load(std::memory_order_acquire) < 2 &&
+               std::chrono::steady_clock::now() < rvDeadline)
+            std::this_thread::yield();
+    }
+
+    for (int i = 0; i < kFiberContentionIters; ++i) {
+        if (c.useLock) c.m->Lock();
+        const int now = c.inside->fetch_add(1, std::memory_order_acq_rel) + 1;
+
+        // PROBE ONLY: hold the section open until the other fiber is also inside, so overlap is
+        // FORCED rather than hoped for. Without this the window is a few nanoseconds wide and
+        // whether anyone observes it depends on how many cores the machine has -- which is why this
+        // passed 5/5 locally on 32 threads and failed on a 2-vCPU CI runner. Bounded, so a machine
+        // that genuinely cannot run them concurrently falls through instead of hanging.
+        // FIRST ITERATION ONLY. The rendezvous above already proved both fibers are running, so one
+        // held section is enough to observe the overlap -- and bounding it here matters: forcing on
+        // every iteration would make whichever fiber finishes second spin the full budget on each
+        // of its remaining iterations, waiting for a partner that has already exited.
+        if (!c.useLock && i == 0) {
+            const auto ovDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+            while (c.inside->load(std::memory_order_acquire) < 2 &&
+                   std::chrono::steady_clock::now() < ovDeadline)
+                std::this_thread::yield();
+        }
+
+        int prev = c.maxSeen->load(std::memory_order_relaxed);
+        while (now > prev && !c.maxSeen->compare_exchange_weak(prev, now)) {}
+        c.counter->fetch_add(1, std::memory_order_relaxed);
+        c.inside->fetch_sub(1, std::memory_order_acq_rel);
+        if (c.useLock) c.m->Unlock();
+    }
+}
+
 
 // Changing the park policy on a RUNNING pool. The setting has changed identity -- IdlePolicy until
 // 5.0, the awake floor now -- but the risk has not.
@@ -558,7 +647,7 @@ static void TestIdlePolicySwitchUnderLoad(JLib::TaskScheduler& sched) {
         wg.n.store(kPerRound, std::memory_order_relaxed);
         for (int i = 0; i < kPerRound; ++i) {
             JLib::Task* t = sched.CreateTask([&ran] { ran.fetch_add(1, std::memory_order_relaxed); },
-                                             JLib::Lane::Normal, JLib::TaskType::Native);
+                                             JLib::Lane::Normal);
             if (!t) { wg.n.fetch_sub(1, std::memory_order_acq_rel); continue; }
             t->waitGroup = &wg;
             sched.Push(t);
@@ -585,52 +674,11 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
         std::atomic<int> arrived{ 0 }, inside{ 0 }, maxSeen{ 0 }, counter{ 0 };
         JLib::WaitGroup wg;
         wg.n.store(2, std::memory_order_relaxed);
+        // One context for both fibers -- nothing varies between them -- and it lives in this frame,
+        // which does the WaitFor below.
+        ContendCtx ctx{ m, &arrived, &inside, &maxSeen, &counter, useLock };
         for (int t = 0; t < 2; ++t) {
-            JLib::Task* task = sched.CreateTask([&arrived, &inside, &maxSeen, &counter, useLock, m] {
-                // Rendezvous: don't start until BOTH fibers are running, so the loops overlap
-                // instead of the first finishing before the second is scheduled. Bounded so a
-                // starved pool degrades to a weaker test rather than a hang.
-                // Bounded IN TIME, not in yields. A yield-count budget is not portable: a yield
-                // costs wildly different amounts across Windows, Linux and macOS QoS scheduling, so
-                // "1,000,000 yields" is a different timeout on every platform and unbounded on the
-                // slowest. A deadline is the same everywhere.
-                arrived.fetch_add(1, std::memory_order_acq_rel);
-                {
-                    const auto rvDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-                    while (arrived.load(std::memory_order_acquire) < 2 &&
-                           std::chrono::steady_clock::now() < rvDeadline)
-                        std::this_thread::yield();
-                }
-
-                for (int i = 0; i < kFiberContentionIters; ++i) {
-                    if (useLock) m->Lock();
-                    const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
-
-                    // PROBE ONLY: hold the section open until the other fiber is also inside, so
-                    // overlap is FORCED rather than hoped for. Without this the window is a few
-                    // nanoseconds wide and whether anyone observes it depends on how many cores the
-                    // machine has -- which is why this passed 5/5 locally on 32 threads and failed
-                    // on a 2-vCPU CI runner. Bounded, so a machine that genuinely cannot run them
-                    // concurrently falls through instead of hanging.
-                    // FIRST ITERATION ONLY. The rendezvous above already proved both fibers are
-                    // running, so one held section is enough to observe the overlap -- and bounding
-                    // it here matters: forcing on every iteration would make whichever fiber
-                    // finishes second spin the full budget on each of its remaining iterations,
-                    // waiting for a partner that has already exited.
-                    if (!useLock && i == 0) {
-                        const auto ovDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-                        while (inside.load(std::memory_order_acquire) < 2 &&
-                               std::chrono::steady_clock::now() < ovDeadline)
-                            std::this_thread::yield();
-                    }
-
-                    int prev = maxSeen.load(std::memory_order_relaxed);
-                    while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
-                    counter.fetch_add(1, std::memory_order_relaxed);
-                    inside.fetch_sub(1, std::memory_order_acq_rel);
-                    if (useLock) m->Unlock();
-                }
-                }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            JLib::Task* task = JLibTest::MakeCtxTask(sched, &ContendBody, &ctx);
             if (!task) return std::pair<int, int>{ -1, -1 };
             task->waitGroup = &wg;
             sched.Push(task);
@@ -662,9 +710,61 @@ static void TestMutexFiberContention(JLib::TaskScheduler& sched) {
                                            : "never two fiber holders at once (overlap unproven)");
 }
 
-// File scope for the same reason as kFiberContentionIters above: used inside a lambda with an
-// explicit capture list, which MSVC requires to be captured if it is a local.
 static constexpr int kMixedContentionIters = 300;
+
+// ---- FIBER BODIES: NAMED FUNCTIONS, EXPLICIT CONTEXTS ---------------------------------------
+//
+// One spelling for every task body -- not a lambda, and not a captureless one either, so there is
+// never a per-site judgement about which form is safe here. A fiber's stack is a PLACE: register
+// state mapped to memory, kept intact across a suspension. A closure is a VALUE the worker loop
+// frees the instant the body returns. A fiber handed a closure that then parks either resumes into
+// a dead frame or never dies and never returns its row, and because SlabPool is append-only and a
+// released slot stays mapped holding its old bytes, neither shows up where it was caused.
+struct CvCtx {
+    JLib::SchedulerMutex*             m;
+    JLib::SchedulerConditionVariable* cv;
+    bool*                             ready;
+    std::atomic<bool>* inWait;                // optional
+    std::atomic<bool>* heldAfterWake;         // optional
+    std::atomic<bool>* finished;              // optional
+    std::atomic<int>*  parked;                // optional
+    std::atomic<int>*  woke;                  // optional
+};
+static void CvWaitBody(void* p) {
+    auto& c = *static_cast<CvCtx*>(p);
+    c.m->Lock();
+    if (c.inWait) c.inWait->store(true, std::memory_order_release);
+    if (c.parked) c.parked->fetch_add(1, std::memory_order_release);
+    while (!*c.ready) c.cv->Wait(*c.m);    // predicate loop: the only correct way to use Wait
+    // We are back and must own the mutex again. Try_Lock is non-recursive, so it failing here means
+    // it is held -- and main released it before notifying, so the holder can only be us.
+    if (c.heldAfterWake) c.heldAfterWake->store(!c.m->Try_Lock(), std::memory_order_release);
+    c.m->Unlock();
+    if (c.finished) c.finished->store(true, std::memory_order_release);
+    if (c.woke)     c.woke->fetch_add(1, std::memory_order_release);
+}
+
+// The mixed fiber/bare-thread arm. Run BOTH ways -- as a fiber task through MixedBody, and directly
+// on a std::thread through MixedRun -- which is the whole point of that test, so the work itself is
+// factored out and the two entry points are thin.
+struct MixedCtx {
+    JLib::SchedulerMutex* m;
+    std::atomic<int>* inside;
+    std::atomic<int>* maxSeen;
+    std::atomic<int>* done;
+};
+static void MixedRun(MixedCtx& c) {
+    for (int i = 0; i < kMixedContentionIters; ++i) {
+        c.m->Lock();
+        const int now = c.inside->fetch_add(1, std::memory_order_acq_rel) + 1;
+        int prev = c.maxSeen->load(std::memory_order_relaxed);
+        while (now > prev && !c.maxSeen->compare_exchange_weak(prev, now)) {}
+        c.inside->fetch_sub(1, std::memory_order_acq_rel);
+        c.m->Unlock();
+    }
+    c.done->fetch_add(1, std::memory_order_release);
+}
+static void MixedBody(void* p) { MixedRun(*static_cast<MixedCtx*>(p)); }
 
 // ---- 10. Mixed FIBER vs BARE-THREAD contention --------------------------------------------------
 // The two paths have to interoperate on the SAME mutex: a suspending fiber and a spin-helping bare
@@ -678,28 +778,18 @@ static void TestMutexMixedContention(JLib::TaskScheduler& sched) {
     std::atomic<int> maxSeen{ 0 };
     std::atomic<int> done{ 0 };
 
-    auto body = [&m, &inside, &maxSeen, &done]() {
-        for (int i = 0; i < kMixedContentionIters; ++i) {
-            m.Lock();
-            const int now = inside.fetch_add(1, std::memory_order_acq_rel) + 1;
-            int prev = maxSeen.load(std::memory_order_relaxed);
-            while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
-            inside.fetch_sub(1, std::memory_order_acq_rel);
-            m.Unlock();
-        }
-        done.fetch_add(1, std::memory_order_release);
-    };
+    MixedCtx ctx{ &m, &inside, &maxSeen, &done };
 
     JLib::WaitGroup wg;
     wg.n.store(1, std::memory_order_relaxed);
-    // `body` passed directly, as an lvalue. This did not compile until LambdaTask gained a const&
-    // constructor -- see TestCreateTaskAcceptsNamedCallable below, which guards it.
-    JLib::Task* t = sched.CreateTask(body, JLib::Lane::Normal, JLib::TaskType::Fiber);
+    // The SAME work, run two ways: MixedBody on a fiber here, MixedRun on a bare thread below.
+    // `ctx` is a local of this frame, which outlives both.
+    JLib::Task* t = JLibTest::MakeCtxTask(sched, &MixedBody, &ctx);
     if (!t) { Check(false, "CreateTask returned null"); return; }
     t->waitGroup = &wg;
     sched.Push(t);
 
-    std::thread bare(body);          // same body, bare-thread path
+    std::thread bare([&ctx] { MixedRun(ctx); });   // same work, bare-thread path
     bare.join();
     sched.WaitFor(wg);
 
@@ -726,16 +816,8 @@ static void TestConditionVariableFiber(JLib::TaskScheduler& sched) {
 
     JLib::WaitGroup wg;
     wg.n.store(1, std::memory_order_relaxed);
-    JLib::Task* waiter = sched.CreateTask([&] {
-        m.Lock();
-        inWait.store(true, std::memory_order_release);
-        while (!ready) cv.Wait(m);            // predicate loop: the only correct way to use Wait
-        // We are back and must own the mutex again. Try_Lock is non-recursive, so it failing here
-        // means it is held -- and main released it before notifying, so the holder can only be us.
-        heldAfterWake.store(!m.Try_Lock(), std::memory_order_release);
-        m.Unlock();
-        finished.store(true, std::memory_order_release);
-        }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+    CvCtx ctx{ &m, &cv, &ready, &inWait, &heldAfterWake, &finished, nullptr, nullptr };
+    JLib::Task* waiter = JLibTest::MakeCtxTask(sched, &CvWaitBody, &ctx);
     if (!waiter) { Check(false, "CreateTask returned null"); return; }
     waiter->waitGroup = &wg;
     sched.Push(waiter);
@@ -769,14 +851,11 @@ static void TestConditionVariableNotifyAll(JLib::TaskScheduler& sched) {
 
     JLib::WaitGroup wg;
     wg.n.store(kWaiters, std::memory_order_relaxed);
+    // Outside the loop: all kWaiters fibers point at this one body, and it must outlive the
+    // WaitFor below rather than dying at the end of an iteration.
+    CvCtx ctx{ &m, &cv, &ready, nullptr, nullptr, nullptr, &parked, &woke };
     for (int i = 0; i < kWaiters; ++i) {
-        JLib::Task* t = sched.CreateTask([&] {
-            m.Lock();
-            parked.fetch_add(1, std::memory_order_release);
-            while (!ready) cv.Wait(m);
-            m.Unlock();
-            woke.fetch_add(1, std::memory_order_release);
-            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        JLib::Task* t = JLibTest::MakeCtxTask(sched, &CvWaitBody, &ctx);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -896,13 +975,12 @@ static void TestEventSignalOne(JLib::TaskScheduler& sched) {
     constexpr int kN = 8;
     JLib::WaitGroup wg;
     wg.n.store(kN, std::memory_order_relaxed);
+    // Plain wait here (released == nullptr): this arm is about SignalOne waking exactly one, so a
+    // self-signalling armed wait would be the wrong instrument.
+    EvCtx ectx{ &evp, &parked, &woke, nullptr };
     for (int i = 0; i < kN; ++i) {
-        JLib::Task* t = sched.CreateTask(+[](void*) {
-            JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
-            parked.fetch_add(1, std::memory_order_relaxed);
-            s.WaitOnEvent(*evp);
-            woke.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        JLib::Task* t = sched.CreateTask(&EventParkBody, &ectx,
+                                         JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
@@ -946,13 +1024,10 @@ static void TestEventSignalOneConcurrent(JLib::TaskScheduler& sched) {
     constexpr int kN = 16;
     JLib::WaitGroup wg;
     wg.n.store(kN, std::memory_order_relaxed);
+    EvCtx ectx2{ &evp2, &parked2, &woke2, nullptr };
     for (int i = 0; i < kN; ++i) {
-        JLib::Task* t = sched.CreateTask(+[](void*) {
-            JLib::TaskScheduler& s = JLib::TaskScheduler::Instance();
-            parked2.fetch_add(1, std::memory_order_relaxed);
-            s.WaitOnEvent(*evp2);
-            woke2.fetch_add(1, std::memory_order_relaxed);
-        }, nullptr, JLib::Lane::Normal, JLib::TaskType::Fiber);
+        JLib::Task* t = sched.CreateTask(&EventParkBody, &ectx2,
+                                         JLib::Lane::Normal, JLib::TaskType::Fiber);
         if (!t) { Check(false, "CreateTask returned null"); return; }
         t->waitGroup = &wg;
         sched.Push(t);
