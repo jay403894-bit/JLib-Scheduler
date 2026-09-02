@@ -8,6 +8,7 @@
 #include "../include/Event.h"
 #include "../include/TaskDAG.h"   // OnTaskDiscarded: a discarded DAG task still owes its dependents
 #include "../include/FiberRegistry.h"   // registry table is built with the fiber pool
+#include "../include/TokenRegistry.h"   // reader-space cleanup index: built here, drained in Join
 #include "../include/IoReactor.h" // Join() stops the completion threads before clearing the pool
 #include <cstdlib>            // getenv / _dupenv_s -- JLIB_PARK selects the park primitive
 #include <cstring>            // strncpy -- the POSIX arm of the JLIB_WATCHDOG env read. MSVC pulls
@@ -592,6 +593,22 @@ bool TaskScheduler::DiscardIfCancelled(Task* task) {
 
 void TaskScheduler::ProcessMainThread() {
 	if (!poolActive) return;
+
+	// ---- DRAIN POINT 2 of 3: CLEANUP OWED BY THIS THREAD ---------------------------------------
+	//
+	// MAIN AND AN APP'S OWN THREADS ARE HOLDERS TOO, and nothing else can discharge them. A worker
+	// cannot: the release is affine to the thread that owes it. The scheduler cannot preempt an app
+	// thread to make it happen. So the debt is settled where the app already agreed to give us
+	// control, which is here.
+	//
+	// AND THAT IS THE CONTRACT, stated plainly because it is a correctness one rather than a tuning
+	// one: an engine that never calls ProcessMainThread accumulates whatever its own threads owe.
+	// It is a fair ask -- a DAG with main-affinity nodes already requires this call, so anything
+	// organising work through the DAG is polling here every frame regardless.
+	if (const size_t h = TokenRegistry::Instance().CurrentHolder(); h < kMaxHolders)
+		if (TokenRegistry::Instance().HolderHasWork(h))
+			TokenRegistry::Instance().DrainHolder(h);
+
 	Task* t;
 	while (mainQ.pop(t)) {
 		if (!t) continue;
@@ -788,6 +805,19 @@ void TaskScheduler::Join() {
 	for (auto& worker : workers)
 		if (worker && worker->GetThread().joinable())
 			worker->GetThread().join();
+
+	// ---- DRAIN POINT 3 of 3: NOTHING EXITS STILL OWING -----------------------------------------
+	//
+	// AFTER the join, deliberately, and it is the one place "the holder drains its own" is broken on
+	// purpose. Every worker thread is gone, so there is no holder left to run its own release --
+	// and the alternative is not a delayed cleanup, it is a leak with the release never running at
+	// all. HazardDomain documents the same shape at thread exit and counts it (OrphanedRetired):
+	// a bag abandoned at exit is not deferred reclamation.
+	//
+	// SAFE EXACTLY HERE AND NOWHERE ELSE. Doing this while a worker still ran would execute its
+	// thread-affine release on the wrong thread, which is the entire bug the routing exists to
+	// prevent. What makes it legal is that the owner provably no longer exists.
+	TokenRegistry::Instance().DrainAllForTeardown();
 
 	{
 		poolMutex.lock();
@@ -4402,6 +4432,13 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// a visible failure. Built here rather than lazily so the failure cannot be first observed at
 	// the moment a fiber dies owing something.
 	FiberRegistry::Instance().Build(globalPool);
+	// THE READER SPACE, SIZED ONCE BOTH BOUNDS ARE KNOWN. Fibers exist as of the line above and
+	// num_workers is already fixed, so this is the first point where the space can be sized at all.
+	// HazardDomain builds its table under the same constraint and for the same reason.
+	//
+	// NOT LAZY. Build() swaps a vector of atomics, which cannot be resized while a holder is
+	// reading its own chain head -- so it happens here, before any worker exists to read one.
+	TokenRegistry::Instance().Build(standardFiberCount, num_workers);
 	// Raw Thread*: delete before clearing. Normally empty here -- StartPool runs before any worker
 	// exists -- but an Init after a Join finds the leftovers of the previous pool.
 	for (Thread* w : workers) delete w;
@@ -5673,6 +5710,17 @@ bool TaskScheduler::PushResume(size_t worker, Task* task) {
 		s->workers[worker]->NotifyWorker();
 	return true;
 }
+bool TaskScheduler::NotifyHolder(size_t worker) {
+	TaskScheduler* s = instance;
+	// NOT Instance(): that throws, and a cleanup wake racing teardown is an ordinary outcome, not
+	// an exceptional one. The caller gets false and decides.
+	if (!s || !s->poolActive) return false;
+	if (worker >= s->workers.size() || !s->workers[worker]) return false;
+	s->workers[worker]->MarkQueuedWork();
+	s->workers[worker]->NotifyWorker();
+	return true;
+}
+
 bool TaskScheduler::MigratableFibers() { return g_migratableFibers.load(std::memory_order_relaxed); }
 
 // ---- REQUEUE BRANCH TRACE -------------------------------------------------------------------

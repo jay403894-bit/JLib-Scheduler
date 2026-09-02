@@ -7,6 +7,7 @@
 #include "../include/TaskScheduler.h"
 #include "../include/Timer.h"   // MonotonicNs -- lane occupancy stamps
 #include "../include/FiberRegistry.h"   // the fiber-death cleanup chain -- see OnFiberReturned
+#include "../include/TokenRegistry.h"   // drain point 1 of 3: cleanup handed to this worker
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -1316,6 +1317,27 @@ void Thread::Worker() {
 	// exists to clear it -- see TaskScheduler::PickNextWorker.
 	scheduler->SetAwake((size_t)qIndex, true);
 	while (running.load(std::memory_order_acquire)) {
+		// ---- DRAIN POINT 1 of 3: CLEANUP HANDED TO THIS WORKER --------------------------------
+		//
+		// AT THE TOP OF THE PASS, NOT AFTER A TASK COMPLETES, and the difference is the whole test.
+		// This was first written next to the post-task epoch Tick, which reads as the natural
+		// "between tasks" seam and is wrong for the one case that matters: a worker WOKEN PURELY TO
+		// DO CLEANUP has no task to finish, so it never reaches that branch. It wakes, finds nothing
+		// in any queue, and parks again holding the debt. token_drain_live_test caught exactly that
+		// -- 8 tokens delivered to parked workers, 8 wakes, 0 released.
+		//
+		// Here it is the first thing a woken worker does, before it decides there is no work.
+		//
+		// THE GUARD IS AN ACQUIRE LOAD, NOT AN RMW, which matters because this runs every pass on
+		// every worker. Event::SignalAll paid for the other version: it exchanged every word of its
+		// occupied table unconditionally, so waking ONE waiter cost 35 RMWs at 31 workers -- a cost
+		// no test could see, because correctness was unaffected. A worker that owes nothing does not
+		// dirty a line.
+#if !defined(JLIB_TOKENDRAIN_CTL_NO_WORKER_DRAIN)
+		if (TokenRegistry::Instance().HolderHasWork((size_t)qIndex))
+			TokenRegistry::Instance().DrainHolder((size_t)qIndex);
+#endif  // CONTROL: worker never drains its own chain -- the live test's point-1 case must fail.
+
 		// Advertised-queue count for THIS pass, filled by the steal block below and read by the
 		// park decision at the bottom. Pass-scoped rather than loop-scoped: it is a snapshot, and a
 		// stale one would park a worker while work is queued.

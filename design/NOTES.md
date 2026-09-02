@@ -1420,3 +1420,79 @@ THE STAMP IS THE POINT. Two aggregate counters each counted honestly and disagre
 neither could check the other because they never counted the same task. Joining them on ONE task --
 the router stamps where it sent the fiber, the fiber reads it back after it wakes -- is what made
 the disagreement legible instead of just puzzling.
+
+## A per-pass singleton must be LEAKED, not a function-local static
+
+Wiring the TokenRegistry drain into the worker loop crashed **five tests that never touch the
+registry** -- `DagCancelTest` 3/3, plus `MutexCancel`, `IoOptIn`, `ReservedLoPriPlacement` and
+`WaitGroupCancel` intermittently. ACCESS_VIOLATION (0xC0000005) and heap corruption (0xC0000374),
+faulting module `ntdll`. Every one of them passed when run ALONE, and the batch failure set changed
+run to run -- which reads exactly like machine load or an orphaned process, and was neither.
+
+**Cause: static destruction order.** `TokenRegistry::Instance()` was
+
+```cpp
+static TokenRegistry r;   // destroyed at exit, in reverse construction order
+```
+
+and drain point 1 reads it on EVERY pass of EVERY worker. `AtExitDestroyer` calls `Join()` from its
+own destructor, so the registry is destroyed while the workers it serves are still spinning; each
+pass then reads `inbound` through freed storage. The fix is the one the fiber pool already makes:
+
+```cpp
+static TokenRegistry* r = new TokenRegistry();   // leaked on purpose
+```
+
+A process about to stop existing gains nothing from freeing its address space, and everything from
+not pulling a structure out from under threads that are still running.
+
+**`FiberRegistry::Instance()` has the same shape and has not been changed.** It is only touched at
+fiber death rather than every pass, so it is far less likely to be caught in the exit window -- but
+that is a probability argument, not a safety one. Worth fixing the same way.
+
+### How it was localised, which is the reusable part
+
+Not by reading the crash. `ntdll` + a varying failure set + individual passes is a fingerprint for
+"someone else's memory", and the stack pointed nowhere near the cause. What found it was a
+**one-line negative control**: `JLIB_TOKENDRAIN_CTL_NO_WORKER_DRAIN` compiles drain point 1 out. With
+it, all five went green 3/3. That turned "the suite is flaky" into "this exact statement" in one
+build, and the control is worth keeping for the same reason.
+
+## The drain point has to be where a WOKEN worker reaches it
+
+Drain point 1 was first written next to the post-task epoch `Tick()` -- the natural-looking "between
+tasks" seam, and wrong for the only case that matters. **A worker woken purely to do cleanup has no
+task to finish**, so it never reaches that branch: it wakes, finds nothing in any queue, and parks
+again still holding the debt. `token_drain_live_test` caught it immediately -- 8 tokens delivered to
+parked workers, 8 wakes, **0 released**.
+
+It belongs at the TOP OF THE PASS, before the worker decides there is no work.
+
+The guard is `HolderHasWork()`, an acquire LOAD and not an RMW, because it now runs every pass on
+every worker. `Event::SignalAll` paid for the other version: it exchanged every word of its occupied
+table unconditionally, so waking ONE waiter cost 35 RMWs at 31 workers -- invisible to every test,
+because correctness was unaffected.
+
+## Delivery must notify, and why it is not just latency
+
+`TokenRegistry::Deliver` links the token onto the holder's chain -- no task, no queue push -- but the
+WAKE is still mandatory. That chain has exactly one legal consumer, so a parked worker never drains
+it. The cost is not delayed cleanup: **a token cannot be recycled until its chain drains, and the
+token is embedded in the fiber, so a parked creditor holds a fiber out of the pool.** Under pressure
+that is starvation.
+
+Controls, both verified RED: `NO_NOTIFY` -> 8 delivered, 1 released, 7 never ran (the one is a worker
+that happened to be awake, which is why the assertion is on all 8 rather than on "any"). 
+`NO_WORKER_DRAIN` -> 0 of 8 released.
+
+## Harness note: three broken PowerShell harnesses in one session
+
+1. `Start-Process` + `WaitForExit` left `ExitCode` blank, reporting **31 of 31 tests failed**.
+2. A control loop reported all four token-registry controls PASSING; they were fine.
+3. `cmake -DJLIBSCHED_TOKENDRAIN_CTL=$ctl` inside a `foreach` did not expand `$ctl`, so the compiler
+   received the literal `JLIB_TOKENDRAIN_CTL_$ctl=1` and BOTH controls silently ran the unmodified
+   build and "passed". Caught by grepping the generated `.vcxproj` for the define rather than
+   trusting the run.
+
+The pattern is the same every time: a harness that reports the reassuring answer. **When a control
+passes, check that the define reached the compiler before concluding anything about the code.**

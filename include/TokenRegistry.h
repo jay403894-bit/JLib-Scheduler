@@ -114,6 +114,34 @@ namespace JLib {
 		DebtToken* TakeAll(std::size_t holder);
 		bool       HolderHasWork(std::size_t holder) const;
 
+		// Drain `holder`'s whole chain: release what it owes on each token, then advance that
+		// token's chain. Returns how many tokens were handled. MUST BE CALLED BY THE HOLDER ITSELF
+		// -- that is the entire point of routing by holder, and calling it for someone else runs
+		// their thread-affine release on the wrong thread.
+		std::size_t DrainHolder(std::size_t holder);
+
+		// This thread's holder id: its worker's if it is on one, otherwise a lazily-claimed external
+		// id. kMaxHolders when the 64 external slots are gone.
+		//
+		// THE WORKER BRANCH IS NOT CACHED AND THE BARE-THREAD BRANCH IS, and the asymmetry is the
+		// point. A bare thread never migrates, so its id is stable for its whole life -- the same
+		// argument CurrentEpochSlot's thread fallback rests on. A worker's answer is only valid
+		// until the caller suspends, because a fiber resumed elsewhere is on a different thread.
+		//
+		// SO THE CONTRACT IS THE ONE THE EPOCH GUARD ALREADY CARRIES: do not hold this across a
+		// suspend. It is a point read, not a value to keep.
+		std::size_t CurrentHolder();
+
+		// Drain every holder's chain. TEARDOWN ONLY -- it deliberately violates "the holder drains
+		// its own", which is safe exactly once: after Join() has stopped the workers there is no
+		// other thread left to run their releases, and the alternative is exiting still owing.
+		std::size_t DrainAllForTeardown();
+
+		// Where a resource wrapper hooks in. Nothing sets a debt kind yet, so this is unset and the
+		// chain is exercised end to end without pretending a debt exists.
+		using ReleaseFn = void (*)(std::size_t holder, DebtToken* t);
+		void SetRelease(ReleaseFn fn);
+
 		// ---- THE CHAIN -------------------------------------------------------------------------
 		//
 		// ONE HOP. True if the token was delivered to a creditor and the chain continues; false if
@@ -148,6 +176,7 @@ namespace JLib {
 
 		DispatchFn dispatch = nullptr;
 		RecycleFn  recycle  = nullptr;
+		ReleaseFn  release  = nullptr;
 	};
 
 }  // namespace JLib

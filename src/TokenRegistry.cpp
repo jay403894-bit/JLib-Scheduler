@@ -5,14 +5,27 @@
 
 #include "../include/TokenRegistry.h"
 #include "../include/TaskScheduler.h"
+#include "../include/Thread.h"
 
 namespace JLib {
 
 	TokenRegistry& TokenRegistry::Instance() {
-		// Function-local static: constructed on first use, after main has started, so it cannot
-		// race the pool's construction order the way a file-scope object could.
-		static TokenRegistry r;
-		return r;
+		// LEAKED ON PURPOSE, and this is not tidiness -- a plain `static TokenRegistry r;` CRASHES.
+		//
+		// Every worker reads this on every pass of its loop (drain point 1). A function-local static
+		// is destroyed at exit in reverse construction order, and AtExitDestroyer calls Join() from
+		// ITS destructor -- so the registry is destroyed while the workers it serves are still
+		// spinning, and each pass then reads `inbound` through freed storage. The symptom was
+		// ACCESS_VIOLATION and heap corruption inside ntdll, in five tests that never touch this
+		// registry at all: DagCancelTest 3/3, MutexCancel / IoOptIn / ReservedLoPriPlacement /
+		// WaitGroupCancel intermittently. Compiling drain point 1 out made every one of them green,
+		// which is what localised it -- the crash was nowhere near the code that caused it.
+		//
+		// SAME CHOICE THE FIBER POOL MAKES, for the same reason: a process about to stop existing
+		// gains nothing from freeing its address space, and everything from not pulling a structure
+		// out from under threads that are still running.
+		static TokenRegistry* r = new TokenRegistry();
+		return *r;
 	}
 
 	void TokenRegistry::Build(std::size_t fiberCount, std::size_t workerCount) {
@@ -78,7 +91,62 @@ namespace JLib {
 			t->next = head;
 		} while (!inbound[holder].compare_exchange_weak(head, t,
 					std::memory_order_release, std::memory_order_relaxed));
+
+		// PUSH FIRST, NOTIFY SECOND -- see TaskScheduler::NotifyHolder. Without the wake a parked
+		// creditor never drains its chain, and because the token is embedded in the fiber, it holds
+		// that fiber out of the pool for as long as it stays parked. Delayed cleanup would be
+		// tolerable; starving the fiber pool is not.
+		//
+		// WORKERS ONLY. External holders (main, an app's own threads) are not parked by the
+		// scheduler and have no permit to hand -- they poll ProcessMainThread, which is the contract.
+#if !defined(JLIB_TOKENDRAIN_CTL_NO_NOTIFY)
+		if (holder < workers) TaskScheduler::NotifyHolder(holder);
+#endif  // CONTROL: no wake. A parked holder then never drains -- token_drain_live_test must hang out.
 		return true;
+	}
+
+	std::size_t TokenRegistry::DrainHolder(std::size_t holder) {
+		DebtToken* t = TakeAll(holder);
+		std::size_t n = 0;
+		while (t) {
+			// READ `next` BEFORE ADVANCING. AdvanceCleanup may deliver this same token onto another
+			// holder's chain, which overwrites `next` -- so the walk has to capture its successor
+			// first or it follows the token into someone else's list.
+			DebtToken* nxt = t->next;
+			t->next = nullptr;
+			// RELEASE WHAT THIS HOLDER OWES, then hand on. The release hook is where a resource
+			// wrapper will live; there is none yet, so today this is the identity and the chain is
+			// exercised end to end without pretending a debt exists.
+			if (release) release(holder, t);
+			AdvanceCleanup(t);
+			++n;
+			t = nxt;
+		}
+		return n;
+	}
+
+	void TokenRegistry::SetRelease(ReleaseFn fn) { release = fn; }
+
+	std::size_t TokenRegistry::CurrentHolder() {
+		// See the header for why one branch caches and the other must not.
+		if (Thread* w = Thread::Current()) {
+			const std::size_t h = HolderOfWorker((std::size_t)w->qIndex);
+			if (h < workers) return h;
+			// A Thread that is not one of our workers (a bound main thread) falls through to the
+			// external path rather than indexing past the worker range.
+		}
+		thread_local std::size_t mine = kMaxHolders;
+		if (mine == kMaxHolders) {
+			const std::size_t r = ClaimExternal();
+			mine = (r == kNoReader) ? kMaxHolders : HolderOfReader(r);
+		}
+		return mine;
+	}
+
+	std::size_t TokenRegistry::DrainAllForTeardown() {
+		std::size_t n = 0;
+		for (std::size_t h = 0; h < inbound.size(); ++h) n += DrainHolder(h);
+		return n;
 	}
 
 	DebtToken* TokenRegistry::TakeAll(std::size_t holder) {

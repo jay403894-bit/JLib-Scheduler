@@ -2478,6 +2478,23 @@ namespace JLib {
 		// is the only one positioned to retry or report.
 		static bool PushResume(size_t worker, Task* task);
 
+		// WAKE A WORKER THAT HAS BEEN HANDED CLEANUP, with nothing to push.
+		//
+		// TokenRegistry::Deliver links the token onto the holder's own chain -- there is no task and
+		// no queue push -- but the WAKE is still required, and for the same reason PushResume does
+		// it: that chain has exactly one legal consumer, so a parked worker with tokens on it never
+		// drains them. The cost is not just delayed cleanup. A token cannot be recycled until its
+		// chain drains, and a token is embedded in the fiber, so a parked creditor holds a fiber out
+		// of the pool. Under pressure that is starvation, not latency.
+		//
+		// PUSH FIRST, NOTIFY SECOND at every call site -- the reverse loses the wake outright, since
+		// the target can observe an empty chain, eat its permit and park with the token arriving
+		// just behind it. Same lost-wake shape as the band-skip fix.
+		//
+		// Returns false if the pool is down or `worker` is out of range; external holders (main, an
+		// app's own threads) are not workers and are never notified -- they poll ProcessMainThread.
+		static bool NotifyHolder(size_t worker);
+
 		GlobalFiberPool& GetGlobalPool();
 		// NAMED events are for a BOUNDED, STATIC set of rendezvous points -- "physics_done",
 		// "level_loaded", the handful of names your app knows at compile time. The registry is

@@ -1076,6 +1076,20 @@ if(JLIBSCHED_TOKENREG_CTL)
   message(STATUS "JLib::Scheduler: token registry NEGATIVE CONTROL ${JLIBSCHED_TOKENREG_CTL} -- the test MUST fail")
 endif()
 
+# THE THREE DRAIN POINTS, AGAINST A LIVE POOL. token_registry_test proves the structure; this proves
+# the WIRING -- that a token delivered to holder N is released BY WORKER N, that a parked worker is
+# woken to do it, and that main and Join() settle what no worker can. Every assertion is about WHICH
+# THREAD ran the release, because a test that only counted releases would pass with the routing gone.
+#   cmake -S . -B build-ctl -DJLIBSCHED_TOKENDRAIN_CTL=NO_NOTIFY   # the parked case MUST time out
+add_executable(SchedulerTokenDrainLiveTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/token_drain_live_test.cpp")
+target_link_libraries(SchedulerTokenDrainLiveTest PRIVATE Scheduler)
+target_compile_features(SchedulerTokenDrainLiveTest PRIVATE cxx_std_17)
+if(JLIBSCHED_TOKENDRAIN_CTL)
+  # PUBLIC: the control lives in the LIBRARY's Deliver, so it has to reach Scheduler's own compile.
+  target_compile_definitions(Scheduler PUBLIC JLIB_TOKENDRAIN_CTL_${JLIBSCHED_TOKENDRAIN_CTL}=1)
+  message(STATUS "JLib::Scheduler: token drain NEGATIVE CONTROL ${JLIBSCHED_TOKENDRAIN_CTL} -- the test MUST fail")
+endif()
+
 # THREAD LAYOUT: how many cache lines one Push touches on the consumer's Thread. Prints the offsets
 # rather than reasoning about them from source order -- see the test header.
 add_executable(SchedulerThreadLayoutTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/thread_layout_test.cpp")
