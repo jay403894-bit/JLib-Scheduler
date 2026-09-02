@@ -327,6 +327,52 @@ namespace JLib {
 	// queues one sweep per death, each walking every participant to free what the first already
 	// freed. The task clears the flag on its way out, so the next death after a sweep completes may
 	// queue another.
+	// ---- FIBER-LOCAL SLOT ALLOCATION ---------------------------------------------------------
+	//
+	// ONE-SHOT AND NEVER RELEASED, which is a decision rather than an omission. Releasing a slot
+	// while any fiber still holds a value in it would hand that value to whoever allocated the same
+	// index next -- a use-after-free with the shape of a working program, since the pointer is live
+	// and the type is wrong. Slots are cheap (kLocalSlots of them, allocated at startup) and the
+	// pattern they exist for is a fixed set of well-known values, so nothing needs to give one back.
+	static std::atomic<uint16_t> g_nextFlsSlot{ 0 };
+
+	uint16_t FiberRegistry::FlsAlloc() noexcept {
+		const uint16_t s = g_nextFlsSlot.fetch_add(1, std::memory_order_relaxed);
+		// CHECKED, NOT ASSERTED. A library that runs out of slots should degrade -- every get()
+		// returns null and the caller's own null handling takes over -- rather than take down a
+		// process for a resource it could have done without.
+		if (s >= (uint16_t)Fiber::kLocalSlots) return kNoSlot;
+		return s;
+	}
+
+	void* FiberRegistry::FlsGet(uint16_t slot) noexcept {
+		if (slot >= (uint16_t)Fiber::kLocalSlots) return nullptr;   // kNoSlot included
+		Thread* t = Thread::GetCurrent();
+		Fiber*  f = t ? t->currentFiber : nullptr;
+		// NULL OFF A FIBER. A Native task and a bare thread have none, which is a legitimate state
+		// for library code that may run in either context -- so it answers rather than asserting.
+		return f ? f->local[slot] : nullptr;
+	}
+
+	void FiberRegistry::FlsSet(uint16_t slot, void* p) noexcept {
+		if (slot >= (uint16_t)Fiber::kLocalSlots) return;
+		Thread* t = Thread::GetCurrent();
+		if (Fiber* f = (t ? t->currentFiber : nullptr)) f->local[slot] = p;
+		// SILENTLY DROPPED off a fiber, and that asymmetry with get() is deliberate: a get can
+		// report "nothing here" honestly, but there is nowhere to PUT a value, and the caller
+		// storing one has already decided it is running on a fiber. Making this loud would fire on
+		// legitimate library code that stores opportunistically.
+	}
+
+	size_t FiberRegistry::GetID(const Fiber* f) noexcept {
+		return f ? f->poolIndex : SIZE_MAX;
+	}
+
+	size_t FiberRegistry::GetID() noexcept {
+		Thread* t = Thread::GetCurrent();
+		return GetID(t ? t->currentFiber : nullptr);
+	}
+
 	static std::atomic<bool> g_reclaimQueued{ false };
 
 	// ---- THE THIRD RECLAMATION DOMAIN: user memory owed by dead fibers ------------------------

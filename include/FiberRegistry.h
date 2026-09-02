@@ -206,6 +206,39 @@ namespace JLib {
 		// no registry state: it reaches the scheduler and the two reclamation domains directly.
 		static void QueueReclaim();
 
+		// ---- FIBER-LOCAL STORAGE: the replacement for thread_local -----------------------------
+		//
+		// TWO DIFFERENT INDICES, and keeping them apart is the whole reason this reads clearly:
+		//
+		//   THE FIBER ID   Fiber::poolIndex -- "the identity every table names". One per fiber,
+		//                  stable for the fiber's life in the pool, and what GetID returns.
+		//   AN FLS SLOT    a KIND of value, the same index on every fiber. FlsAlloc hands these out.
+		//
+		// Together they address fiber[id].local[slot]. Calling both "the id" would make
+		// `FlsGet(slot)` look like it takes a fiber, which it does not -- it always means the
+		// CURRENT fiber, because that is the only one the caller is inside.
+		//
+		// WHY THIS EXISTS AT ALL: migratable fibers resume on whichever worker is free, so a
+		// thread_local read before a suspension point is not the same object after it -- silently,
+		// because you get the resuming worker's copy. This is attached to the fiber, which is the
+		// thing that actually survives the wait.
+		//
+		// FlsAlloc IS PROCESS-WIDE AND ONE-SHOT. Call it once at startup and keep the result; it
+		// never releases a slot, because releasing one while a fiber still holds a value in it
+		// would hand that value to the next caller who allocated the same index. There are
+		// Fiber::kLocalSlots of them and kNoSlot comes back when they are gone -- checked, not
+		// asserted, so a library that runs out degrades instead of taking the process down.
+		static constexpr uint16_t kNoSlot = 0xFFFF;
+
+		static uint16_t FlsAlloc() noexcept;
+		static void*    FlsGet(uint16_t slot) noexcept;
+		static void     FlsSet(uint16_t slot, void* p) noexcept;
+
+		// The registry's identity for a fiber. SIZE_MAX when there is none -- off a fiber, or a
+		// fiber the pool never registered.
+		static size_t GetID(const Fiber* f) noexcept;
+		static size_t GetID() noexcept;          // the fiber this call is running on
+
 		// ---- WHO FREES A FIBER-LOCAL SLOT, IF ANYONE ------------------------------------------
 		//
 		// A slot is a `void*`. The library has no type for it, so by default it CLEARS one on
@@ -285,5 +318,40 @@ namespace JLib {
 		DispatchFn dispatch = nullptr;
 		RecycleFn  recycle  = nullptr;
 	};
+
+	// ---- FiberLocal<T>: the typed face of the slots -------------------------------------------
+	//
+	// Use this where you would have used `thread_local` for anything that must survive a suspend.
+	//
+	//     static JLib::FiberLocal<Scratch> g_scratch = JLib::MakeFiberLocal<Scratch>();
+	//     ...
+	//     g_scratch.set(scratch);          // inside a fiber
+	//     g_scratch->Reset();              // later, possibly on a DIFFERENT worker -- still yours
+	//
+	// A POINTER, NOT A VALUE, and deliberately: the slot is one `void*`, so this hands out what you
+	// put in it and never constructs or destroys anything. Ownership stays yours -- pair it with
+	// TaskScheduler::DeleteOnFiberDeath, or with a FiberRegistry slot deleter, if you want the
+	// object released when the fiber dies.
+	//
+	// NULL IS THE HONEST ANSWER OFF A FIBER, not a crash. A Native task and a bare thread have no
+	// fiber-local storage at all, and library code that may run in either context has to be able to
+	// ask rather than assume. `operator->` on a null get() is the caller's bug, exactly as it is
+	// for any other pointer -- this does not paper over it with a dummy object.
+	template <typename T>
+	struct FiberLocal {
+		uint16_t slot = FiberRegistry::kNoSlot;
+
+		T*   get() const noexcept       { return static_cast<T*>(FiberRegistry::FlsGet(slot)); }
+		void set(T* p) const noexcept   { FiberRegistry::FlsSet(slot, p); }
+		T*   operator->() const noexcept { return get(); }
+		explicit operator bool() const noexcept { return get() != nullptr; }
+	};
+
+	// Allocates the slot. Call ONCE, at startup, and keep the result -- see FlsAlloc for why slots
+	// are never released. Returning the wrapper by value keeps the declaration a one-liner.
+	template <typename T>
+	inline FiberLocal<T> MakeFiberLocal() noexcept {
+		return FiberLocal<T>{ FiberRegistry::FlsAlloc() };
+	}
 
 }

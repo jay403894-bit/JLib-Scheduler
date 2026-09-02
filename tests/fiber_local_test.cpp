@@ -256,6 +256,81 @@ int main() {
         reg.SetSlotDeleter(kOwning, nullptr);   // withdraw before the pool tears down
     }
 
+    // ---- ARM 5: FiberLocal<T> AND GetID(), THE TYPED FACE ----------------------------------
+    //
+    // The raw slot API is what the library uses; this is what an application would. The test that
+    // matters is the same one as arm 1 -- a value set before a suspend must still be there after,
+    // wherever it resumed -- because that is the entire reason to prefer this over thread_local.
+    //
+    // GetID IS CHECKED FOR STABILITY ACROSS THE SUSPEND, not just for being non-null. A fiber's
+    // registry identity is what every table indexes by, so an id that changed under a migration
+    // would silently mis-address the cleanup chain and the hazard cells both.
+    {
+        struct Scratch { int magic; };
+        static JLib::FiberLocal<Scratch> tls = JLib::MakeFiberLocal<Scratch>();
+        Check(tls.slot != JLib::FiberRegistry::kNoSlot, "FlsAlloc handed out a slot");
+
+        // A SECOND ALLOCATION MUST DIFFER. One counter handing the same index to two callers is the
+        // failure that would make two unrelated subsystems silently share storage.
+        auto other = JLib::MakeFiberLocal<Scratch>();
+        Check(other.slot != tls.slot, "a second FlsAlloc returned a DIFFERENT slot");
+
+        constexpr int kN = 48;
+        std::vector<Scratch> objs(kN);
+        std::vector<int>  idBefore(kN, -1), idAfter(kN, -1);
+        std::vector<int>  wBefore(kN, -1),  wAfter(kN, -1);
+        std::vector<int>  gotMagic(kN, -1);
+        std::atomic<int> started{ 0 }, done{ 0 };
+        JLib::Event& gate2 = sched.GetEvent("fiber_local_typed_gate");
+
+        for (int i = 0; i < kN; ++i) {
+            objs[i].magic = 0x5A00 + i;
+            auto* t = sched.CreateTask([i, &objs, &idBefore, &idAfter, &wBefore, &wAfter,
+                                        &gotMagic, &gate2, &started, &done] {
+                JLib::Thread* th = JLib::Thread::GetCurrent();
+                wBefore[i]  = th ? th->qIndex : -1;
+                idBefore[i] = (int)JLib::FiberRegistry::GetID();
+
+                tls.set(&objs[i]);
+                started.fetch_add(1, std::memory_order_release);
+                JLib::TaskScheduler::Instance().WaitOnEvent(gate2);
+
+                JLib::Thread* th2 = JLib::Thread::GetCurrent();
+                wAfter[i]  = th2 ? th2->qIndex : -1;
+                idAfter[i] = (int)JLib::FiberRegistry::GetID();
+                gotMagic[i] = tls ? tls->magic : -1;    // operator bool + operator->
+                done.fetch_add(1, std::memory_order_release);
+            }, JLib::Lane::Normal, JLib::TaskType::Fiber);
+            if (t) sched.Push(t);
+        }
+
+        const auto d5 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (started.load(std::memory_order_acquire) < kN
+               && std::chrono::steady_clock::now() < d5)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        gate2.SignalAll();
+        const auto d6 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (done.load(std::memory_order_acquire) < kN
+               && std::chrono::steady_clock::now() < d6)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        int moved = 0, held = 0, idStable = 0, idValid = 0;
+        for (int i = 0; i < kN; ++i) {
+            if (wBefore[i] != wAfter[i]) ++moved;
+            if (gotMagic[i] == 0x5A00 + i) ++held;
+            if (idBefore[i] >= 0) ++idValid;
+            if (idBefore[i] == idAfter[i]) ++idStable;
+        }
+        std::printf("  typed: %d/%d migrated, %d held their value, ids valid %d stable %d\n",
+                    moved, kN, held, idValid, idStable);
+
+        Check(done.load(std::memory_order_acquire) == kN, "every typed-FLS task finished");
+        Check(idValid == kN, "GetID() returned a real id on every fiber");
+        Check(held == kN, "FiberLocal<T> held its value across the suspend, migrated or not");
+        Check(idStable == kN, "and GetID() was STABLE across the suspend (tables index by it)");
+        Check(moved > 0, "at least one migrated (else this arm repeats arm 3, not arm 1)");
+    }
+
     // ---- OFF A FIBER: answerable, not fatal ------------------------------------------------
     Check(!JLib::TaskScheduler::HasFiberLocal(), "main reports NO fiber-local storage");
     Check(JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) == nullptr,
