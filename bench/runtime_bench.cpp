@@ -490,10 +490,11 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
 
     std::printf("  workload length is SWEPT -- see the note above for why one length cannot answer\n"
                 "  the question. Each row is floor=0 against a pool-wide floor at that length.\n\n");
-    std::printf("  %-20s %12s %12s %10s %14s %10s\n",
-                "length", "parked", "wide+yield", "tax", "wide,NO yield", "tax");
+    std::printf("  %-18s %9s %9s %8s %9s %8s %9s %8s\n",
+                "length", "parked", "wide 1/8", "tax", "wide none", "tax", "wide every", "tax");
+    std::printf("  (yield cadence per idle pass: 1/8 = the default, none, every)\n");
 
-    double taxAtShortest = 0.0, taxAtLongest = 0.0, taxNoYieldLong = 0.0;
+    double taxAtShortest = 0.0, taxAtLongest = 0.0, taxNoYieldLong = 0.0, taxAllYieldLong = 0.0;
 
     // ---- THE THIRD ARM: A WIDE FLOOR THAT DOES NOT YIELD --------------------------------------
     //
@@ -518,12 +519,29 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
     // FALSIFIABLE, WHICH IS THE POINT: if the tax collapses toward the historical +3.5% here, the
     // gap was the yield and there was never a discrepancy. If it does NOT collapse, this whole
     // explanation is wrong and the search reopens. The row is printed either way.
-    const size_t yieldMinEntry = JLib::TaskScheduler::GetYieldFloorMin();
-    const size_t kNoYield      = wideFloor + 1;   // above the pool: nobody is "big enough to yield"
+    // ---- AND A FIFTH ARM, BRACKETING THE YIELD FROM THE OTHER SIDE ---------------------------
+    //
+    // Arm 4 removed the yield and nothing happened, which is evidence in ONE direction. This arm
+    // takes it the other way: SetSpinYieldMask(0) makes a floor worker yield on EVERY idle pass
+    // instead of one in eight (the default mask is 7).
+    //
+    // THE PREDICTION BEING TESTED: that the tax is CORE OCCUPANCY and yielding cannot relieve it,
+    // because std::this_thread::yield() with nothing else ready returns immediately -- with 31
+    // spinning workers and one busy main thread on 32 logical cores, everybody already has a core
+    // and there is nothing to yield TO. The thread keeps its core, keeps it clocked, and the
+    // package stays in a low all-core boost bin.
+    //
+    // If that is right, yielding eight times as often changes nothing either, and the tax is
+    // bracketed from both sides. If the tax FALLS, the occupancy story is wrong and the yield
+    // cadence is a real lever that was left at the wrong setting -- which would be worth knowing.
+    const size_t   yieldMinEntry = JLib::TaskScheduler::GetYieldFloorMin();
+    const unsigned maskEntry     = JLib::TaskScheduler::GetSpinYieldMask();
+    const size_t   kNoYield      = wideFloor + 1;   // above the pool: nobody is "big enough to yield"
 
     for (const Len& L : lengths) {
-        Samples p, w, wq;
-        auto sample = [&](size_t f, size_t yieldMin, Samples& out) {
+        Samples p, w, wq, wy;
+        auto sample = [&](size_t f, size_t yieldMin, unsigned mask, Samples& out) {
+            JLib::TaskScheduler::SetSpinYieldMask(mask);
             // THE TRANSITION IS NOT THE TAX. SetAwakeFloor(N) promotes and WAKES N parked workers,
             // which at ~5 us a wake is real work landing inside the sample -- and asymmetrically,
             // since floor=0 wakes nobody. A discarded pass absorbs it, leaving the recorded one
@@ -533,29 +551,35 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
             (void)workload(L.passes);
             out.add(workload(L.passes));
         };
-        for (int r = 0; r < reps; ++r) {
-            // THREE ARMS, ROTATED, so no arm is always the one that follows a drift.
-            switch (r % 3) {
-                case 0: sample(0, yieldMinEntry, p);
-                        sample(wideFloor, yieldMinEntry, w);
-                        sample(wideFloor, kNoYield, wq); break;
-                case 1: sample(wideFloor, yieldMinEntry, w);
-                        sample(wideFloor, kNoYield, wq);
-                        sample(0, yieldMinEntry, p); break;
-                default: sample(wideFloor, kNoYield, wq);
-                        sample(0, yieldMinEntry, p);
-                        sample(wideFloor, yieldMinEntry, w); break;
+        // FOUR ARMS, ROTATED, so no arm is always the one that follows a drift. A fixed order over
+        // four is worse than over two: the last arm inherits three arms' worth of ramp.
+        //
+        //   p  = parked          floor 0
+        //   w  = wide + yield    floor N, default cadence (mask 7 -- one pass in eight)
+        //   wq = wide, NO yield  floor N, threshold above the pool -> CpuRelax only
+        //   wy = wide, yield ALL floor N, mask 0 -> a yield on every idle pass
+        auto arm = [&](int which) {
+            switch (which) {
+                case 0: sample(0,         yieldMinEntry, maskEntry, p);  break;
+                case 1: sample(wideFloor, yieldMinEntry, maskEntry, w);  break;
+                case 2: sample(wideFloor, kNoYield,      maskEntry, wq); break;
+                default: sample(wideFloor, yieldMinEntry, 0u,       wy); break;
             }
-        }
+        };
+        for (int r = 0; r < reps; ++r)
+            for (int i = 0; i < 4; ++i) arm((r + i) % 4);
         const double tax   = p.median() > 0.0 ? 100.0 * (w.median()  - p.median()) / p.median() : 0.0;
         const double taxNY = p.median() > 0.0 ? 100.0 * (wq.median() - p.median()) / p.median() : 0.0;
-        std::printf("  %-20s %10.2f us %10.2f us %+9.2f %%  %10.2f us %+9.2f %%\n",
-                    L.name, p.median(), w.median(), tax, wq.median(), taxNY);
+        const double taxAY = p.median() > 0.0 ? 100.0 * (wy.median() - p.median()) / p.median() : 0.0;
+        std::printf("  %-18s %9.1f %9.1f %+7.2f%% %9.1f %+7.2f%% %9.1f %+7.2f%%\n",
+                    L.name, p.median(), w.median(), tax, wq.median(), taxNY, wy.median(), taxAY);
         if (&L == &lengths[0]) taxAtShortest = tax;
-        taxAtLongest   = tax;
-        taxNoYieldLong = taxNY;
+        taxAtLongest    = tax;
+        taxNoYieldLong  = taxNY;
+        taxAllYieldLong = taxAY;
     }
-    JLib::TaskScheduler::SetYieldFloorMin(yieldMinEntry);   // restore, always
+    JLib::TaskScheduler::SetYieldFloorMin(yieldMinEntry);
+    JLib::TaskScheduler::SetSpinYieldMask(maskEntry);        // restore BOTH, always
 
     // ---- AND THE SHIPPED FLOOR, WHICH IS THE ONLY ROW THAT IS A CLAIM ABOUT THE DEFAULT ----
     {
@@ -595,20 +619,31 @@ static void BenchIdleTax(JLib::TaskScheduler& sched, int reps) {
     else
         std::printf("  Length is NOT the explanation: the tax barely moves across 0.4 ms to 15 ms.\n");
 
-    // AND THE ONE THAT MATTERS: DID REMOVING THE YIELD CLOSE THE GAP?
-    if (taxNoYieldLong < taxAtLongest * 0.5)
-        std::printf("\n  REMOVING THE YIELD COLLAPSES THE TAX. A wide floor and NoSleep were never the\n"
-                    "  same mechanism: above kYieldFloorMinDefault a floor worker calls\n"
-                    "  std::this_thread::yield() every idle pass -- SwitchToThread on Windows, which\n"
-                    "  hands its core to another ready thread -- plus two CAS operations. NoSleep did\n"
-                    "  none of that; it spun. So there was never a discrepancy to reconcile, and the\n"
-                    "  historical +3.5%% describes the CpuRelax path this row now measures.\n"
-                    "  The yield is still CORRECT for a large floor -- it exists so a big spinning set\n"
-                    "  cannot pin the machine -- it is simply not what NoSleep was.\n");
+    // ---- THE YIELD, BRACKETED FROM BOTH SIDES ------------------------------------------------
+    //
+    // Three cadences at the frame length: none, the default one-in-eight, and every pass. If the
+    // tax is CORE OCCUPANCY then none of them should matter, because a yield with nothing else
+    // ready returns immediately -- the thread keeps its core either way and the package stays in
+    // the same all-core boost bin. If any of them moves the number, the cadence is a real lever.
+    std::printf("\n  YIELD CADENCE, at the frame length: none %+.2f%%   1/8 %+.2f%%   every %+.2f%%\n",
+                taxNoYieldLong, taxAtLongest, taxAllYieldLong);
+
+    const double loCad = std::min(std::min(taxNoYieldLong, taxAtLongest), taxAllYieldLong);
+    const double hiCad = std::max(std::max(taxNoYieldLong, taxAtLongest), taxAllYieldLong);
+    const bool   flat  = (taxAtLongest > 0.0) && ((hiCad - loCad) < taxAtLongest * 0.25);
+
+    if (flat)
+        std::printf("  FLAT ACROSS ALL THREE, which brackets it: the yield cadence is not the lever.\n"
+                    "  That is what core occupancy predicts -- a yield with nothing else ready gives\n"
+                    "  nothing away, since every worker already has a core and the main thread is the\n"
+                    "  only other runnable. So the cost is the cores being HELD and clocked, not the\n"
+                    "  scheduling around them, and no cheaper spin recovers it.\n"
+                    "  It also means a wide floor is NOT distinguishable from NoSleep by its yield,\n"
+                    "  so the historical +3.5%% remains unexplained and unreproduced. Do not quote it.\n");
     else
-        std::printf("\n  Removing the yield does NOT collapse the tax, so the yield is not the\n"
-                    "  difference either. Both explanations offered for the gap are now dead and the\n"
-                    "  search reopens -- do not let the tidy story survive the measurement.\n");
+        std::printf("  THE CADENCE MOVES THE TAX (%.2f%% spread), so it IS a lever and the occupancy\n"
+                    "  explanation is incomplete. Whichever end is cheapest is worth understanding\n"
+                    "  before the default of one-in-eight is treated as settled.\n", hiCad - loCad);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -2447,3 +2447,31 @@ runtime fails to hit. Do not quote it again without re-deriving it.
 UNCHANGED, AND STILL THE ONLY IDLE-TAX NUMBER THE README CARRIES: the shipped floor of 2 sits on the
 CpuRelax path by design (kYieldFloorMinDefault = 4) and measures -0.05% to +0.13% -- indistinguishable
 from a fully parked pool at every length and under both noise conditions.
+
+## Idle tax: bracketed from both sides -- it is core occupancy (2026-09-02)
+
+Fifth arm added at Jay's suggestion: a wide floor yielding on EVERY idle pass (SetSpinYieldMask(0))
+against the default one-in-eight and against none at all. Three cadences, one length.
+
+    frame (~15 ms):   none +29.84%     1/8 +24.80%     every +26.60%
+
+NO ORDERING AND NO TREND. Eight times more yielding does not cost more; none does not cost less. The
+cadence is not a lever, and the tax is now bracketed from BOTH directions rather than inferred from
+one.
+
+THE MECHANISM THAT PREDICTS THIS: std::this_thread::yield() with nothing else ready RETURNS
+IMMEDIATELY. With 31 spinning workers and one busy main thread on 32 logical cores, every worker
+already has a core and the main thread is the only other runnable -- so there is nothing to yield TO.
+The thread keeps its core, keeps it clocked, and the package stays in the same all-core boost bin.
+The cost is the cores being HELD, not the scheduling around them, and no cheaper spin recovers it.
+That is consistent with the historical finding that a pure CpuRelax control pool reproduced almost
+all of the tax and that cheapening the spin had a measured ceiling of 0.8%.
+
+FOUR EXPLANATIONS TESTED: workload length (flat), machine noise (unchanged), yield removed
+(unchanged), yield maximised (unchanged). The +20% is core occupancy on this hardware and is now the
+best-supported number in the file.
+
+AND MY MECHANISM STORY WAS WRONG TWICE ALONG THE WAY, which is the part worth keeping. First I said a
+floor worker yields every idle pass -- it does not, the cadence is masked. Then I said removing the
+yield would collapse the tax -- it did not. Both were built by reading a branch's entrance without
+tracing it to its exit. The arms that killed them cost one constant each.
