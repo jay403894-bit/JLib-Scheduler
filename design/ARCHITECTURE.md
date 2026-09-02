@@ -33,9 +33,35 @@ scheduler had two shapes to be correct in.
 Workers are partitioned by index into two bands sharing one packed 64-bit word.
 
 **K — the reserved lane.** The first `K` workers (clamped at 2) serve `Lane::LowLatency` work.
-They never park, so a completion reaches a running thread rather than paying a kernel wake. They
-read their lane inbox and their resume inbox; they do **not** read the ordinary inbox — placing
-ordinary work there would make it unreachable, which is an invariant with a test of its own.
+They never park, so a completion reaches a running thread rather than paying a kernel wake.
+
+**The invariant is about the INBOX, not about ordinary work.** A reserved worker does not read its
+own ordinary inbox — an inbox has exactly one legal consumer, so work placed there that its owner is
+forbidden to read is not slow, it is *unreachable*. Nothing may push ordinary work at K, and that is
+an invariant with a test of its own.
+
+**But K does run ordinary work, by STEALING it.** When the lane has been quiet for long enough, a
+reserved worker takes from other workers' deques — because a deque exists to be stolen from, and a
+band that never steals is two cores the pool paid for and does not get. Taking work is always safe:
+the thief is the one running it, so nothing can be stranded by the act of claiming it.
+
+**THE TWO FIBER MODES DO NOT HAVE THE SAME INVARIANT.** They are different promises, not two
+implementations of one, and stealing is safe under each for a *different* reason:
+
+| | `Migrate` | `Pin` |
+|---|---|---|
+| the promise | resumes **promptly**, on whichever worker is free | resumes on **its home worker**, whichever that costs |
+| what it gives up | `thread_local` across a suspend | promptness — it waits for one specific worker |
+| where a resumption goes | ordinary placement, which masks `[0,K)` | that worker's **resume inbox**, never a deque |
+| why K may steal | the resumption is on the floor, reachable by anyone | **stealing is not resumes** — a steal takes fresh work off a deque; a resume is delivered to one consumer that reads it |
+
+The `Pin` row is the one worth reading twice. A reserved worker stealing pinned work cannot strand
+its resumption, because the resume never travels by the route stealing uses — the two paths do not
+meet. That is why the fiber mode does not gate stealing, and a gate added on the opposite assumption
+was removed once the drain was actually read.
+
+A reserved worker therefore reads its lane inbox, its resume inbox, and other workers' deques. It
+never reads its own ordinary inbox, and nothing ever puts ordinary work there.
 
 **F — the awake floor.** A *bounded, adaptive* number of ordinary workers held unparked, grown by a
 controller under load and shed when the burst ends. This is the bounded version of what a pool-wide
@@ -196,13 +222,20 @@ mistaken for a participant.
 
 ## 8. Fiber mode: Migrate or Pin
 
-`FiberMode::Migrate` (default) resumes a fiber on whichever worker is free. `FiberMode::Pin` resumes
-it only on the worker it was bound to.
+**This is a choice of INVARIANT, not a tuning knob.** Each mode promises something the other does not,
+and the thing it gives up is the other one's promise:
 
-Migration is the better default — a fiber whose home worker is busy would otherwise wait for that
-worker specifically — and the cost is precisely that `thread_local` is no longer valid across a
-suspension point. `FiberLocal<T>` is the answer; `Pin` is the escape hatch for state you cannot
-audit, and it is what marl's contract gives you.
+- **`Migrate`** (default) — *a suspended fiber resumes promptly, on whichever worker is free.* The
+  runtime does **not** promise the same worker, so `thread_local` written before a suspension point
+  is not the same object after it. It does not crash; you get the resuming worker's copy.
+- **`Pin`** — *a suspended fiber resumes on the worker it was bound to, and nowhere else.* That makes
+  `thread_local` valid across a wait, and gives up promptness: if the home worker is busy the fiber
+  waits for **that** worker while others sit free. This is marl's contract.
+
+Migration is the better default because the thing it gives up has a replacement and the thing it buys
+does not — `FiberLocal<T>` moves the *state* off the thread, whereas nothing recovers a core you are
+declining to use. Take `Pin` when the state crossing the wait belongs to a library you cannot audit,
+which is the one case where moving the state is not available to you.
 
 **In pinned mode the resumption goes to the home worker's resume inbox**, never to a deque — which is
 why the reserved band may steal in either mode. A reserved worker *must* read its resume inbox
