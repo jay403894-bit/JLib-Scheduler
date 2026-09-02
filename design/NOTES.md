@@ -1544,3 +1544,39 @@ to that same worker. **A tick that runs on a fiber can just suspend**, and the w
 So the fiber default is not a cost paid for tidiness; it is what makes worker-side reclamation legal
 again, which is what lets the epoch garbage lists be thread-local without needing a message to
 discharge them. The order matters: the fiber flip had to land before the epoch rework, not after.
+
+## A whole tier of tests was not being built
+
+`JLIBSCHED_COROUTINES` is **OFF by default** and gates every C++20 target -- `SchedulerCoroutineTest`,
+`SchedulerFutureTest`, `SchedulerCoroEpochTest`, `SchedulerHazardCoroSuspendTest`,
+`SchedulerIoAsyncTest`, `SchedulerIoSocketTest`. The default is defensible (requiring C++20 to build
+the suite would quietly make C++20 the project's real floor) and it has a sharp edge:
+
+**Counted epochs were removed with zero coverage of the coroutine path they existed for.** The suite
+was green at 35/1 the whole time, and green meant nothing -- the tests for the thing being deleted
+were not compiled. Turning the option on immediately found two real problems.
+
+**Rule: any change to coroutines, or to anything a coroutine reaches, is untested until
+`-DJLIBSCHED_COROUTINES=ON` has been built and run.**
+
+### What it found, neither of which was the epoch change
+
+**1. The fiber default moved hazard reader identity.** `HazardDomain` indexes cells by
+`Fiber::poolIndex` for fibers and **by worker** for native tasks. `hazard_coro_suspend_test`'s
+nested-worker-row case built its task with a plain `CreateTask` and got Native BY DEFAULT; once the
+public default became Fiber, the task moved to a fiber row, the "second guard on the same worker row"
+collision stopped being possible, and the abort it asserts never fired.
+
+Generalised: **every public task now takes a fiber row rather than a worker row for hazards.** That
+is an improvement -- fiber rows are the migration-safe ones -- but it is a behaviour change, and any
+code that depended on worker-row semantics has to ask for Native explicitly.
+
+**2. `SchedulerIoAsyncTest` and `SchedulerIoSocketTest` HANG.** Bisected in a worktree at `14a6dbd`,
+before the fiber flip: **both hang there too**, so this is pre-existing IO breakage and not caused by
+making the public job a fiber. Not chased -- the reactor is being revised to own its backlog with a
+stack and an aimed `pushIO` at an available worker, and that rework is where the real IO test comes
+from. A stranded backlog is a known possibility in that design.
+
+One of these hangs was found orphaned at **1187 CPU-seconds**, starving every other test in the run
+and making unrelated tests look flaky. When a suite result changes shape run to run, check for a
+leftover process BEFORE reading anything into the failures.
