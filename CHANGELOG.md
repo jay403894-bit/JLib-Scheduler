@@ -15,6 +15,100 @@ what `SetHotWorkers` means, and removed `Join()` from the public API. 4.0.1 had 
 `PushImmediate`. Those change what the API *means*, not just what it does, and three patch numbers
 in a row were making trees that behave differently report nearly the same version.
 
+### [CRITICAL] The last fiber's debts were never released, permanently
+
+A lost wake in the reaper's rate limiter. `ReleasePendingDebts` says a racing producer "is swept by
+the next pass" -- true exactly when a next pass happens, and **fiber death is the only trigger**. So
+the final death in a run has no successor:
+
+1. the sweep drains the debt stack with its `exchange(nullptr)`
+2. the last dying fiber pushes its debts
+3. its `QueueReclaim` finds the rate-limit flag still set and queues nothing
+4. the flag clears, and nothing will ever set it again
+
+Measured at **199 of 200** fibers released, in roughly one run of eight of `fiber_debt_test`; rare
+because the window is one exchange wide, and permanent when it lands. Every task ran and every
+notify was delivered -- the reaper arrived, it simply arrived before the debts did, which is why this
+reads as a leak rather than a hang.
+
+Closed with a clear-then-recheck, **`seq_cst` on both sides**. Release on the store alone is not
+enough: StoreLoad is the one reordering acquire/release does not forbid, so the re-check could be
+hoisted above the clear and see an empty stack the producer is about to fill. 40/40 clean after.
+
+### [CRITICAL] `Join()`'s lane-intake drain was an infinite loop
+
+It pulled `Lane::LowLatency` tasks out of the intake and called `PushTarget`, which routes
+`LowLatency` work straight back **into** the intake -- so the next `TakeLaneIntake` found the same
+task, forever. Live in any teardown with a non-empty intake, and rare only because the intake is
+usually empty by the time `Join` runs. The flag is now saved, cleared for the drain and restored,
+since `Join`/`Init` cycles are supported and leaving it off would silently disable the intake on
+restart.
+
+### Three call sites discarded `Push`'s `bool`, and two of them could hang `WaitFor` forever
+
+`RunCounted` and the `ParallelFor` lane spawn both increment a `WaitGroup` *before* pushing. A
+dropped push there does not lose a task -- it hangs every waiter on that group **forever**, because
+the decrement lives in the completion of a task that was never queued. `QueueReclaim` was the third:
+its flag says "a sweep is coming", so believing a push that did not land stops reclamation for the
+rest of the run. All three now undo their accounting and let the natural trigger retry.
+
+Unreachable today -- `PushTarget` returns false only for a null task, and the inboxes are unbounded
+intrusive Vyukov MPSC queues whose `push()` cannot refuse. Fixed anyway: that is a property of
+today's queues rather than of the API, the cost is one cold predicted branch, and the failure it
+prevents is a hang with no diagnostic. A `bool` nobody reads is indistinguishable from `void`, which
+is how it came to be discarded three times.
+
+### Garbage collection is a task now, and `SetSelfReclaim` / `SetSelfScan` are gone
+
+Safe Memory Reclamation here is three mechanisms -- epochs, hazard pointers, and user-registered
+deletes -- and they are now discharged together by **one queued task**, sent by the reaper on fiber
+death and rate-limited to one sweep in flight. It goes out as `Lane::Normal`, so it never lands on
+the reserved band.
+
+Three designs were tried and the first two were wrong:
+
+| | what it did | why it lost |
+|---|---|---|
+| worker-inline | whichever worker crossed the threshold stopped and swept | **p99 killer** -- walks every participant on a thread that was running your frame, at a moment nobody chose |
+| app-driven | you call `Tick()` at a frame boundary | better tail, but a **library cannot require a loop its embedder may not have**, and forgetting leaks silently in release |
+| **a task** | the sweep is queued like any other work | displaces nothing; waits its turn behind work that was already there |
+
+The difference between the first and the third is not *who* runs it -- a task runs on a worker too --
+it is **when**. `SetSelfReclaim` and `SetSelfScan` are removed along with the obligation they
+implied, and the worker-side `Tick`/`Scan` calls are out of the idle path.
+
+Order inside the task is `Tick()` → `Scan()` → queued deletes, and the deletes go **last** on
+purpose: a user deleter may itself retire, so running the deletes first would leave those
+retirements for the *next* pass. One pass of latency instead of two.
+
+**`TaskDAG` is the exception and still needs a `Tick()` on your thread.** It retires a node per node
+per frame, epoch `RetirePtr` has no threshold-triggered sweep of its own, and a DAG need not produce
+a single fiber death to trigger one -- main nodes are *required* to be `TaskType::Native`, which
+never binds a fiber. A rate of retirement with no rate of reclamation. (Hazards differ: `Retire()`
+does self-trigger, so forgetting `Scan()` reclaims late rather than leaking.)
+
+### Fiber-local storage: `FiberLocal<T>`, `FlsAlloc`, `GetID`
+
+**Thread-local state does not survive a migration, and migration is the default now.** A fiber
+resumes on whichever worker is free, so a `thread_local` written before a suspension point belongs to
+a thread the fiber may no longer be on -- and nothing catches it. You get the resuming worker's copy,
+a plausible-looking value rather than a crash.
+
+`FiberRegistry::FlsAlloc()` hands out a slot; `FiberLocal<T>` wraps one with `get`/`set`/`operator->`;
+`GetID()` identifies the fiber you hold. Slots are **scrubbed on recycle**, which is the failure that
+would otherwise look like working code: a pooled fiber handed to a new task with a previous
+occupant's pointer still in a slot reads perfectly well, because the pointee is usually still
+allocated.
+
+Measured across a resume storm in `fiber_local_test`: **FLS 64/64 survived, TLS 0/49**. The TLS arm
+is the negative control and is `noinline` on purpose -- MSVC caches a `thread_local`'s base address
+across an opaque call, so an inlined read after a context switch returns the *old* thread's slot from
+a register and makes TLS look like it migrated correctly. That is not hypothetical: it is what made
+`migratable_fiber_test` report 0 migrations when there had been 206.
+
+If the state is not yours to move -- a library you cannot audit keeping its own `thread_local` across
+a wait -- take `FiberMode::Pin` instead.
+
 ### Linux I/O is live: `IoReactor::IsAvailable()` returns true on io_uring
 
 `tests/io_socket_test.cpp` passes end to end on Linux and, more importantly, **exits 0** — accept,
@@ -370,6 +464,29 @@ slots` and fails, so a slack of 4 cannot hide a regression that reads 200 → 0.
 
 ### Breaking
 
+- **`IdlePolicy` is gone -- `Sleep`, `NoSleep`, `SetIdlePolicy` and `GetIdlePolicy` all removed.**
+  The awake floor does the job better. `NoSleep` bought the store-instead-of-futex wake path -- a
+  notify a spinning worker observes, against a ~5.5 µs kernel round trip -- by holding **every** core
+  for the whole run. That bill was +3.5% to a memory-bound main thread synthetically and **23%**
+  inside a real 2D game. The floor buys the same path for a *bounded* number of workers and sheds
+  them when the burst ends, which is the half `NoSleep` could not do. The library's own I/O table
+  had already measured `SetHotWorkers(1)` beating a whole spinning pool on p50 *and* p99 at 1/31 of
+  the cost; a setting whose best row is beaten by a cheaper row is a trap, not an option.
+  **Migration:** `SetAwakeFloor(n)` is the replacement, and `SetAwakeFloor(GetWorkerCount())` is
+  what `NoSleep` meant. Note it clamps against the **live** pool, so call it *after* `Init` -- a
+  pre-`Init` call resolves to 0. The `sleep`/`nosleep`/`both` bench arguments are accepted and
+  ignored rather than errors; `SchedulerBench both` no longer re-execs, since there is no second
+  policy to compare. `bench/nosleep_tax.cpp` is now `bench/spin_tax.cpp` (`SchedulerSpinTax`).
+- **`SetMigratableFibers(bool)` / `MigratableFibers()` are now
+  `SetFiberMode(FiberMode)` / `GetFiberMode()`,** with `FiberMode::Migrate` (default) and
+  `FiberMode::Pin`. `SetMigratableFibers(false)` at a call site said nothing about what `false`
+  meant. `FibersMigrate()` is the predicate the routing asks. Same reasoning that turned `bool
+  hiPri` into `Lane` and `bool noFiber` into `TaskType`.
+- **`EnableIoReactor(true)` now reserves K=2, not K=1,** when you have not set K yourself. Measured
+  on a 256-completion burst: K=1 declined 241 of 256 pushes with the backlog 109 deep -- the lane
+  holding essentially the whole run -- against ~19 declines at depth ~27 for K=2. One reserved
+  worker is one body away from having no lane. Call `SetIoHotLane(1)` before `EnableIoReactor` for
+  the old cost. K remains clamped at 2.
 - **`SetHotWorkers(k)` no longer implies never-park.** It sets K and nothing else. Reservation
   ("don't run bulk work here") and spinning ("never sleep") are separate purchases, and folding them
   together charged every caller who wanted the first a ~35% ordinary-latency tax for the second.

@@ -261,7 +261,9 @@ keeps them searching.
 | Per-item cost via `PushArray` (chunk 128) | 0.55 ns | 0.59 ns | -- |
 | 16 heavy tasks from an idle pool | 10.8x of 16 | 12.6x of 16 | flat |
 
-Reproduce either column with `SchedulerBench`, or both side by side with `SchedulerBench both`.
+Reproduce the `Sleep` column with `SchedulerBench`. The `NoSleep` column is no longer reproducible
+as written -- `SchedulerBench both` and the `nosleep` argument are accepted-and-ignored now -- but
+`SchedulerBench floor=<workers>` holds the whole pool unparked, which is what `NoSleep` did.
 The brackets matter: the last digit is not meaningful on several of these rows -- bulk submission
 and fork-join move ~20% run to run on an otherwise idle machine, and the `NoSleep` latency row is
 bimodal -- so read the order of magnitude and the ratio, not the number.
@@ -494,13 +496,20 @@ Independent-task throughput is the row where the architecture actually shows: 69
 290-310 ns for the two fiber/graph libraries, and enkiTS is not really in this race at all because
 submitting N single-item task sets is the usage it tells you to avoid.
 
-`Sleep` is the default and the mobile/embedded configuration; `NoSleep` holds every worker core and
-is for an application that owns the machine. They are close to two different products, which is why
-both are listed rather than only the flattering one.
+`Sleep` was the default and the mobile/embedded configuration; `NoSleep` held every worker core and
+was for an application that owns the machine. They were close to two different products, which is
+why both are listed rather than only the flattering one.
 
-Note that `NoSleep` is not uniformly better: it **loses** on the blocking row (10.1 ms against
+> **Both columns predate 5.0, which removed `IdlePolicy` entirely.** The `NoSleep` arm of these
+> comparisons now means "a pool-wide awake floor" -- pass `nosleep` to the compare binaries and they
+> set the floor as wide as the pool and print the width they got. The numbers below have **not** been
+> re-measured under that arrangement; it is the same workers unparked for the same reason, but treat
+> the column as the historical figure it is.
+
+Note that `NoSleep` was not uniformly better: it **lost** on the blocking row (10.1 ms against
 8.2 ms). Parked fibers have nothing for the spinning workers to do there, so the spin is pure waste.
-It wins where dispatch latency dominates and costs you where it does not.
+It won where dispatch latency dominates and cost you where it does not -- which is the whole argument
+for a bounded floor over a pool-wide one.
 
 **Isolation is not optional here, and it took a wrong result to learn that.** An earlier version ran
 both libraries in one process. Under `Sleep` that is harmless, because the pool not being
@@ -985,7 +994,7 @@ If the state is *not* yours -- a library you cannot audit keeps its own `thread_
 -- take **pinned mode** instead:
 
 ```cpp
-JLib::TaskScheduler::SetMigratableFibers(false);   // BEFORE Init()
+JLib::TaskScheduler::SetFiberMode(JLib::FiberMode::Pin);   // BEFORE Init()
 JLib::TaskScheduler::Init(0);
 ```
 
@@ -1403,8 +1412,13 @@ and the measured cost of choosing wrong is not subtle:
 | | I/O dispatch p50 | p99 | cost |
 |---|---|---|---|
 | `Sleep` (default) | 10.5 us | ~300 us | none |
-| `NoSleep` (whole pool) | 2.7 us | ~25 us | every core spins |
+| `NoSleep` (whole pool) *(removed in 5.0)* | 2.7 us | ~25 us | every core spins |
 | **`SetHotWorkers(1)`** | **1.2 us** | **~7 us** | one core |
+
+**This table is why `NoSleep` no longer exists.** One hot worker beat the whole pool spinning on both
+p50 and p99 while costing one core instead of thirty-one -- a setting whose best row is beaten by a
+cheaper row is not a setting, it is a trap. Its row is kept because it is the measurement that
+retired it.
 
 Parking is ~300 us of that; the residue between NoSleep and K-hot is contention between 31 spinners.
 K-hot makes the idle policy a property of the **worker** rather than the pool, which is what lets one
@@ -1442,6 +1456,13 @@ completions. For scale, K=1's ceiling is ~980 completions per frame at 60 fps.
 3.2% per worker on a 31-worker pool, and more on an SMT machine where a spinning worker also degrades
 its sibling core. On a 16-core machine K=4 is over a quarter of the pool; treat K>=2 as a server
 configuration and K=1 as the game one.
+
+> **`EnableIoReactor(true)` sets K=2 if you have not set it yourself, so opting into I/O costs you
+> two cores rather than one.** It implied K=1 through 4.x, and that was measured wrong: on a
+> 256-completion burst, K=1 declined 241 of 256 pushes with the backlog 109 deep -- the lane holding
+> essentially the whole run -- against ~19 declines at depth ~27 for K=2. One reserved worker is one
+> body away from having no lane at all. Set `SetIoHotLane(1)` explicitly before `EnableIoReactor` if
+> you want the old cost and accept that shape. K is clamped at 2 either way.
 
 **What may go in the lane.** The lane is a *sparse resource*, and that -- not speed -- is what
 decides. Its capacity is K, so everything routed there competes for K workers. Route all your work

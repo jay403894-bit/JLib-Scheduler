@@ -1926,6 +1926,9 @@ cells) and then declined to use it. Migration's costs were already paid; the pin
 suspension point still valid after it. Migratable gives that up SILENTLY -- you get the resuming
 worker's copy, with nothing to catch it. An app that keeps state in TLS across a wait, or embeds a
 library it cannot audit, wants `SetMigratableFibers(false)` before `Init()`.
+*(Spelled `SetFiberMode(FiberMode::Pin)` since 5.0 -- the entry above is left as written, but the
+call in it no longer compiles. `FiberLocal<T>` is the other answer, and usually the better one: it
+keeps migration and moves the state instead of the policy.)*
 
 Thread-affine cleanup is settled through Fiber's creditor set, one hop per creditor, and costs
 nothing for a fiber that never touched affine state -- which today is all of them.
