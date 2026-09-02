@@ -1,4 +1,4 @@
-# ============================ JLib::Scheduler ============================
+﻿# ============================ JLib::Scheduler ============================
 #
 # ONE file, valid in TWO repositories -- the same trick Scheduler.vcxproj and
 # Scheduler.Standalone.props already use on the MSBuild side.
@@ -1165,3 +1165,30 @@ if(WIN32)
     target_link_libraries(SchedulerIoTinyStackTest PRIVATE Scheduler)
     target_compile_features(SchedulerIoTinyStackTest PRIVATE cxx_std_17)
 endif()
+
+# THE SOCKET SUITE, PORTED TO FIBERS. It was written entirely on co_await and went to
+# extras/abandoned with the coroutine layer; this is it back on tests/io_fiber_await.h, which is the
+# same completion-first Submit* API with a WaitGroup where the awaiter used to be.
+#
+# NOT WIN32-ONLY. tests/socket_compat.h gives it Winsock spelling on both platforms, so it is ONE
+# test rather than two that drift, and it skips itself via IoReactor::IsAvailable() where the backend
+# is not live -- the reactor's own answer, so the skip disappears by itself when Linux lands.
+#
+#
+# It runs with SetReservedStealing(false) and that is a WORKAROUND, not a preference -- see the long
+# note at the top of the file. A reserved worker that steals suspendable work loses it forever.
+add_executable(SchedulerIoSocketTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_socket_test.cpp")
+target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler)
+target_compile_features(SchedulerIoSocketTest PRIVATE cxx_std_17)
+if(WIN32)
+    target_link_libraries(SchedulerIoSocketTest PRIVATE ws2_32)
+endif()
+
+# The structural smoke test for the fiber I/O shim -- see the file header.
+if(WIN32)
+    add_executable(SchedulerIoFiberAwaitSmoke "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_fiber_await_smoke.cpp")
+    target_link_libraries(SchedulerIoFiberAwaitSmoke PRIVATE Scheduler)
+    target_compile_features(SchedulerIoFiberAwaitSmoke PRIVATE cxx_std_17)
+    target_link_libraries(SchedulerIoFiberAwaitSmoke PRIVATE ws2_32)
+endif()
+

@@ -2180,3 +2180,33 @@ provision a small deep count by default; fall back to Standard when the asked-fo
 (safe for Deep, NOT safe for Tiny, which would silently undo the I/O footprint win); or refuse at
 CreateTask and return nullptr, which is loud and matches the slab's "grow rather than fail" lesson
 only partly. Worth deciding before anyone ships against the new parameter.
+
+## OPEN: a reserved worker that steals SUSPENDABLE work loses it forever (2026-09-02)
+
+Reserved-worker stealing (added 9-02, so K does not waste two cores while the lane is quiet) is sound
+for work that runs to completion and UNSOUND for work that suspends:
+
+  1. a reserved worker steals a `Lane::Normal` fiber task
+  2. the fiber parks on I/O
+  3. the completion wakes it; the resumption is published on the worker that was running it
+  4. that worker is in the reserved band, WHICH NEVER READS A LOPRI DEQUE
+  5. nobody may take it, ever
+
+MEASURED: io_socket_test after the fiber port passes 1 run in 5 with stealing on, 5 in 5 with it off.
+The watchdog dump names it exactly -- every worker idle, advertised queues = 0, and q0/q1 (the
+reserved band at K=2) each holding `deque(hi/lo) 0/1`.
+
+THIS IS THE 8-31 REACTOR BREAK'S INVARIANT, REACHED FROM THE OTHER END. That one was PLACEMENT --
+never push loPri at K -- and is guarded by reserved_lopri_placement_test. This is RESUMPTION, which
+that file structurally cannot see: it disables stealing itself, and says so, because it measures
+where tasks RAN and cannot tell placement from theft.
+
+THE GENERALISATION WORTH KEEPING: every "K never reads X" invariant has TWO entrances -- where work
+is PUSHED and where work is RESUMED. Guarding the push side is what we did; it leaves the other open.
+
+NOT FIXED, because the fix is a policy choice with three defensible answers:
+  * reserved workers decline work that can suspend (simplest; costs the steal win on fiber tasks)
+  * a resumed task is never published to a reserved worker (narrowest; touches the resume path)
+  * K reads its own loPri deque for work IT stole (keeps the win; weakens an invariant that is
+    currently absolute and easy to reason about)
+Worked around in tests/io_socket_test.cpp with a comment naming this note.
