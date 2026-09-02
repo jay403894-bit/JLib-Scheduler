@@ -498,6 +498,15 @@ endif()
 # ship that overload, so the macOS port replaced it with a compare-exchange loop -- which is what
 # fetch_add lowers to anyway -- and the whole C++20 requirement went with it. There is now no
 # caveat to attach to the project's C++17 claim.
+# THE LANE AS IT IS NOW. bench.cpp and io_dispatch_latency.cpp still carry arms for mechanisms that
+# no longer exist -- adaptive K, the lane deque, the producer-side spill, K=4 rungs against a K
+# clamped to 2 -- and rows measuring a mechanism the code does not have are worse than no rows: two
+# arms of the same configuration read as a finding about the difference between them. This file
+# measures only the shared intake, K's never-park-and-steal policy, and Lane routing.
+add_executable(SchedulerLaneBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/lane_bench.cpp")
+target_link_libraries(SchedulerLaneBench PRIVATE Scheduler)
+target_compile_features(SchedulerLaneBench PRIVATE cxx_std_17)
+
 add_executable(SchedulerBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench.cpp")
 target_link_libraries(SchedulerBench PRIVATE Scheduler)
 target_compile_features(SchedulerBench PRIVATE cxx_std_17)
