@@ -1728,3 +1728,37 @@ harder one to read because a busy worker looks healthy.
    "the task never started", which is a dispatch statement rather than a cancel one.
 
 Every one of those was eliminated by measurement rather than argument. The dump is what ended it.
+
+## Who may block on a contended SchedulerMutex (9-02)
+
+Two rules, and they point in opposite directions.
+
+**A bare thread BLOCKS.** `Lock()` on a non-fiber used to call `SpinThenHelp`: spin on `Try_Lock` and,
+between spins, run stolen Native work. On a fiber-backed pool that help can never succeed --
+`GetTask` vets steal candidates with `fiberlessRunnable`, which rejects `TaskType::Fiber`, and that
+is now every task in the pool. So it burned a core walking candidates it was not permitted to claim.
+It is now a real condvar block. Measured cpu/wall while waiting: **1.00 spinning, 0.00 blocked.**
+
+**A task with no fiber MAY NOT BLOCK AT ALL.** A Native or directly-resumed coroutine task runs on
+the worker with `currentFiber == nullptr`, so it lands on the bare path rather than the suspend path.
+Waiting there pins the worker while that worker's INBOX may hold tasks nobody else may run -- inbox
+work is unstealable by construction. That is `busy=1 + queued=1` with zero advertised queues: a
+self-deadlock that reports as a lost wake. It now aborts with an explanation instead.
+
+This is not a new rule. It is the existing may-not-suspend contract stated over its other half: a
+task that cannot yield the worker cannot WAIT on the worker either, and a contended `Lock()` is a
+wait however it is spelled. Blocking would be strictly WORSE than spinning here -- same stranded
+inbox, worker asleep instead of hot -- which is why the fallback is deliberately not applied to it.
+
+Two things the controls caught that argument would not have:
+
+1. **The refusal was placed before the uncontended try.** That branch had no fast path -- the first
+   spin of `SpinThenHelp` was it -- so refusing on entry rejected every uncontended Native `Lock()`
+   in the codebase. The prohibition is on WAITING, not on locking. `Try_Lock()` runs first now.
+2. **The test reproduced the bug it was testing for.** The first holder used `sleep_for`, pinning its
+   worker for the whole hold. Placement steers to AWAKE workers, that worker was awake *because* it
+   was sleeping-but-busy, and the offending task sat in its unstealable inbox until the hold ended --
+   so it measured an *uncontended* lock at 158 ms and the refusal correctly never fired. The holder
+   now suspends on an Event, which frees the worker while still holding the lock.
+
+`SpinThenHelp` is untouched and still used by the other primitives; only the mutex stopped calling it.

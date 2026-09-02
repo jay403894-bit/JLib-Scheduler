@@ -7136,10 +7136,64 @@ void SchedulerMutex::Lock() {
 		}
 	}
 	else {
-		// Bare thread: cannot suspend, so help with stolen Native work while waiting -- but only
-		// after a brief plain spin comes up empty. See SpinThenHelp for why the fast spin exists
-		// and the block comment above ContendedSpinStep for what the escalated path costs.
-		SpinThenHelp([this] { return Try_Lock(); });
+		// ---- A TASK ON A WORKER MAY NOT BLOCK, for the same reason it may not suspend. ----------
+		//
+		// A task with no fiber bound -- Native, or a coroutine resumed directly -- runs ON the
+		// worker, so `current` is null and it arrives HERE rather than on the suspend path above.
+		// Both things this branch could do are wrong for it:
+		//
+		//   spin  -- it holds the worker while that worker's INBOX may hold work only this worker
+		//            is permitted to drain. Inbox work is unstealable by construction, so no other
+		//            worker can make progress on its behalf. The pool dump for it is busy=1,
+		//            queued=1, advertised queues = 0: a self-deadlock wearing the costume of a lost
+		//            wake, which is exactly how long it took to identify the last one.
+		//   block -- strictly worse. Same stranded inbox, with the worker asleep instead of hot.
+		//
+		// So refuse. This is not a new rule: it is the existing may-not-suspend contract stated over
+		// its other half. A task that cannot yield the worker cannot WAIT on the worker either, and
+		// a contended Lock() is a wait however it is spelled. Note the check is "is a task running",
+		// not "is this a worker" -- a bound main thread is a Thread too, and it is allowed to block.
+		//
+		// UNCONTENDED FIRST, AND THE ORDER IS THE WHOLE RULE. The prohibition is on WAITING, not on
+		// locking: a Native task taking a free lock is fine and common. This branch previously had
+		// no fast path at all -- SpinThenHelp's first spin was it -- so refusing before trying threw
+		// out every uncontended Native Lock() in the codebase. Caught by the control below it.
+		if (Try_Lock()) return;
+
+		if (thread != nullptr && thread->currentRunningTask != nullptr) {
+			if (auto hook = s_blockViolationHook.load(std::memory_order_relaxed)) { hook(); return; }
+			fprintf(stderr,
+				"[JLib::Scheduler] INVARIANT VIOLATED: a task with no fiber blocked on a contended\n"
+				"  SchedulerMutex. Only a fiber can wait here -- it suspends and frees its worker.\n"
+				"  A Native task cannot suspend, so waiting would pin the worker while that worker's\n"
+				"  inbox may hold tasks NOBODY ELSE MAY RUN (inbox work is unstealable). The pool\n"
+				"  deadlocks and reports it as a lost wake.\n"
+				"  Fix: run work that takes a contended lock as TaskType::Fiber. If it genuinely\n"
+				"  must stay Native, use Try_Lock and handle failure without waiting.\n");
+			fflush(stderr);
+			std::abort();
+		}
+
+		// ---- GENUINELY BARE (main, or an app-owned thread): BLOCK, DO NOT SPIN. -----------------
+		//
+		// Nothing is stranded by sleeping here -- a bare thread is not in the pool -- and the help
+		// this used to attempt between spins could not succeed anyway: GetTask vets steal candidates
+		// with `fiberlessRunnable`, which rejects TaskType::Fiber, and on a fiber-backed pool that
+		// is every task. So SpinThenHelp burned a core walking candidates it was never permitted to
+		// claim.
+		//
+		// SEQ_CST ON THE REGISTRATION, paired with the seq_cst load in Unlock, is what makes the
+		// gated notify safe. If Unlock's load reads zero, its store of locked=false is ordered
+		// before this increment in the single total order, so the Try_Lock below -- which runs after
+		// the increment and takes spinLock -- is guaranteed to observe the unlocked state and
+		// succeed rather than sleep. Registering AFTER the wait, or gating on a relaxed load, would
+		// reintroduce exactly the lost wakeup the fiber path documents above.
+		bareWaiters.fetch_add(1, std::memory_order_seq_cst);
+		{
+			std::unique_lock<std::mutex> lk(bareMtx);
+			bareCv.wait(lk, [this] { return Try_Lock(); });
+		}
+		bareWaiters.fetch_sub(1, std::memory_order_release);
 		// Ownership is counted inside Try_Lock, which is the single place a bare thread takes this
 		// lock -- including when a caller uses Try_Lock directly.
 	}
@@ -7312,7 +7366,31 @@ void SchedulerMutex::Unlock()
 		}
 		if (TaskScheduler::IsInitialized()) TaskScheduler::Instance().Push(next.coro);
 	}
+	// ---- OTHERWISE THE LOCK IS GENUINELY FREE: wake a blocked bare thread. ----------------------
+	//
+	// Deliberately an `else`. The two branches above HAND OFF ownership -- `locked` stays true -- so
+	// a bare waiter woken there would only fail Try_Lock and sleep again. It is woken when the fiber
+	// queue runs dry, which is the same handoff-fairness the fiber queue already has.
+	//
+	// bareWaiters GATES THIS so the overwhelmingly common uncontended Unlock pays one load and never
+	// touches the mutex or the condition variable. See the registration in Lock() for why both this
+	// load and that increment are seq_cst.
+	//
+	// THE EMPTY LOCK/UNLOCK OF bareMtx IS NOT VESTIGIAL. It is what stops the classic lost wakeup
+	// where the waiter has evaluated its predicate but has not yet parked: taking the mutex forces
+	// this thread to wait until the waiter is genuinely inside wait(). Notifying outside it is then
+	// safe and avoids the woken thread immediately blocking on a mutex we still hold.
+	//
+	// AND IT CANNOT INVERT: spinLock was released above, so the order taken here is bareMtx alone,
+	// never spinLock -> bareMtx. The waiter's order is bareMtx -> spinLock (inside Try_Lock). One
+	// direction only, so there is no cycle.
+	else if (bareWaiters.load(std::memory_order_seq_cst) != 0) {
+		{ std::lock_guard<std::mutex> lk(bareMtx); }
+		bareCv.notify_one();
+	}
 }
+
+std::atomic<void(*)()> SchedulerMutex::s_blockViolationHook{ nullptr };
 
 WaitResult SchedulerMutex::LockCancellable() {
 	auto thread = Thread::GetCurrent();

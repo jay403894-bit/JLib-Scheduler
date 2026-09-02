@@ -109,6 +109,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>   // SchedulerMutex bare-thread fallback
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -3612,6 +3613,42 @@ namespace JLib {
 		Task* lockHolder = nullptr;
 		std::queue<Waiter> waiters;   // fibers AND coroutines; see Waiter
 		std::atomic_flag holderLock = ATOMIC_FLAG_INIT;
+
+		// ---- THE BARE-THREAD FALLBACK: BLOCK, DO NOT SPIN ------------------------------------
+		//
+		// A bare thread (main, an app's own thread) has no context to switch away from, so it
+		// cannot take the fiber path. It used to spin on Try_Lock and, between spins, try to HELP by
+		// stealing Native work -- and that help cannot succeed on a fiber-backed pool, because
+		// GetTask vets candidates with `fiberlessRunnable` which rejects TaskType::Fiber outright.
+		// So it burned CPU walking steal candidates for work it was never permitted to claim. That
+		// is the 664 us round trip in TryRunStolenNativeTask's own note.
+		//
+		// A REAL BLOCK IS STRICTLY BETTER **FOR A BARE THREAD** AND STRICTLY WORSE FOR A WORKER, and
+		// the difference is why this is not simply "block everywhere". A bare thread is not in the
+		// pool, so taking it off CPU costs nothing. A WORKER put to sleep here would leave its inbox
+		// holding work only it may drain -- unstealable -- which is the busy+inbox deadlock, just
+		// asleep instead of hot. Hence the Native guard in Lock(): a task on a worker never reaches
+		// this path at all.
+		//
+		// LOCK ORDER IS bareMtx -> spinLock AND NEVER THE REVERSE. The waiter holds bareMtx and
+		// takes spinLock inside the Try_Lock predicate; Unlock releases spinLock BEFORE it touches
+		// bareMtx. No call site holds both in the other order, so there is no cycle.
+		//
+		// bareWaiters GATES THE NOTIFY so an uncontended Unlock -- the overwhelmingly common case --
+		// pays one relaxed load and never touches the mutex or the condition variable.
+		std::mutex              bareMtx;
+		std::condition_variable bareCv;
+		std::atomic<int>        bareWaiters{ 0 };
+
+	public:
+		// TEST SEAM for the may-not-block refusal below, modelled on g_epochSuspendViolation. The
+		// violation is a std::abort() in a shipped build, and a test cannot assert on an abort from
+		// inside the same process, so installing a handler substitutes for it.
+		//
+		// CONTROL DOES NOT RETURN HOLDING THE LOCK when a handler is installed -- there is no lock
+		// to return with, that is the whole point. A handler must not be installed outside a test.
+		static std::atomic<void(*)()> s_blockViolationHook;
+	private:
 
 	public:
 		SchedulerMutex() = default;

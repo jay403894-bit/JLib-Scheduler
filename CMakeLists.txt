@@ -1125,6 +1125,13 @@ add_executable(SchedulerDagPriorityNodeTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/d
 target_link_libraries(SchedulerDagPriorityNodeTest PRIVATE Scheduler)
 target_compile_features(SchedulerDagPriorityNodeTest PRIVATE cxx_std_17)
 
+# WHO MAY BLOCK ON A CONTENDED SchedulerMutex. Measures CPU TIME rather than acquisition, because
+# "main got the lock" passes equally against the spin this replaced; a deliberate-spin arm keeps the
+# instrument honest. Also pins the may-not-block refusal for fiberless tasks, controls first.
+add_executable(SchedulerMutexBlockPolicyTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/mutex_block_policy_test.cpp")
+target_link_libraries(SchedulerMutexBlockPolicyTest PRIVATE Scheduler)
+target_compile_features(SchedulerMutexBlockPolicyTest PRIVATE cxx_std_17)
+
 # THREE STACK CLASSES. Tiny and Deep default to 0 per worker (the 127 MB lesson), so a green suite
 # says nothing about them -- this is the only thing that turns them on. Asserts the class bound from
 # INSIDE the task, that poolIndex stays dense across classes (Event's waiter hash and
