@@ -24,7 +24,16 @@ jobs:
         cmake ..
         cmake --build .
 
-    - uses: actions/upload-artifact@v4
-      with:
-        name: my-artifact
-        path: build
+    # THE ARTIFACT UPLOAD IS REMOVED, AND IT WAS THE ONLY THING HERE THAT COST MONEY.
+    #
+    # It uploaded the ENTIRE build tree -- objects, PDBs, the lot -- on every push to main: 136-199
+    # MB a time, 360 artifacts, 19.4 GB live, 305 of them in August alone. Nothing ever downloaded
+    # one, and every byte is reproducible by running the two commands above.
+    #
+    # Compute is not the expense. GitHub-hosted standard runners are free for public repositories,
+    # so the minutes this job burns are free; artifact STORAGE is billed against the account
+    # allowance, which is measured in hundreds of megabytes. That is the whole charge.
+    #
+    # If you want artifacts back, upload the BINARIES and set a retention, not the build directory:
+    #   - uses: actions/upload-artifact@v4
+    #     with: { name: bin, path: build/bin/**/*.exe, retention-days: 7 }

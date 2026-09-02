@@ -1,5 +1,11 @@
 # JLib::Scheduler
 
+[![Windows CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/windows_ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/windows_ci.yml)
+
+<sub>The badge covers a **Windows Debug build**. The Linux and macOS matrix in `ci.yml` is
+`workflow_dispatch` only -- run it from the Actions tab -- so this badge is not a claim about those
+platforms, and it does not run the test suite.</sub>
+
 > **Development note.** This runtime was developed iteratively, using AI-assisted tooling for rapid
 > prototyping and code generation under strict human specification and verification. Lots of work was done by hand,
 > the workflow changed as I found output and testing became of superior quality and speed than I could produce by hand. All
