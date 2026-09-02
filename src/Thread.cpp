@@ -891,11 +891,31 @@ Fiber* Thread::AcquireFiber(Task* task) {
 			// "(64 per core by default)" unconditionally, so a reader who had already raised the
 			// budget was told a number that was not theirs and could not tell whether their call
 			// had taken effect -- the one thing the message exists to help them decide.
-			const size_t perWorker = TaskScheduler::StandardFibersPerWorker();
+			// ---- AND NAME THE CLASS THAT ACTUALLY RAN OUT. ----------------------------------
+			//
+			// This reported the STANDARD budget unconditionally, whatever class the caller asked
+			// for -- so a task exhausting Tiny or Deep was handed a number that had nothing to do
+			// with its shortage. That is not a cosmetic mismatch: when deepPerComputeWorker
+			// defaulted to 0, a Deep task spun forever and this line pointed at the standard budget,
+			// which was already generous. Raising the lever it named would change nothing, and the
+			// one that mattered went unmentioned.
+			const StackClass cls = task ? task->stackClass : StackClass::Standard;
+			const char* clsName  = cls == StackClass::Tiny ? "tiny"
+			                     : cls == StackClass::Deep ? "deep" : "standard";
+			const char* clsArg   = cls == StackClass::Tiny ? "tinyPerKWorker"
+			                     : cls == StackClass::Deep ? "deepPerComputeWorker"
+			                                               : "normalPerComputeWorker";
+			const size_t perWorker = cls == StackClass::Tiny ? TaskScheduler::TinyFibersPerKWorker()
+			                       : cls == StackClass::Deep ? TaskScheduler::DeepFibersPerComputeWorker()
+			                                                 : TaskScheduler::StandardFibersPerWorker();
 			const size_t workers   = scheduler ? scheduler->GetWorkerCount() : 0;
-			std::cerr << "[JLib::Scheduler] fiber pool exhausted. A SUSPENDED task holds its fiber, "
+			std::cerr << "[JLib::Scheduler] fiber pool exhausted for StackClass::" << clsName
+			          << ". A SUSPENDED task holds its fiber, "
 			             "so the number of tasks that may be blocked AT ONCE is capped by the pool: "
-			          << perWorker << " standard per worker";
+			          << perWorker << " " << clsName << " per worker";
+			if (perWorker == 0)
+				std::cerr << " -- WHICH IS ZERO, so this class cannot be bound AT ALL and the task "
+				             "will retry forever rather than fail. Set " << clsArg << " above 0";
 			if (workers) std::cerr << " x " << workers << " workers = " << (perWorker * workers);
 			std::cerr << " total. Past that, workers re-queue and retry instead of running.\n"
 			             "  Usually that is a STALL that clears as blocked tasks finish. INSIDE A "
@@ -904,8 +924,9 @@ Fiber* Thread::AcquireFiber(Task* task) {
 			             "progresses again. A DAG whose concurrently-suspended nodes outnumber the "
 			             "budget above is the shape to look for.\n"
 			             "  Either block fewer tasks concurrently, or call "
-			             "TaskScheduler::SetFiberBudget(standardPerWorker) BEFORE Init() to raise "
-			             "it. This warning prints once.\n";
+			             "TaskScheduler::SetFiberBudget(...) BEFORE Init() to raise the "
+			          << clsArg << " argument -- which is the one this shortage is about, not "
+			             "whichever budget you raised last. This warning prints once.\n";
 		}
 	}
 	return f;

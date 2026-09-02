@@ -106,6 +106,10 @@ int main() {
     //
     // That is a live trap for anyone taking the new StackClass parameter at face value, and it is
     // not this test's to fix -- but a test that asks for a class must provision it.
+    // NOW THE LIBRARY DEFAULT, and this line is kept anyway. It is what caught the trap -- the
+    // control never ran under deepPerComputeWorker = 0 -- so stating the requirement explicitly
+    // keeps this file honest if the default ever moves back. It asks for exactly the default, so it
+    // changes nothing today.
     JLib::TaskScheduler::SetFiberBudget(64, 64, /*deepPerComputeWorker*/ 1);
 
     JLib::TaskScheduler::Init(0);

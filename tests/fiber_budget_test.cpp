@@ -46,7 +46,23 @@ int main() {
     JLib::TaskScheduler& sched = JLib::TaskScheduler::Instance();
 
     const size_t workers = sched.GetWorkerCount();
-    const size_t expected = workers * kPerWorker;
+
+    // ---- ALL THREE CLASSES, NOT JUST STANDARD. ---------------------------------------------
+    //
+    // This was `workers * kPerWorker` and it was right only while the other two budgets were ZERO.
+    // The moment deepPerComputeWorker defaulted to 1 the pool built 72 against an expected 68, and
+    // the four extra were exactly the deep fibers -- a correct pool failing an incomplete
+    // assertion. It caught the change, which is the good outcome; re-baselining the constant would
+    // have thrown that away and left the same blind spot for tiny.
+    //
+    // Computed from the ACCESSORS rather than from literals, so this tracks the defaults instead of
+    // pinning them. The test is about whether StartPool CONSUMES the budget it was given -- not
+    // about what the budget happens to be.
+    const size_t stdPer  = JLib::TaskScheduler::StandardFibersPerWorker();
+    const size_t deepPer = JLib::TaskScheduler::DeepFibersPerComputeWorker();
+    const size_t tinyPer = JLib::TaskScheduler::TinyFibersPerKWorker();
+    const size_t K       = JLib::TaskScheduler::GetHotWorkers();
+    const size_t expected = workers * stdPer + workers * deepPer + K * tinyPer;
     // TotalCount, NOT AvailableCount, and the difference is the whole point of the assertion.
     // The question here is "did StartPool consume the budget it was given" -- a CAPACITY question.
     // AvailableCount answers a different one: how many are unclaimed right now. Those two used to
@@ -57,8 +73,8 @@ int main() {
     const size_t actual = sched.GetGlobalPool().TotalCount();
     char what[128];
     std::snprintf(what, sizeof(what),
-                  "pool capacity is workers(%zu) * (standard+heavy) = %zu, got %zu",
-                  workers, expected, actual);
+                  "capacity = %zu*std(%zu) + %zu*deep(%zu) + %zu*tiny(%zu) = %zu, got %zu",
+                  workers, stdPer, workers, deepPer, K, tinyPer, expected, actual);
     Check(actual == expected, what);
 
     JLib::detail::TeardownForTesting(sched);

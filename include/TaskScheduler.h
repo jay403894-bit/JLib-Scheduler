@@ -2392,7 +2392,7 @@ namespace JLib {
 		// miniature. Set before Init().
 		static void SetFiberBudget(size_t normalPerComputeWorker = 64,
 		                           size_t tinyPerKWorker        = 64,   // 128 at the K=2 default
-		                           size_t deepPerComputeWorker  = 0);
+		                           size_t deepPerComputeWorker  = 1);   // 0 makes Deep UNUSABLE
 		static size_t NormalFibersPerComputeWorker();
 		static size_t TinyFibersPerKWorker();
 		static size_t DeepFibersPerComputeWorker();

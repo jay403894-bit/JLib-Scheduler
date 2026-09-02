@@ -2157,7 +2157,27 @@ STILL UNMEASURED: whether 2 pages is enough for a real continuation. It is the o
 class, so it is 8 KB usable on x64 and 32 KB on a 16 KB-page platform, and an overflow is a
 guard-page fault rather than a spin. A stack-watermark probe would settle it.
 
-### FOUND BY THE CONTROL: StackClass::Deep is unprovisioned by default, and asking for it HANGS
+### FIXED: StackClass::Deep now defaults to 1 per compute worker (2026-09-02)
+
+Jay: "we should give a minimum stackClass::Deep to each thread... 1 is a sane default -- you ask for
+it if you have deep stack needs." Done: deepPerComputeWorker = 1.
+
+WHY 1 AND NOT 5. The stacks are COMMITTED at Init, not lazily paged -- FiberStackArena reserves the
+address space and AllocateStack commits the region -- so this is real memory: ~15 MB at 1 per worker
+on a 29-worker pool, ~74 MB at 5. Deep is opt-in and rare by construction, so 29 concurrent deep
+tasks is a generous floor for a class most applications never bind once.
+
+AND THE EXHAUSTION WARNING NOW NAMES THE CLASS THAT RAN OUT. It reported the STANDARD budget
+whatever class was short, which is what made the original trap so hard to read: a Deep task spun
+forever while the message pointed at a lever that was already generous. It also says outright when a
+budget is ZERO -- "this class cannot be bound AT ALL and the task will retry forever rather than
+fail" -- because that is a different failure from being merely under-provisioned.
+
+fiber_budget_test caught the change, which is the good outcome: it expected workers*standard and got
+four more. Its formula now covers all three classes and is computed from the ACCESSORS, so it tracks
+the defaults instead of pinning them.
+
+## Original note: StackClass::Deep is unprovisioned by default, and asking for it HANGS
 
 `SetFiberBudget(normalPerComputeWorker = 64, tinyPerKWorker = 64, deepPerComputeWorker = 0)`.
 Deep is **zero**. A task created with `StackClass::Deep` under the default budget does not fail, does

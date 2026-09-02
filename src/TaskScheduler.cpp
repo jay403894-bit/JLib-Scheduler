@@ -5879,7 +5879,34 @@ static size_t g_tinyPerKWorker         = 64;
 // a 31-worker box for a class that may never be bound. That is the heavy class's original mistake
 // in miniature. Kept per-worker because it is the simple thing to reason about; revisit it against a
 // real workload rather than against this comment.
-static size_t g_deepPerComputeWorker   = 0;   // OPT-IN. See the header.
+// ---- ONE PER COMPUTE WORKER, AND ZERO WAS A TRAP RATHER THAN A SAVING --------------------------
+//
+// This was 0, on the reasoning above: do not commit memory for a class that may never be bound.
+// The reasoning is sound about the COST and wrong about the FLOOR, because zero does not mean
+// "allocated on demand", it means THE CLASS CANNOT BE USED AT ALL:
+//
+//   AcquireFiber finds no deep fiber -> the task is REQUEUED and retried -> forever.
+//
+// It does not fail, does not fall back to Standard, and does not warn about the class that is
+// actually missing -- the exhaustion message names the STANDARD budget, so the one lever that would
+// not help is the one it points at. A task asking for StackClass::Deep under the old default simply
+// never ran. io_tiny_stack_test's control hit this on its first run and had to provision deep=1
+// itself to proceed.
+//
+// AND 5.0 MADE IT REACHABLE. StackClass used to require poking task->stackClass by hand after
+// creation; it is an ordinary parameter on all five Create* entry points now, so the first caller to
+// pass Deep gets a silent hang rather than a strange one.
+//
+// WHY 1 AND NOT MORE. The stacks are COMMITTED at Init, not lazily paged -- FiberStackArena reserves
+// the address space and AllocateStack commits the region -- so this is real memory: ~15 MB at 1 per
+// worker on a 29-worker pool, ~74 MB at 5. Deep is opt-in and rare by construction (it exists for
+// work that recurses past 60 KB), so 29 concurrent deep tasks is already a generous floor for
+// something most applications never bind once. Raise it with SetFiberBudget against a real workload
+// rather than against this comment -- which is what the note above says, and remains the right rule.
+//
+// EXHAUSTION IS STILL A SPIN, so this is a floor and not a guarantee. It converts "cannot be used"
+// into "works, and degrades if you use a lot of it", which is the difference worth 15 MB.
+static size_t g_deepPerComputeWorker   = 1;
 
 void TaskScheduler::SetFiberBudget(size_t normalPerComputeWorker,
                                    size_t tinyPerKWorker,
