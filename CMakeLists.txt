@@ -534,11 +534,13 @@ target_compile_definitions(SchedulerBench PRIVATE JLIBSCHED_VERSION="${JLIBSCHED
 # `cmake --build .` aborted the whole tree at this file. Three tests after it in the build order were
 # simply never produced, which reads as "those tests do not exist on Linux" rather than as one bench
 # being unportable.
-if(WIN32)
-    add_executable(SchedulerWaitForBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/waitfor_participation.cpp")
-    target_link_libraries(SchedulerWaitForBench PRIVATE Scheduler)
-    target_compile_features(SchedulerWaitForBench PRIVATE cxx_std_17)
-endif()
+# REMOVED 5.0.1. The bench CRASHED on startup -- and had been crashing before any of the 5.0.1
+# work touched it, verified by building and running the pre-change source. Nothing noticed because
+# the suite never ran it: it is a bench, so it was excluded from the test pass, and compiling is not
+# running. The source moved out of the tree rather than staying here unbuilt, because a target that
+# compiles and aborts is worse than one that is absent -- it reads as covered.
+#
+# Fix it and bring it back, or leave it out; do not restore it unrun.
 
 if(WIN32 AND NOT JLIBSCHED_ARCH STREQUAL "aarch64")
     set(JLIBSCHED_CSBENCH_ASM "${CMAKE_CURRENT_SOURCE_DIR}/bench/win32/context_switch_variants.asm")
@@ -1129,6 +1131,13 @@ target_compile_features(SchedulerStackClassesTest PRIVATE cxx_std_17)
 add_executable(SchedulerEpochReclaimTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/epoch_reclaim_test.cpp")
 target_link_libraries(SchedulerEpochReclaimTest PRIVATE Scheduler)
 target_compile_features(SchedulerEpochReclaimTest PRIVATE cxx_std_17)
+
+# THE EPOCH-GUARD SUSPEND CHECK, PROVEN TO FIRE. The check is enforced in Release at all eleven
+# ContextSwitch sites; this is the first thing that ever observed it doing anything. Two arms, so a
+# check that fired unconditionally would fail too -- see the file header.
+add_executable(SchedulerEpochSuspendCheckTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/epoch_suspend_check_test.cpp")
+target_link_libraries(SchedulerEpochSuspendCheckTest PRIVATE Scheduler)
+target_compile_features(SchedulerEpochSuspendCheckTest PRIVATE cxx_std_17)
 
 add_executable(SchedulerEverythingIsAFiberTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/everything_is_a_fiber_test.cpp")
 target_link_libraries(SchedulerEverythingIsAFiberTest PRIVATE Scheduler)
