@@ -759,6 +759,13 @@ static bool SubmitOp(IoReactor::Impl* impl, IoRequest* req, IoResult* out,
     req->resume = resume;
     req->token  = tok;
 
+    // An I/O continuation gets a tiny stack -- the same stamp the Windows backend makes, and it has
+    // to be made in both or the two platforms park on different footprints for the same call. Only
+    // over Standard, so an explicit Deep survives. See the long note at the equivalent line in
+    // src/win32/IoReactor.cpp for why the reactor is the right place to decide this.
+    if (resume && resume->stackClass == StackClass::Standard)
+        resume->stackClass = StackClass::Tiny;
+
     // LINKED BEFORE SUBMITTED, never after. The completion can arrive on another thread the
     // instant the SQE is published -- before this function returns -- and the drain looks the
     // request up in the shard to unlink it. Linking afterwards is a race whose loser is a

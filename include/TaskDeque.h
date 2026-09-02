@@ -291,7 +291,7 @@ namespace JLib {
         static_assert(alignof(Task) > kTagMask,
             "TaskDeque packs steal-vetting bits into the low bits of a Task*; Task's alignment "
             "must leave them free. Shrinking alignas(Task) breaks this silently.");
-        static_assert(static_cast<unsigned>(TaskType::Coroutine) <= 3,
+        static_assert(static_cast<unsigned>(TaskType::Fiber) <= 3,
             "TaskType must fit in the deque's two tag bits (2-3); adding a fifth value needs a "
             "wider tag, and alignof(Task) is what limits how wide it can get.");
 

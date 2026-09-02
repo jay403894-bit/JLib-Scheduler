@@ -9,25 +9,34 @@
 // IoAsync.h, which is what the coroutine mode was built for: I/O is work that is SUSPENDED
 // essentially always, and the cost of being suspended is the whole game.
 //
-// WHY THERE IS NO FIBER API. One was written, measured against the design, and deleted. A parked
-// fiber costs a 64 KB stack and one slot from a pool whose own header calls itself "the exact upper
-// bound on tasks that can be parked" -- against a coroutine frame of 64 to 256 bytes from the task
-// slab. Roughly 500x per in-flight operation, in the one dimension a reactor lives on, and the cap
-// is worse than the memory: a reactor's steady state IS thousands of parked operations, so fibers
-// would not degrade, they would stop.
+// THE FIBER API IS THE ONLY API NOW, and this header used to argue the opposite at length. That
+// argument is kept below because its ARITHMETIC was right and only its PREMISE was wrong -- getting
+// that backwards is how the old text would mislead the next reader.
 //
-// Keeping it as a "fallback" was considered and rejected for a sharper reason: it would not fail, it
-// would get SLOW. A missing C++20 compiler is a build error fixed in a minute; a fiber-backed
-// reactor is a throughput wall found with a profiler weeks later. The deleted version proved how
-// easy the trap is -- it identified its caller with `thread->currentFiber`, which is NULL for a
-// coroutine (coroutine tasks ride the Native path and never get a fiber), so a coroutine calling it
-// fell into the bare-thread branch and SPUN A WORKER for the duration of the I/O. Silently, on
-// exactly the caller it existed for.
+// WHAT IT SAID. A parked fiber costs a stack and a pool slot, against a coroutine frame of 64 to 256
+// bytes from the task slab -- roughly 500x per in-flight operation, in the one dimension a reactor
+// lives on. And the cap is worse than the memory: exhaustion is a spin, so at the limit fibers would
+// not degrade, they would stop.
 //
-// C++20 IS CONFINED TO THE AWAITER. Everything here -- the completion port, the in-flight list, the
-// backends -- is ordinary C++17 in .cpp files. The core pushes a `Task*` and never learns it is a
-// coroutine, the same type erasure Coroutine.h relies on to keep <coroutine> out of the core. An app
-// needs C++20 only if it wants to `co_await`.
+// WHY IT NO LONGER DECIDES ANYTHING. It multiplied that per-operation cost by A SERVER'S
+// CONCURRENCY -- "a reactor's steady state IS thousands of parked operations". That was never this
+// project's steady state. This is a game runtime: a UDP socket or two and some file-streaming
+// connections, tens of operations in flight. The 500x is real, and it is charged against a number
+// two orders of magnitude smaller than the one that made it frightening.
+//
+// AND THE STACK IS NOT 64 KB ANY MORE. StackClass::Tiny exists for exactly this caller -- 2 pages
+// usable, a 3-page region -- because an I/O continuation wakes, reads a completion and finishes. The
+// budget is 64 tiny fibers per reserved worker, 128 at the K=2 default, ~1.5 MB. See SetFiberBudget
+// in TaskScheduler.cpp for why that number deliberately errs high.
+//
+// THE ONE PART TO KEEP TAKING SERIOUSLY. The deleted fiber API identified its caller with
+// `thread->currentFiber` and fell into the bare-thread branch when that was null, SPINNING A WORKER
+// for the duration of the I/O -- silently, on exactly the caller it existed for. That trap is about
+// caller identification rather than about fibers, and it is still there to fall into.
+//
+// THIS RUNTIME IS PURE C++17. The awaiter that made C++20 optional-but-present is gone with the
+// rest of the coroutine layer (extras/abandoned/). The completion port, the in-flight list and the
+// backends were always ordinary C++17 in .cpp files; now everything is.
 //
 // == COMPLETION-FIRST, AND WHY CANCELLING I/O IS A REQUEST RATHER THAN A WAKE ==
 //

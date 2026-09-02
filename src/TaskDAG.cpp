@@ -10,31 +10,18 @@
 using namespace JLib;
 
 TaskNode* TaskDAG::CreateNode(Task* t, uint8_t priority, uint8_t cpu_id) {
-    // A COROUTINE CANNOT BE A DAG NODE, and this has to be a hard error rather than a comment.
+    // A COROUTINE COULD NOT BE A DAG NODE, and the hard error that said so is gone with the type.
     //
-    // The DAG defines "node complete" as "origFn returned" -- Fire() swaps the task's fn for
-    // OnTaskFinishedWrapper, which calls origFn and then fires the dependents. For a coroutine task
-    // origFn is the resume trampoline, and THAT RETURNS ON EVERY SUSPENSION, not on completion. A
-    // coroutine node would therefore fire its dependents at its first co_await, while its own body
-    // is still running -- silently producing wrong results rather than crashing. There is also no
-    // sound ownership story: the DAG retires the node as its last touch, while a coroutine frees its
-    // own Task from inside itself.
+    // Kept as a note because the REASON still governs what may be a node. The DAG defines "node
+    // complete" as "origFn returned" -- Fire() swaps the task's fn for OnTaskFinishedWrapper,
+    // which calls origFn and then fires the dependents. Any task whose function can return
+    // BEFORE its work is done would therefore fire its dependents early and silently produce
+    // wrong results. A coroutine's resume trampoline returned at every suspension, which is why
+    // it was rejected outright.
     //
-    // FIBER NODES ARE FINE AND ARE THE SUPPORTED WAY TO SUSPEND. A fiber's ContextSwitch preserves
-    // the wrapper's stack frame, so origFn returns only on real completion. To drive coroutines from
-    // a DAG, make the node a Fiber task that Spawn()s them and then WaitFor()s the group: the fiber
-    // suspends until they finish, and the node completes exactly when they do.
-    if (t && t->type == TaskType::Coroutine) {
-        std::fprintf(stderr,
-            "[JLib::Scheduler] FATAL: TaskDAG::CreateNode was given a TaskType::Coroutine task.\n"
-            "  The DAG treats 'the task's function returned' as 'the node finished', and resuming a\n"
-            "  coroutine returns at every suspension -- so dependents would fire at the first\n"
-            "  co_await, while the node is still running.\n"
-            "  Use a TaskType::Fiber node that Spawn()s the coroutines and WaitFor()s them: the\n"
-            "  fiber suspends until they complete, and the node finishes when they do.\n");
-        std::fflush(stderr);
-        std::abort();
-    }
+    // FIBER NODES SUSPEND CORRECTLY AND ARE THE ANSWER. A fiber's ContextSwitch preserves the
+    // wrapper's stack frame, so origFn returns only on real completion -- which is the whole
+    // reason a fibers-only runtime has nothing to reject here.
 
     // Stamp the graph's cancellation scope onto the task, so a Cancel() reaches it even after it
     // has been dispatched and is running -- Fire()'s flag only governs what has NOT been dispatched.

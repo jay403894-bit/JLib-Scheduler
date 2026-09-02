@@ -2391,7 +2391,7 @@ namespace JLib {
 		// 31-worker box for a class that may never be bound -- the heavy class's original mistake in
 		// miniature. Set before Init().
 		static void SetFiberBudget(size_t normalPerComputeWorker = 64,
-		                           size_t tinyPerKWorker        = 16,
+		                           size_t tinyPerKWorker        = 64,   // 128 at the K=2 default
 		                           size_t deepPerComputeWorker  = 0);
 		static size_t NormalFibersPerComputeWorker();
 		static size_t TinyFibersPerKWorker();
@@ -2743,19 +2743,20 @@ namespace JLib {
 			return StealClassCompatible(t->corePref, thiefIsP, degenerateTopology);
 		}
 
-		// The C++20 gate lives HERE, in the header, and that placement is the whole point.
-		// TaskType::Coroutine is declared in Task.h, which is C++17 -- so a C++17 translation unit
-		// can NAME the enumerator even though it can never legally produce a coroutine task
-		// (Coroutine.h, the only thing that creates one, #errors below C++20). Nothing caught the
-		// mismatch: the worker reads type == Coroutine purely as an OWNERSHIP signal, meaning "the
-		// frame frees itself, do not free the Task". A counterfeit one therefore RUNS, is never
-		// freed, and never signals its WaitGroup -- a leak plus a hang, with no crash to trace back.
+		// A C++20 GATE USED TO LIVE HERE, and 5.0 removed the thing it was gating. It asserted that
+		// a C++17 translation unit could not pass TaskType::Coroutine -- an enumerator a C++17 TU
+		// could NAME (it was declared in Task.h) but never legally produce, since the only thing
+		// that made one lived in a header that #errored below C++20. The worker read that type as
+		// an OWNERSHIP signal ("the frame frees itself, do not free the Task"), so a counterfeit
+		// one ran, leaked, and never signalled its WaitGroup.
 		//
-		// The check CANNOT sit in the impl's definition: that lives in the C++17 core .cpp, so
-		// __cpp_impl_coroutine there reads the LIBRARY's language version and would reject every
-		// legitimate coroutine (Spawn calls this exact overload). Inlined into the header, the same
-		// macro reads the CALLER's TU, which is the thing actually being asked about.
-		Task* CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type, CorePref corePref);
+		// With the runtime fibers-only there is no third type, no split language mode, and nothing
+		// to counterfeit. The whole class of bug is gone rather than guarded.
+		// `stack` picks which fiber stack the task binds if it ever binds one -- Standard (60 KB),
+		// Tiny (2 pages, for I/O continuations) or Deep (508 KB). It is the LAST parameter and
+		// defaults, so every existing call site is unchanged.
+		Task* CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type,
+		                     CorePref corePref, StackClass stack = StackClass::Standard);
 
 		// ---- THE PUBLIC JOB IS A FIBER --------------------------------------------------------
 		//
@@ -2776,11 +2777,9 @@ namespace JLib {
 		//
 		// Native has NOT gone away -- see CreateInternalTask. It is no longer the thing a caller
 		// gets by accident.
-		Task* CreateTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
-#if !defined(__cpp_impl_coroutine) || __cpp_impl_coroutine < 201902L
-			assert(type != TaskType::Coroutine && "coroutines require a C++20 build");
-#endif
-			return CreateTaskImpl(fn, data, lane, type, corePref);
+		Task* CreateTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber,
+		                 CorePref corePref = CorePref::Default, StackClass stack = StackClass::Standard) {
+			return CreateTaskImpl(fn, data, lane, type, corePref, stack);
 		}
 
 		// ---- INTERNAL JOBS: NATIVE ON PURPOSE, AND THE REASONS ARE NOT INTERCHANGEABLE ----------
@@ -2808,15 +2807,21 @@ namespace JLib {
 		// for it explicitly is asking for "this may never wait on anything", which is a real and
 		// occasionally correct thing to want. This overload exists so the library's own internal
 		// jobs say so at the call site instead of passing an enum whose meaning is a footnote.
+		// STACKCLASS MATTERS HERE EVEN THOUGH THIS IS NATIVE, and that is not obvious. A Native task
+		// is fiberless on the floor -- but a RESERVED worker binds a fiber to one anyway, which is
+		// exactly the path an I/O continuation takes. So `StackClass::Tiny` on an internal task is
+		// the difference between a completion parking on 8 KB and parking on 60 KB.
 		Task* CreateInternalTask(void(*fn)(void*), void* data, Lane lane = Lane::Normal,
-		                         CorePref corePref = CorePref::Default) {
-			return CreateTaskImpl(fn, data, lane, TaskType::Native, corePref);
+		                         CorePref corePref = CorePref::Default,
+		                         StackClass stack = StackClass::Standard) {
+			return CreateTaskImpl(fn, data, lane, TaskType::Native, corePref, stack);
 		}
 
 
 		// Fiber by default, for the reasons on the raw overload above.
 		template<typename F>
-		auto CreateTask(F&& f, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber, CorePref corePref = CorePref::Default) {
+		auto CreateTask(F&& f, Lane lane = Lane::Normal, TaskType type = TaskType::Fiber,
+		                CorePref corePref = CorePref::Default, StackClass stack = StackClass::Standard) {
 			using L = LambdaTask<std::decay_t<F>>;
 			// NO SIZE CEILING, as of 4.0.1. A capture larger than the biggest slot used to be a
 			// COMPILE ERROR, which made the task path stricter than the coroutine path for no reason
@@ -2829,12 +2834,6 @@ namespace JLib {
 			// wall. Disposal needs no size flag because TaskAllocator::Free routes by ADDRESS.
 			// Concrete size is a compile-time constant here, which is also why size-classing the
 			// task path would be nearly free: the class could be picked at compile time.
-			// UNCONDITIONAL, unlike the raw overload above -- a lambda is never a coroutine in ANY
-			// language mode. The coroutine path requires fn == ResumeCoroutine and data == a frame
-			// address; a LambdaTask satisfies neither, so tagging one Coroutine just tells the
-			// worker not to free it. Wrong in C++20 for the same reason it is wrong in C++17, so
-			// there is nothing to gate on. Coroutine tasks come from Spawn() in Coroutine.h.
-			assert(type != TaskType::Coroutine && "coroutines require a C++20 build; use Spawn(), not CreateTask()");
 			detail::RecordTaskSize(sizeof(L));
 
 			static_assert(alignof(L) <= 16, "lambda over-aligned for the slot");
@@ -2854,6 +2853,7 @@ namespace JLib {
 
 			t->type = type;
 			t->corePref = corePref;
+			t->stackClass = stack;
 			// ~LambdaTask is empty and its only member is the functor, so the destructor has work
 			// to do only when the CAPTURES do. Non-capturing lambdas and captures of scalars or
 			// raw pointers -- the overwhelming majority of task bodies -- skip the virtual call.
@@ -2865,8 +2865,9 @@ namespace JLib {
 		// ParallelFor's three leaf paths (flat chunks, cursor lanes, the lazy splitter) are the
 		// callers, and their bodies provably never wait.
 		template<typename F>
-		auto CreateInternalTask(F&& f, Lane lane = Lane::Normal, CorePref corePref = CorePref::Default) {
-			return CreateTask(std::forward<F>(f), lane, TaskType::Native, corePref);
+		auto CreateInternalTask(F&& f, Lane lane = Lane::Normal, CorePref corePref = CorePref::Default,
+		                        StackClass stack = StackClass::Standard) {
+			return CreateTask(std::forward<F>(f), lane, TaskType::Native, corePref, stack);
 		}
 
 		template <class F, std::enable_if_t<!std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<F>>>, int> = 0>

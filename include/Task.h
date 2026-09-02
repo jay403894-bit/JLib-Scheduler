@@ -34,15 +34,21 @@ namespace JLib {
     //             WaitOnEvent* guards check for. This is the default; ask for Fiber explicitly for
     //             anything that waits on something.
     //   Fiber     owns a stack; suspends by ContextSwitch and resumes later on any worker.
-    //   Coroutine a C++20 coroutine handle, resumed through the SAME fn(data) call as everything
-    //             else (fn is a trampoline, data is coroutine_handle::address()), so the worker
-    //             needs no <coroutine> include and the core stays C++17. It differs from Native in
-    //             ONE respect, and it is a lifetime rule rather than a dispatch rule: fn() returning
-    //             means "suspended OR finished", and the worker cannot tell which -- so it NEVER
-    //             completes a coroutine task at all. The C++20 side owns it start to finish and
-    //             frees it from inside the coroutine. See JLib/Coroutine.h for why any flag-based
-    //             alternative is racy.
-    enum class TaskType : uint8_t { Native, Fiber, Coroutine };
+    //
+    // THERE WAS A THIRD, `Coroutine`, AND 5.0 REMOVED IT. This is a FIBERS-ONLY runtime now, I/O
+    // included. A fiber and a coroutine were two answers to one question -- how does a task wait
+    // without blocking its worker -- and carrying both meant every suspension point in the
+    // scheduler had two shapes to be correct in: dispatch, the epoch contract, the hazard contract
+    // and the reactor each paid for it twice. The coroutine's one irreplaceable use was the I/O
+    // awaiter, and once I/O ran on fibers there was nothing left only it could do.
+    //
+    // The runtime is therefore PURE C++17 -- no optional C++20 header, no split standard in the
+    // build, no `JLIBSCHED_COROUTINES`. The old layer is kept unbuilt under extras/abandoned/.
+    //
+    // TWO VALUES, AND THE FIELD STAYS TWO BITS. `type` is a bitfield sized for four; leaving the
+    // width alone means the packing assertions and the wire layout do not move for a change that is
+    // about which values are legal, not about how many bits they need.
+    enum class TaskType : uint8_t { Native, Fiber };
 
     // ---- WHICH STACK A FIBER TASK WANTS --------------------------------------------------------
     //
@@ -455,7 +461,11 @@ namespace JLib {
             // correct and is the point: the flag block's layout really did change, so a library
             // built before the removal must not link against a header from after it. The guard will
             // say so by name instead of faulting at an unrelated address.
-            probe([](TaskFlagPacking& f) { f.type          = TaskType::Coroutine; });
+            // WAS TaskType::Coroutine, AND CHANGING IT MOVES THE FINGERPRINT ON PURPOSE -- same
+            // reasoning as the removed requiredSize probe above. `Coroutine` is not a legal value
+            // any more, so a library built while it was must not link against this header. Probing
+            // the highest value that still exists is what keeps the guard meaningful.
+            probe([](TaskFlagPacking& f) { f.type          = TaskType::Fiber; });
             probe([](TaskFlagPacking& f) { f.priorityBoost = 1; });
             probe([](TaskFlagPacking& f) { f.corePref      = CorePref::Wide; });
             probe([](TaskFlagPacking& f) { f.trivialDtor   = 1; });

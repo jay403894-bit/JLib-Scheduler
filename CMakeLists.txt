@@ -668,36 +668,12 @@ add_executable(SchedulerPrimitivesTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/primit
 target_link_libraries(SchedulerPrimitivesTest PRIVATE Scheduler)
 target_compile_features(SchedulerPrimitivesTest PRIVATE cxx_std_17)
 
-# The C++20 coroutine mode. Compiled at cxx_std_20 while the Scheduler target stays cxx_std_17 --
-# which is the point, and is checked by the build rather than by discipline: if anything from
-# Coroutine.h ever leaks into the core, the library target fails to compile at C++17.
+# THE C++20 COROUTINE TIER IS GONE. 5.0 made this a fibers-only runtime, I/O included, so there
+# is no second language mode to build: no JLIBSCHED_COROUTINES option, no cxx_std_20 targets, and
+# no split standard to police. Everything here is C++17, which used to be a property the build
+# enforced and is now simply what the project is.
 #
-# OFF by default. Not because coroutine support is experimental, but because requiring C++20 to
-# build the test suite would quietly make C++20 the project's real floor, and a C++17 job system
-# this complete is worth keeping buildable on C++17.
-option(JLIBSCHED_COROUTINES "Build the C++20 coroutine mode's tests (the header itself is always shipped)" OFF)
-if(JLIBSCHED_COROUTINES)
-    add_executable(SchedulerCoroutineTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/coroutine_test.cpp")
-    target_link_libraries(SchedulerCoroutineTest PRIVATE Scheduler)
-    target_compile_features(SchedulerCoroutineTest PRIVATE cxx_std_20)
-
-    add_executable(SchedulerFutureTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/future_test.cpp")
-    target_link_libraries(SchedulerFutureTest PRIVATE Scheduler)
-    target_compile_features(SchedulerFutureTest PRIVATE cxx_std_20)
-
-    add_executable(SchedulerCoroEpochTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/coro_epoch_contract_test.cpp")
-    target_link_libraries(SchedulerCoroEpochTest PRIVATE Scheduler)
-    target_compile_features(SchedulerCoroEpochTest PRIVATE cxx_std_20)
-    message(STATUS "JLib::Scheduler: C++20 coroutine tests ENABLED (core still builds as C++17)")
-
-    add_executable(SchedulerCoroBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/coroutine_bench.cpp")
-    target_link_libraries(SchedulerCoroBench PRIVATE Scheduler)
-    target_compile_features(SchedulerCoroBench PRIVATE cxx_std_20)
-
-    add_executable(SchedulerFrameClassBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/frame_class.cpp")
-    target_link_libraries(SchedulerFrameClassBench PRIVATE Scheduler)
-    target_compile_features(SchedulerFrameClassBench PRIVATE cxx_std_20)
-endif()
+# The old layer lives unbuilt under extras/abandoned/ -- see its README.
 
 # Records a histogram of real coroutine FRAME SIZES and live/peak counts. Exists to answer one
 # question with data instead of intuition: is pooling coroutine frames worth it, and what slot size
@@ -819,38 +795,20 @@ if(JLIBSCHED_STANDALONE)
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JLibScheduler")
 endif()
 
-# The reactor. TWO tests on purpose: the engine driven from PLAIN C++17 with a continuation task, and
-# the co_await surface at C++20. The first is what keeps IoReactor.h's "usable from C++17 in callback
-# form" claim honest -- it is the one that would silently stop being true.
+# ONE REACTOR TEST NOW, and it is the C++17 one. The co_await surface it used to be paired with is
+# gone with the coroutine layer, so what was "the arm that keeps the C++17 claim honest" is simply
+# the only arm -- there is no other language mode for it to be honest against.
+#
+# THE SOCKET SUITE WENT WITH IT, and that is a real loss worth naming rather than burying: 1003 lines
+# covering accept/connect/send/recv/vectored/peer-close/the acceptor pool/Stop drain/cancellation/
+# deadlines/IoStream chaining, and the only thing that exercised the Linux io_uring backend. It was
+# written entirely on co_await. Until it is ported to the fiber path, IoReactor::IsAvailable() on
+# Linux is asserted by nothing. See extras/abandoned/io_socket_test.cpp.
 if(WIN32)
     add_executable(SchedulerIoC17Test "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_c17_test.cpp")
     target_link_libraries(SchedulerIoC17Test PRIVATE Scheduler)
     target_compile_features(SchedulerIoC17Test PRIVATE cxx_std_17)
 
-    if(JLIBSCHED_COROUTINES)
-        add_executable(SchedulerIoAsyncTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_async_test.cpp")
-        target_link_libraries(SchedulerIoAsyncTest PRIVATE Scheduler)
-        target_compile_features(SchedulerIoAsyncTest PRIVATE cxx_std_20)
-    endif()
-endif()
-
-# Sockets need the co_await surface, so this one is C++20-only like the async test.
-# NO LONGER WIN32-ONLY. tests/socket_compat.h gives this file Winsock spelling on both platforms, so
-# it is ONE test rather than two that drift. It is built on Linux BEFORE the Linux reactor's
-# operations exist, and skips itself there via IoReactor::IsAvailable() -- which is the reactor's own
-# answer, so the skip disappears by itself when the backend lands. Building it early is the point:
-# it keeps the shim and this file's portability compiled and honest while the backend is written.
-#
-# The other two I/O tests stay Windows-only and for a harder reason than spelling: io_c17_test drives
-# CreateFile + SubmitRead (file I/O, which epoll cannot serve at all), and io_async_test uses NAMED
-# PIPES, which have no POSIX equivalent to shim.
-if(JLIBSCHED_COROUTINES)
-    add_executable(SchedulerIoSocketTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_socket_test.cpp")
-    target_link_libraries(SchedulerIoSocketTest PRIVATE Scheduler)
-    if(WIN32)
-        target_link_libraries(SchedulerIoSocketTest PRIVATE ws2_32)
-    endif()
-    target_compile_features(SchedulerIoSocketTest PRIVATE cxx_std_20)
 endif()
 
 # The service layers are opt-in. This process enables nothing and checks that the pool keeps every
@@ -863,11 +821,6 @@ target_compile_features(SchedulerIoOptInTest PRIVATE cxx_std_17)
 # unless JLIBSCHED_IO_LOCK_STATS is set, because counting means a try_lock before every real lock --
 # exactly the tax that perturbs what is being measured. Same rule as the steal and latency counters.
 option(JLIBSCHED_IO_LOCK_STATS "Count reactor mutex contention (diagnostic; perturbs the I/O path)" OFF)
-if(WIN32 AND JLIBSCHED_COROUTINES)
-    add_executable(SchedulerIoLockBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/io_lock_contention.cpp")
-    target_link_libraries(SchedulerIoLockBench PRIVATE Scheduler ws2_32)
-    target_compile_features(SchedulerIoLockBench PRIVATE cxx_std_20)
-endif()
 if(JLIBSCHED_IO_LOCK_STATS)
     target_compile_definitions(Scheduler PRIVATE JLIBSCHED_IO_LOCK_STATS)
     message(STATUS "JLib::Scheduler: reactor lock stats ENABLED (perturbs the I/O path)")
@@ -875,32 +828,15 @@ endif()
 
 # The dispatch seam: reactor-done to coroutine-running. Needs JLIBSCHED_IO_LOCK_STATS for the
 # completion timestamp; without it the bench says so rather than printing a flattering zero.
-if(WIN32 AND JLIBSCHED_COROUTINES)
-    add_executable(SchedulerIoLatencyBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/io_dispatch_latency.cpp")
-    target_link_libraries(SchedulerIoLatencyBench PRIVATE Scheduler ws2_32)
-    target_compile_features(SchedulerIoLatencyBench PRIVATE cxx_std_20)
-endif()
 
 # ---- samples -------------------------------------------------------------------------------------
 # udp_rect is the receive-LOOP counterpart to io_socket_test's single datagram: one binary that is
 # both ends of a UDP link on loopback, so there is nothing to configure to try it. C++20 because it
 # co_awaits the reactor. WIN32 executable would hide the console the sender needs, so it stays a
 # console app and creates its window by hand.
-if(WIN32 AND JLIBSCHED_COROUTINES)
-    add_executable(SchedulerUdpRect "${CMAKE_CURRENT_SOURCE_DIR}/samples/udp_rect.cpp")
-    target_link_libraries(SchedulerUdpRect PRIVATE Scheduler ws2_32)
-    target_compile_features(SchedulerUdpRect PRIVATE cxx_std_20)
-    set_target_properties(SchedulerUdpRect PROPERTIES OUTPUT_NAME udp_rect)
-endif()
 
 # Staged-timestamp latency bench for the udp_rect pipeline. --plain runs the same pipeline with a
 # blocking recvfrom thread instead of the reactor, which is the control the numbers are read against.
-if(WIN32 AND JLIBSCHED_COROUTINES)
-    add_executable(SchedulerUdpLatencyBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/udp_latency_bench.cpp")
-    target_link_libraries(SchedulerUdpLatencyBench PRIVATE Scheduler ws2_32)
-    target_compile_features(SchedulerUdpLatencyBench PRIVATE cxx_std_20)
-    set_target_properties(SchedulerUdpLatencyBench PROPERTIES OUTPUT_NAME udp_latency_bench)
-endif()
 
 
 # Eager mutex cancellation. Every case holds the lock for its whole duration and never unlocks before
@@ -986,11 +922,6 @@ target_compile_features(SchedulerHazardCeilingTest PRIVATE cxx_std_17)
 
 # THE SUSPENSION CHECK MUST ACTUALLY FIRE. Nothing else in the suite holds a hazard guard across a
 # co_await, so a green suite says nothing about it. C++20: it needs a real coroutine to suspend.
-if(JLIBSCHED_COROUTINES)
-    add_executable(SchedulerHazardCoroSuspendTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/hazard_coro_suspend_test.cpp")
-    target_link_libraries(SchedulerHazardCoroSuspendTest PRIVATE Scheduler)
-    target_compile_features(SchedulerHazardCoroSuspendTest PRIVATE cxx_std_20)
-endif()
 
 # The awake floor must grow under a wave AND shed back to base when idle. Shedding failed silently
 # for a whole bench run before this existed -- a one-way controller reads as a latency regression.

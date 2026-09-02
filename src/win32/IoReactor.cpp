@@ -620,6 +620,30 @@ namespace JLib {
             req->token  = tok;
             req->handle = h;
 
+            // ---- AN I/O CONTINUATION GETS A TINY STACK, AND THIS IS WHERE IT IS DECIDED --------
+            //
+            // ONE PLACE, ON PURPOSE. Every Submit overload funnels through here, and the caller
+            // hands us the resume task without necessarily knowing it is about to be parked for the
+            // duration of an I/O. The reactor DOES know, so the reactor stamps it.
+            //
+            // WHY IT MATTERS AT ALL: a Native resume task is fiberless on the floor, but a RESERVED
+            // worker binds a fiber to one -- which is the path a steered completion takes. Left at
+            // Standard, every outstanding operation parks on a 60 KB stack. At Tiny it is 2 pages.
+            // That 8x is the whole reason StackClass::Tiny exists (see Task.h), and until this line
+            // nothing in the library ever asked for it: the class was provisioned, cached per
+            // worker and never drawn from.
+            //
+            // ONLY OVER Standard, WHICH IS THE DEFAULT. A caller that explicitly asked for Deep is
+            // telling us its continuation recurses, and overriding that would turn an informed
+            // choice into a guard-page fault. Standard is indistinguishable from "did not choose",
+            // so that is the one this may take.
+            //
+            // IF A CONTINUATION NEEDS MORE THAN TWO PAGES it should be a Deep task, or -- better --
+            // it should do its work in a task it spawns rather than in the completion itself. The
+            // continuation is meant to wake, read the result and finish.
+            if (resume && resume->stackClass == StackClass::Standard)
+                resume->stackClass = StackClass::Tiny;
+
             {
                 if (stopping.load(std::memory_order_acquire)) {
                     if (out) *out = IoResult{ IoStatus::Failed, 0, ERROR_SHUTDOWN_IN_PROGRESS };

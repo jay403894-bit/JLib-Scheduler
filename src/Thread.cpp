@@ -2021,62 +2021,46 @@ void Thread::Worker() {
 			// A fiber-backed one suspends and frees the worker instead, so lane work can take a
 			// contended lock like anything else.
 			//
-			// COROUTINES STAY FIBERLESS, and that is not an oversight. Resuming one is a plain
-			// fn(data) call that returns, and a coroutine OWNS ITS OWN COMPLETION -- the worker must
-			// never complete or free it (see the ownership note below). The fiber path completes
-			// whatever it runs, so routing a coroutine through it would free a task the coroutine
-			// also frees. They have their own suspension mechanism and need no fiber for it.
-			const bool fiberless =
-				task_to_run->type == TaskType::Coroutine ||
-				(task_to_run->type == TaskType::Native && !isReservedWorker);
+			// ONE FIBERLESS RULE NOW, AND IT IS THE ONLY ONE. This used to admit coroutines as
+			// well, which is what gave the block below two ownership shapes: a coroutine owned its
+			// own completion and the worker had to be talked out of freeing it, while a Native task
+			// is the worker's to finish. With the runtime fibers-only there is one owner again.
+			const bool fiberless = (task_to_run->type == TaskType::Native && !isReservedWorker);
 
 			if (fiberless) {
-				// READ BEFORE Execute(), and this is load-bearing rather than tidy. A coroutine's
-				// resume can run the body to completion, and completion frees both the frame and
-				// this Task -- so `task_to_run` may be DANGLING the instant Execute() returns.
-				// Touching ->type afterwards to decide what to do about it is a use-after-free.
-				const bool isCoroutine = (task_to_run->type == TaskType::Coroutine);
-
 				currentRunningTask = task_to_run;
 				JLIBSCHED_PHASE(qIndex, Running);
 				busy.store(true, std::memory_order_relaxed);
 				task_to_run->Execute();
 
-				// OWNERSHIP: the worker completes Native tasks and NEVER completes coroutine ones.
+				// OWNERSHIP: THE WORKER COMPLETES WHAT IT RUNS, unconditionally.
 				//
-				// The tempting design -- a "did it finish" flag the worker checks after resuming --
-				// is racy and was written and discarded here. A coroutine that suspends is re-pushed
-				// by whatever armed its resume, so a SECOND worker can pick it up, run it to
-				// completion and free it while the first worker is still deciding; both then observe
-				// "finished" and both free. There is no flag read that closes that, because the
-				// window opens the moment the task becomes re-pushable, which is inside resume().
+				// This was an if/else on "is it a coroutine", and the else-arm existed because a
+				// coroutine freed its own Task from inside itself -- so the worker had to be
+				// stopped from freeing it a second time, and `task_to_run` could already be
+				// DANGLING the instant Execute() returned. That is why the type was read into a
+				// local BEFORE the call.
 				//
-				// Giving the C++20 side sole ownership removes the race instead of racing better:
-				// the coroutine signals its own WaitGroup and frees its own Task exactly once, from
-				// inside the coroutine, before its frame goes away. See JLib/Coroutine.h.
-				if (!isCoroutine) {
-					if (task_to_run->waitGroup) {
-						int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-						if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-							task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
-					}
-					busy.store(false, std::memory_order_relaxed);
-					currentRunningTask = nullptr;
+				// None of it applies now. A Native task cannot free itself, so the pointer is
+				// valid here by construction and there is exactly one owner. Worth recording why
+				// the old shape existed, because it looks like defensive clutter and was not: the
+				// alternative considered at the time -- a "did it finish" flag checked after the
+				// resume -- is racy no matter how it is read, since the window opens the moment the
+				// task becomes re-pushable, which is inside resume() itself.
+				if (task_to_run->waitGroup) {
+					int old = task_to_run->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+					if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+						task_to_run->waitGroup->WakeAll();   // only touches wg if someone registered
+				}
+				busy.store(false, std::memory_order_relaxed);
+				currentRunningTask = nullptr;
 
-					scheduler->CleanupTaskMetadata(task_to_run);
-					DestroyTask(task_to_run);
-					// Free(), not FreeSized(): FreeSized reports failure by RETURNING false, and a task
-					// whose body did not fit a slot lives on the heap. Free() is the funnel that routes
-					// both. Ignoring the bool here leaked such a task.
-					scheduler->GetAllocator()->Free(task_to_run);
-				}
-				else {
-					// Coroutine: the task may already be freed, so nothing below may touch it.
-					// Clearing these two is still required and still safe -- neither reads the task.
-					busy.store(false, std::memory_order_relaxed);
-					currentRunningTask = nullptr;
-					task_to_run = nullptr;
-				}
+				scheduler->CleanupTaskMetadata(task_to_run);
+				DestroyTask(task_to_run);
+				// Free(), not FreeSized(): FreeSized reports failure by RETURNING false, and a task
+				// whose body did not fit a slot lives on the heap. Free() is the funnel that routes
+				// both. Ignoring the bool here leaked such a task.
+				scheduler->GetAllocator()->Free(task_to_run);
 
 				// Same call the fiber arm makes, and deliberately the SAME FUNCTION -- these two
 				// blocks were written separately and drifted within a day (the fiber copy grew the

@@ -2104,3 +2104,55 @@ WORTH WRITING ANYWAY. The cost is one cold predicted branch; the failure it prev
 no diagnostic. And the reachability is a property of TODAY's queues, not of the API -- the moment
 anything acquires a bounded queue or a teardown refusal, every one of these sites becomes live. A
 bool nobody reads is indistinguishable from a void return, which is how it got discarded three times.
+
+## Fibers-only: coroutines removed, and the tiny-stack path wired at last (2026-09-02)
+
+V5 makes this a FIBERS-ONLY runtime, I/O included, so the C++20 coroutine layer is gone to
+extras/abandoned/ and `TaskType` is `{Native, Fiber}`. The runtime is pure C++17: no optional header,
+no split standard in the build, no `JLIBSCHED_COROUTINES`.
+
+WHAT IT COST, stated plainly rather than buried: the I/O test surface was written entirely on
+`co_await`, so io_socket_test (1003 lines -- accept/connect/send/recv/vectored/peer-close/acceptor
+pool/Stop drain/cancellation/deadlines/IoStream chaining, and the ONLY exercise of the Linux io_uring
+backend) went with it. What remains is io_c17_test at ~150 lines. Until that suite is ported to the
+fiber path, `IoReactor::IsAvailable()` on Linux is asserted by nothing.
+
+### The tiny stack was built and never used
+
+`StackClass::Tiny` -- 2 usable pages, a 3-page region -- was created for I/O continuations. All of it
+existed: sizes, the guard-paged arena, a per-worker ThreadLocalCache per class, batch refill through
+`GlobalFiberPool::StealInto`, recycle back into the owning class's cache, and a `SetFiberBudget`
+knob. **Nothing ever asked for it.** `stackClass` was reachable only by assigning the field after
+creation, `StackClass` appeared nowhere in TaskScheduler.h, and the reactor never touched it -- so
+every parked I/O continuation held a 60 KB Standard stack and the tiny pool was provisioned, cached
+and never drawn from. The budget number was unobservable.
+
+Fixed both ends:
+  * `StackClass` is a trailing defaulted parameter on all five Create* entry points.
+  * The reactor STAMPS `Tiny` where it takes the resume task -- one place per backend, since every
+    Submit overload funnels through it. Only over `Standard`: an explicit `Deep` survives, because a
+    caller asking for Deep is saying it recurses and downgrading that is a guard-page fault rather
+    than a slowdown.
+
+Asserted in io_c17_test with the class read BEFORE Submit (so it tests what Submit did, not what the
+constructor defaults to) plus a Deep control. Control verified RED against an unconditional stamp.
+
+### Budget: 64 tiny per reserved worker, 128 at K=2
+
+SIZED FOR A GAME, NOT A SERVER, and that is the whole justification. IoReactor.h argued a
+fiber-backed reactor was unaffordable because "a reactor's steady state IS thousands of parked
+operations" -- a server's premise, never this project's. The real shape is a UDP socket or two and
+some file-streaming connections: tens in flight. The 500x per-operation figure was right; it was
+multiplied by a concurrency two orders of magnitude too large.
+
+The model that makes 128 generous is ONE FIBER PER SOCKET/FILE, LOOPING ON COMPLETIONS -- not one per
+packet or per 4K read. That model is wrong at 16 and still wrong at 4096, so if 128 ever waits, dump
+the spawn sites before raising the number.
+
+Errs high deliberately: over-budget costs ~1.5 MB, under-budget is a SPIN on acquisition that
+deadlocks if the fiber holders are waiting on tasks that cannot get one (4-per-worker did exactly
+that to dag_cancel_test).
+
+STILL UNMEASURED: whether 2 pages is enough for a real continuation. It is the only page-denominated
+class, so it is 8 KB usable on x64 and 32 KB on a 16 KB-page platform, and an overflow is a
+guard-page fault rather than a spin. A stack-watermark probe would settle it.

@@ -77,9 +77,27 @@ int main() {
     // test caught; the type was never the half that mattered.
     Check(cont != nullptr, "created a plain internal (Native) continuation at DEFAULT priority");
 
+    // ---- THE REACTOR STAMPS AN I/O CONTINUATION AS StackClass::Tiny --------------------------
+    //
+    // READ BEFORE Submit, so the assertion after it is a statement about what SUBMIT DID rather
+    // than about what CreateInternalTask happened to default to. Without this the check would pass
+    // just as well if the constructor started returning Tiny, which is a different claim.
+    const JLib::StackClass beforeSubmit = cont->stackClass;
+    Check(beforeSubmit == JLib::StackClass::Standard,
+          "a fresh continuation starts at Standard (else the check below proves nothing)");
+
     const bool immediate = io.SubmitRead(h, st->buf, 256, 0, &st->req, &st->result,
                                          cont, JLib::CancelToken{});
     Check(!immediate, "the read was queued rather than answered immediately");
+
+    // WHY THIS MATTERS AND WHY IT IS ASSERTED RATHER THAN PRINTED: a parked I/O continuation holds
+    // its stack for the whole operation. At Standard that is a 60 KB usable / 64 KB region each; at
+    // Tiny it is 2 pages. StackClass::Tiny was built, sized, pooled and cached per worker for
+    // exactly this caller and then went UNUSED -- nothing in the library ever asked for it, so
+    // every completion parked on a Standard stack and the tiny budget was inert. This line is what
+    // keeps that from silently becoming true again.
+    Check(cont->stackClass == JLib::StackClass::Tiny,
+          "Submit routed the continuation to a TINY stack");
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (done.load(std::memory_order_acquire) == 0 &&
@@ -106,6 +124,34 @@ int main() {
     for (int i = 0; i < 256; ++i)
         if ((unsigned char)st->buf[i] != (unsigned char)(i & 0xFF)) right = false;
     Check(right, "and the buffer holds what the file holds");
+
+    // ---- CONTROL: AN EXPLICIT StackClass MUST SURVIVE THE STAMP -----------------------------
+    //
+    // The check above passes just as well if Submit stamps Tiny UNCONDITIONALLY, and that would be
+    // a real bug rather than a stricter version of the same rule: a caller asking for Deep is
+    // saying its continuation recurses, and silently handing it two pages turns an informed choice
+    // into a guard-page fault -- which is a crash, not a slowdown.
+    //
+    // A SECOND READ, NOT A SECOND FILE. This reuses the open handle and submits a read whose
+    // completion nobody waits for; the assertion is about what Submit did to the task on the way
+    // in, which has already happened by the time Submit returns. Stop() below drains it.
+    {
+        ReadState* ctl = new ReadState();
+        ctl->done = &done;
+        JLib::Task* deep = sched.CreateInternalTask([ctl] { (void)ctl; },
+                                                    JLib::Lane::Normal,
+                                                    JLib::CorePref::Default,
+                                                    JLib::StackClass::Deep);
+        Check(deep && deep->stackClass == JLib::StackClass::Deep,
+              "CONTROL: CreateInternalTask honours an explicit StackClass::Deep");
+
+        io.SubmitRead(h, ctl->buf, 256, 0, &ctl->req, &ctl->result, deep, JLib::CancelToken{});
+
+        Check(deep->stackClass == JLib::StackClass::Deep,
+              "CONTROL: Submit did NOT downgrade an explicit Deep to Tiny");
+        // ctl is intentionally leaked -- its completion may still be in flight, and freeing the
+        // state a queued IoRequest points at is the use-after-free this test exists near.
+    }
 
     delete st;
     io.Stop();

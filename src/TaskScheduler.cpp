@@ -5754,22 +5754,19 @@ bool TaskScheduler::TryRunStolenNativeTask() {
 	// "did I make progress", and removing a cancelled task from the queue is progress.
 	if (DiscardIfCancelled(task)) return true;
 
-	const bool isCoroutine = (task->type == TaskType::Coroutine);
-
 	task->Execute();
 
-	// Same ownership rule as the worker's fast path, and it has to be the same or this is a double
-	// free: a coroutine signals its own WaitGroup and returns its own Task to the slab from inside
-	// the coroutine. Everything below belongs to tasks this caller actually owns.
-	if (!isCoroutine) {
-		if (task->waitGroup) {
-			int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
-			if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
-				task->waitGroup->WakeAll();   // only touches wg if someone registered
-		}
-		DestroyTask(task);
-		taskAllocator.Free(task);
+	// Same ownership rule as the worker's fast path, and it still has to MATCH it -- the two are
+	// one rule written twice, and they disagreeing is a double free. Both are unconditional now:
+	// the coroutine arm that used to guard this (a coroutine freed its own Task from inside itself)
+	// went with TaskType::Coroutine in 5.0.
+	if (task->waitGroup) {
+		int old = task->waitGroup->n.fetch_sub(1, std::memory_order_acq_rel);
+		if ((old & WaitGroup::COUNT_MASK) == 1 && (old & WaitGroup::WAITER_BIT))
+			task->waitGroup->WakeAll();   // only touches wg if someone registered
 	}
+	DestroyTask(task);
+	taskAllocator.Free(task);
 
 	return true;
 }
@@ -5853,7 +5850,29 @@ static size_t g_standardFibersPerWorker = 64;
 // pool is still in the slab.s pre-fix state -- oversized so exhaustion is unreachable. Until it
 // grows, this stays where it was.
 static size_t g_normalPerComputeWorker = 64;
-static size_t g_tinyPerKWorker         = 16;
+
+// ---- TINY: 64 PER RESERVED WORKER, SO 128 AT THE K=2 DEFAULT ---------------------------------
+//
+// THIS IS THE FIBER-BACKED I/O BUDGET. Since 5.0 an I/O continuation waits on a FIBER rather than a
+// coroutine, so a parked operation costs a tiny stack for as long as it is outstanding, and this
+// number is the ceiling on how many may be outstanding at once before acquisition starts spinning.
+//
+// SIZED FOR A GAME, NOT A SERVER, and that distinction is the whole justification. The workload is
+// a UDP socket or two and some file-streaming connections -- tens of operations in flight, not
+// thousands. IoReactor.h used to argue a fiber-backed reactor was unaffordable BECAUSE a reactor's
+// steady state is thousands of parked operations; that premise is a server's, and it was never this
+// project's. At game scale the arithmetic is unremarkable.
+//
+// WHY 64 AND NOT THE 16 IT WAS: the cost curve is lopsided and only one side is recoverable.
+// Over-budgeting costs memory -- 128 tiny fibers at a 12 KB region each is ~1.5 MB, noise against a
+// pool that reserves hundreds of MB. Under-budgeting does NOT degrade gracefully: exhaustion is a
+// SPIN and a requeue (see the note above), and if the tasks holding the fibers are waiting on tasks
+// that cannot get one, it is a deadlock -- which is exactly what 4-per-worker did to
+// dag_cancel_test. There is no reason to economise on the side where being wrong hangs the process.
+//
+// PER RESERVED WORKER, NOT A POOL TOTAL. K is clamped at 2, so this is 128 today and would be 64 if
+// someone ran K=1. Raise it if a workload ever reports the exhaustion warning in Thread.cpp.
+static size_t g_tinyPerKWorker         = 64;
 // DEEP IS THE ONE WHERE PER-WORKER SCALING IS QUESTIONABLE, and it is worth saying so rather than
 // hiding it in a default. "How many deeply-recursive tasks are in flight" is a property of the
 // APPLICATION, not of the core count -- and at 512 KB apiece, 1 per worker is ~15.5 MB committed on
@@ -6256,13 +6275,19 @@ void JLib::detail::ReportTaskSizesTo(std::FILE* out) {
 }
 #endif
 
-Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type, CorePref corePref) {
+Task* TaskScheduler::CreateTaskImpl(void(*fn)(void*), void* data, Lane lane, TaskType type,
+                                    CorePref corePref, StackClass stack) {
 	void* mem = taskAllocator.AllocSized(sizeof(Task));   // a bare Task is exactly 64 B
 	if (!mem) return nullptr;
 	detail::RecordTaskSize(sizeof(Task));   // exactly 64 -- a quarter of the slot it just took
 	Task* t = ::new (mem) Task(fn, data, lane);
 	t->type = type;
 	t->corePref = corePref;
+	// STAMPED HERE RATHER THAN POKED BY THE CALLER. `stackClass` was reachable only by assigning
+	// the field after creation -- which stack_classes_test did, because it was the only way -- so
+	// in practice every task in the library asked for Standard and the Tiny pool was provisioned
+	// and never drawn from. A parameter is what makes the class a decision a caller can express.
+	t->stackClass = stack;
 	// Concrete type is exactly Task, whose destructor is empty -- the completion path can skip the
 	// virtual call entirely. See Task::trivialDtor.
 	t->trivialDtor = 1;

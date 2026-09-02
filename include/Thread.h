@@ -952,12 +952,10 @@ namespace JLib {
     // for it. The case this separates is the coroutine's, where the slot would be BORROWED from
     // whichever worker happens to be running it and stops being the right place the instant it
     // suspends.
-    inline bool OnCoroutineTask() {
-        Thread* w = Thread::GetCurrent();
-        if (!w || w->currentFiber) return false;
-        Task* t = w->currentRunningTask;
-        return t && t->type == TaskType::Coroutine;
-    }
+    // OnCoroutineTask() WAS HERE. Its last caller went when the guard collapsed to one mechanism
+    // (see the note below), and 5.0 removed the type it asked about -- there is no coroutine task
+    // to be on. The paragraph above is kept because the DISTINCTION it draws still explains why a
+    // bare thread answers the way it does.
 
     // ================================================================================================
     // THE GUARD EVERY COROUTINE-REACHABLE CALL SITE SHOULD TAKE.
