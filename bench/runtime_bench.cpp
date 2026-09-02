@@ -383,24 +383,60 @@ static void BenchFiberSuspend(JLib::TaskScheduler& sched, int reps) {
 // serial time at crossover moves only 4.3x (~75us). So this reports the SERIAL BASELINE beside each
 // arm rather than a speedup in isolation: a speedup with no baseline cannot be checked.
 // ---------------------------------------------------------------------------------------------
+static constexpr int kPfN   = 1 << 16;   // items
+static constexpr int kPfOps = 24;         // dependent FP ops per item -- see the note below
+
 static void BenchParallelFor(JLib::TaskScheduler& sched, int reps) {
     Section("4. PARALLELFOR -- against its own serial baseline");
 
-    constexpr int kN = 1 << 20;
-    static std::vector<float> data;
-    data.assign(kN, 1.0f);
+    // ---- THE BODY IS COMPUTE-BOUND, AND THE PREVIOUS ONE WAS THE PROBLEM ---------------------
+    //
+    // This used to stream 4 MB of floats: `data[i] = data[i] * 1.000001f + 0.5f`. That is a MEMORY
+    // benchmark wearing a scheduler's clothes. One core can already saturate a good fraction of DRAM
+    // bandwidth, so adding thirty more buys almost nothing and the row reported ~3x on a 31-worker
+    // pool -- a number about the memory subsystem that a reader would naturally read as a statement
+    // about ParallelFor. It also made the row wildly unstable: a 10x spread on the parallel arm and
+    // a speedup that wandered 3.86 -> 3.57 -> 2.96 across three runs of unchanged code.
+    //
+    // WHAT THE ROW IS SUPPOSED TO ANSWER: how well does the SPLITTER divide work and keep workers
+    // fed. To see that, the body has to be limited by the thing being scaled -- cores -- not by a
+    // resource that is already saturated at one core.
+    //
+    // SO: A DEPENDENT FLOATING-POINT CHAIN PER INDEX, and no array at all.
+    //   * NO MEMORY TRAFFIC. Each item's work is computed FROM ITS INDEX, so the working set is a
+    //     register. There is no array to stream, no cache to miss, and nothing shared to contend on.
+    //   * DEPENDENT, so it cannot be vectorised into something the CPU finishes early. Each step
+    //     needs the previous one's result, which makes the cost per item stable and real.
+    //   * NOT ELIMINABLE. The accumulator escapes into an atomic once per SLICE -- not per item, so
+    //     it is nowhere near the hot loop, and the optimiser cannot delete work whose result leaves
+    //     the translation unit.
+    //
+    // FEWER ITEMS, MORE WORK EACH. 64K items at ~24 dependent ops rather than 1M at ~2, which keeps
+    // the serial baseline in the same few-milliseconds range while making each item's cost dominate
+    // the loop overhead around it.
+
+    // The sink. Written once per slice; its only job is to stop the compiler proving the loop dead.
+    static std::atomic<std::uint64_t> sink{ 0 };
 
     auto body = [](int b, int e) {
-        for (int i = b; i < e; ++i) data[i] = data[i] * 1.000001f + 0.5f;
+        double acc = 0.0;
+        for (int i = b; i < e; ++i) {
+            double x = 1.0 + (double)i * 1e-6;
+            // A DEPENDENT CHAIN: every line needs the line above it.
+            for (int k = 0; k < kPfOps; ++k)
+                x = 1.0 / (1.0 + x * x) + x * 0.5;
+            acc += x;
+        }
+        sink.fetch_add((std::uint64_t)(acc * 1024.0), std::memory_order_relaxed);
     };
 
     Samples serial, par;
 
-    auto runSerial = [&] { const auto t0 = Clock::now(); body(0, kN); serial.add(UsSince(t0)); };
+    auto runSerial = [&] { const auto t0 = Clock::now(); body(0, kPfN); serial.add(UsSince(t0)); };
     auto runPar    = [&] {
         const auto t0 = Clock::now();
         std::function<void(int,int)> f = body;
-        sched.ParallelFor(0, kN, 4096, f);
+        sched.ParallelFor(0, kPfN, 512, f);
         par.add(UsSince(t0));
     };
 
@@ -412,12 +448,38 @@ static void BenchParallelFor(JLib::TaskScheduler& sched, int reps) {
     }
 
     Row("serial baseline", serial, "us");
-    Row("ParallelFor (grain 4096)", par, "us");
+    Row("ParallelFor (grain 512)", par, "us");
     const double sp = par.median() > 0.0 ? serial.median() / par.median() : 0.0;
-    std::printf("  %-34s %9.2f x\n", "speedup", sp);
-    std::printf("\n  %zu workers. A speedup well under the worker count is NOT automatically a defect --\n"
-                "  this body is memory-bound, so it saturates bandwidth long before it saturates cores.\n",
-                sched.GetWorkerCount());
+    const size_t W  = sched.GetWorkerCount();
+    std::printf("  %-34s %9.2f x   of %zu workers (%.0f%% efficiency)\n",
+                "speedup", sp, W, W ? 100.0 * sp / (double)W : 0.0);
+
+    std::printf("\n  COMPUTE-BOUND BODY, so this row is about the SPLITTER rather than about memory\n"
+                "  bandwidth -- see the note in the source for what it used to measure and why that\n"
+                "  was the wrong question.\n");
+
+    // ---- WORKER COUNT IS NOT THE CEILING, AND SAYING SO IS NOT AN EXCUSE ---------------------
+    //
+    // An earlier version of this line warned that efficiency under 50% was "worth looking at" and
+    // pointed at the grain and the pool ramp. On this class of hardware that accuses the wrong
+    // component. Two effects cap the achievable speedup before the scheduler is involved at all:
+    //
+    //   FREQUENCY. The serial arm is ONE core at single-core boost. The parallel arm is every core
+    //   at the all-core bin, which is materially lower. The baseline is measured at a clock the
+    //   parallel arm can never run at, so some of the "missing" speedup is arithmetic.
+    //
+    //   HETEROGENEOUS CORES. A hybrid part has performance and efficiency cores with different
+    //   IPC and different clocks. Thirty-one workers is not thirty-one of whatever ran the serial
+    //   arm, so "31x" was never the target.
+    //
+    // The number to compare across RUNS is this one; the number to compare against the worker count
+    // is not meaningful on a hybrid, boosting machine. A regression shows up as this figure moving,
+    // not as its distance from W.
+    std::printf("  NOTE ON THE CEILING: %zu is not the target. The serial arm runs on ONE core at\n"
+                "  single-core boost; the parallel arm runs on all of them at the all-core bin, and\n"
+                "  on a hybrid part not all of those cores are the same speed. Compare this figure\n"
+                "  against ITSELF across runs -- a regression moves it; its distance from %zu does\n"
+                "  not mean what it looks like.\n", W, W);
 }
 
 // ---------------------------------------------------------------------------------------------
