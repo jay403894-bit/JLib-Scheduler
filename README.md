@@ -941,10 +941,50 @@ that if adding workers stops helping, the loop is the thing to look at. Two ways
 
 `SchedulerBench` reports the two cases as `throughput/1p` and `throughput/mp`.
 
+### Fibers resume anywhere by default
+
+A suspended fiber comes back on **whichever worker is free**, not the one it left. That is the point
+of a fiber task library -- it is the only reason to have a pool rather than a thread per job -- and
+it is the default as of 5.0.
+
+**The trade is `thread_local`, and it is the only one.** A value read from TLS before a suspension
+point is not necessarily the same value after it, because "after" may be a different thread. Nothing
+catches this: you get the resuming worker's copy, silently.
+
+```cpp
+// Migratable (default). Do NOT hold a thread_local across a suspension point.
+auto* tls = &SomeThreadLocal();
+co_something_that_suspends();
+tls->field = 1;                       // WRONG: `tls` may belong to another worker now
+```
+
+If your code -- or a library you cannot audit -- keeps state in `thread_local` across a wait, take
+**pinned mode** instead:
+
+```cpp
+JLib::TaskScheduler::SetMigratableFibers(false);   // BEFORE Init()
+JLib::TaskScheduler::Init(0);
+```
+
+Pinned means a fiber resumes **only** on the worker it was bound to. TLS is then safe, and what you
+give up is resume-anywhere: a fiber whose home worker is busy waits for that worker specifically
+rather than taking the next free one. This is marl's contract, and it was this library's default
+through 5.0.
+
+It is one predicate, not two schedulers -- pinned is the migratable path with the creditor set forced
+to a single member -- so both modes share the same mechanisms and the flag is read at the
+resume-routing decision rather than branched on throughout. It must be set **before `Init()`**;
+flipping it under a live pool would strand already-bound fibers under the old rule.
+
+> **Migratable is the newer path.** Pinned is what shipped through 5.0 and has the mileage. Resume-
+> anywhere is the default because it is the correct shape for this library, not because it has more
+> hours on it -- if you hit something odd under load, flipping to pinned is a useful bisect.
+
 ### Rules worth knowing
 
-A task that will call `WaitFor` must be created with **`TaskType::Fiber`**. It defaults to
-`TaskType::Native`, and a task with no fiber under it cannot suspend -- it fail-fasts with no message.
+A task that will call `WaitFor` needs a fiber under it. `CreateTask` gives you **`TaskType::Fiber`**
+by default, so this is usually automatic; a task explicitly created `TaskType::Native` has no fiber,
+cannot suspend, and fail-fasts with no message if it tries.
 
 Tasks live in 256-byte slab slots, so a lambda capturing more than about **192 bytes** fails a
 `static_assert`. Capture pointers, not payloads.

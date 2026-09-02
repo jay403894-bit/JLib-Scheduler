@@ -5839,7 +5839,17 @@ bool TaskScheduler::PushBatchWide() noexcept { return g_pushBatchWide.load(std::
 // plain mov on x86, so the UB was being accepted for nothing. A flag whose whole selling point is
 // "set once, so the branch predicts perfectly and costs nothing" should not be the one place that
 // relies on a promise instead of the type system.
-static std::atomic<bool> g_migratableFibers{ false };
+// MIGRATABLE BY DEFAULT SINCE 5.0. Resume-anywhere is the point of a fiber task library: a job that
+// suspends should come back on whichever worker is free, which is the only reason to have a pool
+// instead of a thread per job. Pinned was the default through 5.0 and it meant every program paid
+// for the migration machinery -- address-routed frees, the global epoch participant list,
+// fiber-indexed hazard cells -- and then declined to use it.
+//
+// THE TRADE IS thread_local, and it is the only one. Pinned mode is what makes a TLS value read
+// before a suspension point still valid after it; migratable gives that up SILENTLY, handing back
+// whatever the resuming worker has. An application that keeps state in thread_local across a suspend
+// wants SetMigratableFibers(false) before Init(). See the README.
+static std::atomic<bool> g_migratableFibers{ true };
 void TaskScheduler::SetMigratableFibers(bool on) {
 	// THE CREDITOR MASK MUST COVER EVERY ADDRESSABLE WORKER. If it does not, NoteCreditor refuses a
 	// high-numbered worker -- correctly, since wrapping would bill the wrong one -- and that

@@ -1911,3 +1911,28 @@ shed on quiet, and the policy acted as a ceiling); this is the same lesson writt
 
 More `Lane::` values only if two reserved classes genuinely fight over the band -- a 6.0 decision
 with evidence, not a speculative third enumerator now.
+
+## Migratable fibers are the DEFAULT as of 5.0 (9-02)
+
+`SetMigratableFibers` now defaults to **true**. A suspended fiber resumes on whichever worker is
+free, not the one it left.
+
+**Why the flip:** resume-anywhere is what a fiber task library is FOR -- it is the only reason to
+have a pool instead of a thread per job. Defaulting to pinned meant every program bought the
+migration machinery (address-routed frees, the global epoch participant list, fiber-indexed hazard
+cells) and then declined to use it. Migration's costs were already paid; the pin was never a fix.
+
+**The trade is `thread_local` and nothing else.** Pinned mode is what makes a TLS value read before a
+suspension point still valid after it. Migratable gives that up SILENTLY -- you get the resuming
+worker's copy, with nothing to catch it. An app that keeps state in TLS across a wait, or embeds a
+library it cannot audit, wants `SetMigratableFibers(false)` before `Init()`.
+
+Thread-affine cleanup is settled through Fiber's creditor set, one hop per creditor, and costs
+nothing for a fiber that never touched affine state -- which today is all of them.
+
+**HONESTY NOTE FOR THE README, AND IT IS IN THERE:** migratable is the LESS-TESTED path. Pinned is
+what shipped through 5.0 and has the mileage. It is the default because it is the right shape, not
+because it has more hours on it, and flipping to pinned is a useful bisect for anything odd under
+load. Not public yet -- 5.0 is a substantially different product from what shipped before it
+(everything-is-a-fiber, Lane, K frozen at 2, migratable default), and it wants a real test pass and
+at least an epoll backend before any release claim.

@@ -2429,15 +2429,23 @@ namespace JLib {
 
 		// ---- MIGRATABLE FIBERS: the mode switch, and it is ONE PREDICATE, not two schedulers -----
 		//
-		// false (DEFAULT, and what every release through 5.0 shipped): a fiber resumes only on the
-		// worker it was bound to. marl's contract -- "the fiber must belong to this worker" -- and
-		// the conservative one. TLS is safe because the fiber never moves.
+		// true (THE DEFAULT since 5.0): a resumed fiber may continue on ANY worker. This is what a
+		// fiber-task library is FOR -- work that suspends goes back to whichever worker is free,
+		// which is the whole reason to have a pool rather than a thread per job. It is also the
+		// position the architecture header at the top of this file argues for, and the one the
+		// library already PAID for: address-routed frees, a global epoch participant list,
+		// fiber-indexed hazard cells. Defaulting to pinned meant every program bought that
+		// machinery and then declined to use it.
 		//
-		// true: a resumed fiber may continue on ANY worker. This is the position the architecture
-		// header at the top of this file argues for and the one the library already PAID for --
-		// address-routed frees, a global epoch participant list, fiber-indexed hazard cells. What it
-		// costs is that thread-affine cleanup can no longer just happen wherever the fiber ends: it
-		// is settled through Fiber's creditor set, one hop per creditor.
+		// WHAT MIGRATION COSTS: thread-affine cleanup can no longer just happen wherever the fiber
+		// ends. It is settled through Fiber's creditor set, one hop per creditor -- and that costs
+		// nothing for a fiber that never touched affine state, which today is all of them.
+		//
+		// false: a fiber resumes only on the worker it was bound to. marl's contract -- "the fiber
+		// must belong to this worker" -- and the conservative one. THE REASON TO PICK IT IS
+		// thread_local: pinned is what makes a `thread_local` read before a suspension point still
+		// valid after it. Migratable mode gives that up, and gives it up SILENTLY -- the value is
+		// simply the other worker's, with nothing to catch it.
 		//
 		// WHY A SETTING RATHER THAN A CHOICE. The two are not equally right for every host. A game
 		// that owns every job in the process can enforce "do not cache a TLS-derived value across a
