@@ -2539,3 +2539,30 @@ the range must do anyway. It is a defensible START that recruitment corrects, no
 
 SetMeasuredWidth(false) restores the old behaviour and is the A/B control if the width is ever
 suspected.
+
+## The probe A/B: indistinguishable on a uniform range, and my variance story was wrong
+
+Ran SetMeasuredWidth ON vs OFF interleaved in one process (runtime_bench section 4, reps=15):
+
+    serial baseline            3114.00 us  [3005.80 - 3144.40]
+    ParallelFor, probe ON       250.40 us  [181.00 - 413.50]   12.44x
+    ParallelFor, probe OFF      249.50 us  [179.20 - 438.30]   12.48x
+    run-to-run spread            2.28x / 2.45x
+
+TWO CORRECTIONS, ONE OF THEM MINE.
+
+I ATTRIBUTED THE ROW'S VARIANCE TO THE PROBE. It is not: turning the probe off gives the SAME spread
+(2.45x against 2.28x). So the 10.78-vs-14.60 gap between earlier runs has no identified cause yet.
+Recruitment timing, boost behaviour and which cores the slices land on are all still open. The
+explanation was plausible, matched a documented weakness, and was still wrong -- the third time in
+this session that a tidy mechanism story survived until it was A/B'd.
+
+AND THIS BENCH CANNOT SHOW THE PROBE'S VALUE. The body is 64K uniform items at grain 512 -- large,
+even, adequately grained -- which is exactly where any sane width works. The probe is defended by the
+cases the header cites and this row does not contain: trivial work at N=256 measuring 0.02x under the
+fixed rule, heavy work at the same N measuring 6.9x. A uniform large range is where measured width
+matters LEAST.
+
+TO DEMONSTRATE IT RATHER THAN ARGUE IT: a small range, N~256, with a trivial body and a heavy body,
+probe on and off. That is the shape where serial-or-whole-pool is visibly wrong in both directions.
+Not built yet.

@@ -430,29 +430,74 @@ static void BenchParallelFor(JLib::TaskScheduler& sched, int reps) {
         sink.fetch_add((std::uint64_t)(acc * 1024.0), std::memory_order_relaxed);
     };
 
-    Samples serial, par;
+    Samples serial, par, parNoProbe;
 
     auto runSerial = [&] { const auto t0 = Clock::now(); body(0, kPfN); serial.add(UsSince(t0)); };
-    auto runPar    = [&] {
+
+    // ---- THE PROBE, A/B'd IN ONE PROCESS ----------------------------------------------------
+    //
+    // SetMeasuredWidth is ON by default: ParallelFor times the first chunk on the CALLER and picks
+    // fan-out width as sqrt(W/c). Turning it off falls back to the older rule -- serial or the whole
+    // pool, chosen by an iteration count that never looks at the body.
+    //
+    // INTERLEAVED, NOT TWO RUNS. The width is a runtime setter, so both arms are the same binary on
+    // the same thermal state, alternating. Comparing two separate invocations would compare two
+    // machines' worth of drift and call it a design decision.
+    //
+    // THE PROBE IS ALSO WHERE THIS ROW'S VARIANCE COMES FROM: it measures on a caller running at
+    // single-core boost, before the pool spins up and the all-core clock drops, so it under-estimates
+    // the width and recruitment widens afterwards. That means the honest comparison is not just the
+    // medians -- it is the medians AND the spread, printed for both.
+    auto runPar = [&](bool measured, Samples& out) {
+        JLib::TaskScheduler::SetMeasuredWidth(measured);
         const auto t0 = Clock::now();
         std::function<void(int,int)> f = body;
         sched.ParallelFor(0, kPfN, 512, f);
-        par.add(UsSince(t0));
+        out.add(UsSince(t0));
     };
 
-    runSerial(); runPar(); serial.v.clear(); par.v.clear();   // warm-up
+    runSerial(); runPar(true, par); runPar(false, parNoProbe);
+    serial.v.clear(); par.v.clear(); parNoProbe.v.clear();   // warm-up
 
     for (int r = 0; r < reps; ++r) {
-        if (r & 1) { runSerial(); runPar(); }
-        else       { runPar();    runSerial(); }
+        switch (r % 3) {
+            case 0: runSerial(); runPar(true, par);  runPar(false, parNoProbe); break;
+            case 1: runPar(true, par);  runPar(false, parNoProbe); runSerial(); break;
+            default: runPar(false, parNoProbe); runSerial(); runPar(true, par); break;
+        }
     }
+    JLib::TaskScheduler::SetMeasuredWidth(true);   // restore the default, always
 
+    const size_t W = sched.GetWorkerCount();
     Row("serial baseline", serial, "us");
-    Row("ParallelFor (grain 512)", par, "us");
-    const double sp = par.median() > 0.0 ? serial.median() / par.median() : 0.0;
-    const size_t W  = sched.GetWorkerCount();
+    Row("ParallelFor, probe ON  (ships)", par, "us");
+    Row("ParallelFor, probe OFF", parNoProbe, "us");
+
+    const double sp   = par.median()        > 0.0 ? serial.median() / par.median()        : 0.0;
+    const double spNP = parNoProbe.median() > 0.0 ? serial.median() / parNoProbe.median() : 0.0;
     std::printf("  %-34s %9.2f x   of %zu workers (%.0f%% efficiency)\n",
-                "speedup", sp, W, W ? 100.0 * sp / (double)W : 0.0);
+                "speedup, probe ON", sp, W, W ? 100.0 * sp / (double)W : 0.0);
+    std::printf("  %-34s %9.2f x   of %zu workers (%.0f%% efficiency)\n",
+                "speedup, probe OFF", spNP, W, W ? 100.0 * spNP / (double)W : 0.0);
+
+    // SPREAD, NOT JUST THE MEDIAN. The probe's known weakness is variance -- it measures on a caller
+    // at single-core boost and recruitment corrects afterwards -- so an honest A/B has to show
+    // whether turning it off trades a worse median for a steadier one, or is simply worse.
+    auto spread = [](Samples& s) { return s.lo() > 0.0 ? s.hi() / s.lo() : 0.0; };
+    std::printf("  %-34s %9.2f x / %.2f x   (hi/lo: ON, OFF)\n",
+                "run-to-run spread", spread(par), spread(parNoProbe));
+
+    if (sp > spNP * 1.05)
+        std::printf("\n  THE PROBE EARNS ITS PLACE: it is faster than the fixed rule, not merely\n"
+                    "  cheaper to justify. Turning it off falls back to serial-or-whole-pool chosen\n"
+                    "  by an iteration count that never looks at the body.\n");
+    else if (spNP > sp * 1.05)
+        std::printf("\n  THE PROBE IS LOSING on this shape -- the fixed rule is faster here. Worth\n"
+                    "  knowing which body reverses it before treating measured width as settled.\n");
+    else
+        std::printf("\n  INDISTINGUISHABLE on this shape. The probe is defended by the cases where the\n"
+                    "  fixed rule is badly wrong (0.02x for trivial work at N=256, 6.9x for heavy work\n"
+                    "  at the same N), not by this one -- a uniform body is where it matters least.\n");
 
     std::printf("\n  COMPUTE-BOUND BODY, so this row is about the SPLITTER rather than about memory\n"
                 "  bandwidth -- see the note in the source for what it used to measure and why that\n"
