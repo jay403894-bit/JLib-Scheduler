@@ -1028,6 +1028,15 @@ add_executable(SchedulerReservedLoPriPlacementTest "${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(SchedulerReservedLoPriPlacementTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedLoPriPlacementTest PRIVATE cxx_std_17)
 
+# K RUNS FIBER JOBS, THE FLOOR STAYS FIBERLESS. The reserved lane carries I/O completions, which are
+# Native (CreateInternalTask) and want to suspend -- so K binds a fiber. The FLOOR arm is the control
+# that stops "K got fibers" being confused with "everyone got fibers", which would put a
+# ContextSwitch on every task in the pool. Asserts the capability (a Native task suspending on an
+# event) and not just the binding.
+add_executable(SchedulerReservedFiberJobTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_fiber_job_test.cpp")
+target_link_libraries(SchedulerReservedFiberJobTest PRIVATE Scheduler)
+target_compile_features(SchedulerReservedFiberJobTest PRIVATE cxx_std_17)
+
 # FIBER REGISTRY, STRUCTURE IN ISOLATION. Drives RegisterFiberHome/TakeFiberHomeList against fibers
 # the test owns, rather than routing tasks through the scheduler to reach them -- see the test
 # header for why, and for the four -D negative controls that must each go RED.

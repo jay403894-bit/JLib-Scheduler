@@ -1800,3 +1800,37 @@ Two things worth keeping:
   work parked in an inbox nobody is permitted to drain, and every one presents as a lost wake.
   When the dump says every worker is idle and the queue depth is not zero, look at WHO MAY READ
   THAT QUEUE before looking at the wake path.
+
+## K runs fiber jobs; the floor keeps the fiberless fast path (9-02)
+
+The fiberless path runs a task straight on the worker's OS stack with no fiber bound. It is legal
+only because Native is a CONTRACT -- it may not suspend, because there is nothing to switch away to.
+On the floor that is the right trade: work that will never wait should not pay for a fiber.
+
+**On K it is the wrong trade, and the reason is what K is for.** The reserved lane carries I/O
+completions, and a completion is exactly the work that wants to wait -- read, then wait for the next
+read. The reactor's continuations are Native (`CreateInternalTask`), so fiberless they cannot suspend
+at all, and since 9-02 they cannot block either: `SchedulerMutex::Lock` refuses a fiberless task
+rather than stranding the worker's unstealable inbox. A fiber costs one acquire and one
+ContextSwitch and buys suspend/resume, which is the entire capability the lane exists to provide.
+
+    const bool fiberless = type == Coroutine || (type == Native && !reservedForHiPri);
+
+**Coroutines stay fiberless deliberately.** Resuming one is a plain `fn(data)` call that returns, and
+a coroutine OWNS ITS OWN COMPLETION -- the worker must never complete or free it. The fiber path
+completes whatever it runs, so routing a coroutine through it would free a task the coroutine also
+frees. They have their own suspension mechanism and need no fiber for it.
+
+Safe because the two completion paths are already identical for Native: same WaitGroup
+`fetch_sub` + gated `WakeAll`, same `CleanupTaskMetadata`/`DestroyTask`/`Free`. Checked before
+changing the branch, because a fiber path that skipped the WaitGroup decrement would have turned
+every `ParallelFor` on the lane into a hang.
+
+`tests/reserved_fiber_job_test.cpp` measures 200/200 reserved with a fiber and 200/200 floor without,
+then asserts the CAPABILITY rather than the binding: a Native task on K suspends on an event and is
+resumed, which was unreachable before. **The floor arm is the negative control** -- binding a fiber
+to every Native task would leave arm 1 green while putting a ContextSwitch on every task in the pool,
+and only the floor arm going red distinguishes those two.
+
+Keyed on where each task ACTUALLY ran, not where it was aimed: hiPri is routed into the reserved band
+but can spill to another hiPri inbox when K is busy, so "I pushed it hiPri" is not "it ran on K".

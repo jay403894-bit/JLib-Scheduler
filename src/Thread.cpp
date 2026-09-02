@@ -2001,7 +2001,36 @@ void Thread::Worker() {
 			// of TIME_CRITICAL exists to prevent. A lane task gets its latency from being ROUTED to
 			// a reserved worker, which is already at CRITICAL; it does not need to drag whatever
 			// worker it landed on up with it.
-			if (task_to_run->type == TaskType::Native || task_to_run->type == TaskType::Coroutine) {
+			// ---- A RESERVED WORKER RUNS FIBER JOBS. IT DOES NOT TAKE THE FIBERLESS PATH. --------
+			//
+			// The fast path below runs a task straight on this worker's OS stack with no fiber
+			// bound, which is only legal because Native is a CONTRACT: it may not suspend, because
+			// there is nothing to switch away to. On the FLOOR that is exactly the right trade -- a
+			// task that will never wait should not pay for a fiber.
+			//
+			// ON K IT IS THE WRONG TRADE, and the reason is what K is for. The reserved lane exists
+			// to carry I/O completions, and a completion is precisely the kind of work that WANTS to
+			// wait: read, then wait for the next read. The reactor's continuations are Native
+			// (CreateInternalTask), so on the fiberless path they cannot suspend at all -- the
+			// continuation must run to completion or fail loudly in WaitOnEvent's guard. Giving K a
+			// fiber costs one acquire and one ContextSwitch and buys suspend/resume, which is the
+			// entire capability the lane is supposed to provide.
+			//
+			// IT ALSO CLOSES THE BLOCKING HOLE. A fiberless task on a worker cannot block either --
+			// SchedulerMutex::Lock refuses it rather than stranding the worker's unstealable inbox.
+			// A fiber-backed one suspends and frees the worker instead, so lane work can take a
+			// contended lock like anything else.
+			//
+			// COROUTINES STAY FIBERLESS, and that is not an oversight. Resuming one is a plain
+			// fn(data) call that returns, and a coroutine OWNS ITS OWN COMPLETION -- the worker must
+			// never complete or free it (see the ownership note below). The fiber path completes
+			// whatever it runs, so routing a coroutine through it would free a task the coroutine
+			// also frees. They have their own suspension mechanism and need no fiber for it.
+			const bool fiberless =
+				task_to_run->type == TaskType::Coroutine ||
+				(task_to_run->type == TaskType::Native && !reservedForHiPri);
+
+			if (fiberless) {
 				// READ BEFORE Execute(), and this is load-bearing rather than tidy. A coroutine's
 				// resume can run the body to completion, and completion frees both the frame and
 				// this Task -- so `task_to_run` may be DANGLING the instant Execute() returns.
