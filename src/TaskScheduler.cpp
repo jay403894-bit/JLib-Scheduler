@@ -2818,7 +2818,7 @@ void TaskScheduler::SetHotWorkersEffective(size_t k) {
 	// ---- A PROMOTED WORKER SHEDS ITS ORDINARY WORK BEFORE IT IS A LANE WORKER ----------------
 	//
 	// THE INVARIANT IS THAT K NEVER READS A LOPRI INBOX. Every drain site in Worker() is now
-	// gated on !reservedForHiPri, with no exception -- the stray-pop net that used to rehome an
+	// gated on !isReservedWorker, with no exception -- the stray-pop net that used to rehome an
 	// ordinary task found on a reserved worker is gone, because a lane worker stopping to service
 	// bulk work is the thing the lane exists to prevent. It is already behind; that is why it is
 	// reserved.
@@ -2898,7 +2898,7 @@ size_t TaskScheduler::GetHotWorkers() {
 	//   HiPriLaneActive()  -> false, so every push routes to loPriInboxes and hiPri gets nothing
 	//   PickNextWorker     -> the lane branch is `hiPri && hotN`, and the ordinary branch's
 	//                         `idx < hotN` skip stops reserving workers 0..K-1
-	//   isHotWorker        -> `GetHotWorkers() > qIndex` is false for every worker
+	//   isReservedWorker        -> `GetHotWorkers() > qIndex` is false for every worker
 	//   WorkerServesHiPri  -> false, so nobody drains or steals the lane
 	//
 	// DEAD BEFORE DELETED, deliberately. The alternative -- ripping ~300 references out across 13
@@ -6467,7 +6467,7 @@ int TaskScheduler::PickNextWorker(CorePref pref, bool hiPri) {
 		// ---- NEVER THE RESERVED BAND, AND UNCONDITIONALLY ON F ------------------------------
 		//
 		// [0, K) takes hiPri only. A reserved worker does not drain its loPri inbox AT ALL --
-		// drainOwnInbox() opens `if (task_to_run || reservedForHiPri) return false;` (Thread.cpp)
+		// drainOwnInbox() opens `if (task_to_run || isReservedWorker) return false;` (Thread.cpp)
 		// -- and that gate does not consult the floor. So this mask must not consult it either.
 		//
 		// IT USED TO LIVE INSIDE `if (const size_t baseF = GetAwakeFloorBase())` BELOW, which made

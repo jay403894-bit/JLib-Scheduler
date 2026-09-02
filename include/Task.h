@@ -68,10 +68,16 @@ namespace JLib {
     // Standard is 0 so a zero-initialised Task asks for what it used to get.
     enum class StackClass : uint8_t { Standard = 0, Tiny = 1, Deep = 2 };
 
-    // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). FULLY ORTHOGONAL to hiPri by
-    // design: hiPri is QUEUE ORDER (drained/stolen first) and NOTHING ELSE; placement is governed SOLELY
-    // by this field -- priority never implies a core class (a loPri P-core task and a hiPri E-core task
-    // are both legitimate). Unset (Default) means no preference: the full-pool round-robin, the
+    // Which CORE CLASS a task prefers on hybrid CPUs (P-cores vs E-cores). Orthogonal to hiPri in the
+    // dimension THIS field governs: priority never implies a core class, and a loPri P-core task and a
+    // hiPri E-core task are both legitimate.
+    //
+    // hiPri DOES INFLUENCE WHICH WORKER, and this said otherwise for several versions after it stopped
+    // being true. A hiPri push is routed to the reserved band when one exists, because QUEUE ORDER
+    // ALONE CANNOT DELIVER LOW LATENCY -- being first in a queue nobody is currently reading is worth
+    // nothing, which is exactly how a completion aimed at a parked worker sat for a second. Reserved
+    // workers never park, so handing hiPri work to one is the mechanism that makes the priority real
+    // rather than nominal. Core CLASS remains this field's business alone; that part never changed. Unset (Default) means no preference: the full-pool round-robin, the
     // scheduler's original placement behavior. Preference is a HINT, not a constraint: PickNextWorker
     // spills to the other class when the preferred one is unavailable, and stealing stays deliberately
     // preference-blind (work-conserving). Non-hybrid CPUs: all workers are P-labeled, so every value
@@ -117,7 +123,11 @@ namespace JLib {
     // stale-library guard can fingerprint it. Sharing the tokens is the point -- see the note at the
     // expansion site in Task.
     //
-    //   hiPri         queue order only, never placement, never OS priority.
+    //   hiPri         queue order, AND routing to the reserved band when one exists. Never OS
+    //                 priority. A LATENCY mechanism, not an importance one: it is bounded by K plus
+    //                 lane spill, so bulk work marked hiPri funnels onto one or two threads while the
+    //                 floor idles. Use it for latency-critical, low-rate work -- I/O completions,
+    //                 subsystem messages -- and not for anything with volume.
     //   (a requiredSize bit sat here: Standard or Heavy fiber stack. Removed with the heavy
     //    stack class -- it was written by CreateTask and read by nothing.)
     //   type          Native / Fiber / Coroutine. TWO bits: three values today, room for a fourth.

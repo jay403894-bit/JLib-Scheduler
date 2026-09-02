@@ -1295,7 +1295,7 @@ void Thread::Worker() {
 	// when the bit is retired. Sound because nobody else can raise this worker`s bit from zero.
 	// SEEDED FALSE, NOT FROM A PRE-LOOP GetHotWorkers(). It used to read K here, once, for the life
 	// of the thread -- a fourth spelling of K that could never track a change. It does not need one:
-	// the first pass sets this true if the worker is hot (see `if (isHotWorker)` below), so seeding
+	// the first pass sets this true if the worker is hot (see `if (isReservedWorker)` below), so seeding
 	// false is self-healing and costs exactly one pass of not owning a bit nobody has raised yet.
 	bool ownsLaneBit = false;
 	// Did this worker execute a LANE task on the previous pass? The occupancy numerator. A worker
@@ -1386,7 +1386,16 @@ void Thread::Worker() {
 		// the same question; it is a different question asked at the last safe moment.
 		const TaskScheduler::Bands bandsNow = TaskScheduler::GetBands();   // ONE load, whole pass
 		JLIBSCHED_PHASE(qIndex, Start);
-		const bool reservedForHiPri = (size_t)qIndex < bandsNow.k;
+		// AM I A RESERVED WORKER THIS PASS. Named for the JOB, not for the band's priority: this was
+		// `reservedForHiPri`, which read as though the WORKER had a priority. It does not -- a worker
+		// is not high or low priority, it either serves the reserved lane or it serves the floor.
+		// That misreading is not hypothetical: it is what made "K never reads loPri" sound like a
+		// scheduling preference instead of what it is, and a loPri completion aimed at a reserved
+		// worker then looked merely deprioritised rather than UNREACHABLE.
+		//
+		// hiPri remains the right name at the API, where it describes the PUSH: the caller is asking
+		// for low latency and gets routed to a band that never parks. See Task.h.
+		const bool isReservedWorker = (size_t)qIndex < bandsNow.k;
 
 		// ---- DRAIN MY OWN loPri INBOX. ONE DEFINITION, TWO CALL SITES. -------------------------
 		//
@@ -1413,7 +1422,7 @@ void Thread::Worker() {
 		//
 		// Returns true if it set task_to_run.
 		auto drainOwnInbox = [&]() -> bool {
-			if (task_to_run || reservedForHiPri) return false;
+			if (task_to_run || isReservedWorker) return false;
 			JLIBSCHED_PHASE(qIndex, InboxDrain);
 			size_t count = 0;
 			while (count < BATCH_SIZE && scheduler->loPriInboxes[qIndex]->pop(batch[count]))
@@ -1453,7 +1462,7 @@ void Thread::Worker() {
 		// one or two threads that are idle until a completion lands; a floor can be twenty-eight,
 		// and twenty-eight TIME_CRITICAL threads is the process-wide elevation measured 5x worse.
 		const WorkerPrio bandPrio =
-			reservedForHiPri ? WorkerPrio::Critical
+			isReservedWorker ? WorkerPrio::Critical
 			: ((size_t)qIndex >= bandsNow.k && (size_t)qIndex < bandsNow.k + bandsNow.f)
 				? WorkerPrio::High
 				: WorkerPrio::Normal;
@@ -1526,22 +1535,27 @@ void Thread::Worker() {
 			ApplyWorkerPriority(bandPrio);
 			curPrio = bandPrio;
 		}
-		// ---- ONE NAME FOR K ON THIS THREAD ---------------------------------------------------
+		// ---- ONE NAME FOR K ON THIS THREAD, AND NOW LITERALLY ONE ----------------------------
 		//
-		// There were THREE: reservedForHiPri from the pass snapshot, servesHiPri from
-		// WorkerServesHiPri(q), and isHotWorker from GetHotWorkers(). The header defines
-		// WorkerServesHiPri(q) as `q < GetHotWorkers()`, so all three asked the identical question
-		// -- and answered it from up to three different loads of the band word. That family is what
-		// produced k=514: not one wrong decode, but several places entitled to their own K.
+		// There were THREE: the pass snapshot, servesHiPri from WorkerServesHiPri(q), and
+		// isHotWorker from GetHotWorkers(). The header defines WorkerServesHiPri(q) as
+		// `q < GetHotWorkers()`, so all three asked the identical question -- and answered it from
+		// up to three different loads of the band word. That family is what produced k=514: not one
+		// wrong decode, but several places entitled to their own K.
 		//
-		// The old comment here claimed servesHiPri and isHotWorker were "TWO DIFFERENT QUESTIONS".
-		// They are not, and the code proved it: both reduce to q < K. Keeping the distinction alive
-		// in prose is how a future edit re-derives one of them from a different source.
-		const bool isHotWorker = reservedForHiPri;   // q < bandsNow.k, and nothing else
+		// An earlier pass collapsed them to a value and an ALIAS, which is the same hazard wearing a
+		// smaller coat -- two names still invite two derivations. The alias is gone; every site uses
+		// `isReservedWorker`, declared once per pass at the top from the single band snapshot.
+		//
+		// NAMED FOR THE PROPERTY, NOT THE CLIENT. Not isHotWorker (hot describes a temperature, not
+		// a job) and not servesIoLane (I/O is the band's only customer TODAY, not what the band IS).
+		// What makes a reserved worker different is that IT NEVER PARKS. That is the mechanism, it
+		// is what makes a hiPri push actually low-latency rather than merely first in a queue nobody
+		// is reading, and it stays true if something other than the reactor ever uses the band.
 
 		// The hot-core exclusion, decided from the snapshot instead of from a pre-loop K read. One
 		// branch on a latched bool once this has settled; see the declaration for why it is one-way.
-		if (!hotCpuExcluded && !reservedForHiPri) {
+		if (!hotCpuExcluded && !isReservedWorker) {
 			TaskScheduler::ExcludeCurrentThreadFromHotCpus();
 			hotCpuExcluded = true;
 		}
@@ -1553,8 +1567,8 @@ void Thread::Worker() {
 		// It does not mean the work is stranded. Every worker pops its own hiPri inbox in the search
 		// below, reserved or not, so this task WILL run here; what it means is that this worker is
 		// not the one maintaining that lane's hint bit, which is what the retirement below fixes.
-		const bool hiPriStray = !reservedForHiPri && !scheduler->hiPriInboxes[qIndex]->empty();
-		// Read once per pass beside isHotWorker: one relaxed load of a line the app touches only when
+		const bool hiPriStray = !isReservedWorker && !scheduler->hiPriInboxes[qIndex]->empty();
+		// Read once per pass beside isReservedWorker: one relaxed load of a line the app touches only when
 		// it reconfigures. Gates every piece of adaptive-K bookkeeping, so static K -- the default --
 		// runs none of it.
 
@@ -1589,7 +1603,7 @@ void Thread::Worker() {
 			// drained its own backlog by popping. ONCE PER PASS, not per pickup -- that frequency
 			// difference is the entire cost argument, and a pass is exactly when this worker has
 			// nothing better to do anyway.
-			if (isHotWorker) {
+			if (isReservedWorker) {
 				// PRESENCE, NOT DEPTH. An MPSC inbox has no size() -- it is a linked list and
 				// counting it would mean walking it. That costs nothing here, because the lane
 				// hint has only ever been a presence BIT: every reader asks "is there lane work
@@ -1776,7 +1790,7 @@ void Thread::Worker() {
 			// reads them: laneTasksRun stays 0, `low = (topTasks == 0)` is always true, and K sheds
 			// every window -- the exact bug this observer exists to remove. That function is gone.
 			long long laneStartNs = 0;
-			if (reservedForHiPri && bandsNow.kmax > bandsNow.kmin) {
+			if (isReservedWorker && bandsNow.kmax > bandsNow.kmin) {
 				laneCyclesTotal.fetch_add(1, std::memory_order_relaxed);   // sample count
 				if (laneSourced) {
 					laneTasksRun.fetch_add(1, std::memory_order_relaxed);
@@ -1898,7 +1912,7 @@ void Thread::Worker() {
 			// the ring is a task nobody can run and a crash for whoever pops it.
 			constexpr size_t kPublishAtMost = 32;   // <= BATCH_SIZE
 			constexpr size_t kDequeHeadroom = 256;
-			if (!reservedForHiPri
+			if (!isReservedWorker
 			    && inboxDepth.load(std::memory_order_relaxed) >= (int)TaskScheduler::kStealHintDepth
 			    && scheduler->deques[qIndex]->size() < kDequeHeadroom) {
 				size_t got = 0;
@@ -2028,7 +2042,7 @@ void Thread::Worker() {
 			// also frees. They have their own suspension mechanism and need no fiber for it.
 			const bool fiberless =
 				task_to_run->type == TaskType::Coroutine ||
-				(task_to_run->type == TaskType::Native && !reservedForHiPri);
+				(task_to_run->type == TaskType::Native && !isReservedWorker);
 
 			if (fiberless) {
 				// READ BEFORE Execute(), and this is load-bearing rather than tidy. A coroutine's
@@ -2321,7 +2335,7 @@ void Thread::Worker() {
 			// THE NET WAS THE PROBLEM. A lane worker that stops to service bulk work is the exact
 			// thing reservation exists to prevent; it is reserved BECAUSE it is already behind. And
 			// as a reader of loPriInboxes[qIndex] it made the band's contract untestable: the three
-			// drain sites were `!reservedForHiPri`, `!reservedForHiPri` and this one, whose guard is
+			// drain sites were `!isReservedWorker`, `!isReservedWorker` and this one, whose guard is
 			// the complement -- so "K never touches ordinary work" was true of the code everywhere
 			// except the one place that made it false. It also hid the placement bug it absorbed:
 			// PickNextWorker could hand a CorePref::Default task to a reserved index whenever the
@@ -2338,7 +2352,7 @@ void Thread::Worker() {
 			// deliberately. Losing it loudly is worth more than a lane worker quietly doing bulk
 			// work forever, and a net that repairs the symptom guarantees nobody finds the writer.
 			// quiescent(), not empty(): a push mid-commit still counts as an occupant.
-			if (reservedForHiPri && !scheduler->loPriInboxes[qIndex]->quiescent()) {
+			if (isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent()) {
 				static std::atomic<unsigned> strayWarned{ 0 };
 				if (strayWarned.fetch_add(1, std::memory_order_relaxed) == 0)
 					std::fprintf(stderr,
@@ -2468,13 +2482,13 @@ void Thread::Worker() {
 
 				// THE INBOX FIRST -- oldest arrival, and the queue nobody else may drain.
 				//
-				// !reservedForHiPri, LIKE EVERY OTHER READER OF THIS QUEUE. This was the FOURTH
+				// !isReservedWorker, LIKE EVERY OTHER READER OF THIS QUEUE. This was the FOURTH
 				// reader of loPriInboxes[qIndex] and the second one missing the guard: a reserved
 				// worker that had yielded would pop ordinary work here and run it, which is the
 				// lane stopping to do bulk. The other three sites all carry the gate, so this one
 				// silently made the band's contract conditional on whether the worker had yielded
 				// on its previous pass -- which is not a distinction the contract knows about.
-				if (!reservedForHiPri && !scheduler->loPriInboxes[qIndex]->quiescent()) {
+				if (!isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent()) {
 					Task* fromInbox = nullptr;
 					if (scheduler->loPriInboxes[qIndex]->pop(fromInbox) && fromInbox) {
 						inboxDepth.fetch_sub(1, std::memory_order_relaxed);
@@ -2523,7 +2537,7 @@ void Thread::Worker() {
 			// So a reserved worker runs hiPri and nothing else: its own hiPri inbox and deque above,
 			// hiPri stolen from others, and otherwise it spins idle. Spinning idle is the cost of
 			// the guarantee -- R cores that do no bulk work -- and it is why R is 1 by default.
-			if (!task_to_run && !reservedForHiPri) {
+			if (!task_to_run && !isReservedWorker) {
 				auto opt = scheduler->deques[qIndex]->pop_bottom();
 				if (opt) {
 					Task* task = *opt;
@@ -2760,7 +2774,7 @@ void Thread::Worker() {
 					// The lane probe that used to sit here has moved ABOVE MaybeStealable -- see
 					// there for why its position is load-bearing rather than stylistic. What
 					// remains below is the bulk rule, unchanged: a reserved thief takes none.
-					if (reservedForHiPri) return false;
+					if (isReservedWorker) return false;
 					auto s = scheduler->deques[target]->steal_if(classOK);
 					if (!s) return false;
 
@@ -2828,7 +2842,7 @@ void Thread::Worker() {
 				// Do not "solve" >64 by scanning mates harder.
 				// THE ORDINARY MASK MUST INCLUDE THE LANE AT laneHintMode 4, and leaving it out is a
 				// silently disabled feature rather than a slow path. There are TWO lane branches in
-				// tryStealFrom: hot->hot (the isHotWorker block) and, at mode 4 ONLY, ordinary->hot
+				// tryStealFrom: hot->hot (the isReservedWorker block) and, at mode 4 ONLY, ordinary->hot
 				// -- an ordinary worker draining a backlogged lane, which is the DEFAULT (laneHintMode
 				// is 4). That branch only decides what to do with a victim already chosen, so an
 				// ordinary mask of backlog|parallel never names a hot worker advertising on
@@ -2843,7 +2857,7 @@ void Thread::Worker() {
 				// Workers start inside StartPool, before `instance` is assigned, so an unconditional
 				// static read here killed every pool-starting test at 0xC0000409: silent, no message,
 				// invisible to ASan. It survived earlier revisions only because the call sat behind
-				// `isHotWorker` and K defaults to 0, so nothing ever executed it.
+				// `isReservedWorker` and K defaults to 0, so nothing ever executed it.
 				// ---- SWEEP EVERY ADVERTISED VICTIM. RESTORED, AND HERE IS WHY. ----------------
 				//
 				// This was replaced by a single hint-directed probe per pass, on the argument that
@@ -3169,7 +3183,7 @@ void Thread::Worker() {
 						// the drain sites now carry one gate between them, so the set the search
 						// covers and the set the recheck asks about are the same set by
 						// construction. See tests/verify/workerspin_model.c.
-						|| (!reservedForHiPri && !scheduler->loPriInboxes[qIndex]->quiescent())
+						|| (!isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent())
 						// PINNED RESUMES. Not optional and not merely a latency question: nobody
 						// else is permitted to drain this queue, so parking on a non-empty one is
 						// a permanent hang rather than a delay. Same reasoning as the loPri inbox
@@ -3432,7 +3446,7 @@ void Thread::Worker() {
 				// SetHotWorkers(k) buys reservation only, SetIoHotLane(k) buys the spin too, and
 				// the parkable-reserved arm stays available as the A/B control.
 				const bool onAwakeFloor =
-					reservedForHiPri ? (TaskScheduler::ReservedNeverParks()
+					isReservedWorker ? (TaskScheduler::ReservedNeverParks()
 					                    || bandsNow.kmax > bandsNow.kmin)
 					                 : ((size_t)qIndex >= floorBase
 					                    && (size_t)qIndex < floorBase + floorNow);
@@ -3669,7 +3683,7 @@ void Thread::Worker() {
 							    || !scheduler->hiPriInboxes[qIndex]->quiescent()
 							    // Gated, term for term with the recheck above -- K never reads
 							    // loPri, so K must never WAIT on it either.
-							    || (!reservedForHiPri
+							    || (!isReservedWorker
 							        && !scheduler->loPriInboxes[qIndex]->quiescent())
 							    || !scheduler->resumedInboxes[qIndex]->quiescent();
 						});
@@ -3682,7 +3696,7 @@ void Thread::Worker() {
 					       && !laneWake.load(std::memory_order_seq_cst)
 					       && scheduler->hiPriInboxes[qIndex]->quiescent()
 					       // Gated, term for term with the recheck and the condvar predicate.
-					       && (reservedForHiPri
+					       && (isReservedWorker
 					           || scheduler->loPriInboxes[qIndex]->quiescent())
 					       && scheduler->resumedInboxes[qIndex]->quiescent()) {
 #if defined(JLIB_PLATFORM_WINDOWS)
