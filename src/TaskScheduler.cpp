@@ -5082,6 +5082,9 @@ bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 	return PushTarget(task, cpu_affinity);
 }
 
+static std::atomic<long long> g_ioLastPushNs{ 0 };
+static std::atomic<unsigned>  g_ioQuietUs{ 500 };
+
 // ---- THE SHARED LANE INTAKE ------------------------------------------------------------------
 bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
 	if (!tasks || n == 0) return false;
@@ -5092,6 +5095,11 @@ bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
 	if (GetHotWorkers() == 0) return false;      // no consumers: refuse rather than strand
 
 	if (!s->laneIntake.enqueue_bulk(tasks, n)) return false;   // allocation failed
+
+	// STAMP BEFORE THE NOTIFY. A reserved worker woken by the line below must see the lane as ACTIVE
+	// when it decides whether to steal, or it can wake, read a stale quiet stamp, and go take a bulk
+	// task instead of the completion that just woke it.
+	g_ioLastPushNs.store(MonotonicNs(), std::memory_order_relaxed);
 
 	// WAKE ONE RESERVED WORKER. Under SetIoHotLane they never park and this is a store nobody
 	// waits on, but SetHotWorkers reserves WITHOUT pinning them awake -- and in that configuration
@@ -5107,6 +5115,43 @@ bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
 		if (s->workers[w]) { s->workers[w]->MarkQueuedWork(); s->workers[w]->NotifyWorker(); break; }
 	}
 	return true;
+}
+
+// ---- IS THE LANE QUIET ENOUGH FOR A RESERVED WORKER TO GO EARN ITS CORE BACK? ----------------
+//
+// PARKING RETURNS THE CORE TO THE OS, NOT TO THE FLOOR, and conflating those is what made an
+// earlier version of this comment argue the wrong way. The pool is sized at N-K workers whatever K
+// is doing, so a parked reserved worker is not merely "not burning cycles" -- it is a worker's worth
+// of throughput the floor never gets. At K=2 on a 29-worker pool that is ~7% of the pool idle
+// whenever I/O is quiet, which for a game is most of the time.
+//
+// SO LET THEM STEAL, BUT ONLY WHEN NOTHING IS COMING. The cost of getting this wrong is measured
+// and it is large: tryStealFrom's own note records that a reserved worker taking a bulk task "left
+// the max at 1202 us". A completion arriving one microsecond after the steal waits behind work the
+// lane worker chose to accept.
+//
+// A TIMER, NOT AN EMPTINESS CHECK. "The intake is empty" is not "I/O is quiet" -- the gap between
+// two completions in one burst is empty too, and stealing into that gap is exactly the 1202 us
+// case. The stamp says when a push last happened, so a burst with gaps still reads as active
+// throughout.
+//
+// STAMPED ONCE PER FLUSH, NOT PER COMPLETION, and read only on the path where a worker has already
+// failed to find lane work and is about to go looking elsewhere. Neither side pays for this on the
+// path that matters: the producer amortises one clock read across a whole batch, and the consumer
+// only asks when it is otherwise idle, where a clock read is free beside the steal scan it gates.
+
+void TaskScheduler::SetIoQuietWindowUs(unsigned us) noexcept {
+	g_ioQuietUs.store(us, std::memory_order_relaxed);
+}
+unsigned TaskScheduler::IoQuietWindowUs() noexcept {
+	return g_ioQuietUs.load(std::memory_order_relaxed);
+}
+
+bool TaskScheduler::IoLaneQuiet() noexcept {
+	const long long last = g_ioLastPushNs.load(std::memory_order_relaxed);
+	if (last == 0) return true;            // no I/O has ever pushed: nothing to protect
+	const long long win = (long long)g_ioQuietUs.load(std::memory_order_relaxed) * 1000ll;
+	return (MonotonicNs() - last) > win;
 }
 
 Task* TaskScheduler::TakeLaneIntake() noexcept {

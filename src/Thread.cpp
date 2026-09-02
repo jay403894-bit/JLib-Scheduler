@@ -2798,7 +2798,23 @@ void Thread::Worker() {
 					// The lane probe that used to sit here has moved ABOVE MaybeStealable -- see
 					// there for why its position is load-bearing rather than stylistic. What
 					// remains below is the bulk rule, unchanged: a reserved thief takes none.
-					if (isReservedWorker) return false;
+					// ---- UNLESS THE LANE HAS BEEN QUIET LONG ENOUGH -------------------------
+					//
+					// A reserved worker that never steals is a worker's worth of throughput the
+					// floor never gets -- the pool is sized at N-K regardless, so parking hands the
+					// core to the OS rather than to the pool. At K=2 on a 29-worker pool that is
+					// ~7% idle whenever I/O is quiet.
+					//
+					// THE RISK IS THE NUMBER IN THE NOTE ABOVE: 1202 us max, from a reserved worker
+					// holding a bulk task when a completion arrived. So this is gated on TIME SINCE
+					// THE LAST LANE PUSH, not on the intake being empty -- the gap between two
+					// completions in one burst is empty too, and stealing into that gap is exactly
+					// how that 1202 us happened.
+					//
+					// The clock read costs nothing HERE specifically: this worker has already
+					// failed to find lane work and is about to walk victims, which is orders of
+					// magnitude more expensive than asking the time.
+					if (isReservedWorker && !TaskScheduler::IoLaneQuiet()) return false;
 					auto s = scheduler->deques[target]->steal_if(classOK);
 					if (!s) return false;
 

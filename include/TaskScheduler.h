@@ -1920,6 +1920,27 @@ namespace JLib {
 		// inboxes. The notify in PushLaneIntake is what makes that safe: the producer stores, then
 		// wakes, so a worker that parks on a stale idle reading is woken by the push that raced it.
 		// A predicate that trusted this ALONE would be the lost wake again.
+		// ---- WHEN MAY A RESERVED WORKER GO EARN ITS CORE BACK? --------------------------------
+		//
+		// A reserved worker that never steals costs the floor a worker's worth of throughput: the
+		// pool is sized at N-K whatever K is doing, so parking returns the core to the OS and not to
+		// the pool. At K=2 on a 29-worker pool that is ~7% of the pool idle whenever I/O is quiet.
+		//
+		// So they steal -- but only after the lane has been silent for this long. The risk is
+		// measured and it is not small: tryStealFrom records a 1202 us max from a reserved worker
+		// holding a bulk task when a completion arrived.
+		//
+		// TIME SINCE THE LAST PUSH, NOT "IS THE INTAKE EMPTY". The gap between two completions in
+		// one burst is empty too, and stealing into that gap is exactly how that 1202 us happened.
+		//
+		// THE DEFAULT IS A GUESS AND IS MEANT TO BE TUNED. 500 us is long enough that an ordinary
+		// inter-arrival gap does not read as quiet and short enough to reclaim a core promptly, but
+		// no measurement here chose it. Raise it if the lane's tail regresses; lower it if the floor
+		// is visibly short of workers while I/O idles.
+		static void     SetIoQuietWindowUs(unsigned us) noexcept;
+		static unsigned IoQuietWindowUs() noexcept;
+		static bool     IoLaneQuiet() noexcept;
+
 		static bool  PushLaneIntake(Task** tasks, size_t n) noexcept;
 		static Task* TakeLaneIntake() noexcept;
 		static bool  LaneIntakeIdle() noexcept;
