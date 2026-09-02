@@ -131,13 +131,18 @@ Read ratios and orders of magnitude, not last digits. The bench prints observed 
 **INDISTINGUISHABLE** where two arms overlap rather than letting you infer a winner from two medians
 a nanosecond apart.
 
-**The context switch has a trade, and it is not free in both directions.** Saving XMM6-15 with legacy
-SSE while the upper YMM state is dirty costs an SSE/AVX transition on every switch — **87.6 ns**. A
-CPUID-gated `vzeroupper` removes it, and that is what ships: **9.8 ns**, an 8.9× improvement on an
-AVX workload. It is not a pure win. Through a full `Event` round trip it **saves ~112 ns** on a fiber
-with dirty upper state and **costs ~32 ns** on one without. Both numbers are printed by
-`SchedulerContextSwitchBench`, alongside a correctness gate that round-trips XMM6-15 past a
-deliberate clobber for every variant, and a same-vs-same control that must read 1.00×.
+**Where the context-switch number comes from.** Saving XMM6-15 with legacy SSE while the upper YMM
+state is dirty costs an SSE/AVX transition on every switch — **85.4 ns**. A CPUID-gated `vzeroupper`
+removes it, and that is what ships: **9.8 ns**, an **8.7× improvement** on an AVX workload.
+
+Through a full `Event` round trip it **saves ~88 ns** on a fiber with dirty upper state. The cost to
+a fiber *without* one measured **+1 ns** on a quiet machine — indistinguishable, on ranges that
+overlap — and +32 ns on a noisier run, so treat it as free rather than as a tuned trade.
+
+`SchedulerContextSwitchBench` prints both directions, a **correctness gate** that round-trips
+XMM6-15 past a deliberate clobber for every variant, and a same-vs-same control that must read
+1.00× (measured 0.998× and 1.011×). A speed number from a variant that does not preserve the
+registers is not a number at all, which is why the gate runs first.
 
 **There are no comparisons against other schedulers here, on purpose.** A head-to-head implies a
 shared objective function, and schedulers are not built for the same things — this one trades

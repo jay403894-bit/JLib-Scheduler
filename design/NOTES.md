@@ -49,14 +49,25 @@ row — the gate costs something, and a fair figure has to include it:
 state to transition out of. The README quoted it for a while, which understated what a real AVX
 workload pays. Shipped and dirty is **9.82 ns**; shipped and clean is 9.43.
 
-**AND THE FIX IS NOT A PURE WIN, measured through a full `Event` round trip** (31 workers, 20,000
-round trips/rep, 21 reps, gate toggled at RUNTIME so both arms are one binary, control at 0.989x):
+**MEASURED THROUGH A FULL `Event` ROUND TRIP** (31 workers, 20,000 round trips/rep, 21 reps, gate
+toggled at RUNTIME so both arms are one binary). Two runs, the second on a machine with everything
+else closed:
 
-    saves ~112 ns per Event round trip on an AVX fiber
-    costs  ~32 ns per Event round trip on a non-AVX one
+| | noisy | **quiet** |
+|---|---|---|
+| control (same-vs-same) | 0.989x | **1.011x** |
+| saves, AVX fiber | 112 ns | **88 ns** |
+| costs, non-AVX fiber | 32 ns | **1 ns** |
 
-Two switches' worth either way, against 156 ns of raw switch delta. Worth taking — an AVX fiber is
-the case that was pathological — but a non-AVX workload pays for it, and the README says so.
+**THE COST ROW IS THE ONE THAT MOVED, AND IT MOVED TO ZERO.** 631.9 ns against 633.3 ns on ranges
+that overlap heavily — indistinguishable. The 32 ns came from a noisier machine and was pessimism,
+not a trade. Take the quiet figure: the fix is a large win for AVX fibers and free for everything
+else.
+
+WORTH KEEPING AS A METHOD NOTE: the first run's 32 ns was *believable*. It had a plausible story
+attached (two switches' worth, either direction) and it survived a control. Only a quieter machine
+showed it was noise. A difference small enough to be explained is exactly the size that most needs a
+second run.
 
 ### The rule
 
@@ -2372,3 +2383,29 @@ executes per idle pass against what NoSleep made it execute -- not another bench
 WHAT IS SETTLED REGARDLESS: the SHIPPED floor costs +0.13% and is indistinguishable from parked, at
 every length. That is the number the library's default is answerable for, and it is the one the
 README quotes.
+
+## The idle tax survives a silent machine (2026-09-02)
+
+Re-run with every other application closed, to test whether background noise explained the gap
+against the historical +3.5%. It does not.
+
+|  | noisy | quiet |
+|---|---|---|
+| ~0.4 ms (burst) | +24.62% | **+25.83%** |
+| ~4 ms | +22.70% | **+19.93%** |
+| ~15 ms (a frame) | +20.18% | **+20.45%** |
+| shipped floor (~0.4 ms) | +0.13% | **+0.08%** |
+
+TWO HYPOTHESES NOW TESTED AND BOTH DEAD: workload length (swept, barely moves) and machine noise
+(silent run, unchanged). The pool-wide tax is ~20% on this hardware and it is not an artifact of
+either.
+
+SO THE REMAINING CANDIDATE IS THE ONE ALREADY WRITTEN DOWN, and it is a CODE question rather than a
+measurement one: a pool-wide awake floor may simply not be what IdlePolicy::NoSleep was. NoSleep
+workers spun in the idle search; floor workers also run the growth controller and take a different
+path through the park block. Diff what a floor worker executes per idle pass against what NoSleep
+made it execute. If they differ, the two taxes were never comparable and +3.5% describes a
+configuration that no longer exists.
+
+UNCHANGED AND WORTH REPEATING: the SHIPPED floor is +0.08% and indistinguishable from parked, at
+every length, on a silent machine. That is the number the library's default is answerable for.
