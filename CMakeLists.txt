@@ -1192,3 +1192,12 @@ if(WIN32)
     target_link_libraries(SchedulerIoFiberAwaitSmoke PRIVATE ws2_32)
 endif()
 
+
+# THE 5.0 BENCH. bench.cpp grew around a library with two idle policies, three task types and an
+# optional C++20 layer; none of that is true now. This one measures what the fibers-only runtime
+# actually is -- dispatch, throughput, fiber suspend/resume, ParallelFor, and the idle tax. See the
+# file header for the method rules (interleaved arms, rotated order, medians with ranges).
+add_executable(SchedulerRuntimeBench "${CMAKE_CURRENT_SOURCE_DIR}/bench/runtime_bench.cpp")
+target_link_libraries(SchedulerRuntimeBench PRIVATE Scheduler)
+target_compile_features(SchedulerRuntimeBench PRIVATE cxx_std_17)
+set_target_properties(SchedulerRuntimeBench PROPERTIES OUTPUT_NAME runtime_bench)
