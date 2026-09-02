@@ -30,3 +30,23 @@ int main() {
     dag.Submit();
     return 0;
 }
+
+// The README's configuration and FLS snippets, compiled.
+static const uint16_t kScratch = JLib::TaskScheduler::AllocFiberLocalSlot();
+struct State { int x; };
+void ReadmeConfigCheck() {
+    JLib::TaskScheduler::SetFiberMode(JLib::FiberMode::Pin);
+    JLib::TaskScheduler::SetFiberBudget(64, 64, 1);
+    JLib::TaskScheduler::SetIoHotLane(2);
+    JLib::TaskScheduler::SetAffinityPolicy(JLib::TaskScheduler::AffinityPolicy::Ideal);
+    JLib::TaskScheduler::EnableTimers(true);
+    JLib::TaskScheduler::SetAwakeFloor(2);
+    JLib::TaskScheduler::SetReservedStealing(true);
+    JLib::TaskScheduler::SetSubmitLimit(1024);
+    JLib::TaskScheduler::SetStealHint(true);
+
+    JLib::TaskScheduler::FiberLocal(kScratch) = nullptr;
+    auto* s = JLib::TaskScheduler::FiberLocalAs<State>(kScratch);
+    (void)s;
+    (void)JLib::TaskScheduler::Fibers();
+}

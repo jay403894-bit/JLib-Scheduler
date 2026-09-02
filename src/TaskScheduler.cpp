@@ -6092,6 +6092,17 @@ static Fiber* CurrentFiberOrNull() noexcept {
 
 bool TaskScheduler::HasFiberLocal() noexcept { return CurrentFiberOrNull() != nullptr; }
 
+// ---- THE FLS LIFECYCLE, COMPLETED ON THIS HEADER ---------------------------------------------
+//
+// Thin forwards on purpose. The registry owns slot allocation and identity; TaskScheduler owns
+// nothing here and only makes it REACHABLE, so that a consumer who included TaskScheduler.h -- which
+// is everyone -- can allocate a slot without first discovering that FiberRegistry.h exists.
+//
+// Not inline in the header, because that would force FiberRegistry.h on every consumer and undo the
+// forward declaration this exists to make possible.
+uint16_t TaskScheduler::AllocFiberLocalSlot() noexcept { return FiberRegistry::FlsAlloc(); }
+FiberRegistry& TaskScheduler::Fibers() noexcept        { return FiberRegistry::Instance(); }
+
 bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
                                         void (*release)(void*) noexcept) noexcept {
 	if (!obj || !release) return false;

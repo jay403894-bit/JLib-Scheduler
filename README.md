@@ -75,9 +75,34 @@ a **Reaper** — a queued task, not a thread and not a poll — sent by the fibe
 to run `Tick()`, `Scan()` and user-registered deletes in one pass. No stop-the-world, no reference
 counting on the hot path.
 
-**Fiber registry.** Fiber-local storage (`FiberLocal<T>`) that survives migration where
-`thread_local` silently does not, lease/creditor tracking for thread-affine cleanup, type-erased debt
-lists, and generation-tagged identities so a recycled slot can never be mistaken for a live fiber.
+**Migratable or pinned fibers — `FiberMode`.** A suspended fiber resumes on **whichever worker is
+free** (`FiberMode::Migrate`, the default), rather than waiting for the one it started on. That is
+the better trade almost always: a fiber whose home worker is busy would otherwise sit idle beside
+free cores.
+
+The cost is exact and worth stating: **`thread_local` read before a suspension point is not the same
+object after it.** It does not crash — you get the resuming worker's copy, a plausible value — which
+is why the runtime provides fiber-local storage and why the failure is worth naming.
+
+```cpp
+JLib::TaskScheduler::SetFiberMode(JLib::FiberMode::Pin);   // BEFORE Init()
+```
+
+`Pin` resumes a fiber only on its home worker, so `thread_local` is safe again — the contract marl
+gives you. Take it when the state crossing a wait belongs to a library you cannot audit. Otherwise
+prefer `Migrate` and move the *state* rather than the policy.
+
+**Fiber registry.** Fiber-local storage that survives migration where `thread_local` silently does
+not, lease/creditor tracking for thread-affine cleanup, type-erased debt lists, and generation-tagged
+identities so a recycled slot can never be mistaken for a live fiber.
+
+```cpp
+static const uint16_t kScratch = JLib::TaskScheduler::AllocFiberLocalSlot();  // once, not per task
+
+JLib::TaskScheduler::FiberLocal(kScratch) = state;   // survives the wait, in EITHER mode
+sched.WaitOnEvent(gate);
+auto* s = JLib::TaskScheduler::FiberLocalAs<State>(kScratch);
+```
 
 **Cancellation and time.** `CancelScope`/`CancelToken` with parent chains and generation tags,
 reaching work that has *already been dispatched*; a hierarchical timer wheel behind `Deadline` and
@@ -170,6 +195,45 @@ external nodes (`CreateExternalNode` / `SignalExternal`) let a graph wait on som
 JLib::TaskScheduler::EnableIoReactor(true);   // BEFORE Init(); reserves 2 workers
 JLib::TaskScheduler::Init();
 ```
+
+---
+
+## Configuration
+
+**The distinction that matters is *before `Init()`* versus *runtime*.** Anything that decides how the
+pool is BUILT — how many workers, how many fibers, which services exist — is read once at `Init` and
+ignored afterwards. Anything that steers a pool that already exists can be changed at any time.
+
+### Before `Init()`
+
+| | default | |
+|---|---|---|
+| `EnableIoReactor(bool)` | off | Turns on the I/O layer. **Reserves K = 2 workers**, so it is not free — a job-system-only app should not pay for it. |
+| `EnableTimers(bool)` | off | Timer wheel, behind `Deadline` and periodic work. |
+| `SetFiberMode(FiberMode)` | `Migrate` | `Pin` to keep `thread_local` valid across a wait. |
+| `SetFiberBudget(normal, tinyPerK, deep)` | `64, 64, 1` | Fibers per worker, per class. **This is the cap on how many tasks may be SUSPENDED AT ONCE** — a waiting task holds its stack. |
+| `SetIoHotLane(k)` / `SetHotWorkers(k)` | 0 (2 with the reactor) | Size of the reserved band. Clamped at 2. |
+| `SetAffinityPolicy(...)` | `Ideal` | Hard pinning measured *worse* than an ideal-processor hint; `None` for a shared machine. |
+
+### At runtime
+
+| | |
+|---|---|
+| `SetAwakeFloor(n)` | Workers held unparked. **Clamps against the LIVE pool**, so calling it before `Init` silently resolves to 0. |
+| `SetReservedStealing(bool)` | Whether the reserved band takes ordinary work while the lane is quiet. |
+| `SetSubmitLimit(n)` | Ingress backpressure — slows a producer before it builds a backlog. |
+| `SetStealHint(bool)` | Diagnostic A/B of the steal hint. Shipping code leaves it on. |
+
+**On `SetFiberBudget`, because it is the one with a sharp edge:** exhaustion is a **spin**, not a
+failure — `AcquireFiber` returns nothing and the task is requeued. That clears on its own if the
+blocked tasks can finish, and *does not* if they are waiting on work that cannot get a fiber because
+they are holding them all. A graph with more simultaneously-suspended nodes than the budget is the
+shape to look for. The pool warns once, naming the class that ran out and the argument that fixes it.
+
+There are around fifty other setters. They are tuning and diagnostic knobs — split policy, park
+primitive, power throttling, slab growth — and they exist so a behaviour can be A/B'd inside one
+process rather than across two builds. You do not need any of them to use the library, and the
+header documents each one where it is declared.
 
 ---
 

@@ -129,6 +129,9 @@
 #include "WaitPrimitive.h"
 #include "Event.h"
 namespace JLib {
+	// Fibers() below returns this; the definition lives in FiberRegistry.h, which the FLS
+	// accessors do not force a consumer to include.
+	class FiberRegistry;
 	class Thread;
 
 	// How a cancellable wait ended.
@@ -2465,6 +2468,33 @@ namespace JLib {
 		// a fiber never hands its successor stale state -- but it cannot free what they point at,
 		// having no type: a slot holding an owning pointer must be released by the task that set it,
 		// before that task ends.
+		// ---- ALLOCATING A SLOT, WHICH IS THE HALF THIS HEADER WAS MISSING ---------------------
+		//
+		// FiberLocal()/FiberLocalAs<T>() READ AND WRITE a slot; nothing here HANDED one out. So the
+		// feature was reachable only by finding FiberRegistry.h and calling a second type's static
+		// -- and a facility you cannot start using from the header you already include is one
+		// nobody discovers. The whole lifecycle now lives on TaskScheduler:
+		//
+		//     const uint16_t slot = TaskScheduler::AllocFiberLocalSlot();
+		//     TaskScheduler::FiberLocal(slot) = myState;
+		//     auto* s = TaskScheduler::FiberLocalAs<State>(slot);
+		//
+		// ALLOCATE ONCE, NOT PER TASK. A slot is a per-fiber INDEX, so one allocation serves every
+		// fiber for the life of the process -- a static or a namespace-scope constant, never
+		// something a task asks for on entry. Slots are a small fixed set (Fiber::kLocalSlots) and
+		// are not returned; running out is a design error rather than a runtime condition, and the
+		// allocator reports it by returning FiberRegistry::kNoSlot rather than by aborting.
+		static uint16_t AllocFiberLocalSlot() noexcept;
+
+		// The registry itself, for the rest of what it owns -- slot deleters, fiber identity
+		// (GetID), and the lease/creditor machinery. FLS alone does not need this; it is here so
+		// that reaching the registry does not require guessing that a second header exists.
+		//
+		// Returns a reference to a process-wide singleton that outlives the pool: it is LEAKED on
+		// purpose, because a thread_local may be destroyed after it during teardown and handing a
+		// dying object to a destroyed singleton is a worse bug than the leak.
+		static FiberRegistry& Fibers() noexcept;
+
 		static bool   HasFiberLocal() noexcept;
 		static void*& FiberLocal(size_t slot) noexcept;
 
