@@ -2258,3 +2258,35 @@ NOT FIXED, because the fix is a policy choice with three defensible answers:
   * K reads its own loPri deque for work IT stole (keeps the win; weakens an invariant that is
     currently absolute and easy to reason about)
 Worked around in tests/io_socket_test.cpp with a comment naming this note.
+
+## K READS ITS RESUME INBOX, AND MUST -- so pinned mode needs no steal guard (2026-09-02)
+
+Settled by Jay, after I shipped a gate on the opposite assumption and then could not test it.
+
+THE STRUCTURAL ARGUMENT, which is the one that matters: the reserved band exists to serve I/O
+completions, and an I/O completion IS A FIBER COMING BACK FROM AN AWAIT -- delivered through the
+resume inbox. If K could not read resumes the band would be broken for its PRIMARY PURPOSE, not
+merely for stealing. Thread.cpp says exactly this at the pop: "A RESUME IS LANE WORK for a reserved
+worker. It is the I/O completion path itself."
+
+THE CODE EVIDENCE IS A CONTRAST, not an inference. Two readers sit side by side in Worker():
+
+    if (!isReservedWorker && !scheduler->loPriInboxes[qIndex]->quiescent()) {   // loPri: GATED
+    ...
+    if (scheduler->resumedInboxes[qIndex]->pop(resumed) && resumed) {           // resume: NOT gated
+
+The loPri read carries the band gate and its comment says "LIKE EVERY OTHER READER OF THIS QUEUE".
+The resume read, immediately below, has none.
+
+SO IN PINNED MODE NOTHING RESUMES INTO A DEQUE. Requeue sends a fiber-bound task to
+resumedInboxes[home] with MarkQueuedWork + NotifyWorker and returns Pinned. The only fall-through is
+an unbound fiber or a departed home worker at teardown, and that lands in PickNextWorker, which masks
+[0,K) for ordinary work -- the rule reserved_lopri_placement_test guards.
+
+Guard removed. io_socket_test gained a `pin` argument and passes 4/4 in FiberMode::Pin with reserved
+stealing ON.
+
+WHAT I GOT WRONG TWICE, in opposite directions, and the lesson is the same both times: "pinned means
+the resume is stuck to a worker" is TRUE and does not imply "stuck somewhere that worker cannot
+read". I inferred the second from the first without reading the drain -- and the sentence that
+refutes it was already in the file.
