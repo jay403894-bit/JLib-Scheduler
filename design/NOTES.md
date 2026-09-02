@@ -2156,3 +2156,27 @@ that to dag_cancel_test).
 STILL UNMEASURED: whether 2 pages is enough for a real continuation. It is the only page-denominated
 class, so it is 8 KB usable on x64 and 32 KB on a 16 KB-page platform, and an overflow is a
 guard-page fault rather than a spin. A stack-watermark probe would settle it.
+
+### FOUND BY THE CONTROL: StackClass::Deep is unprovisioned by default, and asking for it HANGS
+
+`SetFiberBudget(normalPerComputeWorker = 64, tinyPerKWorker = 64, deepPerComputeWorker = 0)`.
+Deep is **zero**. A task created with `StackClass::Deep` under the default budget does not fail, does
+not fall back, and does not run: `AcquireFiber` finds no deep fiber, the task is requeued, and it
+spins forever. io_tiny_stack_test's control hit it on the first run -- the continuation simply never
+executed.
+
+TWO THINGS MAKE IT WORSE THAN A MISSING RESOURCE:
+
+  * THE EXHAUSTION WARNING NAMES THE WRONG CLASS. It fired and reported the STANDARD budget
+    ("64 standard per worker x 29 workers = 1856 total"), so the message points at a lever that is
+    already generous while the actual shortage -- zero deep fibers -- goes unmentioned. Someone
+    debugging this would raise the standard budget and see no change.
+  * THE NEW StackClass PARAMETER MAKES IT REACHABLE. Deep used to be hard to ask for (you had to
+    poke `task->stackClass` after creation). It is now a normal argument on all five Create* entry
+    points, so the first person to pass `StackClass::Deep` gets a silent hang.
+
+NOT FIXED HERE, deliberately -- it is a separate decision with at least three defensible answers:
+provision a small deep count by default; fall back to Standard when the asked-for class is empty
+(safe for Deep, NOT safe for Tiny, which would silently undo the I/O footprint win); or refuse at
+CreateTask and return nullptr, which is loud and matches the slab's "grow rather than fail" lesson
+only partly. Worth deciding before anyone ships against the new parameter.

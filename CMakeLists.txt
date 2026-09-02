@@ -1154,3 +1154,14 @@ target_compile_features(SchedulerMigratableFiberTest PRIVATE cxx_std_17)
 add_executable(SchedulerQuiesceTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/quiesce_test.cpp")
 target_link_libraries(SchedulerQuiesceTest PRIVATE Scheduler)
 target_compile_features(SchedulerQuiesceTest PRIVATE cxx_std_17)
+
+# THE OTHER HALF OF io_c17_test'S CLAIM. That file asserts Submit STAMPS a continuation Tiny; this
+# one asserts the stamp survives to a BOUND FIBER -- steered to the reserved band, where a Native
+# task actually binds one. On the floor a Native continuation is fiberless, so io_c17_test never
+# reaches the per-class cache at all and the whole tiny pool could be broken without it noticing.
+# Windows-only for the same reason io_c17_test is: it drives CreateFile + SubmitRead.
+if(WIN32)
+    add_executable(SchedulerIoTinyStackTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_tiny_stack_test.cpp")
+    target_link_libraries(SchedulerIoTinyStackTest PRIVATE Scheduler)
+    target_compile_features(SchedulerIoTinyStackTest PRIVATE cxx_std_17)
+endif()
