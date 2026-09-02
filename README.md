@@ -123,13 +123,21 @@ method.
 |---|---|
 | Dispatch latency, p50 | **0.40 µs** |
 | Dispatch latency, p99 | ~2.4 µs (2000+ samples) |
-| Context switch | ~9.2 ns |
+| Context switch | **9.8 ns** (AVX-dirty), 9.4 ns (clean) |
 | 64-fiber wake storm | ~1.7 µs per fiber, median |
 | Idle tax of the shipped floor | indistinguishable from zero |
 
 Read ratios and orders of magnitude, not last digits. The bench prints observed ranges and says
 **INDISTINGUISHABLE** where two arms overlap rather than letting you infer a winner from two medians
 a nanosecond apart.
+
+**The context switch has a trade, and it is not free in both directions.** Saving XMM6-15 with legacy
+SSE while the upper YMM state is dirty costs an SSE/AVX transition on every switch — **87.6 ns**. A
+CPUID-gated `vzeroupper` removes it, and that is what ships: **9.8 ns**, an 8.9× improvement on an
+AVX workload. It is not a pure win. Through a full `Event` round trip it **saves ~112 ns** on a fiber
+with dirty upper state and **costs ~32 ns** on one without. Both numbers are printed by
+`SchedulerContextSwitchBench`, alongside a correctness gate that round-trips XMM6-15 past a
+deliberate clobber for every variant, and a same-vs-same control that must read 1.00×.
 
 **There are no comparisons against other schedulers here, on purpose.** A head-to-head implies a
 shared objective function, and schedulers are not built for the same things — this one trades

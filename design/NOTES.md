@@ -30,6 +30,34 @@ triangulation is what the result rests on, not on any account of the microarchit
 magnitude is larger than a reading of Raptor Lake's documented blend behaviour predicts, and no
 explanation offered here would be worth more than the three-way agreement.
 
+### Re-measured 2026-09-02, with the fix SHIPPED — and the quotable number is 9.8, not 9.2
+
+The table above measures the *variants*. What ships is the CPUID-gated one, and it is not the same
+row — the gate costs something, and a fair figure has to include it:
+
+| | median ns | ratio | |
+|---|---|---|---|
+| `movdqa`, dirty upper | 87.64 | 1.000x | the OLD shipped behaviour |
+| same again | 87.89 | **1.003x** | same-vs-same control |
+| **SHIPPED, dirty upper** | **9.82** | **0.112x** | CPUID-gated `vzeroupper` — *this is the number to quote* |
+| ungated `vzeroupper`+`movdqa` | 9.45 | 0.108x | shipped minus this ≈ **0.4 ns**, the gate's cost |
+| `vmovdqa` (VEX), dirty | 9.45 | 0.108x | the alternative not taken |
+| `movdqa`, CLEAN upper | 9.25 | 0.106x | the floor — no transition to avoid |
+| SHIPPED, CLEAN upper | 9.43 | 0.108x | what the fix costs a non-AVX workload |
+
+**9.2 WAS THE FLOOR, NOT THE PRODUCT.** It is the clean-upper row — the best case, with no dirty
+state to transition out of. The README quoted it for a while, which understated what a real AVX
+workload pays. Shipped and dirty is **9.82 ns**; shipped and clean is 9.43.
+
+**AND THE FIX IS NOT A PURE WIN, measured through a full `Event` round trip** (31 workers, 20,000
+round trips/rep, 21 reps, gate toggled at RUNTIME so both arms are one binary, control at 0.989x):
+
+    saves ~112 ns per Event round trip on an AVX fiber
+    costs  ~32 ns per Event round trip on a non-AVX one
+
+Two switches' worth either way, against 156 ns of raw switch delta. Worth taking — an AVX fiber is
+the case that was pathological — but a non-AVX workload pays for it, and the README says so.
+
 ### The rule
 
 > **One `vzeroupper` at the top of `ContextSwitch`, gated on a CPUID'd byte.**
