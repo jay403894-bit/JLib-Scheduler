@@ -6120,6 +6120,28 @@ bool TaskScheduler::PushLocal(Task* task, uint8_t cpuaffinity) {
 		// worker. Measured: 0 of 300 lane completions ran inside the reserved range while this stood.
 		// Two spellings of one predicate is one too many; there are none left.
 		const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
+
+		// ---- THE SHARED INTAKE, BEFORE A WORKER IS CHOSEN AT ALL -------------------------------
+		//
+		// THIS IS THE PATH THAT MATTERS, and scoping the intake to the reactor's flush is why the
+		// strand counters did not move: ordinary `Push()` of a LowLatency task -- which is most lane
+		// traffic and all of the synthetic kind -- came through here and bound itself to one
+		// worker's inbox exactly as before.
+		//
+		// The block below already argues the general case: "the failure is not 'chose badly' but
+		// 'committed at all'", and "deferring the choice until a worker is free is strictly better
+		// than guessing which body finishes first". It then EXCLUDES lane work, on the grounds that
+		// diverting a completion off the lane defeats the reservation. That was right when the only
+		// alternative was the floor. It is not right against a queue the reserved band itself
+		// drains: this keeps the work ON the lane and merely stops naming which lane worker, which
+		// is the one piece of information the producer does not have.
+		//
+		// NOT the explicit-affinity branch above. A caller that named a worker gets that worker;
+		// silently overriding an explicit request is a different and worse thing than declining to
+		// invent one.
+		if (IsLowLatency(useHi) && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
+			return true;
+
 		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
 
 		// ---- DO NOT COMMIT ORDINARY WORK TO A WORKER THAT CANNOT REACH IT -------------------
@@ -6352,6 +6374,23 @@ TaskScheduler::RequeueResult TaskScheduler::Requeue(Task* task) {
 	// HiPriLaneActive(), NOT hotN -- see the identical fix above.
 
 	const Lane useHi = (IsLowLatency(task->lane) && HiPriLaneActive()) ? Lane::LowLatency : Lane::Normal;
+
+	// ---- THE SHARED INTAKE TAKES EVERY LANE PUSH, NOT JUST THE REACTOR'S -----------------------
+	//
+	// SCOPING THIS TO THE REACTOR WAS THE MISTAKE. The reachability failure is a property of the
+	// PUSH, not of the producer: any LowLatency task committed to one worker's hiPri inbox is
+	// unreachable by an idle sibling, whoever pushed it. Wiring only the reactor's flush left every
+	// ordinary lane push -- which is most of them, and all of the synthetic ones -- still binding at
+	// push time, so the strand counters did not move and could not have.
+	//
+	// A resumed lane task goes here for the same reason a fresh one does: it is still lane work, and
+	// picking a worker for it now is picking one that may be inside a body a microsecond later.
+	// Stealable, not Pinned: the intake has K legal consumers, so "exactly one consumer" -- which is
+	// what Pinned asserts about an inbox -- would be false. No caller reads this value today, which
+	// is why it is worth getting right now rather than when one starts to.
+	if (IsLowLatency(useHi) && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
+		return RequeueResult::Stealable;
+
 	if (task->assignedFiber) JLIB_RQ_BUMP(g_rqPlaced);
 	const uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
 #if defined(JLIBSCHED_REQUEUE_TRACE)
