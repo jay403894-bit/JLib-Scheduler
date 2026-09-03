@@ -1132,6 +1132,13 @@ add_executable(SchedulerEpochReclaimTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/epoc
 target_link_libraries(SchedulerEpochReclaimTest PRIVATE Scheduler)
 target_compile_features(SchedulerEpochReclaimTest PRIVATE cxx_std_17)
 
+# THE STACK HIGH-WATER PROBE. StackClass::Tiny is 8 KB and choosing it is a bet about a body
+# nobody measured -- settled today by a guard-page fault. This proves the probe tracks real depth:
+# a 16 KB local must move the number by about 16 KB, and the probe must record nothing when off.
+add_executable(SchedulerStackHighWaterTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/stack_highwater_test.cpp")
+target_link_libraries(SchedulerStackHighWaterTest PRIVATE Scheduler)
+target_compile_features(SchedulerStackHighWaterTest PRIVATE cxx_std_17)
+
 # THE LAMBDA-FIBER GUARD, PROVEN TO FIRE. The static_assert in CreateTask guards the CONSTRUCTOR;
 # `type` is a public bitfield, so an object can still be flipped to Fiber afterwards. AcquireFiber
 # refuses, and this proves it -- illegal arm in a child process, because the violation aborts.

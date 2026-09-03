@@ -1585,6 +1585,61 @@ static std::atomic<unsigned> g_workerRelax{ TaskScheduler::kWorkerRelaxDefault }
 void     TaskScheduler::SetWorkerRelax(unsigned n) noexcept { g_workerRelax.store(n, std::memory_order_relaxed); }
 unsigned TaskScheduler::GetWorkerRelax() noexcept { return g_workerRelax.load(std::memory_order_relaxed); }
 
+// The guest arm's yield cadence -- see the header. Default 0 is "every pass", which is exactly what
+// the code did before this knob existed, so adding it changes nothing until somebody sets it.
+static std::atomic<unsigned> g_guestYieldMask{ TaskScheduler::kGuestYieldMaskDefault };
+void     TaskScheduler::SetGuestYieldMask(unsigned m) noexcept { g_guestYieldMask.store(m, std::memory_order_relaxed); }
+unsigned TaskScheduler::GetGuestYieldMask() noexcept { return g_guestYieldMask.load(std::memory_order_relaxed); }
+
+// See the header. Relaxed on every operation: this is a diagnostic tally on an idle path, it orders
+// nothing, and a count that is off by one under a race is still the answer to the question asked.
+static std::atomic<std::uint64_t> g_reservedYieldsSuppressed{ 0 };
+void TaskScheduler::NoteReservedYieldSuppressed() noexcept {
+	g_reservedYieldsSuppressed.fetch_add(1, std::memory_order_relaxed);
+}
+std::uint64_t TaskScheduler::GetReservedYieldsSuppressed() noexcept {
+	return g_reservedYieldsSuppressed.load(std::memory_order_relaxed);
+}
+void TaskScheduler::ResetReservedYieldsSuppressed() noexcept {
+	g_reservedYieldsSuppressed.store(0, std::memory_order_relaxed);
+}
+
+// K's cadence -- see the header for the two arguments and why neither is settled. Default is
+// "never", which is what the shipped configuration already did before the coupling to F was removed.
+static std::atomic<unsigned> g_reservedYieldMask{ TaskScheduler::kReservedYieldMaskDefault };
+void     TaskScheduler::SetReservedYieldMask(unsigned m) noexcept { g_reservedYieldMask.store(m, std::memory_order_relaxed); }
+unsigned TaskScheduler::GetReservedYieldMask() noexcept { return g_reservedYieldMask.load(std::memory_order_relaxed); }
+
+// ---- THE STACK HIGH-WATER PROBE. See the header for what it is for and what it cannot see. ----
+//
+// One high-water per CLASS, not per fiber. The sizing question is "is Tiny deep enough for the
+// bodies I put in it", so the number wanted is the deepest any of them reached.
+static std::atomic<bool>   g_stackProbe{ false };
+static std::atomic<size_t> g_stackHigh[3] = {};   // indexed by StackClass: Standard, Tiny, Deep
+
+void TaskScheduler::SetStackProbe(bool on) noexcept { g_stackProbe.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::StackProbeEnabled() noexcept    { return g_stackProbe.load(std::memory_order_relaxed); }
+
+size_t TaskScheduler::GetStackHighWater(StackClass cls) noexcept {
+	const size_t i = (size_t)cls;
+	return i < 3 ? g_stackHigh[i].load(std::memory_order_relaxed) : 0;
+}
+void TaskScheduler::ResetStackHighWater() noexcept {
+	for (auto& h : g_stackHigh) h.store(0, std::memory_order_relaxed);
+}
+
+// MAX, published with a CAS loop rather than a store: several workers reach DEAD concurrently and a
+// plain store would let a shallow fiber erase a deep one's record.
+namespace JLib { namespace detail {
+	void NoteStackHighWater(StackClass cls, size_t used) noexcept {
+		const size_t i = (size_t)cls;
+		if (i >= 3) return;
+		size_t seen = g_stackHigh[i].load(std::memory_order_relaxed);
+		while (used > seen && !g_stackHigh[i].compare_exchange_weak(seen, used,
+		                                                           std::memory_order_relaxed)) {}
+	}
+}}
+
 // AN EXPLICIT CALL PINS THE BASE. Without this flag the pool-size default below could not tell an
 // app that asked for floor=2 on a 4-core box from one that never asked at all, and would quietly
 // overrule the first. Policy the caller stated always wins.

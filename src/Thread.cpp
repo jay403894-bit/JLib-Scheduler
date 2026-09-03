@@ -852,6 +852,44 @@ bool Thread::Ready(){
 	return ready.load(std::memory_order_acquire);
 }
        
+// ---- THE STACK HIGH-WATER PROBE. Off unless TaskScheduler::SetStackProbe(true). --------------
+//
+// LAYOUT, because getting it backwards would report nonsense confidently. AllocateStack returns the
+// LOW end of the region and the guard page is the lowest page of it, unbacked. Fiber::Init sets the
+// stack TOP to stackBase + stackSize, and the stack grows DOWN from there into the region until it
+// meets the guard. So:
+//
+//     [stackBase, stackBase+page)            the guard -- never touch it, that is the whole point
+//     [stackBase+page, stackBase+stackSize)  what the body may use, filled here
+//
+// The LOWEST address ever written is the deepest the body got, so `top - lowest` is what it used.
+static constexpr std::uint64_t kStackPattern = 0xC5C5C5C5C5C5C5C5ull;
+
+static void FillStackPatternIfProbing(Fiber* f) {
+	if (!f || !f->stackBase || !TaskScheduler::StackProbeEnabled()) return;
+	const size_t page = platform::PageSize();
+	if (f->stackSize <= page) return;                       // nothing usable past the guard
+	std::uint64_t* lo = (std::uint64_t*)((char*)f->stackBase + page);
+	std::uint64_t* hi = (std::uint64_t*)((char*)f->stackBase + f->stackSize);
+	for (std::uint64_t* p = lo; p < hi; ++p) *p = kStackPattern;
+}
+
+// Called once the fiber has switched back out and is DEAD, so nothing is running on this stack and
+// reading it is safe. Scans UPWARD from just above the guard: the first word that is no longer the
+// pattern is the deepest point reached.
+static void MeasureStackHighWaterIfProbing(Fiber* f) {
+	if (!f || !f->stackBase || !TaskScheduler::StackProbeEnabled()) return;
+	const size_t page = platform::PageSize();
+	if (f->stackSize <= page) return;
+	const std::uint64_t* lo = (const std::uint64_t*)((char*)f->stackBase + page);
+	const std::uint64_t* hi = (const std::uint64_t*)((char*)f->stackBase + f->stackSize);
+	const std::uint64_t* p  = lo;
+	while (p < hi && *p == kStackPattern) ++p;
+	// p now points at the deepest touched word (or hi if the body never ran / touched nothing).
+	const size_t used = (size_t)((const char*)hi - (const char*)p);
+	detail::NoteStackHighWater(f->stackClass, used);
+}
+
 Fiber* Thread::AcquireFiber(Task* task) {
 	// ---- A CLOSURE MUST NEVER BE HANDED A FIBER ROW. CHECKED HERE, ON THE OBJECT. -------------
 	//
@@ -916,6 +954,7 @@ Fiber* Thread::AcquireFiber(Task* task) {
 #if !defined(NDEBUG) || defined(JLIB_DEVELOPMENT)
 		fiberAcquires.fetch_add(1, std::memory_order_relaxed);   // see OutstandingFiberRows
 #endif
+		FillStackPatternIfProbing(f);
 		return f;
 	}
 
@@ -980,6 +1019,7 @@ Fiber* Thread::AcquireFiber(Task* task) {
 	// pool is already under stress.
 	if (f) fiberAcquires.fetch_add(1, std::memory_order_relaxed);
 #endif
+	if (f) FillStackPatternIfProbing(f);
 	return f;
 }
 
@@ -1119,6 +1159,10 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 		// a matching arrival here is a stranded stack.
 		fiberRecycles.fetch_add(1, std::memory_order_relaxed);
 #endif
+		// MEASURED HERE, BEFORE THE ROW GOES ANYWHERE. The fiber has switched back out and is DEAD,
+		// so nothing is running on this stack -- but the next line may hand it to the creditor chain
+		// or straight back to a cache, either of which can put another body on it before we look.
+		MeasureStackHighWaterIfProbing(f);
 		if (f->OwesCleanup()) FiberRegistry::Instance().AdvanceCleanup(f);
 		else                  ReleaseFiber(f);
 
@@ -4028,6 +4072,56 @@ void Thread::Worker() {
 					// So the handshake, the re-aim and those leftover quanta are all cost paid to
 					// be polite to a problem a small floor does not have. Gate the yield on the
 					// floor being big enough for politeness to matter.
+					// ---- A RESERVED WORKER NEVER YIELDS, AND NOT BECAUSE F IS SMALL ----------
+					//
+					// THE GATE BELOW READS F. A reserved worker reaches this block too --
+					// onAwakeFloor is true for it whenever ReservedNeverParks() -- so until this
+					// branch existed, K's yield policy was decided by THE SIZE OF THE FLOOR. Those
+					// are unrelated quantities. F's size is about how many spinners the machine can
+					// tolerate; K is about one thread being on-core when a completion lands.
+					//
+					// IT LOOKED CORRECT BY ACCIDENT. At the shipped floor=2 against a threshold of
+					// 4, `2 > 4` is false, so K did not yield -- and a reader could conclude the
+					// policy was deliberate. It was not: the growth controller RAISES F under load,
+					// and the moment it passes 4 every reserved worker starts yielding, for a
+					// reason that has nothing to do with K.
+					//
+					// WHY K MUST NOT YIELD AT ALL. A yield is a mini-preempt, and K exists so that
+					// a latency-critical completion meets a thread that is already running. Handing
+					// the core away on the off-chance somebody else wants it is the one thing this
+					// band is reserved to not do -- and a push aimed at a worker that has just
+					// published WS_YIELD either re-aims or eats a quantum, which is the tail K was
+					// bought to remove.
+					//
+					// THE FLOOR'S OWN RULE IS UNCHANGED below. This decouples the two; it does not
+					// retune F.
+					if (isReservedWorker) {
+						// COUNT WHAT THE OLD RULE WOULD HAVE DONE, not what this one does. "K
+						// relaxed a lot" says only that K was idle; the question this counter
+						// exists to answer is whether the OLD coupling was actually firing --
+						// whether F had grown past the threshold and K was yielding because of it.
+						// Zero here means the decoupling changed nothing on this run and the K p99
+						// must be explained some other way. Non-zero means it was live.
+						const size_t liveFK = TaskScheduler::GetAwakeFloor();
+						const unsigned tick = ++spinTick;
+						if (liveFK > TaskScheduler::GetYieldFloorMin() &&
+						    (((tick + (unsigned)qIndex) & TaskScheduler::GetSpinYieldMask()) == 0)) {
+							TaskScheduler::NoteReservedYieldSuppressed();
+						}
+						// K'S OWN CADENCE, defaulting to never -- which is what the shipped config
+						// already did. The two arguments are in the header and neither is settled;
+						// this exists so the question can be answered with a number instead of a
+						// story. Same stagger as everywhere else so two reserved workers cannot
+						// enter YIELD on the same pass.
+						const unsigned rm = TaskScheduler::GetReservedYieldMask();
+						if (rm != TaskScheduler::kReservedYieldNever &&
+						    (((tick + (unsigned)qIndex) & rm) == 0)) {
+							if (yieldWithHandshake()) continue;
+						}
+						else platform::CpuRelax();
+						continue;
+					}
+
 					const size_t liveF = TaskScheduler::GetAwakeFloor();
 					if (liveF > TaskScheduler::GetYieldFloorMin()) {
 						// PHASE-STAGGERED BY qIndex, so a large floor cannot enter YIELD in
@@ -4053,7 +4147,31 @@ void Thread::Worker() {
 					const unsigned relaxN = TaskScheduler::GetWorkerRelax();
 					for (unsigned i = 0; i < relaxN; ++i) platform::CpuRelax();
 				}
-				(void)yieldWithHandshake();
+				// ---- THE GUEST YIELD IS NOW A CADENCE, NOT AN UNCONDITIONAL ------------------
+				//
+				// It was `(void)yieldWithHandshake();` every pass, and the default still is -- mask
+				// 0 makes the test below always true, so this is the same instruction stream until
+				// somebody sets the knob. What changed is that it became MEASURABLE.
+				//
+				// The asymmetry is the reason. The FLOOR is forbidden to sleep, so it holds a core
+				// indefinitely and owes the machine politeness; it yields at 1-in-8, staggered, and
+				// not at all below YieldFloorMin. A GUEST is on its way to a park -- parking is the
+				// yield, and a more complete one -- yet it was the arm paying every single pass.
+				//
+				// SKIPPING THE YIELD IS NOT THE LOST-WAKE SHAPE. That shape is leaving the core
+				// while advertising EMPTY, which is what the handshake exists to prevent. A guest
+				// that stays on the core at WS_EMPTY is advertising the truth: on core, scanning,
+				// no syscall owed. A push aimed at it needs no kernel wake and gets none.
+				//
+				// SAME STAGGER AS THE FLOOR ARM, by qIndex, so a burst of guests woken together
+				// cannot enter YIELD in lockstep and leave a targeted core empty on the same pass.
+				{
+					const unsigned gm = TaskScheduler::GetGuestYieldMask();
+					if (gm != TaskScheduler::kGuestYieldNever &&
+					    ((((++spinTick) + (unsigned)qIndex) & gm) == 0)) {
+						(void)yieldWithHandshake();
+					}
+				}
 			}
 		}
 	}

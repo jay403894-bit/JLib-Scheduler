@@ -217,6 +217,13 @@ namespace JLib {
 	class TaskScheduler;
 
 	namespace detail {
+		// Publishes one fiber's measured depth into its class's high-water. Not public API: the
+		// probe is read through TaskScheduler::GetStackHighWater, and this is the write side that
+		// Thread.cpp calls at FiberStatus::DEAD.
+		void NoteStackHighWater(StackClass cls, size_t used) noexcept;
+	}
+
+	namespace detail {
 		// NOT PUBLIC API, AND NOT A RESTART. Tears the pool down mid-process: stops the service
 		// threads, drains every registered primitive so parked frames unwind, joins the workers.
 		// The pool does NOT come back -- Init() throws on a non-null instance and always has.
@@ -615,6 +622,115 @@ namespace JLib {
 		static constexpr unsigned kWorkerRelaxDefault = 32;
 		static void     SetWorkerRelax(unsigned iterations) noexcept;
 		static unsigned GetWorkerRelax() noexcept;
+
+		// ---- THE GUEST ARM'S YIELD CADENCE. THE OTHER HALF OF SetSpinYieldMask. --------------
+		//
+		// The idle loop has TWO arms and until this knob existed only one of them was measurable.
+		//
+		//   FLOOR   (onAwakeFloor)  always-on, forbidden to sleep. Yields at SetSpinYieldMask,
+		//                           phase-staggered by qIndex, and not at all below YieldFloorMin.
+		//   GUEST   everyone else   awake because something was advertised, and about to park.
+		//                           Yielded EVERY pass, unconditionally, with no way to change it.
+		//
+		// WHY THAT ASYMMETRY IS WORTH QUESTIONING. yield() is politeness, and politeness is owed by
+		// whoever holds a core INDEFINITELY. That is the floor, by construction -- it is forbidden
+		// to sleep. A guest is on its way to a park; parking IS the yield, and a more complete one.
+		// So the arm that pays every pass is the arm with the least reason to.
+		//
+		// WHAT THE UNCONDITIONAL YIELD WAS FOR, because it is not nothing: the floor GROWS, so a
+		// worker that entered this pass as a guest can become a legal aimed target mid-pass. A push
+		// aimed at a spinner that never publishes its state buys nothing and waits a quantum.
+		//
+		// BUT THAT IS THE HANDSHAKE'S JOB, NOT THE FREQUENCY'S. A guest that skips the yield stays
+		// on the core at WS_EMPTY -- "on core, scanning, no syscall needed" -- which is the correct
+		// advertisement for a worker that is still there. The lost-wake shape the handshake exists
+		// to prevent is leaving the core while advertising EMPTY, and skipping a yield does not do
+		// that. So the frequency looks like cost with no matching benefit, and this knob is how
+		// that gets measured instead of argued.
+		//
+		// SAME ENCODING AS SetSpinYieldMask: a power-of-two-minus-one mask tested against a
+		// per-worker tick. 0 means yield every pass, which is the shipped behaviour and therefore
+		// the default -- this knob changes nothing until somebody sets it. kGuestYieldNever turns
+		// the yield off entirely, which is the arm the idle-tax sweep wants.
+		static constexpr unsigned kGuestYieldMaskDefault = 0;          // every pass -- as shipped
+		static constexpr unsigned kGuestYieldNever       = 0xFFFFFFFFu;
+		static void     SetGuestYieldMask(unsigned mask) noexcept;
+		static unsigned GetGuestYieldMask() noexcept;
+
+		// ---- HOW OFTEN K'S YIELD USED TO FIRE, NOW THAT IT NO LONGER DOES -------------------
+		//
+		// A reserved worker never yields: it is reserved so a completion meets a thread that is
+		// already running, and a yield is a mini-preempt of exactly that thread. Before that was
+		// explicit, K borrowed the FLOOR's rule -- the gate reads GetAwakeFloor() -- so K's policy
+		// was decided by a quantity with nothing to do with K, and looked correct only because the
+		// shipped floor of 2 sits under the threshold of 4. The growth controller raises F under
+		// load, and past 4 every reserved worker began yielding for F's reasons.
+		//
+		// THIS COUNTS WHAT THE OLD RULE WOULD HAVE DONE, which is the only form of the number worth
+		// having. A count of K's idle passes would say merely that K was idle. This says whether
+		// the coupling was LIVE on a given run: zero means the decoupling changed nothing there and
+		// any K-latency result has to be explained some other way; non-zero is the yields removed.
+		static void          NoteReservedYieldSuppressed() noexcept;
+		static std::uint64_t GetReservedYieldsSuppressed() noexcept;
+		static void          ResetReservedYieldsSuppressed() noexcept;
+
+		// ---- K'S OWN YIELD CADENCE, WHICH IS AN OPEN QUESTION AND NOT A DECISION -------------
+		//
+		// TWO ARGUMENTS POINT OPPOSITE WAYS AND ONLY ONE HAS EVER BEEN MEASURED.
+		//
+		//   AGAINST YIELDING: K is reserved so a latency-critical completion meets a thread that is
+		//   already RUNNING. A yield is a mini-preempt of precisely that thread, and a push aimed at
+		//   a worker which has just published WS_YIELD either re-aims or eats a quantum -- the tail
+		//   K was bought to remove.
+		//
+		//   FOR YIELDING: K NEVER PARKS. It is therefore the most permanent core hog in the pool,
+		//   and the oversubscribed row (bench section 5b) showed a never-yielding spinner costing
+		//   1.9x on the measuring thread's own frame and 28% of competitor throughput. A thread that
+		//   holds a core forever is exactly the one that starves others at quantum granularity.
+		//
+		// WHAT THE ONE RELEVANT MEASUREMENT SAYS. In a run where the suppression counter read ZERO
+		// -- K did not yield at all -- LowLatency p99 was 1.70 us against the floor's 0.90. Not
+		// yielding did not buy K a better tail than the floor already had. That does not settle it
+		// either, but it does mean the against-case is unsupported rather than obvious.
+		//
+		// SO THIS IS A KNOB, NOT A POLICY. kReservedYieldNever is the default because it is what the
+		// shipped configuration already did (the old rule gated K on F, and floor=2 sits under the
+		// threshold of 4) -- so this changes nothing until somebody measures. The encoding matches
+		// SetSpinYieldMask: a power-of-two-minus-one tested against a per-worker tick.
+		static constexpr unsigned kReservedYieldNever       = 0xFFFFFFFFu;
+		static constexpr unsigned kReservedYieldMaskDefault = kReservedYieldNever;
+		static void     SetReservedYieldMask(unsigned mask) noexcept;
+		static unsigned GetReservedYieldMask() noexcept;
+
+		// ---- HOW DEEP DID ANYTHING ACTUALLY GO? THE STACK HIGH-WATER PROBE -------------------
+		//
+		// StackClass::Tiny is 2 PAGES USABLE -- 8 KB on a 4K-page box -- and choosing it is a bet
+		// about a body you have not measured. The bet is settled by a GUARD PAGE FAULT: the arena
+		// leaves the low page of every region unbacked, so overflow is an access violation rather
+		// than corruption. Deterministic, which is the right design, and useless as a warning -- it
+		// tells you the answer by crashing on the input path at the worst possible moment.
+		//
+		// So: fill a fiber's stack with a pattern when it is acquired, and when it reaches DEAD scan
+		// UPWARD from just above the guard for the first word that is no longer the pattern. The
+		// stack grows DOWN from stackBase + stackSize, so the lowest address ever written is the
+		// deepest the body reached, and (top - that address) is what it actually used.
+		//
+		// OFF BY DEFAULT, EVEN IN DEV BUILDS, because the fill is a memset of the whole region on
+		// every acquire -- up to 60 KB for a Standard fiber, on the path every suspendable task
+		// takes. This is an instrument you switch on to answer a sizing question and switch off
+		// again, not a diagnostic you leave running.
+		//
+		// WHAT IT CANNOT SEE: a body that happens to write the pattern value itself reads as
+		// untouched, so the figure is a LOWER BOUND on depth. The pattern is 64 bits of 0xC5 to make
+		// that improbable rather than impossible. Size against the number with headroom, the way you
+		// would against any high-water mark.
+		//
+		// PER CLASS, not per fiber: the question is "is Tiny enough for the bodies I put in it",
+		// and the answer wanted is the deepest ANY of them went.
+		static void   SetStackProbe(bool on) noexcept;
+		static bool   StackProbeEnabled() noexcept;
+		static size_t GetStackHighWater(StackClass cls) noexcept;   // bytes used, max observed
+		static void   ResetStackHighWater() noexcept;
 
 		static size_t GetAwakeFloor() noexcept;
 
