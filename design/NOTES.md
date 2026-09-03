@@ -2566,3 +2566,32 @@ matters LEAST.
 TO DEMONSTRATE IT RATHER THAN ARGUE IT: a small range, N~256, with a trivial body and a heavy body,
 probe on and off. That is the shape where serial-or-whole-pool is visibly wrong in both directions.
 Not built yet.
+
+================================================================================
+IoFiber.h IS PUBLIC NOW, AND THE NEXT RELEASE IS THEREFORE 5.1.0
+================================================================================
+
+`tests/io_fiber_await.h` became `include/IoFiber.h` (namespace `JLib::Fib`) on 9-03. That is an
+ADDITION to the public API of a released library, so the next tag is a MINOR bump, not 5.0.4.
+
+WHAT SETTLED IT, having deliberately left it private through 5.0.0-5.0.3: porting Game01 off the
+abandoned co_await layer. It was the first application to need async I/O on a fibers-only runtime,
+and it had no supported way to wait on one. Its choices were to copy the header or to hand-roll the
+handshake, and what it would have been hand-rolling is the `true` return from Submit -- already
+final, the reactor never took the resume task, so the caller still owns it. Waiting hangs on a
+WaitGroup nobody will decrement; dropping the pointer leaks a Task. Neither fails loudly.
+
+So the position we were actually shipping was: the RAW Submit* surface is public, and the guard
+against its one sharp edge is test-private. That is the wrong way round, and no amount of
+deliberateness about API additions fixes it.
+
+CONSEQUENCE WORTH STATING: IoFiber.h is now the ONE supported way to wait on I/O from a fiber, and
+`Lane::Normal` on the resume task is load-bearing rather than incidental -- see the long comment in
+Await(). A completion steered to the reserved band deadlocks when its job is to WAKE a Normal
+fiber, because the band never reads a loPri deque. It is written down there; it belongs in the
+public docs too, which is not done.
+
+STILL NOT DONE, both documentation-only:
+  - SlabPool being append-only is LOAD-BEARING for why the lambda/fiber defect is invisible in
+    tests. Nothing says so outside a code comment.
+  - StackClass on a Native task is a silent no-op on the floor.
