@@ -1,3 +1,24 @@
+# Windows CI -- the primary platform, on every push and PR.
+#
+# THIS WORKFLOW USED TO BUILD AND STOP. `cmake ..` then `cmake --build .`, no test step of any
+# kind, while the repository carried 57 test targets. So a green badge on main meant "it compiled",
+# and every invariant the suite exists to defend -- the fiber-row lifecycle, the lambda/fiber
+# guard, the reserved-band placement rules, the epoch suspend check -- was verified only when
+# somebody ran it by hand on their own machine. Which happened, and caught real bugs, and is not a
+# process.
+#
+# It also built the DEFAULT configuration. With the Visual Studio generator that is Debug: a build
+# nobody ships, roughly an order of magnitude slower, and with JLIB_DEVELOPMENT assertions live. So
+# the one thing this workflow did check was the one configuration least like a release.
+#
+# Now: Release, and the whole suite through ctest. It runs in about 40 seconds locally.
+#
+# WHY THIS ONE KEEPS THE PUSH TRIGGER while ci.yml is workflow_dispatch only: ci.yml is a
+# seven-job matrix including macOS at a 10x billing multiplier, and running it per commit tripped
+# the account spending limit. This is a single Windows job at 2x. The whole point of the change
+# above is that main gets checked automatically, so gating it behind a button would put back the
+# problem it fixes.
+
 name: Windows CI
 
 on:
@@ -9,7 +30,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-
+    timeout-minutes: 30
 
     steps:
     - name: Checkout code
@@ -17,23 +38,22 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Build
-      run: |
-        mkdir build
-        cd build
-        cmake ..
-        cmake --build .
+    - name: Configure
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-    # THE ARTIFACT UPLOAD IS REMOVED, AND IT WAS THE ONLY THING HERE THAT COST MONEY.
+    # --config Release matters here and is not redundant with CMAKE_BUILD_TYPE above: the Visual
+    # Studio generator is multi-config and ignores CMAKE_BUILD_TYPE at configure time.
+    - name: Build
+      run: cmake --build build --config Release -j 2
+
+    # The list of tests lives in CMakeLists.txt and is DISCOVERED from the targets that exist, not
+    # written out here -- see the registration block at the end of that file. A hand-maintained list
+    # in a YAML file is what left ci.yml naming three executables that had been deleted for a
+    # release and a half, with nothing able to notice.
     #
-    # It uploaded the ENTIRE build tree -- objects, PDBs, the lot -- on every push to main: 136-199
-    # MB a time, 360 artifacts, 19.4 GB live, 305 of them in August alone. Nothing ever downloaded
-    # one, and every byte is reproducible by running the two commands above.
-    #
-    # Compute is not the expense. GitHub-hosted standard runners are free for public repositories,
-    # so the minutes this job burns are free; artifact STORAGE is billed against the account
-    # allowance, which is measured in hundreds of megabytes. That is the whole charge.
-    #
-    # If you want artifacts back, upload the BINARIES and set a retention, not the build directory:
-    #   - uses: actions/upload-artifact@v4
-    #     with: { name: bin, path: build/bin/**/*.exe, retention-days: 7 }
+    # -j 1: several of these measure pool behaviour, and running them concurrently on a 2-core
+    # runner would have them contend for the CPUs under test. Each carries a 300s TIMEOUT from
+    # CMakeLists, because a deadlocked concurrency test does not fail -- it spins every worker until
+    # something kills it, and without a timeout that something is the 6-hour job limit.
+    - name: Run the test suite (ctest)
+      run: ctest --test-dir build -C Release --output-on-failure -j 1

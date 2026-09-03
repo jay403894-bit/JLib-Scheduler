@@ -31,51 +31,36 @@ jobs:
     strategy:
       fail-fast: false    # one target failing should not hide the others' results
       matrix:
+        # ---- ONLY TWO PATHS PER TARGET NOW, and that is the fix rather than tidying. -------------
+        #
+        # There used to be nine, one per executable this workflow ran by hand. Three of them --
+        # coro, future, coroepoch -- had pointed at targets that STOPPED EXISTING when the C++20
+        # layer moved to extras/abandoned in 5.0, and the list said nothing about it. Meanwhile the
+        # project had grown to 57 test targets, so the six real entries were running about a tenth
+        # of the suite while looking thorough.
+        #
+        # ctest owns the list now (see the registration block at the end of CMakeLists.txt, which
+        # DISCOVERS targets rather than naming them), so a test joins CI by being written. What is
+        # left here are the two executables that are invoked directly for reasons ctest cannot
+        # express: a bench run as a smoke test, and the primitives test driven under a raised
+        # watchdog in the macOS race hunt.
         include:
           - name: Windows x64 (MSVC)
             os: windows-latest
             bench: build/bin/Release/SchedulerBench.exe
-            smoke: build/bin/Release/SchedulerEventSmoke.exe
-            topo: build/bin/Release/SchedulerTopologyTest.exe
             prims: build/bin/Release/SchedulerPrimitivesTest.exe
-            fiberbudget: build/bin/Release/SchedulerFiberBudgetTest.exe
-            slabsize: build/bin/Release/SchedulerTaskSlabSizeTest.exe
-            coro: build/bin/Release/SchedulerCoroutineTest.exe
-            future: build/bin/Release/SchedulerFutureTest.exe
-            coroepoch: build/bin/Release/SchedulerCoroEpochTest.exe
           - name: Linux x86-64 (GCC)
             os: ubuntu-latest
             bench: build/bin/SchedulerBench
-            smoke: build/bin/SchedulerEventSmoke
-            topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
-            fiberbudget: build/bin/SchedulerFiberBudgetTest
-            slabsize: build/bin/SchedulerTaskSlabSizeTest
-            coro: build/bin/SchedulerCoroutineTest
-            future: build/bin/SchedulerFutureTest
-            coroepoch: build/bin/SchedulerCoroEpochTest
           - name: Linux AArch64 (GCC)
             os: ubuntu-24.04-arm
             bench: build/bin/SchedulerBench
-            smoke: build/bin/SchedulerEventSmoke
-            topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
-            fiberbudget: build/bin/SchedulerFiberBudgetTest
-            slabsize: build/bin/SchedulerTaskSlabSizeTest
-            coro: build/bin/SchedulerCoroutineTest
-            future: build/bin/SchedulerFutureTest
-            coroepoch: build/bin/SchedulerCoroEpochTest
           - name: macOS arm64 (AppleClang)
             os: macos-14
             bench: build/bin/SchedulerBench
-            smoke: build/bin/SchedulerEventSmoke
-            topo: build/bin/SchedulerTopologyTest
             prims: build/bin/SchedulerPrimitivesTest
-            fiberbudget: build/bin/SchedulerFiberBudgetTest
-            slabsize: build/bin/SchedulerTaskSlabSizeTest
-            coro: build/bin/SchedulerCoroutineTest
-            future: build/bin/SchedulerFutureTest
-            coroepoch: build/bin/SchedulerCoroEpochTest
 
     steps:
       - uses: actions/checkout@v4
@@ -84,13 +69,13 @@ jobs:
         run: cmake --version
         shell: bash
 
-      # JLIBSCHED_COROUTINES=ON builds the C++20 coroutine mode's tests. It defaults OFF so that a
-      # plain build keeps C++17 as the project's real floor -- the library target stays cxx_std_17
-      # either way, only these test executables ask for cxx_std_20. Turned on here because the flag
-      # defaulting off meant CI had never once built, let alone run, ANY coroutine test: the whole
-      # third execution mode was unverified on every platform.
+      # -DJLIBSCHED_COROUTINES=ON USED TO BE PASSED HERE and was removed because the option no
+      # longer exists: 5.0 is fibers-only, there is no second language mode, and no target asks for
+      # cxx_std_20. CMake does not fail on an unknown -D, it warns and carries on -- so the flag
+      # kept being passed to nothing, which is the same silent-drift failure as the executable list
+      # below it. A dead flag in a CI file is indistinguishable from a live one until you go look.
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJLIBSCHED_COROUTINES=ON
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       # --config matters on Windows (the VS generator is multi-config and ignores
@@ -107,83 +92,41 @@ jobs:
         run: ./${{ matrix.bench }} none
         shell: bash
 
-      # The named-event path: a lock-free waiter stack the benchmark never touches. Worth running on
-      # every target rather than just one, because the thing at risk in new atomic code is memory
-      # ORDERING, and x86 is TSO -- it hands you acquire/release semantics on ordinary loads and
-      # stores whether you asked for them or not. A missing barrier is invisible there. Two of these
-      # four runners are weakly ordered ARM64, which is the only reason this test is worth much.
-      - name: Run event test (lock-free waiter stack)
-        run: ./${{ matrix.smoke }}
-        shell: bash
-
-      # The >64-CPU path, which none of these runners is wide enough to exercise for real. These are
-      # the parts of it that are pure logic: mask math, the flat CpuId split, the sysfs list parser,
-      # and a hand-built uneven-processor-group topology checking that every worker gets a CPU that
-      # actually exists. It carries a negative control asserting the old dense scheme WOULD have
-      # failed that case, so a pass means something rather than just "this runner is dense".
-      - name: Run topology test (wide-CPU logic)
-        run: ./${{ matrix.topo }}
-        shell: bash
-
-      # The fiber-aware locks: mutex, semaphore, condition variable, ScopedPermit. Carries the
-      # regression test for the 1.2.3 self-deadlock, which is verified to FAIL with the guard removed
-      # rather than merely passing with it present. Every blocking case runs under a watchdog, so a
-      # regression exits nonzero in 30 seconds instead of hanging this job for its full timeout --
-      # which is exactly what the 1.2.0 macOS bug did, for thirty minutes a run.
-      - name: Run primitives test (locks, and the deadlock regression)
-        run: ./${{ matrix.prims }}
-        shell: bash
-
-      # A second pass under IdlePolicy::NoSleep used to run here. That policy is gone in 5.0, and
-      # with it the second park path this step existed to cover -- the argument is now accepted and
-      # ignored, so keeping the step would have run the same suite twice and reported it as
-      # coverage. The live park-policy transition it was really guarding (a flip landing mid
-      # handshake) is asserted directly by the awake-floor case inside the suite above.
-
-      # Third mode: worker self-triggered reclamation OFF -- how an application that ticks
-      # EpochManager from its own idle path runs. Exercises the branch where RetirePtr skips its
-      # atomic entirely, and the guarded decrement in TryReclaim that would otherwise wrap size_t
-      # on the first manual Tick(). Neither has any other coverage.
-      - name: Run primitives test with self-reclaim disabled
-        run: ./${{ matrix.prims }}
-        shell: bash
-
-      # SetFiberBudget: does StartPool actually consume the configured per-worker fiber counts, not
-      # just the setter storing them. Verified as a real check before this was added -- reverting
-      # the StartPool wiring back to the old hardcoded 64/8 makes this fail with the wrong pool size
-      # rather than passing regardless.
-      - name: Run fiber budget test (SetFiberBudget wiring)
-        run: ./${{ matrix.fiberbudget }}
-        shell: bash
-
-      # SetTaskSlabSize: same shape of check as the fiber budget one -- does construction actually
-      # consume the configured slot count, and does the allocator genuinely exhaust at it. Verified
-      # as real before this was added: reverting the wiring back to the hardcoded 1024*1024 made
-      # both checks fail (reported capacity 1048576 instead of the configured value, and none of
-      # 137 allocation attempts against a slab meant to hold 37 ever returned nullptr).
-      - name: Run task slab size test (SetTaskSlabSize wiring)
-        run: ./${{ matrix.slabsize }}
-        shell: bash
-
-      # THE C++20 COROUTINE MODE. Built but never run anywhere until now -- these three existed in
-      # CMakeLists behind a default-OFF option, so nothing in CI had ever compiled them.
-      - name: Run coroutine test (C++20 mode)
-        run: ./${{ matrix.coro }}
-        shell: bash
-
-      - name: Run future test (C++20 mode)
-        run: ./${{ matrix.future }}
-        shell: bash
-
-      # RELEASE ONLY, AND THAT IS THE POINT, not an oversight. This test deliberately holds an
-      # EpochGuard across a co_await -- a contract violation -- to check what the counted-epoch
-      # scheme does when someone commits it anyway: a bounded stall instead of the slot scheme's
-      # silent corruption. In Debug/JLIB_DEVELOPMENT the ArmResume tripwire asserts on exactly that
-      # violation and the process aborts, which is the tripwire WORKING. So it can only be run in a
-      # build where that check is compiled out. CI builds Release throughout, so it belongs here and
-      # must never be added to a Development sweep.
-      - name: Run counted-epoch test (Release only -- see comment)
-        run: ./${{ matrix.coroepoch }}
+      # ---- THE WHOLE SUITE, THROUGH CTEST ---------------------------------------------------
+      #
+      # This replaces nine hand-named steps. What they covered is worth keeping on the record,
+      # because the reasons are still the reasons -- they are simply no longer a list anyone has to
+      # maintain:
+      #
+      #   the event test          a lock-free waiter stack the bench never touches. The thing at
+      #                           risk in new atomic code is memory ORDERING, and x86 is TSO: it
+      #                           hands you acquire/release on ordinary loads and stores whether you
+      #                           asked or not, so a missing barrier is invisible there. Two of these
+      #                           four runners are weakly ordered ARM64. That is why this matrix is
+      #                           worth its bill.
+      #   the topology test       the >64-CPU path no runner is wide enough to exercise for real --
+      #                           mask math, the flat CpuId split, the sysfs parser. Carries a
+      #                           negative control asserting the old dense scheme WOULD have failed.
+      #   the primitives test     fiber-aware mutex/semaphore/condvar/ScopedPermit, including the
+      #                           1.2.3 self-deadlock regression, verified to FAIL with the guard
+      #                           removed. Every blocking case is under a watchdog, so a regression
+      #                           exits nonzero in 30s instead of hanging the job for its timeout --
+      #                           which is exactly what the 1.2.0 macOS bug did, half an hour a run.
+      #   fiber budget / slab     does StartPool actually CONSUME the configured counts, not just
+      #                           store them. Both verified real by reverting the wiring and
+      #                           watching them fail.
+      #
+      # And three steps ran coroutine tests that no longer exist. They had been dead since 5.0 and
+      # the workflow could not tell anyone, because a name in a YAML file is not checked by anything.
+      #
+      # ctest now runs all of them plus the ~46 that were never listed at all. --output-on-failure
+      # prints the failing test's stdout, which is where these tests put their reasoning; -j 1
+      # because several are concurrency tests that measure pool behaviour and running them
+      # alongside each other on a 2-core runner would have them fight for the CPUs under test.
+      # Each test carries a 300s TIMEOUT set in CMakeLists: a deadlocked concurrency test does not
+      # fail, it spins every worker until something kills it.
+      - name: Run the test suite (ctest)
+        run: ctest --test-dir build -C Release --output-on-failure -j 1
         shell: bash
 
       # macOS arm64 ONLY, and a deliberate reproducer rather than a test.
@@ -461,6 +404,22 @@ jobs:
 
       - name: Run task slab size test (SetTaskSlabSize wiring)
         run: ./build/bin/Release/SchedulerTaskSlabSizeTest.exe
+        shell: bash
+
+      # ---- THEN THE REST OF THE SUITE ------------------------------------------------------
+      #
+      # The five steps above are KEPT AS STEPS on purpose, unlike the x64 job where ctest replaced
+      # them. This is an ABI bring-up job: the value is the ORDERING -- the harness first because
+      # its failure needs no interpretation, then the shortest thing that drives a real fiber, and
+      # only then the contended suite. ctest runs in registration order and cannot express "die
+      # here, with this symptom, before the ambiguous ones start."
+      #
+      # But that ordering was also the whole job, so on Windows-on-ARM -- the platform with the
+      # newest assembly and the least coverage -- exactly five tests ran. Everything the port could
+      # plausibly break beyond a register clobber went unchecked. So: keep the ordered five for
+      # diagnosis, then run all 52 for coverage. The five that repeat cost under a second.
+      - name: Run the rest of the suite (ctest)
+        run: ctest --test-dir build -C Release --output-on-failure -j 1
         shell: bash
 
       - name: Run benchmark (smoke test)

@@ -1249,3 +1249,58 @@ target_compile_features(SchedulerLambdaCaptureTest PRIVATE cxx_std_17)
 add_executable(SchedulerFiberRowLifecycleTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_row_lifecycle_test.cpp")
 target_link_libraries(SchedulerFiberRowLifecycleTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberRowLifecycleTest PRIVATE cxx_std_17)
+
+# ==============================================================================================
+# CTEST REGISTRATION -- DISCOVERED, NOT LISTED
+# ==============================================================================================
+#
+# WHAT THIS REPLACES. There was no enable_testing() and no add_test(), so there was no way to run
+# the suite as a set. The workflows instead named executables BY HAND, and that list did what hand
+# lists do: windows_ci.yml ran none of them at all, and ci.yml named nine, three of which
+# (SchedulerCoroutineTest, SchedulerFutureTest, SchedulerCoroEpochTest) stopped existing when the
+# C++20 layer moved to extras/abandoned in 5.0. 57 targets, 6 actually running, 0 on the primary
+# platform -- a green badge that meant "it compiled".
+#
+# SO THE LIST IS DERIVED. BUILDSYSTEM_TARGETS enumerates the targets this file actually created,
+# which means a new test joins ctest by being written and platform-gated ones drop out on their own
+# -- SchedulerFiberAbiTest is not built on every configuration, and nothing here has to know that.
+# Registering by hand is the failure this block exists to end; do not reintroduce it by adding a
+# name below.
+#
+# THE EXCLUSIONS ARE THE OPPOSITE, and deliberately explicit. A bench is not a test: it takes
+# minutes, it reports numbers rather than pass/fail, and its numbers are meaningless on a shared CI
+# runner. Excluding by name means adding a bench is a visible decision rather than a silent
+# 20-minute CI job. SchedulerRowProbe is a diagnostic that prints state, not an assertion.
+enable_testing()
+
+set(JLIBSCHED_NOT_TESTS
+    SchedulerBench SchedulerLaneBench SchedulerDagBench SchedulerRuntimeBench
+    SchedulerContextSwitchBench SchedulerEpochMechBench SchedulerEpochVsMutex
+    SchedulerLockBench SchedulerSpinTax SchedulerFutexVariance
+    SchedulerRowProbe)
+
+get_property(JLIBSCHED_ALL_TARGETS DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+             PROPERTY BUILDSYSTEM_TARGETS)
+
+set(JLIBSCHED_TEST_COUNT 0)
+foreach(_t IN LISTS JLIBSCHED_ALL_TARGETS)
+    if(NOT _t MATCHES "^Scheduler")
+        continue()
+    endif()
+    # The library itself is a target in this list too.
+    get_target_property(_type ${_t} TYPE)
+    if(NOT _type STREQUAL "EXECUTABLE")
+        continue()
+    endif()
+    if(_t IN_LIST JLIBSCHED_NOT_TESTS)
+        continue()
+    endif()
+    add_test(NAME ${_t} COMMAND ${_t})
+    # A TIMEOUT IS NOT OPTIONAL HERE. Several of these are concurrency tests, and the way a
+    # concurrency test fails is by DEADLOCKING -- which is not a failure, it is a job that spins
+    # every worker until the runner kills it 6 hours later. 300s is generous against a local worst
+    # case of well under 150s.
+    set_tests_properties(${_t} PROPERTIES TIMEOUT 300)
+    math(EXPR JLIBSCHED_TEST_COUNT "${JLIBSCHED_TEST_COUNT} + 1")
+endforeach()
+message(STATUS "JLib::Scheduler: ${JLIBSCHED_TEST_COUNT} tests registered with ctest")
