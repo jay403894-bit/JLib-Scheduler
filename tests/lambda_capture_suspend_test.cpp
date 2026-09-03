@@ -8,7 +8,7 @@
 // it when the fiber running it SUSPENDS:
 //
 //   IF IT IS FREED AT SUSPEND, then every capturing lambda that waits is a use-after-free the moment
-//   it resumes, io_fiber_await.h is built on sand, and the socket suite passes by luck.
+//   it resumes, IoFiber.h is built on sand, and the socket suite passes by luck.
 //
 //   IF IT SURVIVES UNTIL THE BODY RETURNS, capturing by value is the correct idiom for a task that
 //   waits, and the only hazard is capturing by REFERENCE into a caller's stack.
@@ -203,7 +203,7 @@ int main() {
     if (corrupt.load() > 0)
         std::printf("  first corrupted byte index: %d\n", firstBad.load());
 
-    // THE CLAIM. If this fails, capturing by value across a wait is unsafe and io_fiber_await.h --
+    // THE CLAIM. If this fails, capturing by value across a wait is unsafe and IoFiber.h --
     // and every arm of io_socket_test -- is built on a use-after-free.
     Check(corrupt.load() == 0,
           "a BY-VALUE capture is intact after the fiber resumes (the frame outlived the suspend)");

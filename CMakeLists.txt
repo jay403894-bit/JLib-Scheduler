@@ -1195,7 +1195,7 @@ if(WIN32)
 endif()
 
 # THE SOCKET SUITE, PORTED TO FIBERS. It was written entirely on co_await and went to
-# extras/abandoned with the coroutine layer; this is it back on tests/io_fiber_await.h, which is the
+# extras/abandoned with the coroutine layer; this is it back on include/IoFiber.h, which is the
 # same completion-first Submit* API with a WaitGroup where the awaiter used to be.
 #
 # NOT WIN32-ONLY. tests/socket_compat.h gives it Winsock spelling on both platforms, so it is ONE

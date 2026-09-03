@@ -32,9 +32,18 @@
 // completions" is one STANDARD fiber parked per socket plus transient tiny ones -- which is the
 // model the tiny budget was sized against.
 //
-// THIS BELONGS IN THE LIBRARY, not in a test. It is here because the port that needed it is a test,
-// and putting a public header into the API is a decision worth making deliberately rather than as a
-// side effect of restoring coverage.
+// ---- WHY THIS IS PUBLIC, having spent a release in tests/ ------------------------------------
+//
+// It was written under tests/ deliberately, on the grounds that adding a public header should be a
+// decision rather than a side effect of restoring coverage. Game01 is what settled it: the first
+// application to port off the abandoned co_await layer had to have this, and its only alternatives
+// were to copy the file or to hand-roll the handshake.
+//
+// That second option is the argument. What an application would be hand-rolling is not convenience
+// -- it is the `true` return above, which fails as a hang or a leak and never as an error. Leaving
+// the safe form test-private while the raw Submit* stayed public meant shipping the trap and
+// withholding the guard, which is backwards. So: public, and the ONE supported way to wait on I/O
+// from a fiber.
 
 #pragma once
 
@@ -44,7 +53,7 @@
 #include <utility>
 
 namespace JLib {
-namespace testing {
+namespace Fib {
 
 // ---- THE RESUME TASK IS A RAW fn/data TASK, NOT A LAMBDA -----------------------------------
 //
@@ -310,5 +319,5 @@ inline IoResult RecvV(TaskScheduler& s, IoStream& st, const IoBuffer* bufs, std:
     return Await(s, [&](Task* k) { return st.SubmitRecv(bufs, count, flags, &req, &out, k, tok); }, out);
 }
 
-} // namespace testing
+} // namespace Fib
 } // namespace JLib

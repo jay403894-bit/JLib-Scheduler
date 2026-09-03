@@ -17,8 +17,8 @@
 
 #include "TaskScheduler.h"
 #include "IoReactor.h"
-#include "io_fiber_await.h"
-namespace Fib = JLib::testing;
+#include "IoFiber.h"
+namespace Fib = JLib::Fib;
 #include "Timer.h"
 #include "platform.h"
 

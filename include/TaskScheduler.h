@@ -3033,7 +3033,7 @@ namespace JLib {
 		// above: `void(*)(void*)` plus a context pointer that lives on the CALLER'S stack, or in
 		// something that outlives the wait. That form has one owner, and the fiber's own stack
 		// carries the body's locals across the suspension, which is the entire reason fibers exist
-		// here. tests/io_fiber_await.h is written this way and is the worked example.
+		// here. include/IoFiber.h is written this way and is the worked example.
 		//
 		// LAMBDAS REMAIN THE DEFAULT AND CORRECT SPELLING for the overwhelming majority of task
 		// bodies, which compute something and return. Those are one-shot, they never call

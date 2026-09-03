@@ -9,7 +9,7 @@
 #include "TaskScheduler.h"
 #include "IoReactor.h"
 #include "Thread.h"          // Thread::Current()->qIndex -- arm 4 asks WHICH worker resumed it
-#include "io_fiber_await.h"
+#include "IoFiber.h"
 
 #include <atomic>
 #include <chrono>
@@ -21,7 +21,7 @@
 // src/win32/IoReactor.cpp writes down at its own includes.
 #include "socket_compat.h"
 
-namespace Fib = JLib::testing;
+namespace Fib = JLib::Fib;
 
 static int g_fail = 0;
 static void Check(bool c, const char* what) {

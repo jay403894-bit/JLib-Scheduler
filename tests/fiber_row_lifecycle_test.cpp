@@ -11,7 +11,7 @@
 //
 // THE CLAIM THIS FILE CHECKS is that a task created from a LAMBDA cannot satisfy that invariant --
 // that nothing owns its completion, so its row is stranded RUNNING or PARKED forever. If that is
-// true, every capturing lambda that waits leaks a stack, io_fiber_await.h is built on sand, and the
+// true, every capturing lambda that waits leaks a stack, IoFiber.h is built on sand, and the
 // socket suite passes only because it does not run long enough to exhaust the pool.
 //
 // WHY A COUNT AND NOT AN ASSERTION ABOUT STATUS. Reading `status == DEAD` from outside is a race and

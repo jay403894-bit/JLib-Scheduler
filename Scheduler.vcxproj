@@ -109,6 +109,20 @@
     <ClCompile Include="src\TaskDAG.cpp" />
     <ClCompile Include="src\TaskScheduler.cpp" />
     <ClCompile Include="src\Thread.cpp" />
+    <!-- ADDED AFTER THIS PROJECT SILENTLY WENT STALE. CMake globs src\*.cpp, so a new source file
+         joins the library the moment it exists. This project names each one, so a new source file
+         joins NOTHING, and says nothing about it: the library still BUILDS, because a static lib is
+         not required to resolve its own externals. The failure surfaces one step later, when
+         something LINKS the lib, as a wall of unresolved externals that never mentions the real
+         cause, which is that a translation unit is simply absent.
+         IoReactor_stub.cpp is safe to list alongside src\win32\IoReactor.cpp: it is guarded on
+         !_WIN32 and !__linux__, so on Windows it compiles to nothing. It appears here because
+         CMake's glob picks it up too, and the job of this block is to MATCH that glob, not to
+         curate a subset of it. Anything else is how the two builds drift apart again. -->
+    <ClCompile Include="src\FiberRegistry.cpp" />
+    <ClCompile Include="src\Hazard.cpp" />
+    <ClCompile Include="src\IoShared.cpp" />
+    <ClCompile Include="src\IoReactor_stub.cpp" />
     <!-- Platform-specific sources live in src\win32 and src\posix, split by DIRECTORY rather than
          by filename suffix. That is what lets the CMake build glob src\*.cpp for the shared files
          and add exactly one platform directory, instead of globbing both variants of the same
