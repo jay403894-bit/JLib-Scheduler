@@ -217,15 +217,6 @@ namespace JLib {
 	class TaskScheduler;
 
 	namespace detail {
-		// A false that DEPENDS on a template parameter, so a static_assert inside a template body
-		// fires only when that template is actually instantiated. `static_assert(false, ...)` in a
-		// template is ill-formed whether or not anything calls it; this is the standard workaround.
-		// Used by the poisoned CreateTask overload below to give a real explanation instead of
-		// "use of deleted function".
-		template<typename...> struct dependent_false : std::false_type {};
-	}
-
-	namespace detail {
 		// NOT PUBLIC API, AND NOT A RESTART. Tears the pool down mid-process: stops the service
 		// threads, drains every registered primitive so parked frames unwind, joins the workers.
 		// The pool does NOT come back -- Init() throws on a non-null instance and always has.
@@ -2974,28 +2965,6 @@ namespace JLib {
 			// raw pointers -- the overwhelming majority of task bodies -- skip the virtual call.
 			t->trivialDtor = std::is_trivially_destructible_v<std::decay_t<F>> ? 1 : 0;
 			return t;
-		}
-
-		// THE OLD SPELLING, POISONED WITH AN EXPLANATION. `CreateTask(lambda, lane, TaskType::...)`
-		// used to compile and, at TaskType::Fiber, used to hand a slab-owned closure a fiber row it
-		// could not be trusted to return. Deleting the overload silently would report "no matching
-		// function" and point the reader at the wrong thing; this reports the actual rule.
-		//
-		// It catches TaskType::Native too, which is deliberate -- Native is now what the lambda form
-		// always produces, so passing it is redundant rather than wrong, and one clear error beats
-		// two spellings of the same call.
-		template<typename F>
-		auto CreateTask(F&&, Lane, TaskType, CorePref = CorePref::Default,
-		                StackClass = StackClass::Standard) {
-			static_assert(detail::dependent_false<F>::value,
-				"A lambda task is always Native -- drop the TaskType argument. A lambda body lives "
-				"on the task slab and is freed as soon as it returns, so it cannot own a fiber row "
-				"across a suspension: every AcquireFiber must reach FiberStatus::DEAD exactly once, "
-				"and nothing guarantees that for a closure with two owners. If this task WAITS on "
-				"anything, use the raw overload -- CreateTask(void(*)(void*), void* ctx, lane, "
-				"TaskType::Fiber) -- with the context on the caller's stack. See the comment above "
-				"this overload, and tests/io_fiber_await.h for the worked pattern.");
-			return static_cast<LambdaTask<std::decay_t<F>>*>(nullptr);
 		}
 
 		// Lambda form of CreateInternalTask. Now identical in effect to CreateTask above -- kept
