@@ -2686,11 +2686,23 @@ void Thread::Worker() {
 		// cheaper and more likely to succeed, and doing it after the steal loop meant a worker with
 		// its own work waiting went hunting for somebody else's first.
 		//
-		// `inboxlast` SKIPS THIS ONE, leaving the drain that runs after the walk (before the park
-		// decision) as the only one. That is the experiment, not the default -- see
-		// TaskScheduler::SetInboxLast for both sides, and note that the walk now abandons itself on
-		// ownWorkArrived(), which is what makes deferring survivable at all.
-		if (!TaskScheduler::InboxLast()) drainOwnInbox();
+		// ---- AND MOVING IT AFTER THE WALK WAS TRIED AGAIN, 2026-09-03, AND LOST ---------------
+		//
+		// A pass drains this inbox twice -- here, and again after the walk before the park
+		// decision -- so "inbox last" was exactly this call removed, behind a flag. The argument
+		// for it was real: the inbox is a direct-dispatch FALLBACK, and draining it first lets a
+		// directed push interrupt a worker whose local pipeline was already moving.
+		//
+		// LATENCY WENT UP AND THAT SETTLES IT. The inbox holds the work with the FEWEST legal
+		// consumers -- exactly one, and it carries pinned resumes nobody else may ever take --
+		// while the deque holds work anyone can steal. Deferring it means doing work others could
+		// have done while work only you can do waits. 100% of `latency` pushes land in a floor
+		// worker's inbox, so that row is where the cost showed up.
+		//
+		// The flag is GONE rather than kept as a known-negative arm, because reading it cost a
+		// relaxed load on every pass of the idle loop -- millions per run -- to support an arm
+		// nobody should choose. Reproducing it is deleting this one call.
+		drainOwnInbox();
 
 		{
 			// --- 4. Work stealing ---

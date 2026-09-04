@@ -2768,3 +2768,33 @@ DO NOT generalise "Wide is faster" from the burst numbers. It is faster at the t
   after 1p and mp in the same process, and a wide arm hands it a pool with more workers recently
   woken and warm. Direction matches. NOT ESTABLISHED -- it needs more reps, or a row-selection flag
   so bt can run without 1p/mp ahead of it, which the bench does not have.
+
+--------------------------------------------------------------------------------
+INBOX-LAST TRIED AND LOST (2026-09-03) -- the drain stays before the steal walk
+--------------------------------------------------------------------------------
+
+PROPOSAL (Jay): local deque -> steal -> own inbox -> park. The inbox is a direct-dispatch
+FALLBACK, and draining it first turns it into a priority queue -- letting a directed push
+interrupt a worker whose local pipeline was already moving, when that push might have waited.
+
+Cheap to try: a pass already drains its own inbox TWICE, before the walk and again after it
+before the park decision. "Inbox last" was exactly the first call removed, behind a flag.
+
+RESULT: **latency went up.** Reverted the same session.
+
+WHY, and it is the reason the drain was moved forward in the first place: **the inbox holds the
+work with the FEWEST legal consumers.** Exactly one -- and it carries PINNED RESUMES nobody else
+may ever take. The deque holds work anyone can steal. Deferring the inbox means doing work others
+could have done while work only you can do waits. 100% of `latency` pushes land in a floor
+worker's inbox, so that row is where it showed.
+
+WHAT MADE IT WORTH TRYING ANYWAY, so this is not filed as "obviously wrong": ownWorkArrived() now
+abandons the steal walk the moment hasQueuedWork goes true. That did not exist when the drain was
+moved forward, and it covers most of what the early drain protected -- the 102us dispatch stall
+recorded at that comment was a push landing DURING a walk that then ran to probeLimit. The
+mitigation was real; it just was not enough to pay for the deferral.
+
+THE FLAG IS GONE, not kept as a known-negative arm like `hotpin`. Reading it cost a relaxed load
+on EVERY PASS of the idle loop -- 20M+ per run by the collapse counters -- to support an arm
+nobody should choose. Precedent: a diagnostic atomic was 72% of the 17.8ns speculative task path.
+Reproducing this is deleting one call in Thread.cpp, and the note is at that call.
