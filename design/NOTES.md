@@ -2675,3 +2675,46 @@ The in-progress dump shows queuedTasks=0 and the last push target NOTIFIED with 
 inbox -- nothing stranded, nothing unreachable. Threads the OS did not run. This is the
 third independent time that counter has come back 0-implicated, and it is why no
 placement change moves these: there is nothing there for placement to fix.
+
+--------------------------------------------------------------------------------
+hard vs ideal: THE FLOOR REMOVED IT, AND THE MECHANISM IS STALLS (2026-09-03)
+--------------------------------------------------------------------------------
+
+Jay: "what i notice on hard is its not wake latency its stalls." He is right, and the 2x2 with
+its positive control settles the whole question:
+
+    arm                stalls/20000   p99      max        frame DAG
+    ideal  floor=2          5         1.00us     9.7us     4.09 us/graph
+    ideal  floor=0          6         5.80us   258.4us     6.42
+    hard   floor=0        291        56.90us  1023.2us     7.66
+    hard   floor=0 (2)    815        78.10us 17420.0us     7.67
+
+**THE POSITIVE CONTROL FIRED: 50-136x more stalls, same floor, affinity the only variable.** So
+the harness CAN see affinity. At floor=2 it has nothing to see -- 5 vs 5 -- because the floor
+removed the mechanism. That closes the "is hard still 45% worse" question: the effect is REAL and
+it is GONE at today's default, not absent because the instrument went blind.
+
+**AND "~45% ON WAKE LATENCY" WAS THE WRONG DESCRIPTION ALL ALONG.** p50 barely moves (4.40 ->
+6.40); p99 goes 5.80 -> 78.10 and max 258 -> 17,420. That is a tail, not a shifted average. The
+mechanism the code comment always described -- "a pinned worker cannot escape a core someone else
+is occupying" -- is a STALL, and the percentile framing sent every reader (me included, all
+evening) to p50/p99 instead of the stall count. The stall counter did not exist in August, which
+is why the August run could only express it as a percentage.
+
+**A CLASSIFIER BUG FOUND BY THE SAME RUN.** `expectedIfSpinning = rt / (2.0 / healthyRate)` --
+healthyRate is the row's own polls-per-TRIP, but converting to polls-per-MICROSECOND needs a
+healthy trip's DURATION, and 2.0 was hardcoded for it. A healthy trip is ~0.7 us at floor=2 and
+~6.5 us at floor=0, so the expectation was overstated ~3x in exactly the configuration where
+stalls matter. hard/floor=0 reported `waiter 808 | pool 3` while its own exemplar showed a
+14,288 us trip with 436,772 polls -- MORE than a full-rate spin predicts. The instrument was
+blaming the thread it had just proved was running.
+
+Fixed by measuring healthyDurSum alongside healthyPollSum. Verified: high-poll trips now classify
+POOL, low-poll (513 over 67.9 us) classify WAITER, zero-poll classify PUSHER.
+
+**AND THE CORRECTED ATTRIBUTION NAMES THE CAUSE.** "Pool late" under hard/floor=0 is the pinned
+TARGET unable to get its core -- which is the pinning, not the OS being arbitrary. The old
+labelling blamed the waiter and hid it. SCHEDULER-IMPLICATED stays 0 and stays correct: this is
+not a queueing defect, it is a placement choice with a measurable tail cost.
+
+DEFAULTS UNCHANGED. floor=2 is the default and shows none of this.

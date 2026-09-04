@@ -1011,6 +1011,11 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
     // Healthy-iteration poll rate, the yardstick the stall report is read against. See the
     // accumulate site for why it excludes the pathological iterations.
     unsigned long long healthyPollSum = 0, healthyPollN = 0;
+    // AND THE DURATION THOSE POLLS TOOK. Without it, polls-per-TRIP cannot be turned into
+    // polls-per-MICROSECOND, and the classifier below was hardcoding 2.0 us for the missing half --
+    // see there. Accumulated on exactly the same condition, so the two always describe the same
+    // set of trips.
+    double healthyDurSum = 0.0;
 
     // Both counters are per-row, so they describe THIS row and not the warmup that preceded it.
     JLib::TaskScheduler::ResetWakeCount();
@@ -1373,8 +1378,27 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
 
                 const double pushUs = (double)(pushDoneNs - pushIssuedNs) / 1000.0;
                 if (pushUs >= rt * 0.5) { ++stallPusherLate; whoClass = 3; }
-                else if (healthyRate > 0.0) {
-                    const double expectedIfSpinning = rt / (2.0 / healthyRate);   // rt us at ~healthy us/poll
+                else if (healthyRate > 0.0 && healthyPollN > 0 && healthyDurSum > 0.0) {
+                    // ---- THE 2.0 THAT USED TO BE HERE WAS A HARDCODED HEALTHY ROUND TRIP -------
+                    //
+                    // This read `rt / (2.0 / healthyRate)`, and the comment above it claimed the
+                    // split used "the row's own rate, not a hardcoded constant, so it does not need
+                    // retuning per machine". The rate WAS the row's; the 2.0 was not. healthyRate is
+                    // polls per healthy TRIP, and turning that into polls per MICROSECOND needs the
+                    // duration of a healthy trip -- which nothing measured, so 2.0 stood in for it.
+                    //
+                    // THAT IS FINE AT floor=2 AND WRONG EVERYWHERE ELSE. A healthy trip is ~0.7 us
+                    // with a live floor and ~6.5 us at floor=0, so the expectation was overstated
+                    // by ~3x in exactly the configuration where stalls are worth classifying. A
+                    // waiter spinning at FULL rate then looked like one that had been descheduled:
+                    // hard/floor=0 reported `waiter 808 | pool 3` while its own exemplar showed a
+                    // 14,288 us trip with 436,772 polls -- more than a full-rate spin predicts.
+                    // The instrument was blaming the thread it had just proved was running.
+                    //
+                    // Now both halves come from the row: mean polls and mean duration over the same
+                    // healthy trips, which is what "does not need retuning" requires.
+                    const double healthyDurMean = healthyDurSum / (double)healthyPollN;   // us/trip
+                    const double expectedIfSpinning = rt * healthyRate / healthyDurMean;  // polls
                     if ((double)wPolls >= expectedIfSpinning * 0.5) { ++stallPoolLate;   whoClass = 1; }
                     else                                           { ++stallWaiterLate; whoClass = 2; }
                 }
@@ -1413,14 +1437,18 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
             // Serialise against the watcher's STALL IN PROGRESS block -- see g_reportMx. Held for
             // the whole report, segments included, so the two never splice.
             std::lock_guard<std::mutex> reportLk(g_reportMx);
+            // "healthy" IS MEASURED, not the 2 us this used to assert. At floor=0 a
+            // healthy trip is ~6.5 us, so the old text told the reader the trip was 3x more
+            // pathological than it was -- the same hardcoded constant the classifier above used.
             printf("\n  *** PATHOLOGICAL ROUND TRIP [%s%s]: iteration %d took %.1f us "
-                   "(healthy is ~2 us) ***\n",
+                   "(healthy is ~%.1f us on this row) ***\n",
                    whoClass == 1 ? "POOL late" : whoClass == 2 ? "WAITER late"
                                  : whoClass == 3 ? "PUSHER late" : "unclassified",
                    // Say it in the HEADING. A reader scanning three blocks for the one that matters
                    // should not have to find the idle-pass line in each of them.
                    schedImplicated ? ", SCHEDULER-IMPLICATED" : "",
-                   i, rt);
+                   i, rt,
+                   healthyPollN ? healthyDurSum / (double)healthyPollN : 0.0);
 
             // ---- WHERE THE OUTLIER ACTUALLY LIVES ----------------------------------------
             const long long bs = g_bodyStartNs.load(std::memory_order_relaxed);
@@ -1640,7 +1668,7 @@ static void BenchLatency(JLib::TaskScheduler& sched) {
         // CpuRelax, and how many of those fit in a microsecond is a property of THIS machine --
         // so the healthy rate has to be measured here rather than assumed. Collected only from
         // iterations that did not blow the threshold, so the outlier cannot skew its own baseline.
-        if (rt <= kPathologicalUs) { healthyPollSum += wPolls; healthyPollN += 1; }
+        if (rt <= kPathologicalUs) { healthyPollSum += wPolls; healthyPollN += 1; healthyDurSum += rt; }
 
         if (JLib::kLatencyStatsEnabled) {
             int64_t wakeNs = 0, preStealNs = 0, foundNs = 0;
