@@ -3140,9 +3140,6 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
     bool ok = true;
 
     const unsigned long long spill0    = JLib::TaskScheduler::GetHiPriSpillCount();
-    const unsigned long long strand0   = JLib::TaskScheduler::GetLaneStrandCount();
-    const unsigned long long idlePeer0 = JLib::TaskScheduler::GetLaneStrandIdlePeerCount();
-    const unsigned long long idleWide0 = JLib::TaskScheduler::GetLaneStrandIdleWideCount();
 
     std::thread reactor([&] {
         std::vector<Slot> slots(kIoOvlWindow);
@@ -3203,39 +3200,6 @@ static void BenchIoPipeOverlap(JLib::TaskScheduler& sched, bool variable) {
            "                 push time waits for its owner's current body. At K=1 `spilled` is\n"
            "                 structurally 0; there is no second reserved worker.\n");
 
-    // ---- WOULD A SHARED MPMC LANE WIN ANYTHING? THIS ROW IS WHERE IT WOULD SHOW ----------------
-    const unsigned long long strands  = JLib::TaskScheduler::GetLaneStrandCount()          - strand0;
-    const unsigned long long idlePeer = JLib::TaskScheduler::GetLaneStrandIdlePeerCount()  - idlePeer0;
-    const unsigned long long idleWide = JLib::TaskScheduler::GetLaneStrandIdleWideCount()  - idleWide0;
-    const double pctK  = strands ? (100.0 * (double)idlePeer / (double)strands) : 0.0;
-    const double pctKF = strands ? (100.0 * (double)idleWide / (double)strands) : 0.0;
-    printf("               MPMC prize: %llu dispatches stranded a backlog\n"
-           "                 %llu (%.1f%%) had an idle worker in [0,K)    <- what the spill can reach\n"
-           "                 %llu (%.1f%%) had an idle worker in [0,K+F)  <- what a SHARED lane could\n",
-           strands, idlePeer, pctK, idleWide, pctKF);
-    printf("               ^ a strand is a dispatch that left a non-empty lane inbox behind: one\n"
-           "                 MPSC, one legal consumer, and that consumer is entering a body.\n"
-           "                 IT IS HEAD-OF-LINE BLOCKING, NOT A LOST TASK. The owner drains that\n"
-           "                 backlog the moment its body ends -- 'unreachable' here means to any\n"
-           "                 OTHER worker, for the length of one body, and NOT the permanent kind\n"
-           "                 where nobody may ever read the queue. A non-zero count is a queueing\n"
-           "                 cost to weigh, not a bug to chase; if work were truly lost the row\n"
-           "                 would never finish rather than finish slowly.\n"
-           "                 THE GAP BETWEEN THE TWO LINES is what\n"
-           "                 changing the STRUCTURE buys that improving the spill never could: the\n"
-           "                 first is bounded by K by definition, the second is the consumer set a\n"
-           "                 pull queue would have. Neither counts the parkable band -- a parked\n"
-           "                 worker is never busy, so including it would read ~100%% forever while\n"
-           "                 costing the ~3 us wake the lane exists to avoid.\n"
-           "                 An MPMC removes MISALLOCATION, not queueing,\n"
-           "                 so when every reserved worker is busy it waits exactly as long as this\n"
-           "                 does. Near 0%% means the lane saturates cleanly, the p99 gap above is\n"
-           "                 dispatch cost rather than bad placement, and a shared queue would add\n"
-           "                 contention to buy nothing. Near 100%% means work sits behind busy\n"
-           "                 owners while peers idle -- the one case the producer-side spill cannot\n"
-           "                 reach, because it decides at PUSH time and the owner can enter a body\n"
-           "                 immediately after. Biased HIGH on purpose: a sleeping peer counts as\n"
-           "                 idle, so this is an upper bound on what an MPMC could win.\n");
     (void)g_ioOverlapSink.load(std::memory_order_relaxed);
 }
 
@@ -3261,61 +3225,85 @@ int main(int argc, char** argv) {
     // the default and silently run the whole suite, so asking for help started a multi-minute
     // benchmark under a policy you did not choose.
     auto printUsage = []() {
-            printf("usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
-                   "                     [hot=N] [floor=N] [ev|noev]\n"
-                   "  floor=N   keep N workers unparked. This is the idle policy now: sleep,\n"
-                   "            nosleep and both selected IdlePolicy, which was removed in 5.0,\n"
-                   "            and are accepted-and-ignored so old invocations still run.\n"
-                   "            floor=<workers> is what nosleep used to mean.\n"
-                   "  ideal     (default, and the library's default) Windows: SetThreadIdealProcessor.\n"
-                   "            Linux: bind to the whole LLC domain\n"
-                   "  hard      bind each worker to one logical CPU. Measured ~45%% worse on wake\n"
-                   "            latency and ~2x worse on the frame DAG -- do not assume it wins\n"
-                   "  none      leave placement to the OS\n"
-                   "  physical  one worker per physical core, SMT siblings left empty\n"
-                   "\n"
-                   "  poolSize  worker count passed to Init(). 0 or omitted = auto (hw-1).\n"
-                   "            For sweeping pool size against latency and the frame DAG, which is\n"
-                   "            a DIAGNOSTIC -- do not ship a small pool, it starves everything that\n"
-                   "            is not a tiny graph.\n"
-                   "  nosweep   skip the ParallelFor crossover sweep AND the splitter-vs-cursor\n"
-                   "            sweep (the two slowest sections), so a pool-size sweep is a few\n"
-                   "            seconds per point instead of minutes.\n"
-                   "  hot=N     reserve N workers for the LATENCY LANE (SetHotWorkers). DEFAULT 2,\n"
-                   "            and PINNED: SetHotWorkers fixes the range to [N,N] so the dynamic-K\n"
-                   "            controller cannot move it mid-run. That matters because the\n"
-                   "            controller reacts to lane occupancy that 1p/mp/burst create as a\n"
-                   "            side effect -- left to itself, K would differ between runs of the\n"
-                   "            same command and the banner (sampled once at startup) would not\n"
-                   "            even show it. hot=0 is also pinned: a lane-less pool, deliberately.\n"
-                   "            K=0 collapses the lane: a lane push then routes to loPri by design,\n"
-                   "            because nobody probes lane at K=0 and a task sent there would never\n"
-                   "            run -- so latency/hot and io-pipe SKIP themselves and say why rather\n"
-                   "            than printing a number that is really latency/cold twice.\n"
-                   "            N is taken from the compute pool, so raising it makes the throughput\n"
-                   "            rows slightly worse; latency/hot and io-pipe are what you get back,\n"
-                   "            and they are the only rows that can show it. Start with hot=1.\n"
-                   "  floor=N   the AWAKE FLOOR: workers 0..N-1 never park (SetAwakeFloor). DEFAULT 0,\n"
-                   "            which is the historical behaviour -- the whole pool may go to sleep.\n"
-                   "            THIS IS NOT hot=N, and the two were briefly the same argument, which\n"
-                   "            made every paste ambiguous. hot=K picks WHICH QUEUE a lane push\n"
-                   "            lands in; floor=N decides whether landing anywhere costs an OS wake.\n"
-                   "            They are independent: floor=2 hot=0 is a live floor with no lane,\n"
-                   "            hot=2 floor=0 is a lane whose workers can all be asleep.\n"
-                   "            The floor only pays off if PLACEMENT steers at it, so the latency row\n"
-                   "            prints where each push actually landed and how many kernel wakes the\n"
-                   "            row cost. A high floor with a low on-floor percentage means the\n"
-                   "            feature is decoration and the wake count will say so.\n"
-                   "  noev      skip latency/hot, event/resume and io-pipe. Those are the only\n"
-                   "            sections that exercise the LANE and the Event primitives, and the\n"
-                   "            only reason hot=N changes anything but the compute pool size --\n"
-                   "            every other section reaches the pool through a generic Push, which\n"
-                   "            never routes to the lane. On by default; `ev` re-enables.\n"
-                   "\n"
-                   "The scheduler is a process-wide singleton and both policy and pool size are\n"
-                   "fixed at Init(), so one run measures ONE configuration -- run the exe once per\n"
-                   "point to compare. On macOS and Android every policy is a no-op (no usable\n"
-                   "affinity API there); prefer 'none' on those so the label matches reality.\n");
+            printf(
+"SchedulerBench -- the measurement harness for JLib::Scheduler.\n"
+"\n"
+"WHAT IT MEASURES. Throughput on a few task shapes, wake latency, the frame DAG,\n"
+"ParallelFor against serial, and the reserved lane under I/O-shaped load. Numbers\n"
+"only, no assertions: a regression here is something YOU notice by comparing two\n"
+"pastes, which is why every row prints its configuration. Correctness lives in the\n"
+"test suite -- `ctest --test-dir build -C Release`, 52 targets.\n"
+"\n"
+"WHAT IT IS MEASURING, in one paragraph, because the flags below are meaningless\n"
+"without it. The pool is FIBERS-ONLY and pure C++17 -- no coroutines and no second\n"
+"language tier. Workers are split into two bands: K RESERVED workers serving the\n"
+"low-latency lane (Lane::LowLatency), and an AWAKE FLOOR of F workers that never\n"
+"park; everything above K+F parks when idle and costs an OS wake (~3 us) to bring\n"
+"back. Ordinary work (Lane::Normal) never lands on the reserved band, and a\n"
+"reserved worker never reads an ordinary low-priority deque -- that separation is\n"
+"an invariant, not a heuristic, and it is why hot=N changes what the OTHER rows\n"
+"mean. Each worker owns an MPSC inbox plus a Chase-Lev deque; idle workers steal.\n"
+"\n"
+"usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
+"                      [hot=N] [floor=N] [ev|noev]\n"
+"\n"
+"AFFINITY POLICY (first token, optional -- omit it and you get `ideal`)\n"
+"  ideal     default, and the library's default. Windows: SetThreadIdealProcessor.\n"
+"            Linux: bind to the whole LLC domain.\n"
+"  hard      bind each worker to one logical CPU. MEASURED ~45%% worse on wake\n"
+"            latency and ~2x worse on the frame DAG -- do not assume it wins.\n"
+"  none      leave placement to the OS.\n"
+"  physical  one worker per physical core, SMT siblings left empty.\n"
+"  On macOS and Android every policy is a no-op (no usable affinity API); prefer\n"
+"  `none` there so the label matches what actually happened.\n"
+"\n"
+"SIZE AND SCOPE\n"
+"  poolSize  worker count passed to Init(). 0 or omitted = auto (hw-1). Sweeping it\n"
+"            against latency and the frame DAG is a DIAGNOSTIC -- do not ship a\n"
+"            small pool, it starves everything that is not a tiny graph.\n"
+"  nosweep   skip the ParallelFor crossover sweep AND the splitter-vs-cursor sweep,\n"
+"            the two slowest sections. A pool-size sweep then costs seconds per\n"
+"            point instead of minutes.\n"
+"  noev      skip latency/hot, event/resume and io-pipe. Those three are the ONLY\n"
+"            sections that exercise the lane and the Event primitives, and so the\n"
+"            only reason hot=N changes anything but the compute pool size -- every\n"
+"            other section reaches the pool through a generic Push, which never\n"
+"            routes to the lane. They RUN by default; `noev` skips them and a later\n"
+"            `ev` on the same command line turns them back on.\n"
+"\n"
+"THE TWO BAND KNOBS, WHICH ARE NOT THE SAME KNOB\n"
+"  hot=N     reserve N workers for the latency lane (SetHotWorkers). BENCH DEFAULT 2.\n"
+"            K is STATIC: SetHotWorkers pins the range to [N,N]. The bench always\n"
+"            calls it, including at zero, so the banner's K is the K that ran.\n"
+"            K>0 also keeps that band AWAKE -- reserving a core and then letting it\n"
+"            park pays the wake K existed to remove.\n"
+"            N comes out of the compute pool, so raising it makes the throughput\n"
+"            rows slightly worse; latency/hot and io-pipe are what you get back, and\n"
+"            they are the only rows that can show it. Start with hot=1.\n"
+"            hot=0 is a deliberate lane-less pool. It COLLAPSES the lane: a lane\n"
+"            push routes to loPri instead, because nobody probes the lane at K=0 and\n"
+"            a task sent there would never run. latency/hot and io-pipe then SKIP\n"
+"            themselves and say why, rather than printing latency/cold twice under a\n"
+"            second name.\n"
+"  floor=N   the AWAKE FLOOR: workers 0..N-1 never park (SetAwakeFloor). DEFAULT is\n"
+"            CHOSEN AT Init FROM THE POOL SIZE -- 1 on a pool of 8 or fewer, 2 above\n"
+"            that -- not 0, and not a fixed number you can assume.\n"
+"            THIS IS NOT hot=N. hot=K picks WHICH QUEUE a lane push lands in;\n"
+"            floor=N decides whether landing anywhere costs an OS wake. They are\n"
+"            independent: `floor=2 hot=0` is a live floor with no lane, `hot=2\n"
+"            floor=0` is a lane whose workers may all be asleep.\n"
+"            The floor only pays off if PLACEMENT steers at it, so the latency row\n"
+"            prints where each push actually landed and how many kernel wakes the\n"
+"            row cost. A high floor with a low on-floor percentage means the feature\n"
+"            is decoration, and the wake count will say so.\n"
+"\n"
+"ACCEPTED AND IGNORED: `sleep`, `nosleep`, `both`. They selected IdlePolicy, which\n"
+"was removed in 5.0, and are still parsed so old invocations run instead of printing\n"
+"this text. floor=<workers> is what `nosleep` used to mean.\n"
+"\n"
+"ONE RUN MEASURES ONE CONFIGURATION. The scheduler is a process-wide singleton and\n"
+"both policy and pool size are fixed at Init(), so run the exe once per point to\n"
+"compare -- and compare pastes from the same machine, idle, foregrounded.\n");
     };
 
     // ARGV[1] IS THE AFFINITY POLICY ONLY IF IT NAMES ONE, and is optional otherwise.
@@ -3673,13 +3661,18 @@ int main(int argc, char** argv) {
     // BEFORE Init: StartPool clamps K against the real pool size and publishes the hot CPU set as
     // the workers come up, so the count has to be known by then.
     //
-    // ALWAYS CALLED, INCLUDING AT ZERO, AND THAT IS THE POINT. SetHotWorkers(k) pins the range to
-    // [k,k], which the dynamic-K controller cannot move. Skipping the call -- which is what
-    // `if (hotWorkers)` used to do at the default -- leaves K to the controller, and the controller
-    // reacts to lane occupancy that 1p, mp and burst create as a side effect. K would then differ
-    // between runs of the same command, and every row would be describing a configuration the
-    // reader cannot see, because the banner samples GetHotWorkers() once at startup and a promotion
-    // after that never appears in the paste.
+    // ALWAYS CALLED, INCLUDING AT ZERO. SetHotWorkers(k) pins the range to [k,k], so the banner's
+    // K is the K that ran.
+    //
+    // THE ORIGINAL REASON IS GONE AND THE CALL IS STILL RIGHT, which is worth separating. It was
+    // written when an ADAPTIVE-K CONTROLLER existed: skipping the call left K to that controller,
+    // which reacted to lane occupancy 1p/mp/burst created as a side effect, so K differed between
+    // runs of the same command while the banner -- sampled once at startup -- showed the value it
+    // began with. Adaptive K was removed on 8-30 (it never ramped, and shed on quiet), so there is
+    // no longer a controller to take K away.
+    //
+    // The call stays because pinning is now how K gets SET AT ALL, and because an explicit
+    // [k,k] at every value including zero is one code path rather than two.
     //
     // That is exactly the throughput/bt lesson -- a bench that quietly reports two configurations
     // under one heading -- and it is worse here, because K changes what the OTHER rows mean, not
