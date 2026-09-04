@@ -1,5 +1,6 @@
 # JLib::Scheduler
 [![Windows CI](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/windows_ci.yml/badge.svg)](https://github.com/jay403894-bit/JLib-Scheduler/actions/workflows/windows_ci.yml)
+
 **A C++17 fiber-task library — a user-mode M:N scheduler and jobs system, with optional
 asynchronous I/O.** Built for game engines and real-time simulations, where the number that matters
 is not throughput but *the worst frame*.
