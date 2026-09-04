@@ -2648,38 +2648,26 @@ namespace JLib {
 			return static_cast<T*>(FiberLocal(slot));
 		}
 
-		// ---- OWE A RELEASE UNTIL THIS FIBER DIES ----------------------------------------------
+		// ---- OWE A RELEASE UNTIL THIS FIBER DIES, ON THE WORKER THAT OWES IT ------------------
 		//
-		// The slots above hold a FIXED, SMALL set of well-known values. This holds an arbitrary
-		// number of objects, each allocated a DIFFERENT way -- one from `new`, one from an arena,
-		// one from a pool -- all owed by the same fiber and all released when it is recycled. That
-		// combination is the point: `owedKinds` already records which KINDS are outstanding, and
-		// this is where the payloads live.
+		// A MEMORY-ONLY FORM WAS REMOVED HERE, and the reason is worth stating because it looked
+		// useful. `ReleaseOnFiberDeath(node, obj, release)` and its `DeleteOnFiberDeath(node, p)`
+		// sugar deferred an ordinary free to whichever thread recycled the fiber. That is a THIRD
+		// deferral scheme sitting on top of the two the library already has, and it earns nothing:
+		// the only moment it fires is a moment when freeing was already safe, because memory is
+		// fungible and no other party can still be reading it. If something CAN still be read, a
+		// fiber's death is not the rendezvous that makes it safe -- epochs or hazards are, and both
+		// already exist for exactly that. So a caller either did not need the deferral, or needed a
+		// different one.
 		//
-		// THE CALLER SUPPLIES THE NODE, and that is forced rather than chosen. FiberRegistry's
-		// dispatch path must not allocate -- a malloc on a death path is the allocation most likely
-		// to fail and a dropped cleanup is a resource never given back -- so there is nowhere to put
-		// a node the caller did not already own. Put the FiberDebt inside the object being
-		// registered and it costs two stores and no memory at all.
+		// `FiberRegistry::SetSlotDeleter` went with it, for the same reason and more directly: it
+		// was a SECOND user-deletion ledger, keyed by FLS slot instead of by object, freeing at the
+		// same moment for the same non-reason.
 		//
-		//     struct Buf { JLib::FiberDebt debt; char data[4096]; };
-		//     auto* b = new Buf();
-		//     TaskScheduler::DeleteOnFiberDeath(b->debt, b);      // `delete b` when the fiber dies
-		//
-		//     auto* p = MyArena::Alloc(n);                        // any allocator, via the raw form
-		//     TaskScheduler::ReleaseOnFiberDeath(node, p, &MyArena::Free);
-		//
-		// MEMORY ONLY. NOT EPOCHS, NOT HAZARDS. These run on whichever thread recycles the fiber,
-		// which is safe for memory -- SlabPool.h documents why freeing on another thread costs cache
-		// migration and nothing else -- and WRONG for anything thread-affine. Clearing an epoch slot
-		// from the wrong thread un-announces a slot that was never set there and frees nodes under a
-		// live traversal. Affine debts belong on FiberRegistry's creditor chain, which runs the
-		// release on the owing worker; that is the whole reason that chain exists.
-		//
-		// OFF A FIBER IT IS REFUSED, and returns false rather than leaking silently: there is no
-		// fiber to attach the debt to, so the caller still owns the object and needs to know.
-		static bool ReleaseOnFiberDeath(FiberDebt& node, void* obj,
-		                                void (*release)(void*) noexcept) noexcept;
+		// WHAT REMAINS IS THE AFFINE FORM BELOW, which is not a deferral scheme but a routing one:
+		// it exists because some state may only be retracted by ONE worker, and no epoch or hazard
+		// can move that fact. The FiberDebt list, `owedKinds` and the creditor chain all stay --
+		// they are load-bearing for that, and the removal above does not touch them.
 
 		// ---- AN AFFINE DEBT: released ON `holder`, not on whoever recycles --------------------
 		//
@@ -2707,13 +2695,6 @@ namespace JLib {
 		// kinds it owes -- which is what the list is for. Returns how many ran, so "nothing owed"
 		// is distinguishable from "nothing happened".
 		static size_t DischargeFiberDebts(Fiber* f, size_t holder) noexcept;
-
-		template <typename T>
-		static bool DeleteOnFiberDeath(FiberDebt& node, T* p) noexcept {
-			if (!p) return false;
-			return ReleaseOnFiberDeath(node, p,
-				[](void* q) noexcept { delete static_cast<T*>(q); });
-		}
 
 		// ---- WHICH BRANCH DID A RESUME TAKE? (diagnostic, OFF unless JLIBSCHED_REQUEUE_TRACE) ---
 		//

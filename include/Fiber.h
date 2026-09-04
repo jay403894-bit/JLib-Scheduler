@@ -31,12 +31,18 @@ namespace JLib {
 	// heap nodes would put a malloc on exactly that path. So the node lives inside whatever the
 	// caller is registering, or in storage the caller already owns, and linking is two stores.
 	//
-	// RELEASED ON WHOEVER RECYCLES THE FIBER, which is safe for MEMORY and unsafe for AFFINITY. The
-	// slab note in SlabPool.h draws that line: memory is fungible, so freeing it on another thread
-	// costs cache migration and nothing else. An epoch slot or a hazard cell is NOT fungible --
-	// clearing one from the wrong thread un-announces a slot that was never set there -- so those
-	// belong on the creditor chain, which runs the release ON THE OWING WORKER. Do not register
-	// them here.
+	// EVERY DEBT ON THIS LIST IS AFFINE, and that is now true by construction rather than by
+	// convention. There was a second, MEMORY-ONLY form -- ReleaseOnFiberDeath -- that registered an
+	// untagged debt released by whoever recycled the fiber. It was removed: memory is fungible, so
+	// the moment it fired was a moment when freeing was already safe, which made it a third
+	// reclamation scheme earning nothing over the two the library already has. If something can
+	// still be READ, a fiber's death is not what makes freeing safe -- epochs and hazards are, and
+	// they are thread-local and already there.
+	//
+	// So what remains is the case those two cannot serve: state only ONE WORKER may retract. An
+	// epoch slot or a hazard cell is not fungible -- clearing one from the wrong thread
+	// un-announces a slot that was never set there -- so the release runs ON THE OWING WORKER, via
+	// the creditor chain. That chain is the reason this list exists at all.
 	struct FiberDebt {
 		FiberDebt* next = nullptr;
 		void*      obj  = nullptr;
@@ -50,9 +56,11 @@ namespace JLib {
 		// of every kind, which is the whole reason this is a list with a loop rather than one
 		// pointer and one deleter.
 		//
-		// kAnyHolder is the fungible case -- memory. SlabPool.h has the argument: an arena slot
-		// freed on another thread costs cache migration and nothing else, so it can simply go on the
-		// recycle path and never involve a creditor at all.
+		// kAnyHolder IS NO LONGER REACHABLE THROUGH ANY PUBLIC CALL, and is kept as the field's
+		// "unset" value rather than as a supported mode. It was the fungible case -- memory, which
+		// SlabPool.h argues can be freed on any thread for the price of cache migration -- and the
+		// only API that produced it (ReleaseOnFiberDeath) was removed. ReleaseOnWorker requires a
+		// real worker index and a non-zero kind, so a debt that reaches this list has an owner.
 		//
 		// A REAL WORKER INDEX IS THE AFFINE CASE -- an epoch slot, a hazard cell, a thread-owned
 		// handle. Those must run ON that worker: clearing an epoch slot from the wrong thread
@@ -68,9 +76,10 @@ namespace JLib {
 		// included by nearly everything, and pulling the registry in behind it would invert the
 		// dependency that keeps Fiber a plain data type.
 		//
-		// It is the registry's table, not Fiber's, because the deleters are an application-level
-		// policy registered once, and a per-fiber copy of eight function pointers would cost more
-		// memory than the slots themselves.
+		// IT ONLY CLEARS NOW. It used to consult a registry-side deleter table and free the slots
+		// that had declared how; that table went with SetSlotDeleter. The seam survives the API it
+		// was built for because the out-of-line definition is what keeps Fiber.h free of the
+		// registry, and Fiber.h is included by nearly everything.
 		void ReleaseFiberSlots(void** slots, size_t n) noexcept;
 
 		// HAND THE DEBT LIST TO THE REAPER RATHER THAN RELEASING IT HERE.
@@ -306,7 +315,8 @@ namespace JLib {
 		// route every fiber holding memory through a per-worker hop on the death path to release
 		// something no particular worker owns. It would become real ONLY if a block ever carried an
 		// owner stamp that had to be remote-pushed to that owner's cache, and nothing here does
-		// that. FiberDebt/ReleaseOnFiberDeath is the memory path, and it deliberately sets no kind.
+		// that. There is no memory path any more: the non-affine debt form was removed, because a
+		// free that is safe at fiber death was already safe without a ledger.
 		enum OwedKind : uint32_t {
 			kOwesNothing = 0,
 			kOwesSlab    = 1u << 0,   // RESERVED, unused -- see above. Do not set it for memory.
@@ -381,12 +391,16 @@ namespace JLib {
 			// THE LIBRARY DOES NOT FREE WHAT A SLOT POINTS AT. It cannot -- it has no type. A slot
 			// holding an owning pointer must be released by the task that put it there, before the
 			// task ends. Clearing here prevents a stale READ, not a leak.
-			// FREE BEFORE CLEARING, for slots that declared how. See FiberRegistry::SetSlotDeleter:
-			// a slot with no deleter is BORROWED and is only cleared, a slot with one is owning and
-			// is handed to it. One relaxed load and a return when nobody installed any, which is
-			// every program that does not use the feature.
+			// A SLOT-DELETER PASS USED TO RUN HERE, freeing slots that had declared how via
+			// FiberRegistry::SetSlotDeleter. It was removed with that API: it is a deferred free
+			// running at a moment when freeing was already safe, which is a third reclamation
+			// scheme earning nothing over the two that exist. The rule above is the whole contract
+			// now -- the task that put an owning pointer in a slot releases it before the task
+			// ends, and this only prevents a stale read.
+			// ONE CLEAR, NOT TWO. ReleaseFiberSlots used to consult the deleter table and free the
+			// owning slots, and this loop then zeroed the array regardless. With every slot borrowed
+			// the two steps do the same thing, so only the seam remains.
 			detail::ReleaseFiberSlots(local, kLocalSlots);
-			for (size_t i = 0; i < kLocalSlots; ++i) local[i] = nullptr;
 
 			// DEBTS BEFORE THE SLOTS ARE FORGOTTEN, and the head is cleared BEFORE the walk: a
 			// release that somehow registers another debt on this fiber must not link onto a list

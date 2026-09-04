@@ -984,14 +984,6 @@ add_executable(SchedulerFiberReaperContractTest "${CMAKE_CURRENT_SOURCE_DIR}/tes
 target_link_libraries(SchedulerFiberReaperContractTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberReaperContractTest PRIVATE cxx_std_17)
 
-# FIBER DEBTS: several kinds owed by one fiber, each released EXACTLY once. The reaper reaches each
-# creditor once -- that is what makes double-release impossible -- so that visit must discharge every
-# kind, which is why it is a list and a loop. Counts are asserted PER KIND, not summed: a total is
-# also satisfied by one-missed cancelling one-doubled, which are opposite bugs.
-add_executable(SchedulerFiberDebtTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_debt_test.cpp")
-target_link_libraries(SchedulerFiberDebtTest PRIVATE Scheduler)
-target_compile_features(SchedulerFiberDebtTest PRIVATE cxx_std_17)
-
 # A PARKED RESERVED WORKER MUST BE WOKEN BY A LANE PUSH. The shared intake belongs to no worker, so
 # nothing else will look at it -- PushLaneIntake's notify is the only thing between a full intake and
 # a permanently asleep lane. The race is closed by that NOTIFY and not by the park predicate, which

@@ -194,50 +194,31 @@ namespace JLib {
 
 	void FiberRegistry::SetRelease(ReleaseFn fn) { releaseFn.store(fn, std::memory_order_relaxed); }
 
-	// ---- FIBER-LOCAL SLOT DELETERS ---------------------------------------------------------------
+	// ---- CLEARING FIBER-LOCAL SLOTS --------------------------------------------------------------
 	//
-	// File scope rather than members, because ReleaseFiberSlots is reached from Fiber::ResetForReuse
-	// -- which has no registry pointer and must not acquire one. Instance() there would be a
-	// singleton touch on the recycle path of every fiber, and worse, would order Fiber's teardown
-	// behind the registry's.
+	// A SLOT-DELETER LEDGER WAS REMOVED HERE. `SetSlotDeleter(slot, fn)` made a slot OWNING, and
+	// this function freed those values when a fiber was recycled -- a per-slot deleter table, a
+	// fast-path mask, and a publication order between them.
 	//
-	// THE MASK IS THE FAST PATH AND THE WHOLE REASON THIS IS AFFORDABLE. Programs that install no
-	// deleters -- all of them, until one does -- pay one relaxed load and a branch on a line nothing
-	// else writes. Without it this would be kLocalSlots atomic loads on every fiber recycle, which
-	// is the hot path of the pool.
-	static std::atomic<FiberRegistry::SlotDeleter> g_slotDeleter[Fiber::kLocalSlots] = {};
-	static std::atomic<uint32_t> g_slotDeleterMask{ 0 };
-
-	void FiberRegistry::SetSlotDeleter(size_t slot, SlotDeleter fn) {
-		if (slot >= Fiber::kLocalSlots) return;   // out of range is a caller bug, not a crash
-		g_slotDeleter[slot].store(fn, std::memory_order_release);
-		// SET AFTER THE POINTER, CLEARED BEFORE IT. The reader tests the mask and only then loads
-		// the function, so the bit must never be visible ahead of what it advertises.
-		if (fn) g_slotDeleterMask.fetch_or(1u << slot, std::memory_order_release);
-		else    g_slotDeleterMask.fetch_and(~(1u << slot), std::memory_order_release);
-	}
-
+	// It was the second user-deletion ledger in the library (the other was
+	// TaskScheduler::ReleaseOnFiberDeath, removed with it), and neither earned its keep. Both fired
+	// at the same moment, and that moment is one where freeing was ALREADY safe: the fiber is dead,
+	// nothing else can reach its slot. If something else COULD still reach the value, a fiber's
+	// death is not what makes the free safe -- epochs and hazards are, and both already exist. So
+	// the ledger either replaced a free the caller could have written inline, or stood in for a
+	// reclamation scheme it was not.
+	//
+	// WHAT SURVIVES IS THE CLEAR. Slots are borrowed pointers now, in every case: whoever put a
+	// value in one owns it, and this zeroes the array so a recycled fiber never observes the
+	// previous occupant's value. No table, no mask, no atomics on the recycle path.
+	//
+	// File scope rather than a member, because this is reached from Fiber::ResetForReuse -- which
+	// has no registry pointer and must not acquire one. Instance() there would be a singleton touch
+	// on the recycle path of every fiber, and would order Fiber's teardown behind the registry's.
 	namespace detail {
 		void ReleaseFiberSlots(void** slots, size_t n) noexcept {
-			const uint32_t mask = g_slotDeleterMask.load(std::memory_order_acquire);
-			if (!mask || !slots) return;          // the overwhelmingly common case
-
-			for (size_t i = 0; i < n && i < Fiber::kLocalSlots; ++i) {
-				if (!(mask & (1u << i))) continue;      // borrowed: the caller clears it
-				void* p = slots[i];
-				if (!p) continue;
-				// LOADED ONCE, AFTER THE MASK SAID YES. Re-checking for null matters because
-				// SetSlotDeleter can race this from another thread, and null means it was withdrawn
-				// between the two loads -- skipping is right, since withdrawing a deleter is exactly
-				// the instruction to stop freeing that slot.
-				const FiberRegistry::SlotDeleter fn =
-					g_slotDeleter[i].load(std::memory_order_acquire);
-				if (!fn) continue;
-				// CLEAR BEFORE CALLING, so a deleter that somehow re-enters this fiber cannot see
-				// the pointer it is in the middle of freeing.
-				slots[i] = nullptr;
-				fn(p);
-			}
+			if (!slots) return;
+			for (size_t i = 0; i < n && i < Fiber::kLocalSlots; ++i) slots[i] = nullptr;
 		}
 	}
 

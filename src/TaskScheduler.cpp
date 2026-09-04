@@ -6224,41 +6224,6 @@ bool TaskScheduler::HasFiberLocal() noexcept { return CurrentFiberOrNull() != nu
 uint16_t TaskScheduler::AllocFiberLocalSlot() noexcept { return FiberRegistry::FlsAlloc(); }
 FiberRegistry& TaskScheduler::Fibers() noexcept        { return FiberRegistry::Instance(); }
 
-bool TaskScheduler::ReleaseOnFiberDeath(FiberDebt& node, void* obj,
-                                        void (*release)(void*) noexcept) noexcept {
-	if (!obj || !release) return false;
-	Fiber* f = CurrentFiberOrNull();
-	// REFUSED OFF A FIBER, and refused LOUDLY by returning false rather than quietly by doing
-	// nothing. There is no fiber to attach the debt to, so the caller still owns the object -- and a
-	// caller that assumed otherwise has just leaked it. A Native task and a bare thread both land
-	// here legitimately, which is why this is a return value and not an assert.
-	if (!f) return false;
-
-	node.obj     = obj;
-	node.release = release;
-	node.holder  = FiberDebt::kAnyHolder;   // memory: fungible, see the note on the field
-
-	// PUSH FRONT, single mutator. A fiber runs on one worker at a time, so its own debt list needs
-	// no synchronisation -- the same argument the local slots rest on.
-	node.next = f->debts;
-	f->debts  = &node;
-
-	// DELIBERATELY NO NoteOwed. This called NoteOwed(kOwesSlab) and that was wrong twice over.
-	//
-	// OwesCleanup() is what routes a dying fiber down AdvanceCleanup instead of straight to
-	// ReleaseFiber, so tagging a memory debt sent EVERY fiber holding one through the creditor
-	// chain -- a per-worker hop apiece, on the death path, to release something no particular worker
-	// owns. It also bought nothing: this list drains in ResetForReuse, which runs on both paths.
-	//
-	// AND THE TAG ITSELF IS THE WRONG IDEA. The creditor chain is for "this worker still advertises
-	// an epoch" or "this worker holds a hazard cell" -- a slot in participants[q], which is not an
-	// address in anybody's slab. Memory is fungible (see SlabPool.h): whoever kills the fiber frees
-	// it inline and the shared pool rebalances. A slab-cleanup kind would only be needed if a block
-	// ever carried an owner stamp and had to be remote-pushed to that owner's cache, which nothing
-	// here does and nothing here should.
-	return true;
-}
-
 bool TaskScheduler::ReleaseOnWorker(FiberDebt& node, void* obj,
                                     void (*release)(void*) noexcept,
                                     size_t holder, uint32_t kind) noexcept {

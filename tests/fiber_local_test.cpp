@@ -281,59 +281,17 @@ int main() {
               "a recycled fiber NEVER carries the previous occupant's slot");
     }
 
-    // ---- ARM 4: SLOT DELETERS, AND THE SLOT THAT MUST NOT BE FREED --------------------------
+    // ---- ARM 4 IS GONE: SLOT DELETERS WERE REMOVED ------------------------------------------
     //
-    // A slot is a void*, so the library cannot free one without being told how. SetSlotDeleter is
-    // how an application says "this slot is OWNING, and here is my allocator's free" -- which is the
-    // point of taking a `void (*)(void*)` rather than assuming `new`/`delete`.
+    // It tested FiberRegistry::SetSlotDeleter -- an owning slot freed at fiber death, with a
+    // BORROWED slot as the control that must never be touched. The control was the good part and
+    // the feature was not: a slot deleter is a deferred free that fires at a moment when freeing
+    // was already safe, which is a third reclamation scheme on top of epochs and hazards, earning
+    // nothing either of those does not already do. The API went, so its arm goes with it.
     //
-    // THE BORROWED SLOT IS THE CONTROL AND IT IS THE ONE THAT MATTERS. An over-eager implementation
-    // that freed every non-null slot would pass an "owning slots get freed" test perfectly and
-    // corrupt every program that parks a borrowed pointer in a slot. Slot 1 is never given a
-    // deleter, is handed a pointer to a live object, and must come back untouched.
-    {
-        (void)&Alloc::NeverCalled;   // referenced only to keep the intent visible
-
-        // SLOTS NO EARLIER ARM TOUCHED, and this is the test obeying the rule SetSlotDeleter
-        // states rather than a tidiness preference. Arms 1 and 3 wrote FAKE pointers into slot 0
-        // (0xF1BE00xx, 0xDEAD) as sentinels. Declaring slot 0 owning here made the first fiber
-        // still cached with one of those free(0xDEAD) on recycle -- a hard crash, and exactly the
-        // failure the header warns about: "installing a deleter for a slot that already holds live
-        // pointers in flight would start freeing values the application still believes it owns."
-        // The library did what it was told; the test was what was wrong.
-        auto& reg = JLib::FiberRegistry::Instance();
-        reg.SetSlotDeleter(kOwning, &Alloc::Free);
-        // kBorrowed gets NO deleter on purpose. It is the control.
-
-        std::atomic<int> ran{ 0 };
-        std::atomic<int> sawStale{ 0 };
-        const int kRounds = 150;
-
-        // Outside the loop, for the same reason as the round above.
-        ScrubCtx bctx{ &ran, &sawStale };
-        for (int i = 0; i < kRounds; ++i) {
-            auto* t = JLibTest::MakeCtxTask(sched, &BorrowSlotBody, &bctx);
-            if (t) sched.Push(t);
-        }
-
-        const auto d4 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (ran.load(std::memory_order_acquire) < kRounds
-               && std::chrono::steady_clock::now() < d4)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-        std::printf("  deleters: %d/%d tasks ran, %d owning frees, borrowed object magic=0x%X\n",
-                    ran.load(), kRounds, s_freed.load(), (unsigned)s_live.magic);
-
-        Check(ran.load(std::memory_order_acquire) == kRounds, "every deleter-probe task ran");
-        Check(sawStale.load(std::memory_order_relaxed) == 0, "no task inherited a previous slot");
-        Check(s_freed.load(std::memory_order_relaxed) > 0,
-              "the OWNING slot's deleter ran (else the hook is not wired at all)");
-        Check(s_borrowedFreed.load(std::memory_order_relaxed) == 0,
-              "CONTROL: a slot with NO deleter was never freed -- borrowed pointers survive");
-        Check(s_live.magic == 0xABCD, "and the borrowed object is intact");
-
-        reg.SetSlotDeleter(kOwning, nullptr);   // withdraw before the pool tears down
-    }
+    // Nothing here replaces it, deliberately. The rule the library keeps is the one arm 1 checks:
+    // a slot is a void*, the library never frees what one points at, and clearing on recycle
+    // prevents a stale READ rather than a leak.
 
     // ---- ARM 5: FiberLocal<T> AND GetID(), THE TYPED FACE ----------------------------------
     //
