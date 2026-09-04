@@ -2751,3 +2751,20 @@ per-layer FlushBatchTask are fan-outs the frame blocks on -- the burst shape exa
 tree aims Wide at a stream, which was luck rather than judgement until this row existed.
 
 DO NOT generalise "Wide is faster" from the burst numbers. It is faster at the thing burst measures.
+
+  INTERLEAVED CONFIRMATION (3 reps each, alternating, same session):
+      throughput/1p    default 2.14 .. 2.39 M/s    wide 0.89 .. 0.90    DISJOINT
+      kernel wakes/5   default  898 .. 944         wide 928,588 .. 929,735   DISJOINT
+      throughput/bt    default 14.33 .. 16.96      wide 16.77 .. 22.30  OVERLAP (0.19)
+
+  THE WAKE COUNT IS THE REAL RESULT: a 0.12% spread across three runs, ~929,000 wakes per
+  1,000,000 tasks = 92.9% of pushes waking a parked worker, reproducible to three digits. That is
+  a property, not a benchmark number. Note wide's RATE is also tighter than default's (1.01x vs
+  1.12x spread) -- it is wake-bound, and wakes are uniform.
+
+  bt OVERLAPS AND THE OBSERVATION WAS STILL REAL. wide's range sits higher and its 22.30 is the
+  best bt figure recorded all night, but the ranges touch, so three samples do not separate them.
+  `wide` does not touch that row's tasks, so the only mechanism available is CARRY-OVER: bt runs
+  after 1p and mp in the same process, and a wide arm hands it a pool with more workers recently
+  woken and warm. Direction matches. NOT ESTABLISHED -- it needs more reps, or a row-selection flag
+  so bt can run without 1p/mp ahead of it, which the bench does not have.
