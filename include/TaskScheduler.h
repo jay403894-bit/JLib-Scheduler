@@ -526,6 +526,35 @@ namespace JLib {
 		// numbers and this gives them back if it is wrong.
 		static void   SetPlacementFollowsGrownFloor(bool on) noexcept;
 		static bool   GetPlacementFollowsGrownFloor() noexcept;
+
+		// ---- WHERE THE OWN-INBOX DRAIN SITS IN A PASS (experiment, default false) --------------
+		//
+		// A worker's pass drains its own inbox TWICE: once before the steal walk and once after,
+		// before the park decision. This skips the FIRST one, leaving the order
+		//
+		//     local deque -> steal -> own inbox -> park
+		//
+		// THE CASE FOR IT: the inbox is a direct-dispatch fallback, not a priority queue. Draining
+		// it first lets a directed push interrupt a worker that already had a pipeline going, when
+		// that push might have waited happily while local work kept moving.
+		//
+		// THE CASE AGAINST, WHICH IS MEASURED: the inbox holds the work with the FEWEST legal
+		// consumers -- exactly one, and it carries PINNED RESUMES nobody else may ever take. The
+		// deque holds work anyone can steal. Deferring the inbox means doing work others could have
+		// done while work only you can do waits. `drainOwnInbox() before the walk` was itself a
+		// reorder made for that reason, and it was NOT ENOUGH: a push landing DURING the walk still
+		// sat while the worker probed foreign deques, which is the 102 us dispatch stall recorded
+		// at the ownWorkArrived() comment.
+		//
+		// WHY IT IS NEWLY WORTH TESTING ANYWAY: ownWorkArrived() now abandons the steal walk the
+		// moment hasQueuedWork goes true, so the walk no longer runs to probeLimit with a task
+		// waiting. That mechanism did not exist when the drain was moved forward, and it covers
+		// most of what the early drain was protecting.
+		//
+		// WATCH THE LATENCY AND io-pipe ROWS, not throughput: 100% of `latency` pushes land in a
+		// floor worker's inbox, so this changes when they are seen. Move it back if they regress.
+		static void   SetInboxLast(bool on) noexcept;
+		static bool   InboxLast() noexcept;
 		static void   SetAwakeFloor(size_t k) noexcept;
 		// ---- IDLE-SPIN POLITENESS ------------------------------------------------------------
 		//

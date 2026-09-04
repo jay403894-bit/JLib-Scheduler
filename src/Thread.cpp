@@ -2685,7 +2685,12 @@ void Thread::Worker() {
 		// single MPSC pop against a queue nobody else may touch. Looking there first is both
 		// cheaper and more likely to succeed, and doing it after the steal loop meant a worker with
 		// its own work waiting went hunting for somebody else's first.
-		drainOwnInbox();
+		//
+		// `inboxlast` SKIPS THIS ONE, leaving the drain that runs after the walk (before the park
+		// decision) as the only one. That is the experiment, not the default -- see
+		// TaskScheduler::SetInboxLast for both sides, and note that the walk now abandons itself on
+		// ownWorkArrived(), which is what makes deferring survivable at all.
+		if (!TaskScheduler::InboxLast()) drainOwnInbox();
 
 		{
 			// --- 4. Work stealing ---

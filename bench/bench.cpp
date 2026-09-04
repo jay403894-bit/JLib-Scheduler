@@ -3425,6 +3425,25 @@ int main(int argc, char** argv) {
 "            the case where averaging a trivial and a heavy body describes neither\n"
 "            (trivial N=256 went 0.33x -> 0.01x). Only meaningful with `mwidth`.\n"
 "\n"
+"=== THE WORK-SEARCH ORDER =====================================================\n"
+"  inboxlast A worker's pass drains its OWN inbox twice: once before the steal\n"
+"            walk and once after, before the park decision. This skips the first,\n"
+"            leaving   local deque -> steal -> own inbox -> park.\n"
+"            FOR: the inbox is a direct-dispatch fallback, not a priority queue.\n"
+"            Draining it first lets a directed push interrupt a worker that had a\n"
+"            pipeline going, when it might have waited happily.\n"
+"            AGAINST, and measured: the inbox holds the work with the FEWEST legal\n"
+"            consumers -- exactly one -- and carries PINNED RESUMES nobody else may\n"
+"            ever take, while the deque holds work anyone can steal. Draining it\n"
+"            before the walk was itself a reorder made for that reason, and it was\n"
+"            not enough: a push landing DURING the walk still sat while foreign\n"
+"            deques were probed, which is a recorded 102us dispatch stall.\n"
+"            WHY IT IS TESTABLE NOW: the walk abandons itself on ownWorkArrived(),\n"
+"            which did not exist when the drain was moved forward and covers most\n"
+"            of what the early drain protected.\n"
+"            WATCH `latency` AND io-pipe, NOT throughput -- 100%% of latency pushes\n"
+"            land in a floor worker's inbox, so this changes when they are seen.\n"
+"\n"
 "=== PUSH ======================================================================\n"
 "  wide      the ordinary throughput pushes (1p and mp) aim CorePref::Wide instead\n"
 "            of steering at the awake floor. Wide skips the awake-map steer and\n"
@@ -3510,6 +3529,11 @@ int main(int argc, char** argv) {
         // steering at the awake floor. Burst has had both arms forever and Wide wins there by
         // 1.7-3x; this is the same question where the wake count dominates instead, which nobody
         // has run. Does not touch throughput/bt -- that row has `batchwide`, its own mechanism.
+        // inboxlast: skip the own-inbox drain that runs BEFORE the steal walk, leaving the one
+        // after it (before the park decision). Order becomes local deque -> steal -> inbox -> park.
+        // Watch `latency` and io-pipe, not throughput: 100% of latency pushes land in a floor
+        // worker`s inbox, so this changes when they are seen. See SetInboxLast for both sides.
+        if (JLIB_STRICMP(argv[a], "inboxlast") == 0) { JLib::TaskScheduler::SetInboxLast(true); continue; }
         if (JLIB_STRICMP(argv[a], "wide") == 0)    { g_pushPref = JLib::CorePref::Wide; continue; }
         if (JLIB_STRICMP(argv[a], "hotpin") == 0)  { hotPin = true;  continue; }
         if (JLIB_STRICMP(argv[a], "hotexcl") == 0) { hotExcl = true; continue; }
@@ -3931,6 +3955,8 @@ int main(int argc, char** argv) {
            // one command-line word, and a table that does not name its arm is the easiest way to
            // compare two numbers that were never comparable.
            JLib::TaskScheduler::PushBatchWide() ? "  batchwide=ON" : "");
+    if (JLib::TaskScheduler::InboxLast())
+        printf("placement: own-inbox drained AFTER the steal walk (inboxlast)   <- EXPERIMENT\n");
     if (g_pushPref == JLib::CorePref::Wide)
         printf("placement: ordinary throughput pushes aim CorePref::Wide (1p, mp)   <- EXPERIMENT\n");
     // PLACEMENT ARM ON ITS OWN LINE, and only when one is on. These change where every hot-band

@@ -1453,6 +1453,12 @@ bool TaskScheduler::GetPlacementFollowsGrownFloor() noexcept {
 	return g_placementFollowsGrownFloor.load(std::memory_order_relaxed);
 }
 
+// Default FALSE: the shipped order drains the own inbox before the steal walk. See the header for
+// both sides of the argument and for which rows can answer it.
+static std::atomic<bool> g_inboxLast{ false };
+void TaskScheduler::SetInboxLast(bool on) noexcept { g_inboxLast.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::InboxLast() noexcept { return g_inboxLast.load(std::memory_order_relaxed); }
+
 // ---- RESERVED FOR lane ----------------------------------------------------------------------
 //
 // Workers [0, R) take lane work ONLY. Ordinary placement skips them, so a completion steered there

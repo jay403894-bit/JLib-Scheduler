@@ -78,7 +78,11 @@ TaskNode* TaskDAG::CreateMainNode(Task* t, uint8_t priority) {
             "  switch away to, so any suspension inside one fail-fasts with no message.\n"
             "  A public job is a fiber by DEFAULT, so this is what you get from a plain CreateTask.\n"
             "  For a main node, ask for the non-suspending type explicitly:\n"
-            "      CreateTask(fn, data, /*lane*/0, TaskType::Native)\n"
+            // SPELLED AS IT MUST BE TYPED. This said `/*lane*/0`, from when the parameter was a
+            // bool and then an int. Lane is an `enum class` with no implicit conversion, so anyone
+            // who hit this abort and followed it verbatim got a COMPILE ERROR as their reward --
+            // wrong guidance at the one moment the reader is already stuck.
+            "      CreateTask(fn, data, Lane::Normal, TaskType::Native)\n"
             "  Or put the suspending work on a pool node (CreateNode) and give the main node a\n"
             "  dependency on it.\n");
         std::fflush(stderr);
