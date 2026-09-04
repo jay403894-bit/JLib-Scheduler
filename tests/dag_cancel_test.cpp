@@ -33,6 +33,15 @@ static void Check(bool c, const char* what) {
     if (!c) ++g_fail;
 }
 
+static bool WaitUntilFlag(std::atomic<bool>& f, int ms = 4000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!f.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
 static bool WaitUntil(std::atomic<int>& v, int want, int ms = 4000) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     while (v.load(std::memory_order_acquire) != want) {
@@ -192,6 +201,25 @@ static void HoldOnEventBody(void* p) {
     c.m->Unlock();
 }
 
+// ---- HOLD A DAG INPUT OPEN WITHOUT HOLDING A WORKER -------------------------------------------
+//
+// The AND-gate arm needs one input still in flight when Cancel() lands. A Native task cannot
+// suspend, so the only way it can stay unfinished is to spin -- and a spinning task owns its worker
+// and everything queued behind it in that worker's inbox. See the long note at the call site.
+struct AndHoldCtx {
+    JLib::TaskScheduler* s;
+    JLib::Event*         hold;
+    std::atomic<int>*    ran;
+    std::atomic<bool>*   parked;
+};
+static void AndHoldBody(void* p) {
+    auto& c = *static_cast<AndHoldCtx*>(p);
+    // ARMED: the flag is published after this fiber is registered as a waiter and before it parks,
+    // so a signaller that waits for the flag cannot signal into the gap.
+    c.s->WaitOnEventArmed(*c.hold, [&c] { c.parked->store(true, std::memory_order_release); });
+    c.ran->fetch_add(1, std::memory_order_relaxed);
+}
+
 struct EnterThenLockCtx {
     JLib::SchedulerMutex* m;
     std::atomic<bool>*    entered;
@@ -329,7 +357,7 @@ int main() {
     std::printf("AND gate with a cancelled input\n");
     {
         std::atomic<int> ran{ 0 }, sinkRan{ 0 };
-        std::atomic<bool> release{ false };
+        std::atomic<bool> parked{ false };
         JLib::WaitGroup wg;
         JLib::TaskDAG dag(sched);
 
@@ -338,10 +366,27 @@ int main() {
         ta->waitGroup = &wg; wg.n.fetch_add(1, std::memory_order_relaxed);
         auto* a = dag.CreateNode(ta);
 
-        auto* tb = sched.CreateTask([&] {
-            while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
-            ran.fetch_add(1, std::memory_order_relaxed);
-        });
+        // ---- b SUSPENDS. IT USED TO SPIN, AND THAT STARVED a ON A NARROW POOL ----------------
+        //
+        // This was a lambda -- therefore NATIVE, therefore unable to suspend -- busy-waiting on
+        // `release` until after the cancel. A Native task that never returns OWNS ITS WORKER, and a
+        // worker's inbox has exactly ONE legal consumer: nothing else may take what is queued
+        // behind it. So whenever a and b landed in the same inbox and b was drained first, a sat
+        // behind a task that would not finish until a had already run. Deadlock, resolved only by
+        // WaitUntil's 4-second timeout.
+        //
+        // Invisible on a 31-worker box and reproducible on CI's 3-worker pool, which is where it
+        // failed: "the first input completed" FAILED with every other assertion in the file green.
+        // This file has had exactly this defect before -- a self-deadlock at busy=1, lo=1 -- so it
+        // is the second instance, not a coincidence.
+        //
+        // A FIBER waiting on an Event holds the node open WITHOUT holding the worker: the worker
+        // goes back to its loop and drains a. Armed, so the signal cannot land between registering
+        // and parking -- Push-then-SignalAll is a lost wake, and this file's own holder at the
+        // bottom uses the same shape.
+        JLib::Event& hold = sched.GetEvent("dagcancel_and_hold");
+        AndHoldCtx bctx{ &sched, &hold, &ran, &parked };
+        auto* tb = JLibTest::MakeCtxTask(sched, &AndHoldBody, &bctx);
         tb->waitGroup = &wg; wg.n.fetch_add(1, std::memory_order_relaxed);
         auto* b = dag.CreateNode(tb);
 
@@ -353,9 +398,12 @@ int main() {
 
         Check(dag.Submit(), "DAG submitted");
         Check(WaitUntil(ran, 1), "the first input completed");
+        // PARKED BEFORE SIGNALLED, or the signal is lost and WaitFor below never returns. `a`
+        // completing says nothing about whether `b` has reached its wait yet.
+        Check(WaitUntilFlag(parked), "the second input parked without holding a worker");
 
         dag.Cancel();
-        release.store(true, std::memory_order_release);
+        hold.SignalAll();
         sched.WaitFor(wg);
 
         Check(sinkRan.load() == 0, "AND with a cancelled input did not run");
