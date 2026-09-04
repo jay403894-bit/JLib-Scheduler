@@ -243,6 +243,28 @@ namespace JLib {
 		// PINNED MODE IS THIS SET WITH EXACTLY ONE MEMBER. It is not a second mechanism and not a
 		// second code path -- the binding worker is added at bind, nothing else ever is, and the
 		// cleanup chain degenerates to one hop. See TaskScheduler::MigratableFibers.
+		//
+		// ---- AND IT STILL EARNS ITS KEEP AT ONE MEMBER, which is the part worth writing down ----
+		//
+		// The obvious cleanup, once fibers are pinned, is "a set of one is just a field -- collapse
+		// it to a single home worker and delete the bitmask." That trades away the property the
+		// reclamation systems are actually built on, and the trade is invisible from here.
+		//
+		// A BITMASK OF HOLDERS IS WHAT MAKES THE DELETION LISTS THREAD_LOCAL. Cleanup is ADDRESSED:
+		// each set bit names a thread, TakeCreditor hands the fiber to exactly that thread, and the
+		// release runs there -- so every reclamation system can keep its pending work in its OWN
+		// storage. That is not hypothetical; it is what is already there. EpochManager's retire
+		// bag is `thread_local t_epochBag` and HazardDomain's is the same shape.
+		//
+		// WITHOUT ADDRESSING, THOSE HAVE TO BE GLOBAL. If a dying fiber cannot say WHICH thread owes
+		// what, the only place a reclaimer can look is one structure every thread shares -- so every
+		// retire becomes a push onto a contended list, and every sweep walks other threads' garbage
+		// to find its own. The bitmask is what buys the per-thread form, and a single `homeWorker`
+		// field would buy it too ONLY for as long as a fiber never touches affine state on a second
+		// thread. Migration is the case that breaks that, and migration is the DEFAULT in 5.0.
+		//
+		// So: pinning does not make this redundant, it makes it CHEAP -- one bit, one hop, and the
+		// thread_local retire bags stay legal either way.
 		// WIDE ENOUGH FOR HOLDERS, NOT JUST WORKERS. A creditor is any THREAD that can own
 		// thread-affine state, and that is workers PLUS the external ids main and an app's own
 		// threads claim. At 4 words this covered 256 workers and silently refused every external
@@ -300,8 +322,14 @@ namespace JLib {
 		//
 		// KINDS ARE THE THREE RECLAMATION SYSTEMS, and that is not a coincidence: they are exactly
 		// the three costs the architecture header says migration already paid (address-routed slab
-		// frees, a global epoch participant list, fiber-indexed hazard cells). Recording the debt is
-		// what would let those go back to their cheap per-thread forms.
+		// frees, a global epoch participant list, fiber-indexed hazard cells).
+		//
+		// RECORDING THE DEBT IS WHAT KEEPS THOSE IN THEIR CHEAP PER-THREAD FORMS -- present tense,
+		// not a future option. The kind says a cleanup is owed and the creditor bit says by WHOM, and
+		// between them a reclaimer only ever touches its own storage: EpochManager's retire bag is
+		// `thread_local t_epochBag` today, HazardDomain's is the same shape. Take the addressing
+		// away and both have to become one structure shared by every thread, because a dying fiber
+		// could no longer say whose garbage it left. See the creditors field for the full argument.
 		// ---- WHAT THE CREDITOR CHAIN IS FOR, AND WHAT IT IS NOT -------------------------------
 		//
 		// A SLOT ON A WORKER, NOT AN ADDRESS IN A POOL. The chain exists for "worker q still
