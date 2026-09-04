@@ -325,6 +325,19 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 	// pool: a pinned worker cannot escape a core someone else is occupying, and with N workers the
 	// chance that SOME core is occupied approaches certainty.
 	//
+	// ---- THAT NUMBER IS DATED 2026-08-05 AND THE POOL HAS CHANGED UNDER IT --------------------
+	//
+	// The AWAKE FLOOR shipped in 4.0.1 on 2026-08-27, three weeks AFTER that run. So the ~45% was
+	// measured on a pool where EVERY WORKER PARKED WHEN IDLE: every dispatch paid a wake, and a
+	// pinned worker that could not migrate paid it worse. That is not a side effect of the
+	// experiment, it IS the mechanism the number measures -- and the floor removes it for the band
+	// that matters, because those threads no longer park at all.
+	//
+	// So the figure still explains why the default is Ideal HISTORICALLY, and it should not be
+	// quoted as a current property of this scheduler. What settles it is a re-run of `hard` against
+	// `ideal` at today's floor, which nobody has done. Do not read this comment as either
+	// "hard is fine now" or "hard is still 45% worse"; both are guesses.
+	//
 	// A hot worker looked like the opposite case -- it never parks, so it has no wake latency to
 	// lose, and there are one or two rather than N. IT MEASURED WORSE ANYWAY, and badly: burst p99
 	// 27ms against a 150us baseline, HOT p99 up to 10ms, and pin+RT worse than RT alone.

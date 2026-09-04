@@ -2595,3 +2595,34 @@ STILL NOT DONE, both documentation-only:
   - SlabPool being append-only is LOAD-BEARING for why the lambda/fiber defect is invisible in
     tests. Nothing says so outside a code comment.
   - StackClass on a Native task is a silent no-op on the floor.
+
+================================================================================
+THE ~45% HARD-AFFINITY RESULT PREDATES THE AWAKE FLOOR (found 2026-09-03)
+================================================================================
+
+Jay: "i dont see a diff between hard and ideal anymore probably because we pre-wake threads."
+
+He is right that the recorded result cannot be trusted as current, and the timeline is the whole
+argument:
+
+    ~45% worse wake latency, ~2x frame DAG, hard vs ideal     measured 2026-08-05
+    the AWAKE FLOOR ships                                     4.0.1, 2026-08-27
+
+Three weeks apart, in that order. So the affinity run was taken on a pool where EVERY WORKER PARKED
+WHEN IDLE. Every dispatch paid a wake; a pinned worker that could not migrate paid it worse. That is
+not an artefact of the experiment, it is the mechanism the number measures -- and the floor deletes
+that mechanism for the band that matters, because floor workers never park.
+
+WHAT THIS DOES AND DOES NOT LICENSE. It does NOT say hard is fine now; nobody has measured it at
+today's floor. It says the number is evidence about a scheduler that no longer exists, and quoting
+it as a current property is the same error as a stale doc. The bench help and the comment above
+`GetHotWorkerPin()` in Thread.cpp now carry the date and the confound.
+
+THE RUN THAT SETTLES IT: `hard` against `ideal`, same floor, interleaved. If they are now equal, the
+default is a free choice rather than a forced one, and the whole "pinning is harmful" family of
+comments -- eight citations of this figure across the tree -- needs revisiting rather than repeating.
+
+AND IT WEAKENS MY OWN ARGUMENT AGAINST floorpin. I used the ~45% to argue the base floor should not
+be pinned. If the figure is an artefact of a parking pool, it says nothing about pinning threads
+that never park -- which is exactly what K and the base floor are. The K PIN result (27ms burst p99,
+2026-08-2x) is the evidence that still applies, because K never parked either.
