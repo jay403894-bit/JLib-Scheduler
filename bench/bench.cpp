@@ -294,6 +294,22 @@ static void PrintBandVerdict() {
 static std::atomic<const char*> g_section{ "startup" };
 static std::atomic<bool> g_benchDone{ false };
 
+// ---- CorePref FOR THE ORDINARY THROUGHPUT PUSHES (`wide`) -------------------------------------
+//
+// THE ONE COMPARISON THIS HARNESS NEVER MADE. `CorePref::Wide` skips the awake-map steer and aims
+// across the pool, which costs a kernel wake per sleeping target; Default narrows to the awake
+// floor, which costs none. Burst has had both arms since it shipped -- and Wide wins there by
+// 1.7-3x, because steering a wave at two floor workers is what caps it. Individual small pushes are
+// the OPPOSITE case on paper: 200,000 of them, where the steer's whole purpose is to avoid ~620
+// wakes, and nobody has ever run the other arm.
+//
+// IT IS NOT AN ACADEMIC KNOB. CorePref::Wide is shipped in Physics3D's Jolt job queue and the
+// Renderer's fan-outs on the strength of the BURST measurement (Default 12 of 31 participants at
+// 5.2x, Wide 29 of 31 at 10.1x). Those are fan-outs, so the burst shape is the right evidence for
+// them -- but it is the ONLY evidence the flag has anywhere, and a throughput arm is the first
+// chance to find out whether it also holds where the wake count dominates.
+static JLib::CorePref g_pushPref = JLib::CorePref::Default;
+
 static void Section(const char* name) {
     g_section.store(name, std::memory_order_release);
     // EVERY ROW STARTS AT THE CONFIGURED FLOOR. Push-side growth is transient by design, but the
@@ -440,7 +456,9 @@ static void BenchThroughputSingleProducer(JLib::TaskScheduler& sched) {
         wg.n.store(kThroughputTasks, std::memory_order_relaxed);
         auto t0 = Clock::now();
         for (int i = 0; i < kThroughputTasks; ++i) {
-            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
+            // g_pushPref: Default steers at the awake floor, `wide` aims across the pool.
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr, JLib::Lane::Normal,
+                                             JLib::TaskType::Fiber, g_pushPref);
             t->waitGroup = &wg;
             sched.Push(t);
         }
@@ -491,7 +509,9 @@ ProducerArg g_producerArgs[kProducers];
 static void ProducerBody(void* p) {
     auto* a = static_cast<ProducerArg*>(p);
     for (int i = 0; i < a->count; ++i) {
-        JLib::Task* t = a->sched->CreateTask(&EmptyBody, nullptr);
+        // g_pushPref -- see its definition; this is the multi-producer arm of the same test.
+        JLib::Task* t = a->sched->CreateTask(&EmptyBody, nullptr, JLib::Lane::Normal,
+                                             JLib::TaskType::Fiber, g_pushPref);
         if (!t) { ++a->failed; a->wg->n.fetch_sub(1, std::memory_order_release); continue; }
         t->waitGroup = a->wg;
         a->sched->Push(t);
@@ -529,6 +549,9 @@ static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
         auto t0 = Clock::now();
         int made = 0;
         for (int i = 0; i < kThroughputTasks; ++i) {
+            // NOT g_pushPref. This row already has its own placement arm -- `batchwide`, which
+            // makes PushBatch place Wide -- and setting a per-task CorePref on top would leave two
+            // mechanisms aiming the same row with no way to tell which moved it.
             JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
             if (!t) { printf("throughput/batch: ERROR -- CreateTask returned null\n"); return; }
             t->waitGroup = &wg;
@@ -3403,6 +3426,20 @@ int main(int argc, char** argv) {
 "            (trivial N=256 went 0.33x -> 0.01x). Only meaningful with `mwidth`.\n"
 "\n"
 "=== PUSH ======================================================================\n"
+"  wide      the ordinary throughput pushes (1p and mp) aim CorePref::Wide instead\n"
+"            of steering at the awake floor. Wide skips the awake-map steer and\n"
+"            costs a kernel wake per sleeping target; Default narrows to the floor\n"
+"            and costs none. THE BURST ROWS HAVE HAD BOTH ARMS SINCE THEY SHIPPED\n"
+"            and Wide wins there by 1.7-3x -- steering a wave at two floor workers\n"
+"            is what caps it. Individual small pushes are the opposite case on\n"
+"            paper: 200,000 of them, where avoiding ~620 wakes is the steer's whole\n"
+"            purpose. Nobody has ever run that arm, which is why this flag exists.\n"
+"            NOT ACADEMIC: CorePref::Wide ships in Physics3D's Jolt job queue and\n"
+"            the Renderer's fan-outs, justified by the BURST measurement (Default\n"
+"            12 of 31 participants at 5.2x, Wide 29 of 31 at 10.1x). Right evidence\n"
+"            for a fan-out, and the only evidence the flag has anywhere.\n"
+"            Does NOT touch throughput/bt -- that row has `batchwide`, its own\n"
+"            mechanism, and two placement knobs on one row measure neither.\n"
 "  batchwide PushBatch places Wide, skipping the awake-map steer entirely. Compare\n"
 "            the kernel-wake counts ACROSS arms: unchanged means a win came from\n"
 "            the cheaper push, not from width. It will NOT move the burst rows --\n"
@@ -3469,6 +3506,11 @@ int main(int argc, char** argv) {
         // hotexcl  the other half: every other thread masks those cores off. Implies hotpin. This
         //          is the arrangement pinning alone was missing, and the one with no recorded
         //          number -- run it against the same command without it.
+        // wide: the ordinary throughput pushes (1p and mp) aim CorePref::Wide instead of
+        // steering at the awake floor. Burst has had both arms forever and Wide wins there by
+        // 1.7-3x; this is the same question where the wake count dominates instead, which nobody
+        // has run. Does not touch throughput/bt -- that row has `batchwide`, its own mechanism.
+        if (JLIB_STRICMP(argv[a], "wide") == 0)    { g_pushPref = JLib::CorePref::Wide; continue; }
         if (JLIB_STRICMP(argv[a], "hotpin") == 0)  { hotPin = true;  continue; }
         if (JLIB_STRICMP(argv[a], "hotexcl") == 0) { hotExcl = true; continue; }
         // floorpin: widen the pinned/exclusive band from [0,K) to [0,K+Fbase). Fbase is 1 on a
@@ -3889,6 +3931,8 @@ int main(int argc, char** argv) {
            // one command-line word, and a table that does not name its arm is the easiest way to
            // compare two numbers that were never comparable.
            JLib::TaskScheduler::PushBatchWide() ? "  batchwide=ON" : "");
+    if (g_pushPref == JLib::CorePref::Wide)
+        printf("placement: ordinary throughput pushes aim CorePref::Wide (1p, mp)   <- EXPERIMENT\n");
     // PLACEMENT ARM ON ITS OWN LINE, and only when one is on. These change where every hot-band
     // thread runs, so a paste that does not name them is not comparable with one that does -- the
     // same reason batchwide is stamped above. Read from the library rather than the local flags, so
@@ -3969,7 +4013,7 @@ int main(int argc, char** argv) {
         JLib::WaitGroup wg;
         wg.n.store(10'000, std::memory_order_relaxed);
         for (int i = 0; i < 10'000; ++i) {
-            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
+            JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);   // warmup: placement is not under test
             t->waitGroup = &wg;
             sched.Push(t);
         }
