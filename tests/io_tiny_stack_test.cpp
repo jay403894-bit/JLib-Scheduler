@@ -120,8 +120,21 @@ int main() {
     const size_t page = JLib::platform::PageSize();
     std::printf("  K=%zu, page=%zu\n", K, page);
     if (K == 0) {
+        // ---- 77 IS CTEST'S SKIP CODE, AND THE DISTINCTION MATTERS ---------------------------
+        //
+        // This used to return 1. Returning nonzero was right when the only way to run this file was
+        // by hand on a machine with cores to spare: a vacuous run must not look like a pass. But it
+        // is WRONG once CI runs it, because a GitHub runner has two cores, K clamps to 0 there
+        // every single time, and "the reserved band cannot exist on this machine" is not a defect
+        // in the scheduler -- it is a precondition the hardware cannot meet.
+        //
+        // A permanently red check gets ignored, and an ignored check is worse than no check: it
+        // trains everyone to skim past the one place a real failure would appear. So: SKIPPED,
+        // which ctest reports as its own state and which cannot be mistaken for either outcome.
+        // Registered by SKIP_RETURN_CODE in CMakeLists.
         std::printf("  K clamped to 0 -- nothing steers to a reserved worker, so this file is vacuous\n");
-        return 1;
+        std::printf("  SKIPPED: needs a machine wide enough to reserve a worker.\n");
+        return 77;
     }
 
     char path[MAX_PATH], dir[MAX_PATH];

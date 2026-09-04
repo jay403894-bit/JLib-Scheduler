@@ -1300,7 +1300,14 @@ foreach(_t IN LISTS JLIBSCHED_ALL_TARGETS)
     # concurrency test fails is by DEADLOCKING -- which is not a failure, it is a job that spins
     # every worker until the runner kills it 6 hours later. 300s is generous against a local worst
     # case of well under 150s.
-    set_tests_properties(${_t} PROPERTIES TIMEOUT 300)
+    # SKIP_RETURN_CODE 77: a test whose PRECONDITION the machine cannot meet reports SKIPPED, not
+    # passed and not failed. Two of these need a pool wider than a 2-core CI runner -- the reserved
+    # band cannot exist at K=0, and the awake floor cannot grow above a base of 2 in a 2-worker
+    # pool. Both used to fail there, which is honest but useless: a permanently red check is one
+    # everybody learns to skim past, and that is the state a real failure would have to appear in.
+    # 77 is ctest's convention and cannot be confused with either outcome. Harmless on the other 50,
+    # which never return it.
+    set_tests_properties(${_t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     math(EXPR JLIBSCHED_TEST_COUNT "${JLIBSCHED_TEST_COUNT} + 1")
 endforeach()
 message(STATUS "JLib::Scheduler: ${JLIBSCHED_TEST_COUNT} tests registered with ctest")

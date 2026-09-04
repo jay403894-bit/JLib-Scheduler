@@ -52,6 +52,24 @@ int main() {
 	JLib::TaskScheduler::Init(0);
 	auto& sched = JLib::TaskScheduler::Instance();
 
+	// ---- THE FLOOR CANNOT GROW PAST THE POOL, so a narrow machine cannot host this test -----
+	//
+	// The whole claim below is "the floor rises ABOVE its base of 2 under load and sheds back".
+	// On a two-core GitHub runner the pool is two workers wide, so there is nowhere above 2 to
+	// grow into and the growth assertion fails every run -- not because the controller is broken
+	// but because the machine cannot express the thing being asserted.
+	//
+	// SKIPPED (77) rather than failed, for the reason io_tiny_stack_test.cpp states at length: a
+	// check that is permanently red is a check everybody learns to skim past. Needs a worker for
+	// the base floor plus at least one to grow into, plus the main thread's own core to not be
+	// fighting them -- 4 is the smallest honest bar.
+	const size_t nWorkers = sched.GetWorkerCount();
+	if (nWorkers < 4) {
+		std::printf("  pool is %zu workers; the floor base is 2, so there is no headroom to grow into.\n"
+		            "  SKIPPED: needs a pool of at least 4.\n", nWorkers);
+		return 77;
+	}
+
 	const size_t base = JLib::TaskScheduler::GetAwakeFloorBase();
 	Check(base == 2, "base floor is what was configured (2)");
 
