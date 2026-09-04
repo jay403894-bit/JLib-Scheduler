@@ -1242,6 +1242,16 @@ add_executable(SchedulerFiberRowLifecycleTest "${CMAKE_CURRENT_SOURCE_DIR}/tests
 target_link_libraries(SchedulerFiberRowLifecycleTest PRIVATE Scheduler)
 target_compile_features(SchedulerFiberRowLifecycleTest PRIVATE cxx_std_17)
 
+
+# Does an affine debt run ON THE WORKER THAT OWES IT? The memory-only ledgers were removed, so what
+# remains on the debt list is the case epochs and hazards cannot serve for themselves: state only
+# one thread may retract. "It was released" is not the claim -- "it was released BY THE HOLDER" is,
+# and a test that only counted releases would pass while the mechanism did the one thing it exists
+# to prevent. See the file header.
+add_executable(SchedulerFiberDebtAffineTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/fiber_debt_affine_test.cpp")
+target_link_libraries(SchedulerFiberDebtAffineTest PRIVATE Scheduler)
+target_compile_features(SchedulerFiberDebtAffineTest PRIVATE cxx_std_17)
+
 # ==============================================================================================
 # CTEST REGISTRATION -- DISCOVERED, NOT LISTED
 # ==============================================================================================
@@ -1303,3 +1313,10 @@ foreach(_t IN LISTS JLIBSCHED_ALL_TARGETS)
     math(EXPR JLIBSCHED_TEST_COUNT "${JLIBSCHED_TEST_COUNT} + 1")
 endforeach()
 message(STATUS "JLib::Scheduler: ${JLIBSCHED_TEST_COUNT} tests registered with ctest")
+
+# ---- ADD NEW TEST TARGETS ABOVE THE CTEST REGISTRATION BLOCK ---------------------------------
+#
+# BUILDSYSTEM_TARGETS is evaluated where the foreach runs, so a target defined after it is built and
+# never registered -- it silently leaves the suite. That is not hypothetical: the affine debt test
+# was appended here first and the configure line read 51 instead of 52, which is the only symptom
+# there is. If that count ever drops when you added a test, this is why.

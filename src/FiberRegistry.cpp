@@ -150,6 +150,30 @@ namespace JLib {
 			f->cleanupNext = nullptr;
 			// RELEASE WHAT THIS HOLDER OWES, then hand on. Running the release BEFORE advancing is
 			// load-bearing: advance may recycle the fiber, and a recycled fiber is a new fiber.
+			//
+			// ---- THE LIBRARY'S OWN DEBTS FIRST. THIS CALL WAS MISSING ENTIRELY. --------------
+			//
+			// `releaseFn` is the APPLICATION's hook and it is normally null. The library's own
+			// affine debts -- everything registered through ReleaseOnWorker -- are discharged by
+			// DischargeFiberDebts, and nothing in the tree called it. So this loop ran the hook
+			// nobody installed, advanced, and released nothing of its own.
+			//
+			// WHAT THAT COST, and it is not a leak, which is why nothing caught it: an undischarged
+			// affine debt survives the chain to ResetForReuse, where HandOffFiberDebts splices every
+			// remaining debt onto the pending stack, and the reclaim task then releases it on
+			// WHATEVER WORKER RUNS THAT TASK. So the debts were all released -- and the single
+			// guarantee the affine form exists to make, released BY the holder, was the one it did
+			// not keep. fiber_debt_affine_test measured 275 of 300 on the wrong thread.
+			//
+			// For memory that is a cache migration. For what this path is FOR -- an epoch slot, a
+			// worker-owned hazard cell, a COM apartment, a thread-owned handle -- it is wrong:
+			// clearing a slot from a thread that never set it un-announces a live traversal.
+			//
+			// ONE VISIT PER WORKER PER FIBER LIFE (TakeCreditor clears the bit before dispatching,
+			// which is what makes a double release impossible), so this visit must discharge
+			// everything this worker is owed. That is why the debts are a LIST and not one pointer.
+			// Anything left after this belongs to another holder and stays linked for their visit.
+			(void)TaskScheduler::DischargeFiberDebts(f, holder);
 			if (ReleaseFn r = releaseFn.load(std::memory_order_relaxed)) r(holder, f);
 			AdvanceCleanup(f);
 			++n;
@@ -551,11 +575,15 @@ namespace JLib {
 	void FiberRegistry::CleanupHop(void* fiber) {
 		Fiber* f = static_cast<Fiber*>(fiber);
 		if (!f) return;
-		// THE ACTUAL RELEASE OF THIS WORKER'S AFFINE STATE GOES HERE, and it is an application
-		// concern: COM apartments, thread-owned handles, a magazine that refuses to be remote-freed.
-		// The library itself owes nothing at this point -- slab frees route by address, epochs use a
-		// global participant list, hazard cells are indexed by the fiber. So this is an extension
-		// point with no default body rather than a list of library steps.
+		// DISCHARGE WHAT THIS WORKER IS OWED, the same as DrainHolder does and for the reasons
+		// written there. This is the OTHER entry point onto a holder's own thread -- the dispatch
+		// task's body, rather than the inbox drain -- and both have to discharge or the guarantee
+		// depends on which one a given fiber happened to take. Idempotent: a debt DrainHolder
+		// already released is off the list, so a second visit finds nothing for this holder.
+		if (Thread* self = Thread::GetCurrent())
+			(void)TaskScheduler::DischargeFiberDebts(f, (size_t)self->qIndex);
+
+		// Anything left on the list is owed to a DIFFERENT holder and stays linked for their visit.
 		//
 		// Then take the next hop. Running the release BEFORE advancing is load-bearing: advance may
 		// recycle the fiber, and a recycled fiber is a new fiber.
