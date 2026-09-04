@@ -642,6 +642,144 @@ static void LaneBody(void*) {
 }
 
 
+// ---- fiber-press: WHAT HAPPENS WHEN FIBER ROWS ARE THE SCARCE RESOURCE ----------------------
+//
+// EVERY OTHER ROW IN THIS FILE RUNS WITH ROWS TO SPARE. The default budget is 64 standard fibers
+// per compute worker -- on 31 workers that is ~1,984 -- and no row here has ever come close, so
+// acquisition has never been on any measured path. That makes a whole regime invisible: an app
+// with many concurrently-SUSPENDED tasks (a server holding a fiber per connection, a game holding
+// one per streaming request) runs there permanently, and this harness has never described it.
+//
+// WHAT THE ROW DOES. `fibers=N` sets the budget before Init. Then kInFlight tasks are pushed, each
+// of which acquires a fiber, parks on an Event, and finishes when signalled. With kInFlight well
+// above the budget, most tasks CANNOT START until a parked fiber is released -- so the row measures
+// acquisition under contention rather than dispatch.
+//
+// WHY IT IS NOT JUST "SLOWER". A suspended fiber holds its row out of the magazine until it reaches
+// DEAD. Under pressure the pool's throughput is bounded by RELEASE rate, not push rate, which means
+// the interesting number is not tasks/sec but how long a task waits for a row that another task is
+// sitting on. That is what `wait for a row` reports.
+//
+// AND IT IS THE ONLY ROW THAT COULD SHOW A RESUME-ORDER CHANGE. A worker's pass takes its lane
+// inbox, then its loPri inbox, then its resumed inbox. All three have exactly one legal consumer,
+// so "fewest consumers first" cannot rank them. The argument for lifting RESUMED above loPri is
+// that a resumed fiber already HOLDS a scarce row and a fresh loPri task holds nothing -- running
+// the resume first returns a row, running the loPri task first consumes another. That difference
+// is invisible when rows are plentiful and should appear here, or nowhere.
+//
+// READ IT AS: does the pool keep making progress when rows run out, and how long does a task wait
+// for one. A hang here is a real defect -- rows that are never released.
+static std::atomic<int> s_fpArmed{ 0 };
+static std::atomic<int> s_fpDone{ 0 };
+
+struct FiberPressCtx {
+    JLib::TaskScheduler* s;
+    JLib::Event*         gate;
+    std::atomic<long long>* startSumNs;   // sum of (push -> body entered), for the mean
+    std::atomic<long long>* startMaxNs;
+    long long            pushedNs;
+};
+
+static void FiberPressBody(void* p) {
+    auto& c = *static_cast<FiberPressCtx*>(p);
+    // THE FIRST THING, before parking: this timestamp is what the row is for. The gap from push to
+    // here is dispatch PLUS however long the task waited for a fiber row to become free.
+    const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              Clock::now().time_since_epoch()).count();
+    const long long d = now - c.pushedNs;
+    c.startSumNs->fetch_add(d, std::memory_order_relaxed);
+    long long prev = c.startMaxNs->load(std::memory_order_relaxed);
+    while (d > prev && !c.startMaxNs->compare_exchange_weak(prev, d, std::memory_order_relaxed)) {}
+
+    // Armed, so the signaller cannot signal into the gap between registering and parking.
+    c.s->WaitOnEventArmed(*c.gate, [] { s_fpArmed.fetch_add(1, std::memory_order_release); });
+    s_fpDone.fetch_add(1, std::memory_order_release);
+}
+
+static void BenchFiberPressure(JLib::TaskScheduler& sched) {
+    const size_t budget = JLib::TaskScheduler::StandardFibersPerWorker() * sched.GetWorkerCount();
+    // FOUR TIMES THE BUDGET, so most tasks provably cannot hold a row at once. Not fifty times:
+    // this row should exercise scarcity, not spend a minute proving the queue is a queue.
+    const int kInFlight = (int)(budget * 4);
+
+    s_fpArmed.store(0, std::memory_order_relaxed);
+    s_fpDone.store(0, std::memory_order_relaxed);
+    std::atomic<long long> startSum{ 0 }, startMax{ 0 };
+
+    JLib::Event& gate = sched.GetEvent("bench_fiberpress_gate");
+    JLib::WaitGroup wg;
+    wg.n.store((unsigned)kInFlight, std::memory_order_relaxed);
+
+    // ONE CONTEXT FOR ALL OF THEM except the push timestamp, which differs per task -- so the ctx
+    // array is owned here and outlives the wait, the same rule every fiber body in this tree obeys.
+    std::vector<FiberPressCtx> ctxs((size_t)kInFlight);
+
+    const auto t0 = Clock::now();
+    int pushed = 0;
+    for (int i = 0; i < kInFlight; ++i) {
+        ctxs[(size_t)i] = { &sched, &gate, &startSum, &startMax,
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                Clock::now().time_since_epoch()).count() };
+        JLib::Task* t = sched.CreateTask(&FiberPressBody, &ctxs[(size_t)i],
+                                         JLib::Lane::Normal, JLib::TaskType::Fiber);
+        if (!t) break;                       // slab exhausted -- report what we managed
+        t->waitGroup = &wg;
+        if (!sched.Push(t)) break;
+        ++pushed;
+    }
+
+    // ---- A RELEASER, BECAUSE WAITING FOR ALL OF THEM TO PARK IS THE DOCUMENTED DEADLOCK -------
+    //
+    // The first version of this row waited for every pushed task to arm, then signalled once. That
+    // cannot work and the scheduler says so in its own exhaustion warning: only `budget` tasks can
+    // be parked AT ONCE, the rest re-queue and retry, and they cannot park until a parked one is
+    // released -- which was gated on all of them parking. It hung at BOTH budgets, which is the
+    // tell that it was structural rather than scarcity.
+    //
+    // So the gate is signalled REPEATEDLY while the wave drains. Each signal frees rows, the
+    // re-queued tasks acquire them, park, and are freed by the next signal. Rows RECIRCULATE,
+    // which is the thing being measured -- a task's `push -> body start` now contains however long
+    // it waited for someone else's fiber to come back.
+    //
+    // 1 ms, not a spin: the point is to keep rows moving, not to minimise the release latency, and
+    // a tight loop on SignalAll would put this thread in contention with the pool it is measuring.
+    std::thread releaser([&] {
+        while (s_fpDone.load(std::memory_order_acquire) < pushed) {
+            gate.SignalAll();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        gate.SignalAll();   // final, for anything that armed after the last check
+    });
+
+    sched.WaitFor(wg);
+    releaser.join();
+    const double totalMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+    const double meanUs = pushed ? (double)startSum.load(std::memory_order_relaxed) / pushed / 1000.0 : 0.0;
+    const double maxUs  = (double)startMax.load(std::memory_order_relaxed) / 1000.0;
+
+    printf("fiber-press  : %d tasks against a %zu-fiber budget (%.1fx oversubscribed)\n",
+           pushed, budget, budget ? (double)pushed / (double)budget : 0.0);
+    printf("               drained in %.2f ms  (%.2f us per task, rows recirculating)\n",
+           totalMs, pushed ? totalMs * 1000.0 / pushed : 0.0);
+    printf("               push -> body start: mean %.2f us, max %.2f us\n"
+           "               ^ COMPARE THIS ACROSS ARMS, NEVER READ IT AS A LATENCY. It contains the\n"
+           "                 releaser's 1 ms cadence: a task cannot start until a row frees, rows\n"
+           "                 free on a signal, and signals tick once a millisecond. So the absolute\n"
+           "                 value is mostly this harness, and only the DIFFERENCE between two runs\n"
+           "                 at the same cadence says anything about the scheduler. The row exists\n"
+           "                 to compare fibers=N against fibers=M, or one work-search order against\n"
+           "                 another -- not to produce a number to quote.\n",
+           meanUs, maxUs);
+    printf("               outstanding rows at the end: %llu   <- must be ~0. A number that grows\n"
+           "                 run over run is a row that never reached DEAD, which is a leak the\n"
+           "                 other rows are far too generously provisioned to ever show.\n",
+           (unsigned long long)JLib::TaskScheduler::OutstandingFiberRows());
+    printf("               ^ THE ONLY ROW WHERE FIBER ROWS ARE SCARCE. Every other row in this file\n"
+           "                 runs with rows to spare, so acquisition never appears on their paths.\n"
+           "                 Set `fibers=N` to move the budget; the default here is the library's.\n");
+}
+
 static void BenchIdleBurst(JLib::TaskScheduler& sched, JLib::CorePref pref) {
     constexpr int kBurst = 16;
     constexpr int kRuns  = 5;
@@ -3331,6 +3469,20 @@ int main(int argc, char** argv) {
 "            Default 50. Lower it to catch smaller stalls, and to exercise the\n"
 "            stall report on a healthy machine.\n"
 "\n"
+"=== FIBER ROWS ================================================================\n"
+"  fibers=N  standard fiber rows PER COMPUTE WORKER, set before Init. Library\n"
+"            default 64 -- about 1,984 on 31 workers -- which is why no row here\n"
+"            has ever had to WAIT for one, and why a whole regime (many tasks\n"
+"            suspended at once: a fiber per connection, a fiber per streaming\n"
+"            request) has never been described by this harness.\n"
+"            The `fiber-press` row oversubscribes 4x whatever this ends up being,\n"
+"            so `fibers=4` on 31 workers is 124 rows against 496 tasks. Expect the\n"
+"            pool's own exhaustion warning to fire; that is the row working.\n"
+"            READ fiber-press AS AN A/B ONLY. Its push->start figure includes the\n"
+"            harness's 1 ms release cadence, so the absolute value is mostly this\n"
+"            bench. `outstanding rows at the end` is the honest one: it must be 0,\n"
+"            and a number that grows run over run is a row that never reached DEAD.\n"
+"\n"
 "=== THE BANDS =================================================================\n"
 "  hot=N     reserve N workers for the latency lane (SetHotWorkers). BENCH DEFAULT\n"
 "            2. K is STATIC: the range is pinned to [N,N], and the bench always\n"
@@ -3483,6 +3635,7 @@ int main(int argc, char** argv) {
     bool   hotPin  = false;   // SetHotWorkerPin       -- see the flag parsing below
     bool   hotExcl = false;   // SetHotWorkerExclusive -- implies pinning
     bool   floorPin = false;  // SetBandPinIncludesFloor -- widen the band to K+Fbase
+    size_t fiberBudget = 0; bool haveFiberBudget = false;   // fibers=N -- see the flag parse
 
     size_t awakeFloor  = JLib::TaskScheduler::GetAwakeFloor();
     // floor=auto -- skip SetAwakeFloor entirely so the library's pool-size default applies.
@@ -3750,6 +3903,17 @@ int main(int argc, char** argv) {
             hotWorkers = (size_t)strtoul(argv[a] + 4, nullptr, 10);
             continue;
         }
+        // fibers=N -- standard fiber rows PER COMPUTE WORKER. Library default 64, so ~1,984 on 31
+        // workers, which is why no row here has ever had to wait for one. Lower it to put the
+        // fiber-press row under real scarcity; the row oversubscribes 4x whatever this ends up
+        // being, so `fibers=4` on 31 workers is 124 rows against ~496 tasks.
+        //
+        // MUST PRECEDE Init, like every sizing call -- the magazines are built with the pool.
+        if (JLIB_STRNICMP(argv[a], "fibers=", 7) == 0) {
+            fiberBudget = (size_t)strtoul(argv[a] + 7, nullptr, 10);
+            haveFiberBudget = true;
+            continue;
+        }
         // floor=N -- THE AWAKE FLOOR, AND IT IS NOT hot=N. Two different knobs, briefly wired to the
         // same argument, which made every paste ambiguous:
         //   hot=N   -> K, the latency LANE. Changes WHICH QUEUE a lane push routes to.
@@ -3871,6 +4035,9 @@ int main(int argc, char** argv) {
     // BEFORE Init, like every placement setting: binding happens as each worker starts, so a call
     // after this point silently does nothing. Exclusive implies pin -- setting only the mask would
     // clear the cores for a worker that is still free to wander off them.
+    // BEFORE Init, with the other sizing calls. tiny and deep keep their defaults: the row
+    // under test uses Standard rows, and starving Tiny would break the reactor instead.
+    if (haveFiberBudget) JLib::TaskScheduler::SetFiberBudget(fiberBudget, 64, 1);
     if (floorPin) JLib::TaskScheduler::SetBandPinIncludesFloor(true);
     if (hotExcl) { JLib::TaskScheduler::SetHotWorkerPin(true); JLib::TaskScheduler::SetHotWorkerExclusive(true); }
     else if (hotPin) JLib::TaskScheduler::SetHotWorkerPin(true);
@@ -4046,6 +4213,10 @@ int main(int argc, char** argv) {
     // pool has to go after everything it would otherwise contaminate.
     // The "lane pressure" row is gone with adaptive K: it existed to ask whether the
     // controller ramps under sustained lane load, and there is no controller.
+    // AFTER the throughput and latency rows, BEFORE burst. It leaves the fiber magazine churned and
+    // the floor grown, and Section() resets the floor between rows but cannot un-churn a magazine --
+    // so it goes late, next to the other row that deliberately disturbs the pool.
+    Section("fiber-press");    BenchFiberPressure(sched);
     Section("burst");          BenchIdleBurst(sched, JLib::CorePref::Default);
     Section("burst");          BenchIdleBurst(sched, JLib::CorePref::Wide);
     if (runSweep) { Section("ParallelFor crossover sweep"); BenchParallelForCrossover(sched); }
