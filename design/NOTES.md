@@ -2626,3 +2626,52 @@ AND IT WEAKENS MY OWN ARGUMENT AGAINST floorpin. I used the ~45% to argue the ba
 be pinned. If the figure is an artefact of a parking pool, it says nothing about pinning threads
 that never park -- which is exactly what K and the base floor are. The K PIN result (27ms burst p99,
 2026-08-2x) is the evidence that still applies, because K never parked either.
+
+--------------------------------------------------------------------------------
+BAND PINNING IS A NULL RESULT AT TODAY'S FLOOR (measured 2026-09-03, Jay's box)
+--------------------------------------------------------------------------------
+
+Three arms, 31 workers, floor=2, K=2, `nosweep`:
+
+    A  hotexcl floorpin              K PARKED 10,314 times -- INVALID, see below
+    B  hotexcl floorpin neverpark    pinned + excluded, K never parks
+    C  neverpark                     the control: same never-park, no pinning
+
+A IS NOT A RESULT. The bench's own banner caught it: "K IS NOMINAL: 2 of 2 workers
+in [0,2) PARKED". Pinning and reserving cores for threads that then sleep is the
+whole-pool failure in miniature. Reservation does not imply never-park -- SetHotWorkers
+is K only, SetReservedNeverParks is the separate opt-in, deliberately decoupled.
+
+B vs C, which is the actual experiment, moves NOTHING:
+
+    latency p50/p99      0.70 / 1.00   vs   0.70 / 1.00
+    latency/cold         0.70          vs   0.70
+    io-pipe p50/p99      0.40 / 0.60   vs   0.40 / 0.70
+    io-pipe/ovl p50      4.50          vs   4.40
+    io-pipe/ovlv p50/p99 2.40 / 13.90  vs   2.50 / 13.90
+    frame DAG            4.13 us/graph vs   4.09
+
+Only `max` differs, and that row's own note says five identical runs spanned 27.5..197.9
+us of max (7.2x) with p50/p99 stable -- a max from one run measures the afternoon.
+
+**AND THAT IS AN UPDATE, not a non-event.** The 2026-08-05 claim is that pinning is
+HARMFUL (~45% wake latency, and 27ms burst p99 for the K pin). It is not reproducing as
+harmful. It is reproducing as NEUTRAL. Consistent with the awake floor having removed the
+mechanism -- see the entry above on that result predating the floor by three weeks.
+
+ONE RUN PER ARM, so this refutes "pinning is harmful today" rather than proving "pinning
+is exactly free". The defaults stay as they are: neutral is not a reason to change one.
+
+WHAT B vs A DID SHOW is the known never-park trade, reproduced almost exactly:
+io-pipe/ovlv p99 49.50 -> 13.90 (3.6x better), max 278.90 -> 38.90 (7.2x), latency/hot
+going from 1.37x of cold to 0.92x -- and ordinary latency p99 ~43% worse, frame DAG ~14%
+worse. Recorded previously as "io 2.9x p50 / 6.8x p99 better, ordinary latency ~35% worse".
+
+AND THE STALLS ARE STILL THE OS. Same run, the stall instrument:
+    stalls >50us: 5 of 20000   dispatch 4 | execution 0 | completion 1
+    SCHEDULER-IMPLICATED: 0 of 5      WHO was late: pool 4 | waiter 1 | pusher 0
+    0 of them bought a kernel wake
+The in-progress dump shows queuedTasks=0 and the last push target NOTIFIED with an empty
+inbox -- nothing stranded, nothing unreachable. Threads the OS did not run. This is the
+third independent time that counter has come back 0-implicated, and it is why no
+placement change moves these: there is nothing there for placement to fix.
