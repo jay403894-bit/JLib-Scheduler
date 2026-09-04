@@ -3245,7 +3245,7 @@ int main(int argc, char** argv) {
 "mean. Each worker owns an MPSC inbox plus a Chase-Lev deque; idle workers steal.\n"
 "\n"
 "usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
-"                      [hot=N] [floor=N] [ev|noev]\n"
+"                      [hot=N] [floor=N] [ev|noev] [hotpin] [hotexcl]\n"
 "\n"
 "AFFINITY POLICY (first token, optional -- omit it and you get `ideal`)\n"
 "  ideal     default, and the library's default. Windows: SetThreadIdealProcessor.\n"
@@ -3270,6 +3270,20 @@ int main(int argc, char** argv) {
 "            other section reaches the pool through a generic Push, which never\n"
 "            routes to the lane. They RUN by default; `noev` skips them and a later\n"
 "            `ev` on the same command line turns them back on.\n"
+"\n"
+"PLACEMENT EXPERIMENTS (both OFF by default, and both are experiments)\n"
+"  hotpin    confine workers [0,K) to their own cores (SetHotWorkerPin). MEASURED\n"
+"            WORSE ALONE: burst p99 27ms against a 150us baseline, and pin+RT worse\n"
+"            than RT alone. Pinning confines the worker without excluding anyone\n"
+"            else from its core, so an OS thread landing there becomes a WAIT\n"
+"            rather than a migration. Here to be REPRODUCED, not adopted.\n"
+"  hotexcl   the other half: every other thread masks those cores off\n"
+"            (SetHotWorkerExclusive; implies hotpin). This is the arrangement that\n"
+"            pinning alone was missing -- the userspace approximation of isolcpus.\n"
+"            It CANNOT exclude other processes, which is where it stops being the\n"
+"            real thing. Neither flag had a way in from this harness until now,\n"
+"            which is why the changelog records them as measured with no number\n"
+"            beside them. A knob nobody can turn is a result nobody can reproduce.\n"
 "\n"
 "THE TWO BAND KNOBS, WHICH ARE NOT THE SAME KNOB\n"
 "  hot=N     reserve N workers for the latency lane (SetHotWorkers). BENCH DEFAULT 2.\n"
@@ -3330,6 +3344,9 @@ int main(int argc, char** argv) {
     // hot=N: workers dedicated to the latency lane. DEFAULT 2, AND PINNED -- see the SetHotWorkers
     // call below for why a benchmark must not leave this to the controller.
     size_t hotWorkers = 2;
+    bool   hotPin  = false;   // SetHotWorkerPin       -- see the flag parsing below
+    bool   hotExcl = false;   // SetHotWorkerExclusive -- implies pinning
+
     size_t awakeFloor  = JLib::TaskScheduler::GetAwakeFloor();
     // floor=auto -- skip SetAwakeFloor entirely so the library's pool-size default applies.
     bool floorAuto = false;
@@ -3339,6 +3356,22 @@ int main(int argc, char** argv) {
     size_t splitCap = 0; bool haveSplitCap = false;   // splitcap=N  // floor=N; default = the shipped one
     for (int a = firstOpt; a < argc; ++a) {
         if (JLIB_STRICMP(argv[a], "nosweep") == 0) { runSweep = false; continue; }
+        // ---- THE TWO PLACEMENT FLAGS THAT HAD NO WAY IN ---------------------------------------
+        //
+        // SetHotWorkerPin and SetHotWorkerExclusive have shipped off-by-default since 5.0 and this
+        // harness could not set either, which is why the CHANGELOG records them as "measured" with
+        // no number beside them. A knob nobody can turn is a result nobody can reproduce.
+        //
+        // hotpin   confine workers [0,K) to their own cores. MEASURED WORSE ALONE -- burst p99 27ms
+        //          against a 150us baseline -- because pinning confines the worker without
+        //          excluding anyone else from its core, so a landing OS thread becomes a wait
+        //          instead of a migration. It is here to be REPRODUCED, not adopted.
+        // hotexcl  the other half: every other thread masks those cores off. Implies hotpin. This
+        //          is the arrangement pinning alone was missing, and the one with no recorded
+        //          number -- run it against the same command without it.
+        if (JLIB_STRICMP(argv[a], "hotpin") == 0)  { hotPin = true;  continue; }
+        if (JLIB_STRICMP(argv[a], "hotexcl") == 0) { hotExcl = true; continue; }
+
         if (JLIB_STRICMP(argv[a], "noev") == 0)    { runEvents = false; continue; }
         // nogrow: pin the awake floor at its base -- no push-side spill, no completion-side growth,
         // no redistribute. The A/B for the whole growth controller, in ONE binary, so the machine
@@ -3688,6 +3721,11 @@ int main(int argc, char** argv) {
     // range is therefore applied HERE, in the same place and after the same parse, rather than
     // inside the argument handler where ordering decides the outcome.
     // hotrange= is gone with the controller; K is whatever hot=N says.
+    // BEFORE Init, like every placement setting: binding happens as each worker starts, so a call
+    // after this point silently does nothing. Exclusive implies pin -- setting only the mask would
+    // clear the cores for a worker that is still free to wander off them.
+    if (hotExcl) { JLib::TaskScheduler::SetHotWorkerPin(true); JLib::TaskScheduler::SetHotWorkerExclusive(true); }
+    else if (hotPin) JLib::TaskScheduler::SetHotWorkerPin(true);
     JLib::TaskScheduler::SetHotWorkers(hotWorkers);
 
     // AFTER the K setters, deliberately. Neither of them touches this flag any more, but this is
@@ -3745,6 +3783,15 @@ int main(int argc, char** argv) {
            // one command-line word, and a table that does not name its arm is the easiest way to
            // compare two numbers that were never comparable.
            JLib::TaskScheduler::PushBatchWide() ? "  batchwide=ON" : "");
+    // PLACEMENT ARM ON ITS OWN LINE, and only when one is on. These change where every hot-band
+    // thread runs, so a paste that does not name them is not comparable with one that does -- the
+    // same reason batchwide is stamped above. Read from the library rather than the local flags, so
+    // the line reports what actually took effect rather than what was asked for.
+    if (JLib::TaskScheduler::GetHotWorkerPin() || JLib::TaskScheduler::GetHotWorkerExclusive())
+        printf("placement: hotpin=%s  hotexcl=%s  hotcpumask=0x%llX   <- EXPERIMENT, not the default\n",
+               JLib::TaskScheduler::GetHotWorkerPin() ? "ON" : "off",
+               JLib::TaskScheduler::GetHotWorkerExclusive() ? "ON" : "off",
+               (unsigned long long)JLib::TaskScheduler::GetHotCpuMask());
     // NO RESET HERE. It used to zero the park counters so the verdict "covered the measured run"
     // -- and it hid the fact that reserved workers park ONCE at startup and then sleep through
     // everything, reporting them as never parking at all. Lifetime totals are the honest number:
