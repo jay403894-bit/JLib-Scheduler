@@ -360,8 +360,9 @@ test** locks it, because no model reads `PickNextWorker`.
 
 ## Documentation
 
-- **[Architecture & Technical Reference](design/ARCHITECTURE.md)** — the K/F topology, the queue
-  kinds, hazard pointers and epochs, the reaper lifecycle, the fiber registry, the state machines.
+- **[Architecture & Technical Reference](DESIGN.md)** — the K/F topology, the queue
+  kinds, hazard pointers and epochs, the reaper lifecycle, the fiber registry, the state machines,
+  and the contracts a caller owes.
 - **[Design notes](design/NOTES.md)** — dated experiments, measurements, and the reasoning behind
   decisions that were reversed. The history, including what did not work.
 - **[The I/O lane](design/IO_LANE.md)** — the reserved band and completion routing.

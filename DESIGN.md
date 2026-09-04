@@ -1,680 +1,430 @@
-# JLib::Scheduler design notes
+# JLib::Scheduler — Architecture
 
-Everything that does not belong in a README: how the scheduler works, the contracts you have to
-honour, and the decisions that turned out to be wrong.
+**A fibers-only execution substrate in pure C++17.** No coroutines, no optional language tier, no
+idle policy to select. A task that waits suspends a *fiber*; the worker underneath it keeps running.
 
-- [Execution model](#execution-model)
-- [Core placement (CorePref)](#core-placement-corepref)
-- [Starvation prevention](#starvation-prevention)
-- [Task modes](#task-modes)
-- [Integration contracts](#integration-contracts)
-- [API patterns](#api-patterns)
-- [Synchronization and memory](#synchronization-and-memory)
-- [TaskDAG](#taskdag)
-- [Platform notes](#platform-notes)
-- [Design decisions, and the bugs that taught them](#design-decisions-and-the-bugs-that-taught-them)
+This document describes the **shape** of the runtime — what the pieces are and why they are separate.
+It deliberately contains almost no measurements: numbers age against hardware and belong in
+`design/NOTES.md`, where each one is dated and attached to the experiment that produced it. When this
+document says "measured", it means the number lives there.
 
 ---
 
-## Execution model
+## 1. The substrate
 
-The scheduler maps physical cores to logical workers and provisions everything from slabs, so a
-steady-state frame makes no allocations and no syscalls.
+**Hand-rolled context switching.** Fiber switching is assembly per architecture (x86-64, ARM64,
+Windows-on-ARM), not `ucontext` or Fibers API. The switch saves what the platform ABI requires and
+nothing more.
 
-### Topology
+**Call-graph transparency.** A fiber's stack is a real stack. A task that calls into a library, which
+calls into another, which waits, suspends the whole call graph and resumes it intact — no `async`
+colouring, no rewriting of the functions in between. This is the property coroutines could not
+provide and the reason the runtime is fibers-only.
 
-`Init()` queries the real CPU topology rather than assuming CPU numbering: LLC clusters, SMT
-siblings, and per-core efficiency class on hybrid parts. Windows reads
-`GetLogicalProcessorInformationEx`; Linux parses sysfs; macOS reads sysctl. Work-stealing prefers
-victims in the same cache domain before reaching across hardware boundaries, and skips busy SMT
-siblings, since stealing from a busy sibling recruits no new execution ports.
-
-### Slab allocator
-
-`new` and `delete` are deleted on `Task`. Tasks come from a fixed-slot slab with epoch-based
-reclamation: no runtime heap traffic, and `sizeof(Task) == 64` is enforced by `static_assert`.
-
-### Queues
-
-Each worker has split high/low priority deques plus an MPSC inbox that only the owner drains.
-Stealing prefers LLC-local peers, then an idle SMT sibling, then a random victim. Priority is queue
-order only. It never decides which core class runs a task -- see below.
+**Three task types became two.** `TaskType::Native` runs directly on the worker's OS stack and **must
+not suspend**; `TaskType::Fiber` owns a stack and may. `Coroutine` was removed in 5.0 — a fiber and a
+coroutine were two answers to one question, and carrying both meant every suspension point in the
+scheduler had two shapes to be correct in.
 
 ---
 
-## Core placement (CorePref)
+## 2. Topology: two bands
 
-Hybrid CPUs (Intel 12th-gen and later) mix performance and efficiency cores. Under `Hard` pinning
-the OS cannot place work by class, so the scheduler does it -- explicitly, and orthogonally to
-priority.
+Workers are partitioned by index into two bands sharing one packed 64-bit word.
 
-```cpp
-enum class CorePref : uint8_t {
-    Default,     // steered at the awake floor -- the cheap push, no kernel wake
-    Wide = 1,    // spread across the FULL pool, paying wakes to get capacity now
-    Any  = 0     // alias of Default
-};
+**K — the reserved lane.** The first `K` workers (clamped at 2) serve `Lane::LowLatency` work.
+They never park, so a completion reaches a running thread rather than paying a kernel wake.
 
-sched.CreateTask(fn, data, /*hiPri*/ false, TaskType::Native, CorePref::Wide);
-```
+**The invariant is about the INBOX, not about ordinary work.** A reserved worker does not read its
+own ordinary inbox — an inbox has exactly one legal consumer, so work placed there that its owner is
+forbidden to read is not slow, it is *unreachable*. Nothing may push ordinary work at K, and that is
+an invariant with a test of its own.
 
-**This was a core-CLASS axis until 5.0.0** (`P` / `E`, prefer performance or efficiency cores) and is
-a **breadth** axis now. `P`/`E` were requested by nothing that shipped and were only meaningful under
-`Hard` binding, which is measured ~45% worse on wake latency and is not the default -- so the hint
-was real only in a configuration nobody runs. What placement actually consumes is how *wide* to
-spread, which is measurable: on 16 heavy tasks from an idle pool, `Wide` ran on 29 workers against
-`Default`'s 12.
+**But K does run ordinary work, by STEALING it.** When the lane has been quiet for long enough, a
+reserved worker takes from other workers' deques — because a deque exists to be stolen from, and a
+band that never steals is two cores the pool paid for and does not get. Taking work is always safe:
+the thief is the one running it, so nothing can be stranded by the act of claiming it.
 
-The rules:
+**THE TWO FIBER MODES ARE TWO STRICT POLICIES, AND THEIR INVARIANTS DIFFER.** Not two arrangements
+of one guarantee — different rules about *who may resume a fiber, when and where* — which is why
+stealing is safe under each for a *different* reason:
 
-- Priority and placement are orthogonal. `hiPri` orders queues, `corePref` places work, and they are
-  never coupled. A coupled design (hiPri→narrow, loPri→wide) creates a structural starvation
-  gradient: sustained high-priority load would squeeze bulk work from both directions at once.
-- Preference is a hint at push and nothing at all afterwards. It selects the landing set; it never
-  makes a task unstealable. Every task is stealable by every worker -- which was already true for
-  every preference anyone used, and is now true unconditionally.
-- **It only reaches work that placement actually distributes.** A burst of independent tasks is
-  placed and then runs where it landed, so `Wide` is decisive there (12 → 29 participants on the
-  burst row). A recursively-split range is distributed by *stealing*, so the hint has nothing to act
-  on -- measured, both settings reach the same 28-31 of 31 workers. Ask for `Wide` when nothing else
-  is going to spread the work for you.
-- Owners run what they own. Explicit CPU affinity (DAG fork nodes, `Push(cpu, ...)`) overrides
-  `corePref` entirely: pinning to a named core is a stronger, more explicit request than a breadth
-  preference.
-
-`CorePref` is opt-in; `Default` is right for most work and is what every task gets unless it says
-otherwise. See [Platform notes](#platform-notes) for where placement means less than it looks.
-
----
-
-## Starvation prevention
-
-Two mechanisms, and one that was removed.
-
-**Steal fairness.** After 8 consecutive hiPri steals a worker is forced to scan loPri before
-resuming hiPri preference. Without it a hiPri stream keeps every thief busy while loPri work sits.
-
-**Priority inheritance.** When a high-priority task contends a lock held by a low-priority task, the
-holder is boosted for the duration and restored on unlock. Fiber-aware, via
-`Thread::GetCurrent()->currentRunningTask`. Use `SchedulerMutex` to get it.
-
-**Age-based promotion, removed.** An earlier version promoted loPri tasks after 50 ms in queue.
-Measurement showed it was vestigial: single-item stealing already un-starves a task the moment any
-thief takes it, so promotion only ever helped work that got re-queued. The fairness window above is
-the real anti-starvation mechanism. It stays out until a profile says otherwise.
-
----
-
-## Task modes
-
-Two execution paths. Choosing the wrong one deadlocks or corrupts queue state, so this is the one
-table worth memorising.
-
-| Mode | `TaskType` | Stack | Model | Use for |
-|---|---|---|---|---|
-| Native | `Native` (default) | worker's own stack | run to completion, never suspends | bulk math, raycasts, data sweeps, physics jobs |
-| Fiber | `Fiber` | pooled fiber stack | cooperative, may suspend | fork-join, anything that waits |
-
-`Native` tasks skip fiber acquisition and the context switch entirely, which is why per-job
-overhead stays small enough to run an entire physics engine's job graph through the pool.
-
----
-
-## Integration contracts
-
-### Fork-join requires a fiber
-
-A task that will call `WaitFor` must be created with `TaskType::Fiber`.
-
-If it is `Native`, the scheduler runs it directly on a worker thread. When it then calls `WaitFor`,
-suspension is attempted on a thread with no fiber under it -- that throws inside a `noexcept`
-`Execute()` and fail-fasts immediately, with no message (`STATUS_STACK_BUFFER_OVERRUN` on Windows).
-
-### Pinned services must not be fibers
-
-`PushImmediate(cpu_affinity, task)` removes a worker from the general pool, offloads its queue to
-its neighbours, and locks it to one task's loop. Service tasks launched this way -- audio mixers,
-network listeners -- must be `TaskType::Native`. Immediate-mode tasks sit outside the fiber pool, so
-a suspend/resume from one corrupts worker-queue boundary tracking.
-
-### Suspending never blocks a thread
-
-A fiber task that waits on an event suspends the *fiber*; the worker immediately picks up other
-work. That is the property that lets GPU-fence waits, physics barriers, and IO share one pool with
-compute without stalling cores, and it is the reason fibers exist here at all.
-
-### From a bare thread, hold nothing across a blocking call into the scheduler
-
-A bare thread cannot suspend, so when it blocks on a `SchedulerMutex`, a `SchedulerSemaphore`, a
-condition variable or `WaitFor`, it runs stolen Native tasks instead of burning the core. That is
-work-conserving and it has a consequence worth stating plainly: **acquiring a lock executes user
-code**. Whatever the caller holds can be demanded by the task it runs, and the interleaving is
-chosen by the scheduler, so lock-ordering discipline in the caller's own code cannot prevent it.
-
-The concrete failure is self-deadlock. A thread holding mutex A waits on B, helps, and the helped
-task asks for A. A is owned by that same thread, which is stuck inside the task, so nothing can ever
-release it. No fiber is involved.
-
-Three guards bound this (see `ContendedSpinStep`): a thread owning a `SchedulerMutex` stops helping
-entirely, helping never nests more than one level deep, and a thread that has made no progress for a
-long time yields rather than spinning. `SchedulerSemaphore::ScopedPermit` opts a lock-like permit
-into the first of those, which raw `Wait`/`Signal` cannot do because a permit has no owner.
-
-**None of that makes deadlock impossible, which is why the rule above is the actual protection.** A
-helped task can block on something the scheduler cannot see: a plain `std::mutex`, a file read, a
-GPU fence, a user's own condition variable. Ownership tracking reaches none of those. Hold nothing,
-and the question does not arise.
-
-Fibers are exempt from all of it. A fiber suspends on contention and never enters the helping path,
-which is the main reason to prefer running work as tasks rather than blocking a bare thread.
-
-### Nothing thread-derived may be held across a suspend point
-
-The direct consequence of the above: a suspended fiber resumes on whatever worker picks it up, which
-is usually not the one it left. So any value that identifies or belongs to a thread, a `Thread*`, a
-thread index, the address of a `thread_local`, is stale the moment a suspend returns. Re-fetch it,
-never carry it across.
-
-This is not a style rule, and it bites harder on AArch64 than on x86-64. Reaching a `thread_local`
-on x86-64 goes through `%fs:`-relative addressing that is re-evaluated at every access, so a stale
-one is hard to construct. AArch64 has to materialize the thread pointer from `TPIDR_EL0` into a
-general register, which the compiler may hoist into a callee-saved one, and a correct context switch
-then faithfully preserves it across the migration. Same for Windows on ARM64 via `x18`. The bug is
-invisible on the platform most people develop on and live on the one they ship to.
-
-The scheduler's own thread-local state is structured so this cannot arise rather than trusting the
-rule. Epoch slots are the example worth copying: `Epochs::ThreadSlot(tid)` exists only as the
-fallback for callers that are *not* on a fiber and therefore cannot migrate, while a fiber's epoch
-slot is registered per-fiber in `GlobalFiberPool` and travels with it. `TaskAllocator`'s per-thread
-free-list cache is safe for the other available reason, `Alloc` and `Free` contain no suspend point,
-so the window does not exist.
-
----
-
-## API patterns
-
-### Fork-join
-
-```cpp
-JLib::WaitGroup wg;
-
-// MUST be TaskType::Fiber: this task suspends while waiting on children
-Task* parent = sched.CreateTask(ParentWork, data, /*hiPri*/ 1, FiberSize::Standard, TaskType::Fiber);
-parent->waitGroup = &wg;
-wg.n.fetch_add(1, std::memory_order_release);   // count BEFORE push -- workers decrement on completion
-sched.Push(parent);
-
-sched.WaitFor(wg);   // fiber callers park; main spin-helps by stealing Native tasks
-```
-
-### Pinned service
-
-```cpp
-// Runs raw on the pinned thread, so it MUST be TaskType::Native
-Task* audioService = sched.CreateTask([](void*) {
-    while (engineRunning) {
-        UpdateAudioBuffers();   // OS waits or atomics -- never a fiber yield
-    }
-}, nullptr, /*hiPri*/ 1, FiberSize::Standard, TaskType::Native);
-
-sched.PushImmediate(/*coreID*/ 2, audioService);   // evicts core 2's queue, locks the loop to it
-```
-
-### ParallelFor
-
-`ParallelFor(start, end, chunk, fn)` picks between flat dispatch, where the caller spawns every
-chunk, and **slice-stealing**, where one task per worker pulls `[lo, lo+grain)` off a shared cursor
-until the range is consumed. Flat wins up to about 2 tasks per worker; past that its O(#tasks)
-serial spawn on one thread collapses.
-
-That crossover used to hand off to recursive fork-join splitting, which built the spawn tree with
-the pool and measured roughly 8x faster than flat at ~15k tasks. Slice-stealing replaced it in 1.4
-because it removes the per-chunk task entirely -- fork-join distributes the *spawning* but still
-creates one task per chunk, at ~80-140 ns each for a slab slot, a push and an epoch retirement.
-Measured against it: 1.7-1.9x on a uniform body, 1.2-1.3x when cost varies ~20x across the range.
-`ParallelForFJ` remains public for callers who want the fork-join tree directly; it is simply not
-what `ParallelFor` selects any more.
-
-Whether to parallelize at all is decided by measurement, not element count: it runs a small prefix
-inline, times it, extrapolates, and only splits if the estimated work clears ~75 µs. **That probe is
-the one thing `ParallelRange` does not do** -- on a 20,000-item job the prefix is ~312 items run
-serially, about a third of the wall time, which is worth skipping when you already know the range is
-large and worth keeping when you do not. See
-[Choosing a range API](README.md#choosing-a-range-api-parallelfor-vs-parallelrange), and see
-[the crossover note](#parallelfor-is-gated-on-measured-work-not-element-count) below for why the
-element count was the wrong unit, and for the limitation that remains.
-
----
-
-## Synchronization and memory
-
-Use `SchedulerMutex` instead of `std::mutex` where a lock may be held by a low-priority task while a
-high-priority task waits -- it carries the priority inheritance described above. Scheduler-internal
-locks and locks used within a single priority level do not need it.
-
-While spinning on a contended `SchedulerMutex` or `SchedulerConditionVariable`, the spinner helps
-drain the pool by stealing `Native` tasks (class-vetted against the core it is actually standing on)
-rather than burning cycles.
-
-You never call `delete` on a task. On completion the scheduler returns the slot to the slab, guarded
-by epoch-based reclamation. This is enforced rather than documented: `operator delete` is deleted on
-`Task`.
-
----
-
-## TaskDAG
-
-`TaskDAG` expresses execution order -- physics before render submission -- without blocking
-primitives.
-
-### Memory
-
-Completion hooks live in the `TaskNode` rather than the `Task`, because the node doubles as the
-trampoline's context and outlives it. That is what keeps `Task` at exactly 64 bytes. Firing a node
-performs no heap allocation; nodes come from the slab and retire through EBR, which is what makes
-the lock-free dependents lists safe against concurrent readers.
-
-Root discovery and cycle checking use a single-threaded build-phase vector that `Submit()` clears.
-After submission the graph is fully decentralized: nodes are autonomous and free themselves.
-
-### Node types
-
-**Worker nodes** (`CreateNode`) distribute across the stealing pool, with optional priority and
-explicit `cpu_id` pinning.
-
-**Main-thread nodes** (`CreateMainNode`) route through `PushMain` and run only when the main thread
-pumps `ProcessMainThread`. Anything awaiting a graph that contains one must use `WaitForMain` -- a
-plain `WaitFor` hangs forever on a node nothing is servicing.
-
-**Gates** (`CreateGate`) are structural nodes with no payload. AND fires when every dependency
-completes; OR fires on the first and short-circuits the rest. Gates nest, so `(A && B) || C`
-composes naturally.
-
-### Lifecycle
-
-```
-[ Build ] ──► [ HasCycle ] ──► [ Submit() ] ──► [ trampoline loop ]
-(AddDependency) (Kahn's)       (fire roots)     (OnTaskFinishedWrapper)
-```
-
-`Fire()` wraps the task's fn/data with the completion trampoline. A worker runs the payload.
-`OnTaskFinished()` atomically decrements dependents' counters, and satisfied dependents fire
-immediately -- work cascades through the pool with no coordinator.
-
-```cpp
-JLib::TaskDAG graph(sched);
-
-Task* inputTask   = sched.CreateTask(UpdateInput,          nullptr, 1, FiberSize::Standard, true);
-Task* physicsTask = sched.CreateTask(IntegratePhysics,     nullptr, 1, FiberSize::Standard, true);
-Task* renderTask  = sched.CreateTask(SubmitRenderCommands, nullptr, 1, FiberSize::Standard, true);
-
-TaskNode* inputNode   = graph.CreateNode(inputTask);
-TaskNode* physicsNode = graph.CreateNode(physicsTask);
-TaskNode* renderNode  = graph.CreateMainNode(renderTask);  // graphics context wants the main thread
-
-graph.AddDependency(renderNode, inputNode);    // render waits on both (implicit AND)
-graph.AddDependency(renderNode, physicsNode);
-
-if (!graph.Submit()) { /* cycle detected -- graph refused safely */ }
-```
-
----
-
-## Platform notes
-
-### Where the four targets come from
-
-The context switch is hand-written assembly per ABI: MASM for Win64, GAS for System V and for
-AAPCS64. A new *architecture* therefore needs a new `ContextSwitch` and a matching `Fiber::Init`,
-not a compiler flag.
-
-Verified in CI on every push: Windows x64 (MSVC), Windows ARM64 (MSVC), Linux x86-64 (GCC), Linux
-AArch64 (GCC), macOS arm64 (AppleClang). AArch64 on Android/Termux (Clang) is verified by hand. The
-benchmark suite passes on all of them, fibers suspending and resuming through the switch under the
-real scheduler, and the AAPCS64 switch has a standalone ABI harness (`tests/fibertest_aarch64.cpp`)
-run at `-O0` and `-O2` on both POSIX ARM64 platforms; Windows ARM64 has its own isolated harness,
-`tests/fibertest_win_aarch64.cpp`, run before the scheduler suite so a bad switch localises to the
-exact register that failed instead of surfacing as an unexplained scheduler crash.
-
-The ARM64 results agreeing across three toolchains, three libcs and two object formats
-(GCC/glibc/ELF, Clang/bionic/ELF, AppleClang/libc++/Mach-O) is what makes the ABI claim worth
-anything. Raspberry Pi is the same configuration as the CI ARM64 runner and needs nothing extra.
-32-bit targets are not supported and are not planned.
-
-Platform code lives in `src/win32/`, `src/posix/` (Linux, Android) and `src/darwin/` (macOS). The
-ABI layer under `src/posix/<arch>/` is shared by every POSIX target, because the calling convention
-belongs to the instruction set and not to the kernel. `include/platform.h` is the only place that
-tests OS and architecture.
-
-Windows on ARM64 is supported, not refused -- verified on a real `windows-11-arm` GitHub Actions
-runner, a required leg (not allowed-to-fail) since five consecutive green runs of the isolated ABI
-harness plus the full scheduler suite. It needed a third hand-written context switch,
-`src/win32/aarch64/ContextSwitch.asm`, because MSVC's ARM64 assembler is `armasm64`, whose syntax is
-unrelated to the GAS syntax the POSIX AArch64 switch is written in -- this is the one place the
-"OS axis is orthogonal to the arch axis" claim above does not fully hold, since a calling convention
-belongs to the (OS, ARCH) pair, and Windows needed its own assembler even though the ABI underneath
-is close to identical.
-
-Two things that sound like they should be true here are not. There is no TEB fixup: an earlier
-version of this document claimed a Windows fiber switch must update the TEB's stack bounds "the way
-the x64 MASM does" -- there is no such fixup anywhere in `src/win32/`, on x64 or ARM64, and the claim
-was wrong on both platforms it was made about. And `Fiber::Init` did not need a Windows-ARM64-specific
-version: `src/posix/aarch64/FiberInit.cpp` is reused verbatim, because Windows ARM64 and AAPCS64 agree
-on the callee-saved register set and frame layout closely enough that only the assembler syntax and
-unwind format differ, not the ABI contract itself. `x18` is never touched by the switch, and that is
-load-bearing rather than incidental: it is the TEB pointer on Windows, and fibers here migrate between
-worker threads, so saving it into a fiber frame and restoring it after a migration would install a
-stale TEB on whichever thread resumed that fiber next.
-
-### ucontext is not used, and that is a measurement
-
-`swapcontext` saves and restores the signal mask, which is a `sigprocmask` syscall on every switch:
-120 ns against 8 ns for the hand-written version. Its POSIX deprecation is the lesser reason.
-
-### Worker binding
-
-Under `Hard`/`PhysicalOnly`, worker *i* binds to logical CPU *i+1* with main on CPU 0. That is what
-makes the topology maps true rather than guesses.
-
-Under the default `Ideal`, Windows uses `SetThreadIdealProcessor` (a hint) and Linux binds to the
-whole LLC domain -- a mask, which Windows has no equivalent of. That mask ends up exactly as tight as
-the hardware warrants. On multi-L3 parts (Ryzen CCDs, Threadripper, EPYC) it genuinely binds, and
-that is where it matters, because a worker migrating across cache domains pays inter-die latency on
-every steal. On single-L3 parts the domain is every CPU, so it binds nothing -- correct rather than
-missing, since there is no domain to protect. It does not keep `siblingQIndex` true on Linux; the
-kernel can still migrate within the LLC.
-
-`Ideal` is the default because `Hard` measured worse: about 45% on wake latency and about 2x on the
-frame DAG, because a wake has to wait for one specific, possibly parked core instead of landing on
-any awake core in the domain. That contradicts the usual "engines pin everything" advice, and it
-contradicted this project's own earlier position.
-
-### Pool size
-
-Auto size is `hardware_concurrency − 1`: main on CPU 0, workers on the rest. That is only safe
-because the JLib stack keeps *busy* foreign threads at zero by construction -- input is Raw Input
-riding the app's existing message pump, and gamepad support is opt-in and dynamically loaded
-precisely because XInput spawns its own threads.
-
-The rule is to reserve one core per foreign thread with measured busy time, never per thread that
-merely exists. The one library that earned a reservation was GameInput, whose always-polling worker
-showed a dose-responsive one-core deficit. JLib audio's remaining foreign thread -- its backend's
-device-IO thread, event-driven at ~100 wakes/s and microseconds of memcpy per wake -- measurably
-costs nothing, so audio does not change the default. `Init(N)` honours explicit sizes up to full
-`hardware_concurrency`.
-
-### Transient oversubscription is accepted on purpose
-
-Pinned workers cannot dodge threads no user-mode process controls: GPU driver workers, DXGI, DWM,
-all waking for microseconds at unpredictable times in every process on the machine. Desktop Windows
-has no core isolation -- that is a console feature -- so the only correct handling is the one the OS
-already provides, which is brief preemption.
-
-Profilers report this faithfully and it looks alarming. VTune's Thread Oversubscription metric
-counts spin-waiting threads as running, and in a mostly-idle game nearly all CPU time *is* short
-spin and wake bursts. So the metric reads high while sampled concurrency never approaches core count
-and frame times do not move with pool size. The number is real by Intel's definition; it describes a
-designed trade, not a defect.
-
-### CorePref does nothing outside Windows
-
-P/E classification reads each core's `EfficiencyClass` from `GetLogicalProcessorInformationEx`.
-Linux has no single equivalent -- the available signals are a perf-driver artifact
-(`/sys/devices/cpu_core` vs `cpu_atom`) or CPPC `highest_perf` -- so it reports every core as equal.
-
-That includes big.LITTLE and DynamIQ AArch64, where the heterogeneity is realer than on any x86
-hybrid part: a phone typically spans three capacity tiers rather than two. Android is nonetheless
-the wrong place to add it, because the platform's cgroups own thread placement and affinity requests
-from an unprivileged app are routinely ignored. It arguably matters less on Linux generally, since
-the kernel does hybrid placement itself via ITMT -- a class table there second-guesses a scheduler
-that already knows, where on Windows nothing else is making the call.
-
-An explicit `P` or `E` request is therefore silently a no-op on those platforms. That is safe rather
-than broken: preference is a hint, so an empty class set spills and the task runs full-pool. But do
-not build a design around it and expect it to hold cross-platform.
-
-**macOS and QoS.** macOS has no thread-affinity API on arm64, but Apple provides a different
-mechanism for the same intent: `pthread_set_qos_class_self_np` with `QOS_CLASS_USER_INITIATED`
-biases toward P-cores and `QOS_CLASS_UTILITY` toward the efficiency cluster. That is a hint needing
-no index-to-level mapping, so the missing piece on macOS -- sysctl publishes per-level CPU counts but
-not which CPU is which -- stops being a blocker.
-
-The scheduler still sets no QoS at all, and that is a decision. Workers inherit the QoS of whatever
-thread calls `Init()`, and that inheritance is the configuration mechanism: an app wanting a
-particular class sets its own before initialising and the pool follows, with no API to learn. QoS is
-a power and thermal choice as much as a scheduling one, and a host running at `UTILITY` because it
-is a background exporter has decided something about battery and fan noise. A job system that
-silently promoted its workers would be overriding that -- the same argument that justifies
-`AffinityPolicy::None` elsewhere.
-
-If explicit tiering is ever added it must be opt-in and gated more tightly than affinity, for two
-reasons that have nothing to do with Apple. Stealing is preference-blind, so a `Default` task will
-land on a `UTILITY` worker -- which on macOS is a deprioritised, throttleable thread rather than
-merely a slower core. And tiering shrinks the usable pool: a class-preferred task can only be placed
-on its subset, which today is survivable only because preference spills to the other class, and
-under QoS the spill target is throttled rather than just slower.
-
-### Other limits
-
-Processor group 0 only, so at most 64 logical CPUs. Fine for desktops and workstations; dual-socket
-machines need work this project does not do.
-
-Tasks are 256-byte slab slots, so lambda captures beyond about 192 bytes fail a `static_assert`.
-Capture pointers, not payloads.
-
----
-
-## Design decisions, and the bugs that taught them
-
-Negative results with receipts.
-
-### Do not route large uniform ranges to the cursor
-
-`ParallelFor` has two implementations -- the lazy **splitter** (recursive halving, untaken splits run
-inline) and `RunCursorRange`, a shared atomic cursor with one task per worker. The obvious-looking
-optimisation is to pick between them by shape: send big uniform ranges to the cursor, keep the
-splitter for ragged ones. The splitter-vs-cursor sweep appears to support it. It should not be done,
-and the reason takes two tables rather than one.
-
-**First: that sweep does not hold a sign.** Four runs of the same binary, `heavy`, ratio is
-splitter/cursor so `>1` means the cursor wins:
-
-| N | 1000 | 4000 | 20000 | 100000 | 200000 | 400000 | verdict printed |
-|---|---|---|---|---|---|---|---|
-| run 1 | 7.47 | 1.12 | 1.06 | 1.50 | 1.49 | 1.59 | cursor ahead from 100000 |
-| run 2 | 7.41 | 0.57 | 0.58 | 0.51 | 0.76 | 0.77 | splitter ahead throughout |
-| run 3 | 7.42 | 0.81 | 0.82 | 0.76 | 0.87 | 0.80 | splitter ahead throughout |
-| run 4 | 7.28 | 0.78 | 0.99 | 0.89 | 0.92 | 0.79 | splitter ahead throughout |
-
-Three to one for the splitter, and run 1 is the one a routing rule would have been built on. Most
-cells in these runs carry the harness's own `?` marker -- the same-vs-same control moved more than
-5% on its own -- so the table is directional and nothing in it should be quoted to two digits.
-
-**Second, and this is the part that settles it: the cursor only wins where parallel loses.** Put the
-crossover sweep (speedup against SERIAL) beside the splitter-vs-cursor ratio at the same N:
-
-| N=4000 | vs serial | splitter vs cursor |
+| | `Migrate` | `Pin` |
 |---|---|---|
-| trivial | **0.04x** -- parallel is 25x SLOWER | cursor ahead |
-| light | **0.19x** -- parallel is 5x slower | cursor ahead |
-| medium | **3.50x** -- parallel wins | splitter ahead |
-| heavy | **9.79x** -- parallel wins | splitter ahead |
+| who may resume it | **any worker** — near a free-for-all | **exactly one**, the worker it was bound to |
+| the exchange | gives up safe `thread_local` | buys safe `thread_local`, pays in promptness |
+| where a resumption goes | ordinary placement, which masks `[0,K)` | that worker's **resume inbox**, never a deque |
+| why K may steal | the resumption is on the floor, reachable by anyone | **stealing is not resumes** — a steal takes fresh work off a deque; a resume is delivered to one consumer that reads it |
 
-Every cell the cursor takes is a cell that should not have fanned out at all. The cursor being
-"3.8x better" at trivial N=4000 means it loses to serial by 6x instead of by 25x. That is not a win
-worth a branch, and a router built on it would be optimising the cases whose correct answer is
-"run it serially".
+The `Pin` row is the one worth reading twice. A reserved worker stealing pinned work cannot strand
+its resumption, because the resume never travels by the route stealing uses — the two paths do not
+meet. That is why the fiber mode does not gate stealing, and a gate added on the opposite assumption
+was removed once the drain was actually read.
 
-**So the splitter is the default and the only path, and its bad cells are a GATE problem rather than
-a path-selection problem.** The gate is `N < workers * minItersPerWorker` -- on 31 workers that is
-1984, so N=2000 clears it by sixteen elements, and there `trivial` measures 0.05x while `heavy`
-measures 7.8x. Moving the threshold cannot separate them: N is identical and only the body differs.
-That is the stated price of being probe-free, not a defect in the splitter.
+A reserved worker therefore reads its lane inbox, its resume inbox, and other workers' deques. It
+never reads its own ordinary inbox, and nothing ever puts ordinary work there.
 
-**The one idea left, and why it is not the probe returning.** `GrowFloorIfLongBody` already resolves
-the same tension elsewhere -- *"a completion knows what a push can only guess"* -- by using the
-duration of a body it had to run anyway. The equivalent here is to measure the FIRST LEAF, project it
-across the remaining leaves, and stop splitting when the projection falls under dispatch cost. One
-clock read per range, no speculative sampling. The catch is structural: `RunLazyRange` splits to
-grain before it runs any leaf, so at the moment of decision there is nothing measured yet. Making
-one available means restructuring to *split one, run one, then decide* -- which is close enough to
-the removed probe that it has to be proven on the crossover sweep before it is believed, not
-argued into place.
+**F — the awake floor.** A *bounded, adaptive* number of ordinary workers held unparked, grown by a
+controller under load and shed when the burst ends. This is the bounded version of what a pool-wide
+"never sleep" policy used to do: the same store-instead-of-futex wake path, for a few workers, given
+back when it is not earning.
 
-### A dense bounded key is a better index than any hash of it
+**The bands are one word.** K and F were separate mechanisms with separate ideas of where the
+boundary was, which produced a family of bugs that were all correct at K=0. One atomic word, read
+once per decision.
 
-The scheduler shipped a `LockFreeList` and a bucketed `LockFreeHashMap` for two years and then
-removed both, because each of their consumers independently found a better structure:
+---
 
-- **Event's waiter index** became a flat array indexed by `Fiber::poolIndex`. The keys were never
-  arbitrary -- a parked task always holds a fiber, fibers have dense stable indices, and a fiber
-  parks on one event at a time. A perfect hash already existed. The general map was strictly worse:
-  it allocated a cell per suspend, on a path documented as allocation-free.
-- **`TaskNode::dependents`** became pointer-linked edges in DAG-owned chunk storage. Graph
-  construction is single-threaded by contract, so the lock-freedom was unreachable in practice --
-  and the list cost four slab slots per node before a single edge existed.
+## 3. Dispatch and the permit machine
 
-The generalisable part: **reach for a hash map when the key space is genuinely arbitrary and
-concurrent.** When the keys are already a dense bounded index, they *are* the index, and any hash of
-them is a slower spelling of an array subscript. Both of these looked like map problems and neither
-was.
+**A 64-bit atomic bitmap of awake workers**, so placement is a bit scan rather than a walk. A pusher
+prefers a worker that is already awake, which costs the pusher nothing — an awake worker never
+advertises that it is going to sleep, so the push takes a skip instead of a notify.
 
-### A structure the library hands out must not share the library's allocator
+**The permit machine** is the park/wake handshake: a small lock-free state machine per worker
+(`EMPTY / NOTIFIED / GOING_TO_SLEEP / YIELD`) with a latched permit, so a wake that arrives during
+the commit to sleep is consumed rather than lost. `YIELD` is a fourth state rather than a flag: a
+worker that is runnable but momentarily off-core is neither awake nor parked, and collapsing it into
+either loses the distinction that makes re-aiming a push worthwhile.
 
-The same two containers were also the tree's only headers that called themselves general-purpose
-while taking a `TaskAllocator&` and reclaiming through `EpochManager::RetirePtr` -- so anyone
-reaching for "a lock-free hashmap" would have linked a fiber scheduler to get one.
+**Park reads the queue, never the hint.** The hint is an optimisation; the queue is the truth. Every
+lost-wake bug in this project's history came from a park predicate that trusted a summary.
 
-**The coupling was not the defect.** `TaskDeque`, `TaskMPSCQueue`, `TaskNode` and `Coroutine` all
-share the slab and the epoch domain, and that sharing is exactly why they are fast: no `malloc` on
-any hot path, one reclamation scheme to reason about. They are internal and never claimed otherwise.
-The defect was one structure wearing both labels.
+---
 
-Shipping them properly would have meant templating on an allocator *and* a reclamation policy whose
-default works with no infrastructure at all -- hazard pointers, RCU, or leak-on-remove. That is a
-different data structure, not a relocated file, and a Harris list plus a fixed-bucket map is not
-worth it: a sharded `unordered_map` behind a `shared_mutex` beats bucket-of-linked-lists on nearly
-any real workload, in twenty lines. The contrast is in this repo -- `ThirdParty/concurrentqueue.h`
-is genuinely general-purpose and needs nothing injected.
+## 4. Work distribution: two queue kinds, on purpose
 
-### Fibers rather than C++20 coroutines
+**Inboxes are unstealable staging.** One legal consumer — the owning worker. Intrusive MPSC (Vyukov),
+so a push is a store and a link. Work arrives here and is republished in batches into the deque.
 
-Coroutines colour the call chain. A function can only suspend if it was written as a coroutine, and
-so must every frame between it and the scheduler -- `co_await` propagates one frame at a time, and
-any ordinary function in the middle stops it dead. A fiber suspends the stack, so the wait can sit at
-the bottom of a call chain whose middle frames are plain functions, including ones you do not own.
+**Deques are stealable execution queues.** Chase–Lev, owner pushes and pops one end, thieves take the
+other. A deque exists *so that other threads can steal from it*; an inbox exists so that they cannot.
 
-It is easy to overstate this, so: the suspend call is still yours. A third-party function that blocks
-internally on a mutex or a syscall blocks the worker thread, and no fiber rescues you -- the library
-has to hand you a callback, a visitor, or a polling hook first. What fibers remove is the requirement
-that everything *between* your suspension point and the scheduler be a coroutine. Given a physics
-library that takes a visitor callback, your callback can wait on a `WaitGroup` with the library's
-frames sitting untouched in the middle of the stack. Coroutines cannot express that without
-rewriting the library.
+**Steal hints.** A thief that probes every victim's deque endpoint finds almost nothing and burns
+cache lines doing it. A word of hint bits, published by the owner and read by thieves, turns a scan
+into a test — and it is also the park gate: nothing advertised anywhere means nothing to steal.
 
-The same applies to code you do own, because colouring is transitive: making one leaf function
-suspend means converting every caller above it. Recursive algorithms are the sharpest case. This
-scheduler's own fork-join benchmark calls `WaitFor` at every level of a recursive split, which is
-ordinary code on a fiber and a whole-program refactor with coroutines.
+**The lane intake.** A shared MPMC (moodycamel) that lets any producer hand lane work to the reserved
+band without choosing a worker, so a burst does not have to be bound to a target at push time.
 
-Two smaller differences. A suspended fiber has a real stack, so debuggers walk it and profilers
-attribute samples to it, where a suspended coroutine is a heap object whose call history is gone.
-And fiber stacks are pooled at fixed cost from a guard-paged arena rather than allocated per
-invocation and elided if the compiler manages it.
+**One placement path.** Everything — new work and resumptions alike — goes through `PushTarget`,
+which masks the reserved band, marks queued work and notifies. A second placement path that skipped
+those rules is exactly how work became unreachable.
 
-Where coroutines do fit they are cheaper -- no stack, no switch, a frame sized to its locals -- and
-they are standard C++, whereas fibers cost a hand-written context switch per ABI. That is exactly
-why this scheduler is a hybrid rather than fibers-everywhere.
+---
 
-### The hybrid is a correctness boundary, not a performance dial
+## 5. Memory
 
-A `Native` task runs on one OS thread from start to finish and cannot migrate, because it has no
-suspension point to migrate across. Everything thread-affine is therefore correct inside it:
-`thread_local` stays consistent, `std::this_thread::get_id()` is stable, thread-bound OS resources
-(COM apartments, GL contexts, per-thread allocator arenas) behave, and a plain `std::mutex` can be
-locked and unlocked normally. Unlocking from a different thread than locked it is undefined
-behaviour, and that is exactly the trap a migrating task sets.
+**Task allocator.** Size-classed slabs for `Task` objects, freeing routed by *address* so the caller
+never has to remember which class it came from. It **grows on exhaustion rather than failing** — the
+lesson that took it from a 176 MB pre-sized pool to a 4 MB growing one while removing a failure mode
+rather than papering over it.
 
-None of that holds on the fiber path, where a task may suspend on one worker and resume on another,
-so TLS read before a wait and after it can belong to different threads. That is why the scheduler
-ships fiber-aware synchronization and why the contracts say not to hold a raw `std::mutex` across a
-suspend.
+**Fiber stack arena.** One reservation of address space; each stack is a region committed on
+allocation with its lowest page left unbacked as a **guard page**, so overflow faults instead of
+corrupting a neighbour. Usable depth is therefore one page less than the region.
 
-The payoff is that middleware written for an ordinary thread pool drops straight in. JLib's Physics3D
-drives Jolt Physics through a `JPH::JobSystem` adapter over this scheduler, with every Jolt job
-submitted as `TaskType::Native`. Jolt is pure compute, never suspends, and keeps per-thread temp allocators,
-so it needs exactly the guarantee the default path gives -- it runs as if it were on enkiTS and never
-learns fibers exist. Under a fiber-everything scheduler that integration is a hazard instead.
+**Three stack classes**, because one size is either wasteful or unsafe:
 
-That generalises to three shapes, which cover most of what an engine links:
+| class | for |
+|---|---|
+| `Tiny` | I/O continuations — wake, read a completion, finish. Page-denominated (2 usable pages). |
+| `Standard` | everything else. |
+| `Deep` | work that recurses past a standard stack. Opt-in, provisioned with a small floor. |
 
-- Libraries with a pluggable dispatcher -- Jolt's `JobSystem`, PhysX's `PxCpuDispatcher`, Bullet's
-  `btITaskScheduler`, Box2D v3's task callbacks. A thin adapter submitting `TaskType::Native` tasks
-  is enough.
-- Poll-driven libraries -- an ASIO `io_context::poll()`, an `enet_host_service` with a zero timeout.
-  Pump it from one `TaskType::Native` task per frame.
-- Blocking service loops -- a network listener or audio mixer that wants to own a thread. Use
-  `PushImmediate` with `TaskType::Native`, which reserves a worker for it.
+**Stacks are never returned to the OS in steady state.** They circulate through the pools — mapped,
+committed and cache-warm. Nothing calls `VirtualFree` or `munmap` on a stack during normal operation.
 
-So you are not cut off from the ecosystem in exchange for having fibers, which is the trade a fiber
-scheduler usually asks you to make. This is also where the design departs from marl and
-FiberTaskingLib rather than from coroutines: those run every task on a fiber, imposing the migration
-discipline on the overwhelming majority of tasks that never suspend.
+### Thread-local fiber caches
 
-### No batch steal
+**Every worker holds its own cache of fibers, one per stack class.** Acquiring a fiber is a pop from
+a structure only that worker touches; releasing one is a push back into the cache for the class the
+fiber belongs to. The global pool is consulted only on a miss.
 
-A lock-free batch steal claims `[t, t+n)` under one `top` CAS, but the owner's `pop_bottom` takes
-from the other end without touching `top` for non-last items. A batch can therefore double-claim a
-task the owner also popped. That was a real use-after-free heisenbug, not a thought experiment.
-Single-item stealing is standard, fast, and correct. There is no `steal_batch`.
+This is what keeps fiber acquisition off the contended path. A single global free-list would put
+every worker on one cache line for an operation that happens on *every task that can suspend* — the
+allocator would become the bottleneck the work-stealing exists to avoid.
 
-### Predicated steal, not peek-then-steal
+**Refill is a batch, not an item.** A cache that runs dry takes a run of fibers from the global pool
+in one operation, so the cost of touching shared state is amortised across many acquisitions rather
+than paid per fiber. The batch path writes straight into the cache's storage; an earlier version
+returned a `std::vector` and paid a heap allocation per refill.
 
-Class-aware stealing has to vet candidates, but a separate peek and steal is a TOCTOU race: another
-thief advances `top` in between and you claim a task you never inspected. `steal_if` evaluates the
-predicate between the buffer read and the CAS, so declines cost zero atomics and claims are exactly
-the vetted slot.
+**The class travels with the fiber.** A released fiber goes back to the cache for *its own* class, so
+a `Tiny` stack cannot drift into the `Standard` pool and quietly shrink what a standard task gets.
+The per-class split is what makes three stack sizes safe to mix in one pool.
 
-### Priority is orthogonal to placement
+**Caches are primed at startup** rather than filled lazily, so the first task on a cold worker does
+not pay for the pool.
 
-The first P/E design coupled hiPri→P and loPri→E. Analysis killed it before it shipped: under
-sustained hiPri load, spill floods the E-workers' hiPri lanes, and since every worker drains hiPri
-first, bulk work gets squeezed by placement and priority simultaneously. Worse, it silently
-invalidated the reasoning that justified removing age-based promotion. Orthogonal axes, always.
+---
 
-### ParallelFor is gated on measured work, not element count
+## 6. Safe Memory Reclamation
 
-The old gate was `N > 10000`, chosen before fork-join dispatch existed and never re-measured. The
-deeper problem was that element count cannot express the crossover at all: what races dispatch
-overhead is total work, which is count multiplied by per-element cost, and that differs by orders of
-magnitude between callers. Sweeping both axes showed the crossover element count moving roughly 400x
-with body cost while the crossover *work* stayed pinned around 70–92 µs. So the gate now probes a
-prefix, extrapolates, and parallelizes at ~75 µs of estimated work.
+A lock-free structure cannot `free()` while another core might still be reading. Two mechanisms,
+chosen by what the reader is:
 
-The remaining limitation, found in third-party benchmark data: the probe measures elapsed time, which
-cannot distinguish 75 µs of CPU work from 75 µs of waiting on DRAM -- and only the first parallelizes.
-On a bandwidth-constrained machine the compute-bound bodies crossed over at 78 µs and 95 µs, matching
-the constant closely, while the cheap memory-bound bodies needed 164 µs and 272 µs. The constant is
-well-calibrated for compute-bound work and optimistic for memory-bound work.
+**Hazard pointers — for readers with no stable identity, and for reads that span a suspend.** A
+reader publishes the address it is about to dereference into a per-fiber cell; retirement checks the
+cells before freeing. This is the mechanism that works when the reader may migrate mid-traversal.
 
-### Hard pinning, and the foreign-thread problem solved at the source
+**Epochs — for bulk retirement by readers that do have a stable identity.** A thread-keyed slot, a
+global epoch, and thread-local retire bags. Nothing may suspend inside an `EpochGuard`; that is the
+contract, and it is what makes the cheap mechanism sound. Bags orphaned by a thread exiting are
+handed to a leaked global store rather than dropped.
 
-Pinning makes the topology maps true, since sibling, cluster and P/E stealing are only meaningful
-when workers cannot migrate. The cost is that pinned threads cannot dodge foreign threads landing on
-their core.
+**The reaper — a function of the fiber registry, and a *task*, not a thread.**
 
-Profiling a real game process found the persistent offender: GameInput's internal workers,
-undocumented in count and varying by machine, with dose-response testing showing a full core of
-deficit. Manual-dispatch mode (`IGameInputDispatcher`) was tried first and was not the fix -- it
-controls when queued async work runs, not whether the library keeps threads of its own. The actual
-fix was replacing the dependency: keyboard and mouse moved to Raw Input on the app's existing message
-pump, gamepads to opt-in, dynamically-loaded XInput. A library whose thread count you cannot know is
-a library you cannot budget for.
+On fiber death the registry queues **one ordinary task**, rate-limited to a single sweep in flight,
+that performs `Tick()` → `Scan()` → user-registered deletes, in that order. The deletes go last
+because a user deleter may itself retire, and running them first would leave those retirements for
+the following pass.
 
-The portable lesson is the reservation rule above: reserve for measured busy time, never for thread
-existence, and never for transient wakers like drivers, DXGI or DWM -- those are unknowable,
-universal, microsecond-scale, and already handled by preemption.
+Three designs were tried and the first two were wrong:
 
-Note that hard pinning is no longer the default, for the reasons under [Worker
-binding](#worker-binding). It remains available because it is the only mode where you decide where
-oversubscription lands rather than discovering it.
+| | why it lost |
+|---|---|
+| worker-inline | a p99 killer — it walks every participant on a thread that was running your frame, at a moment nobody chose |
+| app-driven `Tick()` | better tail, but a library cannot require a loop its embedder may not have, and forgetting it leaks silently |
+| **a queued task** | displaces nothing; it waits its turn behind work that was already there |
+
+The difference between the first and the third is not *who* runs it — a task runs on a worker too —
+it is **when**. There is no reaper thread and nothing polls.
+
+**The exception the design owes you:** `TaskDAG` retires a node per node per frame, epoch retirement
+has no threshold-triggered sweep of its own, and a DAG need not produce a single fiber death — main
+nodes are *required* to be `Native`. That is a rate of retirement with no rate of reclamation, so a
+DAG frame loop must call `Tick()` itself.
+
+---
+
+## 7. The fiber registry
+
+Fibers are identified by slot, not by pointer, and the registry owns everything keyed on that
+identity:
+
+**`FiberLocal<T>` and `FlsAlloc`.** Fiber-local storage. `thread_local` does not survive a migration
+and fails *silently* — you get the resuming worker's copy, a plausible value rather than a crash — so
+a migratable runtime needs storage keyed to the fiber. Slots are scrubbed on recycle, because a
+pooled fiber carrying a previous occupant's pointer reads perfectly well and corrupts quietly.
+
+**Lease / creditor tracking.** A fiber that acquired thread-affine state owes a cleanup hop to each
+creditor. The set is a bitmask on the fiber, delivery is one visit per creditor, and the nodes are
+intrusive — a death path may not allocate.
+
+**Debt lists.** Objects a fiber must have released before its stack is reused, with a type-erased
+deleter each, so `new`, a custom allocator and a pool free can all be discharged by the same sweep.
+
+**ABA-proofing.** Slots are reused; a stale index must never resolve to a live fiber. Generation
+counters on the identity, and a returned batch clears its local epoch so a recycled fiber cannot be
+mistaken for a participant.
+
+---
+
+## 8. Fiber mode: Migrate or Pin
+
+**These are two strict policies about WHO MAY RESUME A FIBER — when, where, and why.** Not a tuning
+knob, and not two ways of arranging the same thing. Everything else about each mode follows from its
+permission rule.
+
+- **`Migrate`** (default) — **near enough a free-for-all.** Any worker may resume the fiber. Ordinary
+  placement decides where the resumption lands, a thief may take it from there, and it will run on
+  whichever worker is free. The fiber's stack goes wherever it is needed.
+- **`Pin`** — **exactly one worker may ever resume it.** The resumption is delivered to that worker's
+  resume inbox and no other queue; no thief can take it, and no placement decision applies. This is
+  marl's contract.
+
+**The exchange is TLS.** The free-for-all is what makes `thread_local` unsafe: a value written before
+a suspension point belongs to a thread the fiber may no longer be on, and the failure is silent —
+you get the resuming worker's copy, a plausible value rather than a fault. Pinning buys that back by
+forbidding everyone else, and pays for it in promptness: a fiber whose one permitted worker is busy
+waits for it while other cores sit free.
+
+Migration is the better default because the thing it gives up has a replacement and the thing it buys
+does not — `FiberLocal<T>` moves the *state* off the thread, whereas nothing recovers a core you are
+declining to use. Take `Pin` when the state crossing the wait belongs to a library you cannot audit,
+which is the one case where moving the state is not available to you.
+
+**In pinned mode the resumption goes to the home worker's resume inbox**, never to a deque — which is
+why the reserved band may steal in either mode. A reserved worker *must* read its resume inbox
+regardless: an I/O completion **is** a fiber returning from an await, so the band could not do its
+primary job otherwise.
+
+---
+
+## 9. Synchronization
+
+Fiber-aware primitives that **suspend the fiber and release the worker**, rather than blocking the
+thread: `SchedulerMutex`, `SchedulerSemaphore` (with `ScopedPermit`), `SchedulerConditionVariable`,
+`Event`, `WaitGroup`. A raw `std::mutex` inside a task blocks a worker and is a bug.
+
+`Event` uses a perfect-hash table keyed by name, with waiters indexed from the waiter side. A
+`WaitGroup` is a **concurrency counter**, not a wait primitive — it has no waiter queue, which is why
+it is not cancellable and why cancellation belongs on the primitives that own one.
+
+A bare thread that blocks on the scheduler **helps** — it runs stolen work while it waits — with the
+exception that a thread owning a `SchedulerMutex` must not, or it can deadlock against a task that
+wants the same lock.
+
+---
+
+## 10. Cancellation and time
+
+**`CancelScope` / `CancelToken`** with parent chains: cancelling a scope reaches its children. Tokens
+are generation-tagged so a recycled scope cannot cancel work that outlived it.
+
+**Cancellation reaches dispatched work**, not merely queued work — a token is stamped on the task, so
+a scope can end something already running.
+
+**In-flight I/O is different and the API says so.** Cancelling a scope does not by itself end a
+posted operation: the kernel holds a buffer. `IoReactor::RequestCancel` asks, and the operation ends
+through its *completion* — which is the only correct shape, because the memory cannot be released
+until the kernel is finished with it.
+
+**Timer wheel** — hierarchical, backing `Deadline` and periodic work, with occupancy bitmaps so an
+empty level costs nothing to skip.
+
+---
+
+## 11. Parallel algorithms
+
+**`ParallelFor` has no calibrated constant, and its division is decided by stealing.** Work is handed
+out through an atomic slice-stealing cursor: idle workers take slices, so how the range is split is
+decided by *who is free* rather than by a guess about how long an item takes. There is no tuned
+threshold to get wrong on hardware it has never seen — the old body-probe-plus-threshold design was
+removed in 1.4 for exactly that reason.
+
+**One estimate survives, and it decides FAN-OUT WIDTH rather than the split.** `SetMeasuredWidth`
+(on by default) times the first chunk on the calling thread and picks a width of `sqrt(W/c)`, where
+`c` is the wake cost — the *k* minimising `W/k + k·c`. It exists to fill a missing middle: without
+it, fan-out has two states, serial or the whole pool, chosen by an iteration count that never looks
+at the body. Measured, that meant trivial work at N=256 recruiting 23 workers for ~2 µs of work,
+while heavy work at the same N was refused outright.
+
+The probe is close to free — the first chunk is work the range must do anyway, so it costs two clock
+reads — but it is **a lower bound by design, and it does not always hit.** A back-loaded body makes
+the first chunk unrepresentative; so does measuring on a caller running at single-core boost before
+the rest of the pool spins up and the clock drops. Range recruitment corrects upward as expensive
+leaves complete, so the probe picks a defensible start rather than a final answer — and how quickly
+recruitment catches up is a real source of run-to-run variance in wide, uniform ranges.
+
+`SetMeasuredWidth(false)` restores the older behaviour exactly.
+
+**`TaskDAG`** — dependency graphs with **AND/OR gates** (`CreateGate`, `TaskNode::LogicType`). A gate
+carries no task: when its trigger fires it propagates instantly rather than scheduling work, so gates
+compose into arbitrary boolean expressions — `(A && B) || C`. **External nodes** let a graph wait on
+something outside it (`CreateExternalNode` / `SignalExternal`), which is how I/O or another thread
+joins a frame. Node completion is defined as "the node's function returned". Any task whose function can return before its work is done would fire dependents early,
+which is why a fiber node is the correct way to suspend inside a graph: `ContextSwitch` preserves the
+wrapper's frame, so the function returns only on real completion.
+
+**Main-thread nodes** are supported and required to be `Native`, for game and simulation shapes where
+some work must run on the thread that owns a device or a window.
+
+---
+
+## 12. I/O
+
+**Completion-first.** `Submit*` takes a buffer, a request, a result and a **resume task**, and returns
+`true` when the answer is already final — meaning the caller must not suspend and still owns the
+resume task. Everything else is a completion that pushes the task.
+
+**Backends:** IOCP on Windows, io_uring on Linux. epoll is the intended Android path. macOS is
+supported for the jobs system only.
+
+**The reactor is C++17.** It was paired with a `co_await` awaiter until 5.0; on a fibers-only runtime
+the wrapper is a `WaitGroup` the completion decrements, which needs no language feature because a
+fiber already knows how to suspend.
+
+**That wrapper is `include/IoFiber.h` (`JLib::Fib`), and it is the supported way to wait on I/O.**
+It spent 5.0.0–5.0.3 under `tests/`, on the grounds that adding a public header should be a decision
+rather than a side effect. Porting the first application off the `co_await` layer settled it: the
+raw `Submit*` surface was public while the guard against its one sharp edge — the `true` return,
+which fails as a hang or a leak and never as an error — was test-private. That is the wrong way
+round. The resume task it creates is **`Lane::Normal`, and that is load-bearing**: a completion
+steered to the reserved band deadlocks when its job is to wake a `Normal` fiber, because the band
+never reads a loPri deque.
+
+**Completions are stamped `StackClass::Tiny`** at submit — one place per backend, since every
+overload funnels through it — and only over `Standard`, so an explicit `Deep` survives.
+
+**Enabling the reactor reserves K workers**, and the design states that cost rather than hiding it.
+
+---
+
+## 13. State machines
+
+Four lock-free state machines, each with a model:
+
+- **Fiber** — `READY / RUNNING / WANTS_YIELD / WANTS_SUSPEND / SUSPEND_SIGNALED / SUSPENDED / DEAD`.
+  `WANTS_*` exist because a context is not safe to re-queue until it has actually been *saved*, and
+  `SUSPEND_SIGNALED` is the race made explicit: a `Resume` that arrives during `WANTS_SUSPEND` must
+  wake the fiber rather than let it park on a signal already delivered. The CAS on the suspend commit
+  is what makes that decision atomic.
+- **Thread** — the worker pass: which queue is consulted in which order, and what makes a pass
+  unproductive.
+- **Pool permit** — the park/wake handshake described in §3.
+- **Adaptive F controller** — growth on crowding, shedding on quiet, with the shed collapsing to the
+  base rather than to zero.
+
+---
+
+## 14. Formal verification
+
+The concurrency is **model-checked**, not argued. Twelve GenMC models live in `tests/verify/`:
+
+`deque_model`, `deque_grow_model`, `mpsc_model`, `event_model`, `event_table_model`,
+`sleepwake_model`, `sleepwake_permit_model`, `workerpass_model`, `workerspin_model`,
+`yieldstate_model`, `fiberwait_model`, `counted_epoch_model`.
+
+These are not documentation. The Chase–Lev `pop_bottom` `seq_cst` fence is *proven* required — a
+model with it removed is red. Several carry deliberate negative-control builds (`-DPLACE_ON_RESERVED`,
+`-DTARGET_YIELDED`) so that "the model is green" can be distinguished from "the model cannot fail".
+
+**A model proves a model.** Where an invariant depends on this codebase reading its own state — which
+worker may drain which queue — the model explains and a runtime test locks it, because no model reads
+`PickNextWorker`.
+
+---
+
+## 15. Platforms
+
+| | |
+|---|---|
+| Windows | x64 and ARM64, full runtime with IOCP |
+| Linux | x64 and ARM64, full runtime with io_uring |
+| Android | jobs system; epoll reactor is the intended path |
+| macOS | **jobs system only** — kqueue is not tested and is not claimed |
+
+---
+
+## 16. Contracts the caller owes
+
+Short list, because each of these is a silent failure rather than a loud one:
+
+1. **`TaskType::Native` must not suspend.** There is nothing to switch away from; it fail-fasts with
+   no message.
+2. **Use the fiber-aware primitives inside a task.** A raw `std::mutex` blocks a worker.
+3. **Nothing may suspend inside an `EpochGuard`.** Use hazards for reads that span a wait.
+4. **A `TaskDAG` frame loop must `Tick()`.** See §6.
+5. **`IoRequest` and `IoResult` must outlive the operation.** The kernel writes into them after the
+   call returns.
+6. **Cancelling a scope does not cancel posted I/O** — `RequestCancel` does.
+7. **Nothing thread-derived may be held across a suspend point.** A fiber may resume on a different
+   worker, so a thread id, a `thread_local` address, a TLS slot or anything keyed off "which thread
+   am I" is stale the moment it comes back. This is the rule the ownership-tracking comment in
+   `TaskScheduler.h` defers to: no tracking reaches a raw `std::mutex`, a file read or a GPU fence,
+   so the rule is the real protection and the assertions are only a reminder of it.
+8. **A lambda task is always `TaskType::Native`,** and since 5.0.3 the API will not let you say
+   otherwise — the overload takes no `TaskType` and pins `Native` internally. A lambda body lives on
+   the task slab and is freed the moment it returns, while a fiber belongs to whoever resumes it:
+   two owners, no shared destructor. The failure is invisible, because `SlabPool` is append-only and
+   releases no extent before the pool dies, so a freed slot stays mapped and usually still holds its
+   bytes — the suspend/resume round trip reads its capture back intact and the test passes while the
+   bill accrues as a live count that never returns to baseline. **If a body suspends, it must be a
+   `void(*)(void*)` with its context on the caller's stack.** See `include/IoFiber.h`.
+
+---
+
+*Measurements, dated experiments, and the reasoning behind decisions that were reversed live in
+`design/NOTES.md`. This document is the shape; that one is the history.*
