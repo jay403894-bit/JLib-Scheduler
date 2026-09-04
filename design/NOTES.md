@@ -2718,3 +2718,36 @@ labelling blamed the waiter and hid it. SCHEDULER-IMPLICATED stays 0 and stays c
 not a queueing defect, it is a placement choice with a measurable tail cost.
 
 DEFAULTS UNCHANGED. floor=2 is the default and shows none of this.
+
+--------------------------------------------------------------------------------
+CorePref::Wide IS FOR WAVES, NOT STREAMS (measured 2026-09-03, Jay's box)
+--------------------------------------------------------------------------------
+
+The flag had exactly one measurement -- a BURST -- and shipped into Physics3D's Jolt job queue and
+the Renderer's fan-outs on it. `wide` adds the arm nobody had run: ordinary per-task pushes.
+
+    throughput/1p        default            wide
+    rate                 2.68 M/s           0.89 M/s        3.0x WORSE
+    kernel wakes / 5     723                924,235
+    wakes per task       0.07%              92.4%           1,278x more
+
+**Wide wakes a parked worker for essentially every push.** Marginal cost works out at
++149.35 ms per 200k-task run over ~184,847 wakes = **~808 ns of throughput per wake**.
+
+THIS CONFIRMS THE FLAG RATHER THAN REFUTING IT, and the two rows are the same mechanism with
+opposite signs:
+
+  BURST  -- 16 heavy tasks. Steered, the wave is capped at the 2 floor workers: 9.89ms / 5.3x.
+            Wide pays 16 wakes and gets 29 participants: 5.67ms / 9.3x. WIN 1.7-3x.
+  STREAM -- 200,000 no-ops. Steered, every push lands on an already-running worker and costs no
+            wake at all. Wide pays ~185,000 wakes to spread work that was never contended. LOSS 3x.
+
+**THE DISCRIMINATOR IS WAVE VS STREAM, not size.** A wave is a bounded set you are about to BLOCK
+on, where participants cap the answer and a wake is cheap against the body. A stream is continuous
+submission where the steer is already free and the wake is pure cost.
+
+CONSEQUENCE FOR THE SHIPPED USES: correct, and now evidenced. Jolt's QueueJobs and the Renderer's
+per-layer FlushBatchTask are fan-outs the frame blocks on -- the burst shape exactly. Nothing in the
+tree aims Wide at a stream, which was luck rather than judgement until this row existed.
+
+DO NOT generalise "Wide is faster" from the burst numbers. It is faster at the thing burst measures.
