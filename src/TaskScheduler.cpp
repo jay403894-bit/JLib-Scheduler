@@ -3302,6 +3302,21 @@ bool TaskScheduler::GetHotWorkerExclusive() { return g_hotExclusive.load(std::me
 void TaskScheduler::SetHotCpuMask(unsigned long long m) { g_hotCpuMask.store(m, std::memory_order_relaxed); }
 unsigned long long TaskScheduler::GetHotCpuMask() { return g_hotCpuMask.load(std::memory_order_relaxed); }
 
+static std::atomic<bool> g_bandPinFloor{ false };
+void TaskScheduler::SetBandPinIncludesFloor(bool on) { g_bandPinFloor.store(on, std::memory_order_relaxed); }
+bool TaskScheduler::GetBandPinIncludesFloor() { return g_bandPinFloor.load(std::memory_order_relaxed); }
+
+// ONE DEFINITION OF THE BAND, read by both the mask builder in StartPool and the per-worker check
+// in Thread::StartWorker. They computed it separately before this existed, which is how the mask
+// and the pinning can disagree: cores cleared for a band that a different rule decides who is in.
+//
+// Fbase, NOT F. See the header -- F is a controller output that rises under load and sheds after,
+// so pinning it would pin whatever the last burst grew, permanently.
+size_t TaskScheduler::PinnedBandWidth() {
+	const size_t k = GetHotWorkers();
+	return GetBandPinIncludesFloor() ? k + GetAwakeFloorBase() : k;
+}
+
 // Called BY a thread ON ITSELF -- ordinary workers at loop entry, the reactor's completion threads
 // at Run() entry, and the application's own thread if it wants to stay off the hot cores. Each
 // thread masking itself avoids plumbing native handles around, and means a thread the scheduler does
@@ -4839,7 +4854,11 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	// formula as the loop below, deliberately duplicated rather than reordered, because the loop's
 	// order is load-bearing for the Ready() handshake underneath it.
 	if (GetHotWorkerExclusive()) {
-		const size_t hotN = GetHotWorkers();
+		// SAME WIDTH THE PINNING USES. This read GetHotWorkers() directly while
+		// Thread::StartWorker had its own copy of the rule, so extending one without the other
+		// would clear cores for workers nobody pinned there, or pin workers onto cores nobody
+		// cleared. Both now ask PinnedBandWidth().
+		const size_t hotN = PinnedBandWidth();
 		unsigned long long mask = 0;
 		for (size_t i = 0; i < hotN && i < num_workers; ++i) {
 			size_t cpu;

@@ -1720,6 +1720,33 @@ namespace JLib {
 		// exactly where it stops being equivalent to the real thing.
 		static void SetHotWorkerExclusive(bool on);
 		static bool GetHotWorkerExclusive();
+
+		// ---- EXTEND THE PINNED/EXCLUSIVE BAND FROM [0,K) TO [0,K+Fbase) ------------------------
+		//
+		// Set before Init, OFF BY DEFAULT, and only meaningful with pinning or exclusive on.
+		//
+		// WHY THIS IS NOT THE WHOLE-POOL EXPERIMENT AGAIN, which is the objection it invites. That
+		// result -- hard-pinning every worker, ~45%% worse wake latency and ~2x on a frame DAG -- is
+		// an argument about N: with N workers the chance that SOME core is occupied approaches
+		// certainty, so someone is always confined behind a squatter. The BASE floor is not N. It is
+		// 1 on a pool of eight or fewer and 2 above, fixed however wide the machine is, so the cost
+		// is bounded the same way K's is.
+		//
+		// The GROWN floor is deliberately excluded. F rises under load and sheds after, so pinning
+		// what it grows to would pin transient workers and leave them pinned once the burst passed
+		// -- the ratchet failure this project has shipped once already. Fbase is a constant chosen
+		// at Init; F is a controller output.
+		//
+		// UNMEASURED. The nearest evidence is the K pin result (27ms burst p99 against a 150us
+		// baseline) which is the same scale and the same mechanism -- confined without exclusion --
+		// so expect this to need `SetHotWorkerExclusive` to be worth anything at all, and expect
+		// nothing from pinning alone. Run it: SchedulerBench nosweep hotexcl floorpin.
+		static void SetBandPinIncludesFloor(bool on);
+		static bool GetBandPinIncludesFloor();
+
+		// The width of the pinned/exclusive band: K, or K+Fbase when the above is on. One place, so
+		// the mask builder and the per-worker check cannot disagree about who is in the band.
+		static size_t PinnedBandWidth();
 		static void SetHotCpuMask(unsigned long long m);
 		static unsigned long long GetHotCpuMask();
 

@@ -3245,7 +3245,7 @@ int main(int argc, char** argv) {
 "mean. Each worker owns an MPSC inbox plus a Chase-Lev deque; idle workers steal.\n"
 "\n"
 "usage: SchedulerBench [ideal|hard|none|physical] [poolSize] [nosweep]\n"
-"                      [hot=N] [floor=N] [ev|noev] [hotpin] [hotexcl]\n"
+"                      [hot=N] [floor=N] [ev|noev] [hotpin] [hotexcl] [floorpin]\n"
 "\n"
 "AFFINITY POLICY (first token, optional -- omit it and you get `ideal`)\n"
 "  ideal     default, and the library's default. Windows: SetThreadIdealProcessor.\n"
@@ -3284,6 +3284,15 @@ int main(int argc, char** argv) {
 "            real thing. Neither flag had a way in from this harness until now,\n"
 "            which is why the changelog records them as measured with no number\n"
 "            beside them. A knob nobody can turn is a result nobody can reproduce.\n"
+"  floorpin  widen that band from [0,K) to [0,K+Fbase), so the BASE awake floor is\n"
+"            pinned and excluded too. Fbase is 1 on a pool of eight or fewer and 2\n"
+"            above -- a fixed small set however wide the machine is, which is why\n"
+"            this is NOT the whole-pool experiment: that result (~45%% worse wake\n"
+"            latency) is an argument about N, not about what the threads do. The\n"
+"            GROWN floor is excluded on purpose -- F is a controller output that\n"
+"            rises under load, and pinning it would strand whatever the last burst\n"
+"            grew. UNMEASURED, and since pinning alone is a known negative at K,\n"
+"            expect it to need exclusion: `nosweep hotexcl floorpin`.\n"
 "\n"
 "THE TWO BAND KNOBS, WHICH ARE NOT THE SAME KNOB\n"
 "  hot=N     reserve N workers for the latency lane (SetHotWorkers). BENCH DEFAULT 2.\n"
@@ -3346,6 +3355,7 @@ int main(int argc, char** argv) {
     size_t hotWorkers = 2;
     bool   hotPin  = false;   // SetHotWorkerPin       -- see the flag parsing below
     bool   hotExcl = false;   // SetHotWorkerExclusive -- implies pinning
+    bool   floorPin = false;  // SetBandPinIncludesFloor -- widen the band to K+Fbase
 
     size_t awakeFloor  = JLib::TaskScheduler::GetAwakeFloor();
     // floor=auto -- skip SetAwakeFloor entirely so the library's pool-size default applies.
@@ -3371,6 +3381,11 @@ int main(int argc, char** argv) {
         //          number -- run it against the same command without it.
         if (JLIB_STRICMP(argv[a], "hotpin") == 0)  { hotPin = true;  continue; }
         if (JLIB_STRICMP(argv[a], "hotexcl") == 0) { hotExcl = true; continue; }
+        // floorpin: widen the pinned/exclusive band from [0,K) to [0,K+Fbase). Fbase is 1 on a
+        // pool of eight or fewer and 2 above -- a FIXED small set, which is why this is not the
+        // whole-pool experiment: that result is an argument about N. UNMEASURED, and expect it to
+        // need hotexcl to be worth anything, since pinning alone is a known negative at K.
+        if (JLIB_STRICMP(argv[a], "floorpin") == 0) { floorPin = true; continue; }
 
         if (JLIB_STRICMP(argv[a], "noev") == 0)    { runEvents = false; continue; }
         // nogrow: pin the awake floor at its base -- no push-side spill, no completion-side growth,
@@ -3724,6 +3739,7 @@ int main(int argc, char** argv) {
     // BEFORE Init, like every placement setting: binding happens as each worker starts, so a call
     // after this point silently does nothing. Exclusive implies pin -- setting only the mask would
     // clear the cores for a worker that is still free to wander off them.
+    if (floorPin) JLib::TaskScheduler::SetBandPinIncludesFloor(true);
     if (hotExcl) { JLib::TaskScheduler::SetHotWorkerPin(true); JLib::TaskScheduler::SetHotWorkerExclusive(true); }
     else if (hotPin) JLib::TaskScheduler::SetHotWorkerPin(true);
     JLib::TaskScheduler::SetHotWorkers(hotWorkers);
@@ -3788,9 +3804,11 @@ int main(int argc, char** argv) {
     // same reason batchwide is stamped above. Read from the library rather than the local flags, so
     // the line reports what actually took effect rather than what was asked for.
     if (JLib::TaskScheduler::GetHotWorkerPin() || JLib::TaskScheduler::GetHotWorkerExclusive())
-        printf("placement: hotpin=%s  hotexcl=%s  hotcpumask=0x%llX   <- EXPERIMENT, not the default\n",
+        printf("placement: hotpin=%s  hotexcl=%s  band=[0,%zu) %s  hotcpumask=0x%llX   <- EXPERIMENT, not the default\n",
                JLib::TaskScheduler::GetHotWorkerPin() ? "ON" : "off",
                JLib::TaskScheduler::GetHotWorkerExclusive() ? "ON" : "off",
+               JLib::TaskScheduler::PinnedBandWidth(),
+               JLib::TaskScheduler::GetBandPinIncludesFloor() ? "(K+Fbase)" : "(K only)",
                (unsigned long long)JLib::TaskScheduler::GetHotCpuMask());
     // NO RESET HERE. It used to zero the park counters so the verdict "covered the measured run"
     // -- and it hid the fact that reserved workers park ONCE at startup and then sleep through

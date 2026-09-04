@@ -341,7 +341,11 @@ void Thread::StartWorker(size_t cpu_affinity, size_t fiberCacheCapacity)
 	//
 	// Requires SetHotWorkers BEFORE Init -- qIndex is set by SetQueueIndex before StartWorker, but
 	// the hot COUNT has to already be known here.
-	if (TaskScheduler::GetHotWorkerPin() && TaskScheduler::GetHotWorkers() > (size_t)qIndex)
+	// PinnedBandWidth() is K, or K+Fbase when SetBandPinIncludesFloor is on -- one definition, shared
+	// with the mask builder in StartPool, so the set of cores cleared and the set of workers pinned
+	// cannot disagree. Extending it to the base floor is off by default and UNMEASURED; see the
+	// header, and do not confuse it with the whole-pool result, which is an argument about N.
+	if (TaskScheduler::GetHotWorkerPin() && TaskScheduler::PinnedBandWidth() > (size_t)qIndex)
 		affinityPolicy = TaskScheduler::AffinityPolicy::Hard;
 	if (cpu_affinity >= topology::CpuMask::kMaxCpus &&
 	    affinityPolicy != TaskScheduler::AffinityPolicy::None) {
