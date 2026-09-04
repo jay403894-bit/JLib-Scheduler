@@ -92,14 +92,22 @@ int main() {
     bulkWg.n.store(kBulk, std::memory_order_relaxed);
     g_bulkWg = &bulkWg;
 
-    // Bulk FIRST, so it is outstanding by the time the lane task blocks on it.
-    for (int i = 0; i < kBulk; ++i) {
-        JLib::Task* t = sched.CreateTask(BulkPayload, nullptr);
-        if (!t) { std::printf("  CreateTask(bulk) returned null\n"); return 1; }
-        t->waitGroup = &bulkWg;
-        sched.Push(t);
-    }
-
+    // ---- THE LANE TASK FIRST, AND WAIT FOR IT TO BE RUNNING ------------------------------------
+    //
+    // BULK USED TO GO FIRST, "so it is outstanding by the time the lane task blocks on it". That
+    // creates a window where the reserved worker exists and has NO LANE WORK, while 4,000 bulk
+    // tasks are already in flight -- and the assertion below claims the lane worker ran zero bulk
+    // "WHILE ITS LANE TASK WAS BLOCKED". During that window there is no lane task at all, so the
+    // test was measuring a period its own claim does not cover.
+    //
+    // The old mitigation was a little arithmetic in BulkPayload "so the bulk does not all drain
+    // before the lane task even starts blocking" -- which is probabilistic, and it lost about 2% of
+    // the time: 3 failures in 160 runs on Linux, reporting `bulk run on q0 = 71` where the contract
+    // is zero. That reads exactly like a reservation bug in the scheduler, and it is not one.
+    //
+    // Arming bulkWg above but PUSHING the bulk after the lane task is running makes the
+    // precondition true by construction: WaitFor sees a non-zero count and blocks, and every bulk
+    // task that exists does so while the lane task is already parked.
     JLib::WaitGroup laneWg;
     laneWg.n.store(1, std::memory_order_relaxed);
     JLib::Task* lane = sched.CreateTask(LaneBlockingPayload, nullptr);
@@ -107,6 +115,29 @@ int main() {
     lane->waitGroup = &laneWg;
     lane->lane = JLib::Lane::LowLatency;             // routes to the reserved band -- this is the lane task
     sched.Push(lane);
+
+    // THE LANE TASK MUST BE RUNNING BEFORE ANY BULK EXISTS, or the window this test lost 2% to is
+    // still open. g_laneRan is set as its FIRST statement, so this returns once the reserved worker
+    // is inside the payload and about to block on bulkWg.
+    {
+        const auto armed = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!g_laneRan.load(std::memory_order_acquire)
+               && std::chrono::steady_clock::now() < armed)
+            std::this_thread::yield();
+        Check(g_laneRan.load(std::memory_order_acquire),
+              "the lane task is RUNNING before any bulk exists (the window this test lost 2% to)");
+    }
+
+    // Any bulk that ran before this point would be uncounted rather than mis-counted -- there is
+    // none, and the reset says so rather than relying on it.
+    for (int i = 0; i < kMaxW; ++i) g_ranOn[i].store(0, std::memory_order_relaxed);
+
+    for (int i = 0; i < kBulk; ++i) {
+        JLib::Task* t = sched.CreateTask(BulkPayload, nullptr);
+        if (!t) { std::printf("  CreateTask(bulk) returned null\n"); return 1; }
+        t->waitGroup = &bulkWg;
+        sched.Push(t);
+    }
 
     // BOUNDED WAIT, NOT WaitFor. If the change did introduce the hang the old comment feared, a
     // plain WaitFor would hang this process and the test would report nothing at all. Polling with

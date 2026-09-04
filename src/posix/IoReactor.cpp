@@ -457,8 +457,13 @@ void IoReactor::Impl::CompletionLoopEntry(IoReactor::Impl* impl) {
             if (r->onComplete) r->onComplete(r);   // after the lock, before the push
 
             if (resume) {
-                if (resume->lane) batchHi[nHi++] = resume;
-                else               batchLo[nLo++] = resume;
+                // IsLowLatency, not `if (resume->lane)`. Lane is an `enum class` with no implicit
+                // conversion to bool, so the old spelling stopped compiling the day the bool became
+                // an enum -- and this file kept it, because nothing built src/posix/ after that
+                // change. The win32 reactor was updated at the time; this one was not, and there
+                // was no Linux job to notice. It is the first thing linux_ci.yml found.
+                if (IsLowLatency(resume->lane)) batchHi[nHi++] = resume;
+                else                            batchLo[nLo++] = resume;
                 if (nHi == kBatch || nLo == kBatch) flush();
             }
         }

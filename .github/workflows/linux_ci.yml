@@ -1,0 +1,68 @@
+# Linux CI -- the second platform, on every push and PR.
+#
+# WHY THIS EXISTS SEPARATELY FROM ci.yml. That workflow is a seven-job matrix including macOS arm64
+# and two ABI harnesses, and it is `workflow_dispatch` only because running it per commit once
+# tripped the account spending limit. This is ONE Linux job, which is the cheapest runner there is,
+# so it can afford to run automatically -- and automatic is the whole point: a check nobody triggers
+# is a check that reports the state of whenever somebody last remembered.
+#
+# WHAT IT ADDS OVER THE WINDOWS JOB, which is more than "the same thing on Linux":
+#
+#   THE PARK PRIMITIVE IS A DIFFERENT SYSCALL. Windows parks on WaitOnAddress, Linux on futex.
+#   Those are separate implementations of the permit handshake, and the permit machine is the part
+#   of this scheduler with the most unverified controls.
+#
+#   THE MEMORY MODEL IS THE SAME BUT THE COMPILER IS NOT. GCC reorders differently from MSVC, and
+#   an atomic that is accidentally correct under one is not evidence about the other.
+#
+#   THE OS LAYER IS A DIFFERENT DIRECTORY. src/posix/ against src/win32/ -- Topology, FiberInit and
+#   the reactor are all separate code paths that only this job compiles.
+#
+# WHAT IT CANNOT COVER, stated so a green badge is not read as more than it is: several targets are
+# WIN32-gated in CMakeLists and simply do not exist here -- the context-switch bench, the ABI
+# harness, the IOCP tests, the tiny-stack test and the fiber-await smoke. ctest runs what was built,
+# so the count on this job is legitimately lower than the Windows one. That is not a gap in the run,
+# it is the platform.
+#
+# io_uring: the reactor's Linux backend reports IsAvailable() == false while the chained IoStream
+# path is unresolved, so the I/O tests that exist here skip themselves rather than fail. When that
+# lands, this job starts covering it with no change needed.
+
+name: Linux CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # CMAKE_BUILD_TYPE is the one that matters here -- the Makefile/Ninja generators are
+    # single-config, unlike the Visual Studio generator the Windows job has to pass --config to.
+    - name: Configure
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build -j 2
+
+    # The list of tests is DISCOVERED in CMakeLists from the targets that exist, so this job
+    # automatically runs the Linux subset without anyone maintaining a second list. That is the
+    # whole reason the registration was written that way: a hand-kept list in a YAML file is what
+    # left ci.yml naming three executables that had been deleted for a release and a half.
+    #
+    # -j 1: several of these measure pool behaviour, and running them concurrently on a 2-core
+    # runner would have them contend for the CPUs under test. Each carries a 300s TIMEOUT from
+    # CMakeLists, because a deadlocked concurrency test does not fail -- it spins every worker until
+    # something kills it, and without a timeout that something is the 6-hour job limit.
+    - name: Run the test suite (ctest)
+      run: ctest --test-dir build --output-on-failure -j 1
