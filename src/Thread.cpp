@@ -1259,16 +1259,47 @@ void Thread::OnFiberReturned(Fiber* f, Task* task) noexcept {
 		// fails to requeue is never resumed, so its stack never unwinds -- silence here costs
 		// RAII, a WaitGroup slot and a hazard record, and reports none of it.
 		//
-		// PINNED (unconditional since 4.0.2): NOT the deque. A yielded fiber has a live saved context
-		// exactly like a suspended one, so pushing it to this worker's deque -- which IS
-		// stealable -- lets a thief migrate it, and pinning would leak through the one path
-		// that looks local. It reads local: push_bottom is the owner's own LIFO end. It is
-		// not; the other end is public.
+		// NOT THE DEQUE, in either mode. A yielded fiber has a live saved context exactly like a
+		// suspended one, so pushing it to this worker's deque -- which IS stealable -- lets a thief
+		// migrate it, and pinning would leak through the one path that looks local. push_bottom
+		// READS local; it is not, the other end is public.
 		//
-		// The cost is real and accepted: an MPSC push instead of a deque push_bottom, and
-		// the loss of LIFO reuse of a hot stack. Single-producer here (only the owner
-		// yields its own fiber), and correctness outranks the cache win.
-		myResumed->push(task_to_run);
+		// THROUGH Requeue, WHICH IS THE ONE PLACE THAT KNOWS THE MODE. This used to be an
+		// unconditional `myResumed->push(task_to_run)`, which predates the migratable split and was
+		// wrong on both sides of it once that landed:
+		//
+		//   MIGRATABLE (the default) -- the only pop of myResumed is gated `!FibersMigrate()`, so a
+		//   yield parked here would never be drained. The fiber never resumes, its stack never
+		//   unwinds, and `!myResumed->quiescent()` in the park predicates pins that worker awake
+		//   holding it forever. Not a dropped task: a live-lock.
+		//
+		//   PINNED -- myResumed is THIS worker's inbox, which is the right one only if this worker
+		//   is the fiber's home. Requeue targets resumedInboxes[f->homeWorker] instead, and does
+		//   the MarkQueuedWork + NotifyWorker handshake that this line never did.
+		//
+		// Requeue's migratable path goes through PushTarget, so it also gets the reserved-band mask
+		// -- without which a reserved worker yielding a fiber parks the resumption in its own loPri
+		// inbox, the one queue whose owner is forbidden to read it.
+		//
+		// WHY NOT COPY Worker()'s INLINE DRAW. Worker() open-codes the `k + FastRand() % (n - k)`
+		// placement because in the pass loop a call and a TaskScheduler dependency are a real cost.
+		// Neither applies out here, and a third copy of a decision that has already drifted once is
+		// exactly what the header above says this function exists to stop: "one copy of a
+		// three-state machine with a CAS in the middle, not two that drift."
+		//
+		// NEVER DROP -- see above. Requeue returns Failed only for a null task, which this cannot
+		// be, so reaching the abort means that invariant broke and continuing would silently strand
+		// a live stack.
+		if (scheduler->Requeue(task_to_run) == TaskScheduler::RequeueResult::Failed) {
+			std::fprintf(stderr,
+				"[JLib::Scheduler] FATAL: Requeue refused a yielded fiber in OnFiberReturned.\n"
+				"  Failed is returned only for a null task, which this call site excludes. A\n"
+				"  yielded fiber that is never requeued is never resumed: its stack never unwinds,\n"
+				"  so RAII, its WaitGroup slot and its hazard record are all leaked, and the\n"
+				"  failure would surface later as an unexplained hang.\n");
+			std::fflush(stderr);
+			std::abort();
+		}
 		// ---- THE ONE UNBOUNDED SOURCE, MARKED AT ITS PRODUCER --------------------------------
 		//
 		// A yield re-arms the resumed inbox, and the search checks that inbox BEFORE it drains the
