@@ -246,10 +246,23 @@ namespace JLib {
 		void  operator delete[](void*) = delete;
 
 		std::atomic<FiberStatus>  status;
-		// EBR participation slot. SIZE_MAX == "not in an epoch". The fiber is the unit
-		// that migrates across workers, so the slot lives here (not on the thread).
-		// Default member init covers the move ctor too (a moved/fresh fiber is not in an
-		// epoch), so the move ctor doesn't need to mention it.
+		// NOT AN EBR PARTICIPANT ANY MORE -- this field is scrubbed, never registered.
+		//
+		// IT USED TO BE, and the comment here said the slot lived on the fiber "because the fiber
+		// is the unit that migrates across workers". That reasoning is dead and the field outlived
+		// it, which is worse than either: a reader takes the comment for the design. The epoch slot
+		// is on the THREAD (CurrentEpochSlot), and the reason is the reclamation CONTRACT, not the
+		// unit of migration -- suspending inside an EpochGuard is forbidden and enforced in
+		// Release, so a guard's enter and leave are always on the same thread and the thread's slot
+		// is provably the right one.
+		//
+		// WHAT THAT BOUGHT: MinActiveEpoch scanned one slot PER FIBER -- 2016 of them at 0.629 us
+		// per reclaim attempt on a 31-worker box -- against 32 once only threads participate. See
+		// GlobalFiberPool.cpp's "NO PER-FIBER EPOCH SLOT" note, which is the authority here.
+		//
+		// WHY IT IS STILL HERE: a recycled fiber must not carry a stale value, and ReturnBatch
+		// stores SIZE_MAX for that reason. Keeping the scrub is cheap; removing the field is a
+		// separate change from removing the participation, and only the participation is gone.
 		std::atomic<size_t> localEpoch{ SIZE_MAX };
 		// INLINE STATIC (C++17): the out-of-line definition lived in Fiber.cpp, which is gone --
 		// every Fiber definition is now in a header so the switching path has no call in it.
