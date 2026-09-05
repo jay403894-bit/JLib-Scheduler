@@ -6,9 +6,38 @@
 #include "TsanFiber.h"   // tsanFiber below; no-ops without the sanitizer
 #include "platform.h"
 #include "Task.h"
+#include "Epochs.h"    // JLIB_EPOCH_CHECK_NO_GUARD -- the suspend paths below assert on it
 #include <atomic>
 #include <cstdint>
+// Defined in the platform ContextSwitch assembly (src/win32/ContextSwitch.asm, its aarch64 twin,
+// or src/posix/<arch>/ContextSwitch.S). The restore lands on this at a 16-aligned SP; it calls the
+// entry point Init stashed in the ABI's designated register (rbx on x86-64, x19 on AArch64),
+// which re-establishes the ABI entry alignment. Declared at namespace scope with C linkage so
+// Fiber::Init below can take its address without pulling in a platform header.
+extern "C" void FiberTrampoline();
 namespace JLib {
+
+	// ---- WHAT Fiber REACHES UPWARD FOR, DECLARED SO THE BODIES CAN LIVE HERE -----------------
+	//
+	// Fiber.cpp IS GONE. Every definition is in this header so the switching path has no call in
+	// it -- and a caller only needs to include Fiber.h, which is what WaitGroup.cpp and
+	// DirectEvent.h already do. The two things Fiber cannot see from the bottom layer are
+	// declared here and defined in TaskScheduler.cpp:
+	//
+	//   RequeueFromFiber      Resume() re-queues through the scheduler. This was ALWAYS a
+	//                         cross-TU call (Requeue is a TaskScheduler member defined in the
+	//                         .cpp), so nothing is lost by keeping it one -- what is gained is
+	//                         that Fiber.h no longer needs TaskScheduler.h, so it stays the
+	//                         bottom layer and the include direction is not inverted.
+	//   TsanSwitchToScheduler ONLY under JLIB_TSAN. In an ordinary build the annotation compiles
+	//                         to nothing, so CoYield and Suspend contain no call at all; a TSan
+	//                         build takes one, where it cannot matter.
+	// Task is declared by Task.h, included above -- no forward declaration needed here.
+	namespace detail {
+#if defined(JLIB_TSAN)
+		void TsanSwitchToScheduler() noexcept;
+#endif
+	}
 	enum class FiberStatus {
 		READY,         // In a work queue, waiting to be run/stolen
 		RUNNING,       // Currently executing on a worker
@@ -18,83 +47,17 @@ namespace JLib {
 		SUSPENDED,     // Parked, not queued; only now may Resume() make it READY + re-queue
 		DEAD           // Finished, pending cleanup/reclamation
 	};
-	// ---- A DEBT A FIBER OWES: one object, one way to release it -----------------------------
-	//
-	// The eight fixed slots answer "a few well-known per-fiber values". This answers the other
-	// shape: an ARBITRARY NUMBER of objects, each allocated a DIFFERENT way -- one from `new`, one
-	// from a custom arena, one from a pool -- all owed by the same fiber and all released when it
-	// dies. `owedKinds` already says WHICH KINDS are outstanding; this is where the payloads live.
-	//
-	// INTRUSIVE, AND THAT IS FORCED RATHER THAN PREFERRED. FiberRegistry's dispatch note is explicit
-	// that the death path must not allocate -- "an allocation here is least welcome and most likely
-	// to be the thing that fails", and a dropped cleanup is a resource never given back. A list of
-	// heap nodes would put a malloc on exactly that path. So the node lives inside whatever the
-	// caller is registering, or in storage the caller already owns, and linking is two stores.
-	//
-	// EVERY DEBT ON THIS LIST IS AFFINE, and that is now true by construction rather than by
-	// convention. There was a second, MEMORY-ONLY form -- ReleaseOnFiberDeath -- that registered an
-	// untagged debt released by whoever recycled the fiber. It was removed: memory is fungible, so
-	// the moment it fired was a moment when freeing was already safe, which made it a third
-	// reclamation scheme earning nothing over the two the library already has. If something can
-	// still be READ, a fiber's death is not what makes freeing safe -- epochs and hazards are, and
-	// they are thread-local and already there.
-	//
-	// So what remains is the case those two cannot serve: state only ONE WORKER may retract. An
-	// epoch slot or a hazard cell is not fungible -- clearing one from the wrong thread
-	// un-announces a slot that was never set there -- so the release runs ON THE OWING WORKER, via
-	// the creditor chain. That chain is the reason this list exists at all.
+
 	struct FiberDebt {
 		FiberDebt* next = nullptr;
 		void*      obj  = nullptr;
 		void     (*release)(void*) noexcept = nullptr;
-
-		// WHICH WORKER MUST RUN THIS, or kAnyHolder when nobody in particular must.
-		//
-		// THE REAPER VISITS EACH CREDITOR EXACTLY ONCE -- `creditors` is a bitmask and TakeCreditor
-		// clears the bit before dispatching, which is precisely what makes a double release
-		// impossible. That single visit therefore has to discharge EVERYTHING that worker is owed,
-		// of every kind, which is the whole reason this is a list with a loop rather than one
-		// pointer and one deleter.
-		//
-		// kAnyHolder IS NO LONGER REACHABLE THROUGH ANY PUBLIC CALL, and is kept as the field's
-		// "unset" value rather than as a supported mode. It was the fungible case -- memory, which
-		// SlabPool.h argues can be freed on any thread for the price of cache migration -- and the
-		// only API that produced it (ReleaseOnFiberDeath) was removed. ReleaseOnWorker requires a
-		// real worker index and a non-zero kind, so a debt that reaches this list has an owner.
-		//
-		// A REAL WORKER INDEX IS THE AFFINE CASE -- an epoch slot, a hazard cell, a thread-owned
-		// handle. Those must run ON that worker: clearing an epoch slot from the wrong thread
-		// un-announces a slot that was never set there and frees nodes under a live traversal. The
-		// index is what lets one visit release its own subset and leave the rest for their owners.
 		static constexpr size_t kAnyHolder = (size_t)-1;
 		size_t holder = kAnyHolder;
 	};
 
 	namespace detail {
-		// The seam ResetForReuse calls to release owning fiber-local slots. Declared here and
-		// DEFINED IN FiberRegistry.cpp so Fiber.h does not have to include the registry -- Fiber is
-		// included by nearly everything, and pulling the registry in behind it would invert the
-		// dependency that keeps Fiber a plain data type.
-		//
-		// IT ONLY CLEARS NOW. It used to consult a registry-side deleter table and free the slots
-		// that had declared how; that table went with SetSlotDeleter. The seam survives the API it
-		// was built for because the out-of-line definition is what keeps Fiber.h free of the
-		// registry, and Fiber.h is included by nearly everything.
 		void ReleaseFiberSlots(void** slots, size_t n) noexcept;
-
-		// HAND THE DEBT LIST TO THE REAPER RATHER THAN RELEASING IT HERE.
-		//
-		// ResetForReuse runs on the recycle path, which is a worker finishing a fiber and about to
-		// look for more work. Running arbitrary user deleters there is the same mistake as sweeping
-		// epochs there: unbounded work of the caller's choosing, on a thread that was doing
-		// something, at a moment nobody picked.
-		//
-		// So the list is SPLICED onto a pending stack and the reclaim task drains it, alongside the
-		// epoch Tick and the hazard Scan. One task, one place, everything reclaimed together --
-		// which is also the only arrangement where a deleter that itself retires something gets
-		// swept by the same pass rather than waiting for the next one.
-		//
-		// TAKES THE WHOLE CHAIN AND LEAVES THE HEAD NULL, so the fiber carries nothing forward.
 		void HandOffFiberDebts(FiberDebt* head) noexcept;
 	}
 
@@ -103,195 +66,37 @@ namespace JLib {
 		uint64_t id;
 		void* stackBase;
 		size_t stackSize;
-		// WHICH CLASS THIS FIBER BELONGS TO. Recorded rather than inferred from stackSize so
-		// ReturnBatch can route it home in one load, and so a future class with a coincidentally
-		// equal size cannot be misfiled.
 		StackClass stackClass = StackClass::Standard;
-		// DENSE, STABLE index into the global fiber pool: standard fibers occupy [0, standardCount),
-		// heavy fibers follow. The pool is leaked and its vectors are reserve()d so they never
-		// reallocate, so this is fixed for the life of the program.
-		//
-		// It is what makes Event's waiter index a PERFECT HASH rather than a hash table: a parked
-		// task always holds a fiber, and a fiber can be parked on at most one event at a time
-		// (parking is what the fiber is doing), so fiber index -> waiter slot has no collisions
-		// by construction. See Event::AddWaiter.
 		size_t poolIndex = SIZE_MAX;
 		Task* owningTask = nullptr; // The task currently running on this fiber
 		Context* homeCtx = nullptr; // Scheduler ctx to return to; the worker sets this before each switch-in
-		// THE WORKER THIS FIBER IS PINNED TO. Unconditional since 4.0.2 (was Mode::FiberOnly). Set once, where the fiber is
-		// bound to a task, and read by every resume path to decide where the fiber goes back.
-		//
-		// WHY PINNING EXISTS. Nothing about a fiber's saved context is thread-specific -- the switch
-		// is a pure register save/restore and the stack travels with the fiber -- but everything
-		// reached through `thread_local` IS. TLS follows the THREAD; a migrating fiber does not. So
-		// a resumed fiber reads `thread_id`, `Thread::instance` and every per-thread cache belonging
-		// to whichever worker happened to pick it up, and any value derived from those BEFORE the
-		// suspend is silently wrong AFTER it. Pinning removes the class of bug rather than asking
-		// every future call site to remember the rule.
-		//
-		// marl takes the same position by construction -- `switchToFiber()` is documented "the fiber
-		// must belong to this worker", and its steal() moves TASKS, never fibers. What it gives up,
-		// and what this gives up with it: a worker holding many blocked fibers cannot shed them, so
-		// resumed work is not rebalanced. TASK stealing is untouched; a Fiber task that has not run
-		// yet holds no fiber and stays freely stealable.
-		//
-		// SIZE_MAX means "not bound" -- a fiber sitting in a pool cache. It is not a valid target.
 		size_t homeWorker = SIZE_MAX;
 
-		// ---- FIBER-LOCAL STORAGE: what `thread_local` cannot be here ---------------------------
-		//
-		// Migratable fibers resume on whichever worker is free, so a `thread_local` read before a
-		// suspension point is not the same object after it -- silently, because you simply get the
-		// resuming worker's copy. That is the one real cost of the default mode, and this is the
-		// thing to use instead: storage attached to the FIBER, which is the object that actually
-		// survives the suspension.
-		//
-		// A FIXED ARRAY, INDEXED BY A COMPILE-TIME SLOT. One load from a pointer the caller already
-		// has -- no map, no hash, no lock, no allocation. That matters because the whole point is to
-		// be cheap enough to use on the path where TLS would have been used.
-		//
-		// EIGHT SLOTS, and the number is a memory decision rather than a guess at demand. Every
-		// fiber in the pool carries this whether it uses it or not, and the pool is sized by the
-		// fiber budget -- at 64 standard fibers per worker on a 32-worker box that is 2048 fibers,
-		// so each slot costs 16 KB of committed memory across the pool. Eight is 128 KB, which is
-		// nothing beside the 64 KB stack each of those fibers already owns. Raising it is a
-		// one-line change with a visible price; a dynamic map would have neither property.
-		//
-		// SLOT MEANING IS THE APPLICATION'S. The library defines the storage and the count and never
-		// reads a slot. Callers declare their own `enum class : uint16_t` ending in COUNT and
-		// static_assert it against kLocalSlots -- see FiberLocal() in TaskScheduler.h.
 		static constexpr size_t kLocalSlots = 8;
 		void* local[kLocalSlots] = {};
 
-		// Head of this fiber's debt list. Plain, not atomic: a fiber runs on exactly one worker at a
-		// time -- that is what a fiber IS -- so its own debts have a single mutator for their whole
-		// life. What changes under migration is which thread that mutator is, and the list travels
-		// with the fiber, which is the same reason the slots above are safe.
 		FiberDebt* debts = nullptr;
 
 #if defined(JLIBSCHED_REQUEUE_TRACE)
-		// WHERE Requeue SENT THIS FIBER on its last resume, stamped by the router and read back by
-		// the fiber once it is running again. Diagnostic only, compiled out by default.
-		//
-		// IT EXISTS BECAUSE TWO SEPARATE INSTRUMENTS DISAGREED and neither could settle it: the
-		// router reported 178 of 256 resumes routed AWAY from home, while the test reported every
-		// fiber waking on the worker it left. Both counted honestly; they just never counted the
-		// SAME task, so nothing could join them. This joins them -- one task, both ends.
 		size_t lastPlacedOn = SIZE_MAX;
 #endif
 
-		// INTRUSIVE LINK for a WaitGroup's direct waiter stack. Owned by whichever
-		// primitive this fiber is parked on, and null whenever it is not parked on one.
-		//
-		// WHY IT LIVES ON THE FIBER AND NOT THE TASK. Task is on a hard 64-byte budget; Fiber is
-		// not. It is also the correct owner: a fiber is parked on at most one thing at a time --
-		// parking is what the fiber is DOING -- so one link per fiber can never be contended between
-		// two primitives. That is the same argument that makes Event's fiber-indexed waiter table a
-		// perfect hash.
-		//
-		// AN EARLIER DESIGN THREADED THE WAITER LIST THROUGH Task AND WAS RETIRED FOR A REAL BUG:
-		// the links WERE the tasks, so a task freed back to the slab while a list still held its
-		// address meant the next drain walked a recycled slot. Fibers are never freed -- the global
-		// pool reserves and leaks them -- so a link through a fiber cannot dangle that way.
 		Fiber* nextWaiter = nullptr;
-
-		// ---- THE CLEANUP CHAIN LINK -- SEPARATE FROM nextWaiter ON PURPOSE ----------------------
-		//
-		// THE FIBER IS THE MESSAGE. A dying fiber that owes a worker is linked onto that worker's
-		// inbound chain with one CAS, carrying everything the worker needs -- which fiber, and what
-		// it owes. The alternative, and what this replaced, was a real Task per hop: a 64-byte slab
-		// allocation, a task lifecycle, an inbox hop and a DestroyTask, to carry two words.
-		//
-		// NOT REUSING nextWaiter, even though a dead fiber is provably not parked on a primitive.
-		// That argument is true today and is exactly the kind that stops being true quietly: the
-		// two links have different owners (a primitive owns one, the registry the other) and
-        // different lifetimes, and sharing them would make "is this fiber parked or owing?" a
-		// question the pointer cannot answer. Fiber is not on a size budget; Task is.
 		Fiber* cleanupNext = nullptr;
-
-		// TSan's handle for this fiber, or null in any build without the sanitizer. Made once with
-		// the pool and never destroyed, because fibers are never destroyed -- the pool reserves and
-		// leaks them. See TsanFiber.h for why an unannotated fiber scheduler produces meaningless
-		// TSan output in BOTH directions.
-		//
-		// NOT CLEARED BY ResetForReuse: like poolIndex, it describes the SLOT, not the occupant. A
-		// recycled fiber is the same fiber to TSan, which is correct -- the stack is the same stack.
+		
 		void* tsanFiber = nullptr;
 
-		// ---- THE CREDITOR SET: every worker this fiber owes thread-affine cleanup to ------------
-		//
-		// A SET, NOT ONE HOME, AND THAT IS THE WHOLE POINT. `homeWorker` above can name one worker.
-		// Under migration that is not enough: a fiber that allocates on A, migrates, and allocates
-		// again on B owes BOTH, and no single index can say so. An earlier draft of this design
-		// tried one `uint8_t home` and the second creditor is exactly what broke it.
-		//
-		// A SET, NOT A SEQUENCE. Cleanup order does not matter -- each worker releases its own
-		// resources and no creditor's work depends on another's -- so this needs membership, not
-		// ordering. Which makes a bitmask strictly better than the linked list of ids it replaces:
-		//
-		//   * NOTHING TO ALLOCATE on the death path, where an allocation is least welcome.
-		//   * DEDUPLICATED BY CONSTRUCTION. A worker that touches this fiber fifty times sets one
-		//     bit. A list would queue fifty cleanup jobs and need its own dedup pass to avoid it.
-		//   * ONE `fetch_or` to record, no CAS loop, so the debt-incurring path stays cheap.
-		//   * The iteration is CountTrailingZeros64, the same idiom the scheduler already uses for
-		//     the awake bitmap.
-		//
-		// AND IT IS ON THE FIBER, NOT THE TASK, for the reason the nextWaiter comment above gives:
-		// Task is on a hard 64-byte budget and Fiber is not. 32 bytes here is free; on Task it
-		// would push every single-capture lambda out of the 64-byte slab class.
-		//
-		// PINNED MODE IS THIS SET WITH EXACTLY ONE MEMBER. It is not a second mechanism and not a
-		// second code path -- the binding worker is added at bind, nothing else ever is, and the
-		// cleanup chain degenerates to one hop. See TaskScheduler::MigratableFibers.
-		//
-		// ---- AND IT STILL EARNS ITS KEEP AT ONE MEMBER, which is the part worth writing down ----
-		//
-		// The obvious cleanup, once fibers are pinned, is "a set of one is just a field -- collapse
-		// it to a single home worker and delete the bitmask." That trades away the property the
-		// reclamation systems are actually built on, and the trade is invisible from here.
-		//
-		// A BITMASK OF HOLDERS IS WHAT MAKES THE DELETION LISTS THREAD_LOCAL. Cleanup is ADDRESSED:
-		// each set bit names a thread, TakeCreditor hands the fiber to exactly that thread, and the
-		// release runs there -- so every reclamation system can keep its pending work in its OWN
-		// storage. That is not hypothetical; it is what is already there. EpochManager's retire
-		// bag is `thread_local t_epochBag` and HazardDomain's is the same shape.
-		//
-		// WITHOUT ADDRESSING, THOSE HAVE TO BE GLOBAL. If a dying fiber cannot say WHICH thread owes
-		// what, the only place a reclaimer can look is one structure every thread shares -- so every
-		// retire becomes a push onto a contended list, and every sweep walks other threads' garbage
-		// to find its own. The bitmask is what buys the per-thread form, and a single `homeWorker`
-		// field would buy it too ONLY for as long as a fiber never touches affine state on a second
-		// thread. Migration is the case that breaks that, and migration is the DEFAULT in 5.0.
-		//
-		// So: pinning does not make this redundant, it makes it CHEAP -- one bit, one hop, and the
-		// thread_local retire bags stay legal either way.
-		// WIDE ENOUGH FOR HOLDERS, NOT JUST WORKERS. A creditor is any THREAD that can own
-		// thread-affine state, and that is workers PLUS the external ids main and an app's own
-		// threads claim. At 4 words this covered 256 workers and silently refused every external
-		// holder above it -- NoteCreditor drops an out-of-range holder rather than wrapping, which
-		// is right, but the debt is then dropped with it. See the static_assert in
-		// FiberRegistry.cpp that ties this to kMaxHintQueues + kExternalReaders.
+		
 		static constexpr size_t kCreditorWords = 6;   // 384 holders
 		std::atomic<uint64_t> creditors[kCreditorWords] = {};
 
-		// Record that `worker` now owes cleanup for this fiber. Idempotent BY CONSTRUCTION rather
-		// than by checking -- setting a set bit is a no-op, so the caller never has to ask whether
-		// it already registered, and a hot path that fires on every affine allocation costs one
-		// atomic OR with no branch and no retry.
-		void NoteCreditor(size_t worker) {
+		inline void NoteCreditor(size_t worker) {
 			if (worker >= kCreditorWords * 64) return;   // refuse, do not wrap: a wrapped index
 			                                             // would silently bill the wrong worker
 			creditors[worker >> 6].fetch_or(1ull << (worker & 63), std::memory_order_release);
 		}
 
-		// Remove and return the lowest-numbered creditor, or SIZE_MAX when the set is empty.
-		//
-		// THIS IS THE CHAIN STEP. Cleanup pops ONE creditor and queues one job to it; that job does
-		// its work and pops the next; whoever gets SIZE_MAX recycles the fiber. The fan-out shape --
-		// pop them all, queue N jobs, then recycle -- looks equivalent and is not: the jobs would be
-		// QUEUED, not run, so the fiber returns to the pool while cleanup still references it.
-		// Priority changes when those jobs run; it does not change that ordering.
-		size_t TakeCreditor() {
+		inline size_t TakeCreditor() {
 			for (size_t w = 0; w < kCreditorWords; ++w) {
 				uint64_t cur = creditors[w].load(std::memory_order_acquire);
 				while (cur) {
@@ -307,44 +112,7 @@ namespace JLib {
 			return SIZE_MAX;
 		}
 
-		// ---- WHAT IS OWED, AS OPPOSED TO WHO IS OWED IT ----------------------------------------
-		//
-		// `creditors` records WHO ran this fiber; this records WHAT it incurred. They are separate
-		// because they are set at different times by different parties: registration happens on
-		// EVERY pickup (cheap, unconditional, one fetch_or), while a kind is set only when a
-		// resource is actually acquired.
-		//
-		// AND THE SPLIT IS WHAT MAKES REGISTRATION AFFORDABLE. Without it, wiring registration made
-		// every fiber death dispatch a cleanup task per worker it had run on -- to run an empty
-		// routine, and to recycle through the GLOBAL pool instead of the thread-local cache. Real
-		// work for nothing. With it, a fiber that never touched affine state has creditors, no
-		// kinds, and takes the same path it always did.
-		//
-		// KINDS ARE THE THREE RECLAMATION SYSTEMS, and that is not a coincidence: they are exactly
-		// the three costs the architecture header says migration already paid (address-routed slab
-		// frees, a global epoch participant list, fiber-indexed hazard cells).
-		//
-		// RECORDING THE DEBT IS WHAT KEEPS THOSE IN THEIR CHEAP PER-THREAD FORMS -- present tense,
-		// not a future option. The kind says a cleanup is owed and the creditor bit says by WHOM, and
-		// between them a reclaimer only ever touches its own storage: EpochManager's retire bag is
-		// `thread_local t_epochBag` today, HazardDomain's is the same shape. Take the addressing
-		// away and both have to become one structure shared by every thread, because a dying fiber
-		// could no longer say whose garbage it left. See the creditors field for the full argument.
-		// ---- WHAT THE CREDITOR CHAIN IS FOR, AND WHAT IT IS NOT -------------------------------
-		//
-		// A SLOT ON A WORKER, NOT AN ADDRESS IN A POOL. The chain exists for "worker q still
-		// advertises an epoch" and "worker q still holds a hazard cell" -- a position in
-		// participants[q], which only that worker may retract. That is why the release has to run
-		// ON that worker, and why the chain visits each creditor exactly once.
-		//
-		// MEMORY IS NOT ONE OF THESE AND MUST NOT BE TAGGED AS ONE. Slab blocks are fungible --
-		// SlabPool.h has the argument -- so the thread that kills the fiber frees them inline and
-		// the shared pool rebalances. kOwesSlab is retained only as a reserved bit: setting it would
-		// route every fiber holding memory through a per-worker hop on the death path to release
-		// something no particular worker owns. It would become real ONLY if a block ever carried an
-		// owner stamp that had to be remote-pushed to that owner's cache, and nothing here does
-		// that. There is no memory path any more: the non-affine debt form was removed, because a
-		// free that is safe at fiber death was already safe without a ledger.
+		
 		enum OwedKind : uint32_t {
 			kOwesNothing = 0,
 			kOwesSlab    = 1u << 0,   // RESERVED, unused -- see above. Do not set it for memory.
@@ -353,14 +121,14 @@ namespace JLib {
 		};
 		std::atomic<uint32_t> owedKinds{ kOwesNothing };
 
-		void NoteOwed(uint32_t kinds) { owedKinds.fetch_or(kinds, std::memory_order_release); }
-		uint32_t Owed() const { return owedKinds.load(std::memory_order_acquire); }
+		inline void NoteOwed(uint32_t kinds) { owedKinds.fetch_or(kinds, std::memory_order_release); }
+		inline uint32_t Owed() const { return owedKinds.load(std::memory_order_acquire); }
 
 		// THE GATE ON THE WHOLE CLEANUP CHAIN. Creditors alone are not a reason to run it -- being
 		// picked up is not a debt.
-		bool OwesCleanup() const { return Owed() != kOwesNothing; }
+		inline bool OwesCleanup() const { return Owed() != kOwesNothing; }
 
-		bool HasCreditors() const {
+		inline bool HasCreditors() const {
 			for (size_t w = 0; w < kCreditorWords; ++w)
 				if (creditors[w].load(std::memory_order_acquire)) return true;
 			return false;
@@ -370,7 +138,7 @@ namespace JLib {
 		// drained -- a fiber returning to the pool is a NEW fiber and must owe nobody. Calling this
 		// with debts outstanding does not lose a task, it loses a RELEASE: the COM apartment or
 		// handle those creditors were holding is never given back, and nothing reports it.
-		void ClearCreditors() {
+		inline void ClearCreditors() {
 			for (size_t w = 0; w < kCreditorWords; ++w)
 				creditors[w].store(0, std::memory_order_release);
 		}
@@ -391,7 +159,7 @@ namespace JLib {
 		// in the system is keyed by -- see Event's perfect hash), id, stackBase, stackSize, ctx and
 		// the arena pointers. Those describe the SLOT, not the occupant, and clearing them would
 		// unmake the fiber rather than free it.
-		void ResetForReuse() {
+		inline void ResetForReuse() {
 			ClearCreditors();
 			// AND THE KINDS WITH THEM. A recycled fiber carrying a stale kind would send its next
 			// occupant's death down the cleanup chain to release something it never acquired. This
@@ -447,31 +215,6 @@ namespace JLib {
 			}
 			status.store(FiberStatus::READY, std::memory_order_release);
 		}
-
-		// ---- A FIBER IS NEVER HEAP-ALLOCATED AND NEVER DELETED --------------------------------
-		//
-		// Fibers live in GlobalFiberPool's `std::vector<Fiber> fibers[kClassCount]`, each paired
-		// with a stack carved out of a FiberStackArena that was mapped ONCE at startup. The pool
-		// hands them out and takes them back; nothing else may create or destroy one.
-		//
-		// A heap-allocated Fiber is not merely unusual, it is unrecoverable: it has no arena stack
-		// under it, no poolIndex that any table can name, no epoch slot -- and FiberRegistry indexes
-		// EVERYTHING by poolIndex, so such a fiber is invisible to the cleanup chain and to hazard
-		// reclamation both. `delete` on a pooled one is worse: it frees memory the vector owns, and
-		// the recycle path hands the same address out again afterwards.
-		//
-		// DELETED OUTRIGHT, unlike Task's, and the difference is instructive. Task has a VIRTUAL
-		// destructor, so the compiler emits a deleting destructor into its vtable and requires an
-		// accessible `operator delete` whether or not anything calls it -- which is why Task defines
-		// one that asserts instead. Fiber has no virtual anything, so the compile-time form is
-		// available here and is strictly better: it cannot be reached at runtime to assert.
-		//
-		// PLACEMENT NEW IS UNAFFECTED, and this is the part worth stating because declaring any
-		// operator new at class scope HIDES all of them, placement included. Every site in this
-		// library writes `::new (mem) T(...)` with the global qualifier, and the standard library's
-		// allocator_traits::construct does the same -- so `std::vector<Fiber>` keeps working. An
-		// unqualified `new (p) Fiber(...)` would now fail to compile, which is the correct outcome:
-		// the pool is the only thing that should be constructing these.
 		void* operator new(std::size_t) = delete;
 		void* operator new[](std::size_t) = delete;
 		void  operator delete(void*) = delete;
@@ -483,7 +226,9 @@ namespace JLib {
 		// Default member init covers the move ctor too (a moved/fresh fiber is not in an
 		// epoch), so the move ctor doesn't need to mention it.
 		std::atomic<size_t> localEpoch{ SIZE_MAX };
-		static std::atomic<uint64_t> idGenerator;
+		// INLINE STATIC (C++17): the out-of-line definition lived in Fiber.cpp, which is gone --
+		// every Fiber definition is now in a header so the switching path has no call in it.
+		inline static std::atomic<uint64_t> idGenerator{ 0 };
 		void (*taskFunction)();
 		Fiber() : stackBase(nullptr), stackSize(0), taskFunction(nullptr), status(FiberStatus::READY), id(idGenerator.fetch_add(1, std::memory_order_relaxed)) {
 
@@ -494,24 +239,191 @@ namespace JLib {
 		Fiber& operator=(Fiber&&) = delete;
 		Fiber(const Fiber&) = delete;
 		Fiber& operator=(const Fiber&) = delete;
-		void Init(void (*entryPoint)());
-		void CoYield();    // Swaps back to scheduler                            
-		void Suspend();  // Moves from RUNNING -> SUSPENDED
-		// The CAS half of Resume, WITHOUT the re-queue. Returns true when this call is the one that
-		// moved SUSPENDED -> READY, meaning the CALLER now owns re-queueing owningTask. Lets a waker
-		// with many fibers to wake (Event::SignalAll) collect them and submit one batch instead of
-		// paying a placement, an inbox push and a condition-variable signal per fiber.
-		bool ResumeQueueless();
-		void Resume();   // Moves from SUSPENDED -> READY
+		// NOT inline: the body is in src/win32/FiberInit.cpp (and the posix twin), next to the
+		// ContextSwitch assembly whose restore frame it has to match. An `inline` declaration needs
+		// its definition in every TU that calls it, so marking it inline while the body sits in one
+		// .cpp gives an unresolved external from Thread.obj -- which is exactly what it did.
+		// ---- Fiber::Init -- THE FRAME ContextSwitch RESTORES. THREE ABIs, ONE DEFINITION SITE ----
+		//
+		// This was three separate FiberInit.cpp files. They are here now because keeping ONE
+		// definition reachable was costing three separate safeguards in the build, all of them
+		// guarding the same hazard: two definitions of Fiber::Init both land in Scheduler.lib and
+		// static-archive linking picks whichever member comes FIRST, with no duplicate-symbol
+		// error. That already happened -- an AArch64 build seeding an x86-64 stack frame, which
+		// faults on the first switch-in with nothing pointing at the cause. The three guards were
+		// a CMake REMOVE_ITEM, a cross-directory list(APPEND), and a configure-time FATAL_ERROR on
+		// a stale file. A compile-time #if makes the whole class unrepresentable.
+		//
+		// THE SPLIT IS BY ABI, NOT BY OS, and that is why there are three arms and not four:
+		// Windows-on-ARM64 and AAPCS64 agree on the callee-saved set (x19-x28, x29, x30, low 64
+		// bits of v8-v15) and therefore on the frame, so ONE arm serves both. Only x86-64 splits,
+		// because Win64 and SysV genuinely differ.
+		//
+		// EACH ARM IS ONE CONTRACT WITH ITS ContextSwitch. Init writes what the restore reads back,
+		// register for register and slot for slot; disagree and the failure is a wild jump, not a
+		// compile error. The assembly no longer sits in the same directory, so the per-slot
+		// comments below are now the only thing holding the two halves in step -- they earn their
+		// keep more here than they did next to the .asm, not less.
+#if defined(__aarch64__) || defined(_M_ARM64)
+		// ---- AAPCS64 (Linux AND Windows on ARM64): 176-byte frame -----------------------------
+		void Init(void (*entryPoint)()) {
+			uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
+			uintptr_t* sp = (uintptr_t*)top;
+			*(--sp) = (uintptr_t)&FiberTrampoline;
+			*(--sp) = 0;                     // x29 (FP): zero terminates a backtrace cleanly at the fiber base
+			*(--sp) = 0;                     // x28
+			*(--sp) = 0;                     // x27
+			*(--sp) = 0;                     // x26
+			*(--sp) = 0;                     // x25
+			*(--sp) = 0;                     // x24
+			*(--sp) = 0;                     // x23
+			*(--sp) = 0;                     // x22
+			*(--sp) = 0;                     // x21
+			*(--sp) = 0;                     // x20
+			*(--sp) = (uintptr_t)entryPoint; // x19: the trampoline's 'blr x19' target
+			*(--sp) = 0;
+			*(--sp) = 0;
+			for (int i = 0; i < 8; ++i)       // low 64 bits of v8-v15
+				*(--sp) = 0;
+			ctx.rsp = (void*)sp;
+		}
+#elif defined(_WIN32)
+		// ---- Windows x64: 272-byte frame ------------------------------------------------------
+		void Init(void (*entryPoint)()) {
+			// 16-byte-align the very top of this fiber's stack.
+			uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
+			uintptr_t* sp = (uintptr_t*)top;
+
+			// Windows x64 ABI: a called function gets 32 bytes of shadow space ABOVE its return
+			// address for its callees to spill register params. The trampoline 'call's the C++
+			// entry, so reserve that shadow at the very top, inside this fiber's own stack --
+			// otherwise the entry function writes past stackTop (next fiber's base => silent
+			// corruption, or unmapped memory => write AV at the stack-region boundary).
+			// SysV has no shadow space, which is why the POSIX arm does not do this.
+			sp -= 4;                                 // 32 bytes shadow space
+
+			// Return address consumed by ContextSwitch's final 'ret': the trampoline. It runs at
+			// a 16-aligned RSP and 'call's the real entry (in RBX) to land it at ABI 8-mod-16.
+			*(--sp) = (uintptr_t)&FiberTrampoline;
+
+			// 8 callee-saved GPR slots. ContextSwitch pops them r15..rbx, so rbx (popped last)
+			// is the highest slot -- seeded with the entry point for the trampoline's `call rbx`.
+			// RDI and RSI are callee-saved on Windows and NOT on SysV -- that difference is why
+			// the POSIX frame has six GPR slots here rather than eight.
+			*(--sp) = (uintptr_t)entryPoint; // rbx
+			*(--sp) = 0;                     // rbp
+			*(--sp) = 0;                     // rdi
+			*(--sp) = 0;                     // rsi
+			*(--sp) = 0;                     // r12
+			*(--sp) = 0;                     // r13
+			*(--sp) = 0;                     // r14
+			*(--sp) = 0;                     // r15
+
+			// 8-byte slot that realigns the XMM block to 16 -- mirrors ContextSwitch's
+			// `sub rsp, 168` (= 160 XMM + 8). Without it ctx.rsp would be 8 mod 16 and the
+			// restore's movdqa would #GP. ContextSwitch also stashes the FP control state here:
+			// MXCSR at [base+160] (low 4 bytes), x87 FCW at [base+164] (next 2). Seed the ABI
+			// defaults so the first switch-in's ldmxcsr/fldcw load a sane masked state instead
+			// of garbage: MXCSR 0x1F80 (all FP exceptions masked, round-to-nearest), FCW 0x037F.
+			*(--sp) = 0x0000037F00001F80ULL;
+
+			// 160 bytes for non-volatile XMM6-15 (10 * 16). Restored with movdqa, so this block
+			// -- and ctx.rsp -- must be 16-aligned. Zero-initialized; no incoming XMM state.
+			// Every XMM register is CALLER-saved under SysV, so this block does not exist there.
+			for (int k = 0; k < 20; ++k) *(--sp) = 0; // 20 * 8 = 160 bytes
+
+			ctx.rsp = (void*)sp; // 16-aligned base of the XMM block; ContextSwitch loads RSP here
+		}
+#else
+		// ---- System V AMD64 (Linux x86-64): 64-byte frame -------------------------------------
+		//
+		// Every difference from the Windows arm is an ABI difference:
+		//   - no 32-byte shadow space (a Win64 requirement with no SysV equivalent)
+		//   - six callee-saved GPRs, not eight: RDI and RSI are ARGUMENT registers here
+		//   - no XMM block at all: every XMM register is caller-saved under SysV
+		//
+		// Layout at ctx.rsp, low to high -- must match ContextSwitch.s exactly:
+		//   +0  MXCSR (4) + x87 CW (2) + 2 pad     +8  r15   +16 r14   +24 r13
+		//   +32 r12                                +40 rbx   +48 rbp   +56 return address
+		void Init(void (*entryPoint)()) {
+			// 16-byte-align the very top of this fiber's stack.
+			uintptr_t top = ((uintptr_t)((char*)stackBase + stackSize)) & ~(uintptr_t)0xF;
+			uintptr_t* sp = (uintptr_t*)top;
+
+			// Return address consumed by ContextSwitch's final 'ret': the trampoline. It runs at a
+			// 16-aligned RSP and 'call's the real entry (in RBX) to land it at ABI 8-mod-16.
+			*(--sp) = (uintptr_t)&FiberTrampoline;
+
+			// Six callee-saved GPR slots, in the order ContextSwitch pops them (r15 first, rbp
+			// last). rbp is therefore the highest slot and rbx the second highest -- rbx carries
+			// the entry point for the trampoline's `call rbx`.
+			*(--sp) = 0;                     // rbp
+			*(--sp) = (uintptr_t)entryPoint; // rbx
+			*(--sp) = 0;                     // r12
+			*(--sp) = 0;                     // r13
+			*(--sp) = 0;                     // r14
+			*(--sp) = 0;                     // r15
+
+			// FP control state, and the 8 bytes that bring the frame to 16-byte alignment: MXCSR
+			// in the low 4, x87 FCW in the next 2. ABI defaults, so the first switch-in's
+			// ldmxcsr/fldcw load a sane masked state rather than garbage. Identical encoding to
+			// the Windows slot.
+			*(--sp) = 0x0000037F00001F80ULL;
+
+			// 8 slots * 8 bytes = 64, so a 16-aligned top leaves ctx.rsp 16-aligned too.
+			ctx.rsp = (void*)sp;
+		}
+#endif
+
+		inline void CoYield() {
+			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::CoYield");
+			// Record intent and switch out.
+			this->status.store(FiberStatus::WANTS_YIELD, std::memory_order_release);
+#if defined(JLIB_TSAN)
+			detail::TsanSwitchToScheduler();
+#endif
+			ContextSwitch(&this->ctx, this->homeCtx);
+		}
+
+		inline void Suspend() {
+			JLIB_EPOCH_CHECK_NO_GUARD("Fiber::Suspend");
+			// Record intent and switch out.
+			this->status.store(FiberStatus::WANTS_SUSPEND, std::memory_order_release);
+#if defined(JLIB_TSAN)
+			detail::TsanSwitchToScheduler();
+#endif
+			ContextSwitch(&this->ctx, this->homeCtx);
+		}
+		inline bool ResumeQueueless() {
+			while (true) {
+				FiberStatus s = status.load(std::memory_order_acquire);
+				if (s == FiberStatus::SUSPENDED) {
+					FiberStatus exp = FiberStatus::SUSPENDED;
+					return status.compare_exchange_strong(exp, FiberStatus::READY, std::memory_order_acq_rel);
+				}
+				else if (s == FiberStatus::WANTS_SUSPEND) {
+					FiberStatus exp = FiberStatus::WANTS_SUSPEND;
+					if (status.compare_exchange_strong(exp, FiberStatus::SUSPEND_SIGNALED, std::memory_order_acq_rel))
+						return false;           // worker will wake it when it parks
+					// CAS lost to the worker parking us (now SUSPENDED) -> loop and take that path
+				}
+				else {
+					// RUNNING / READY / SUSPEND_SIGNALED / DEAD: not resumable right now (already
+					// signaled, not waiting, or running). Nothing to do.
+					return false;
+				}
+			}
+		}
+		// NOT `inline`. Both are DEFINED in TaskScheduler.cpp, where Thread is complete -- an inline
+		// function must be defined in every TU that uses it, so `inline` on a declaration whose only
+		// definition lives in one .cpp is an unresolved external. Fiber.h stays a LEAF: Event.h and
+		// DirectEvent.h call these from their own inline bodies, so anything Fiber.h includes is
+		// included by every consumer of the event headers -- which is why #include "Thread.h" here
+		// closed a cycle (Thread.h includes Fiber.h) and left Fiber incomplete in both.
+		void Resume();
+		static void RequeueResumedBatch(Task** tasks, size_t n, Lane lane);
 
 		// Safety check for the work-stealer
-		bool IsReady() const { return status == FiberStatus::READY; }
+		inline bool IsReady() const { return status == FiberStatus::READY; }
 	};
 } // namespace JLib
-
-namespace JLib {
-	// Re-queue fibers already transitioned to READY by ResumeQueueless. Lives here rather than in
-	// Event.h because Event.h only knows Fiber.h -- reaching TaskScheduler from a header it already
-	// includes would be circular.
-	void RequeueResumedBatch(Task** tasks, size_t n, Lane lane);
-}

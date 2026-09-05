@@ -166,3 +166,44 @@ size_t GlobalFiberPool::AvailableCount() const
 	for (size_t ci = 0; ci < kClassCount; ++ci) n += availableFibers[ci].size_approx();
 	return n;
 }
+
+// ---- WHICH FIBER OWNS THIS STACK ADDRESS? See the declaration for why this exists. -------------
+//
+// THE STRIDE IS THE PAGE-ROUNDED REGION, NOT RegionFor(cls). AllocateStack rounds its request up to
+// whole pages before advancing the arena offset -- it has to, or two stacks could share a page and
+// a guard page would land on the previous fiber's live stack top. Recomputing the raw region here
+// would drift from the real spacing on any platform whose page size does not divide it, and the
+// drift is SILENT: the index comes out one too low near the end of a large arena, so a fiber reads
+// ANOTHER fiber's slot rather than failing. Round the same way the allocator did.
+//
+// BOUNDED BY WHAT WAS ACTUALLY BUILT, not by the reservation. The arena reserves address space for
+// `n` stacks up front but a class may hold fewer live fibers than it reserved for; an address past
+// the last one is not a fiber stack, and answering with an index into unbuilt storage would be
+// worse than answering null.
+//
+// THE GUARD PAGE IS INSIDE THE REGION and is deliberately NOT special-cased: an address there still
+// belongs to that fiber's region, and treating it as "no fiber" would answer null exactly when a
+// stack is about to overflow -- the moment the answer matters most.
+const JLib::Fiber* JLib::GlobalFiberPool::FiberForStack(const void* addr) const noexcept {
+	if (!addr) return nullptr;
+	const auto a = reinterpret_cast<uintptr_t>(addr);
+	for (size_t ci = 0; ci < kClassCount; ++ci) {
+		const FiberStackArena* ar = arenas[ci];
+		if (!ar || fibers[ci].empty()) continue;
+		const auto base = reinterpret_cast<uintptr_t>(ar->Base());
+		if (a < base || a >= base + ar->TotalSize()) continue;
+
+		const size_t page   = ar->PageSize();
+		const size_t stride = (RegionFor((StackClass)ci) + page - 1) & ~(page - 1);
+		if (stride == 0) continue;
+
+		const size_t idx = (size_t)((a - base) / stride);
+		if (idx >= fibers[ci].size()) return nullptr;   // reserved but never built
+		return &fibers[ci][idx];
+	}
+	return nullptr;   // not on any fiber stack -- a Native task, main, or an app's own thread
+}
+
+JLib::Fiber* JLib::GlobalFiberPool::FiberForStack(const void* addr) noexcept {
+	return const_cast<Fiber*>(static_cast<const GlobalFiberPool*>(this)->FiberForStack(addr));
+}

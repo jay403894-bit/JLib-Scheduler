@@ -1227,6 +1227,7 @@ void TaskScheduler::ResumeAll() {
 static TaskScheduler::AffinityPolicy g_affinityPolicy = TaskScheduler::AffinityPolicy::Ideal;
 void TaskScheduler::SetAffinityPolicy(AffinityPolicy p) { g_affinityPolicy = p; }
 TaskScheduler::AffinityPolicy TaskScheduler::GetAffinityPolicy() { return g_affinityPolicy; }
+std::atomic<bool> TaskScheduler::stealHintOn{ true };
 
 // K-HOT. DEFAULT IS ZERO, and that is not timidity -- it is the same rule the I/O layer follows:
 // a job-system-only user must not pay for something they never asked for. A spinning core is a real
@@ -1311,12 +1312,7 @@ TaskScheduler::AffinityPolicy TaskScheduler::GetAffinityPolicy() { return g_affi
 //
 // I GOT THAT BACKWARDS ONCE: an earlier version let an explicit SetHotWorkers shrink F to make room.
 // It "worked" and it is the same hazard wearing a caller's authority.
-static std::atomic<uint64_t> g_bands{ (2ull) | (2ull << 8) };   // F=2, Fbase=2, K=0, Kmax=0
 
-static constexpr uint64_t kBandF     = 0;
-static constexpr uint64_t kBandFbase = 8;
-static constexpr uint64_t kBandK     = 16;
-static constexpr uint64_t kBandKmax  = 24;
 // ---- Kmin JOINS THE WORD, bits 32..39 --------------------------------------------------------
 //
 // It lived in a standalone g_hotMin beside a g_hotMax, which made the SCALING RANGE a second source
@@ -1326,97 +1322,6 @@ static constexpr uint64_t kBandKmax  = 24;
 // and every band question becomes one load.
 //
 // Kmax at 24..31 was already here, so this only had to move its partner.
-static constexpr uint64_t kBandKmin  = 32;
-static inline size_t BandField(uint64_t w, uint64_t sh) noexcept { return (size_t)((w >> sh) & 0xFFull); }
-static inline uint64_t BandPut(uint64_t w, uint64_t sh, size_t v) noexcept {
-	return (w & ~(0xFFull << sh)) | ((uint64_t)(v & 0xFFu) << sh);
-}
-
-// Acquire on the read side pairs with the release on every mutating CAS, so a worker that observes a
-// new band also observes whatever the controller published before it.
-static inline uint64_t BandsWord() noexcept { return g_bands.load(std::memory_order_acquire); }
-static inline size_t BandsK()  noexcept { return BandField(BandsWord(), kBandK);     }
-static inline size_t BandsF()  noexcept { return BandField(BandsWord(), kBandF);     }
-static inline size_t BandsFb() noexcept { return BandField(BandsWord(), kBandFbase); }
-
-static inline void BandsSetFb(size_t fb) noexcept {
-	uint64_t cur = g_bands.load(std::memory_order_relaxed), next;
-	do { next = BandPut(cur, kBandFbase, fb); }
-	while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed));
-}
-static inline void BandsSetKmax(size_t km) noexcept {
-	uint64_t cur = g_bands.load(std::memory_order_relaxed), next;
-	do { next = BandPut(cur, kBandKmax, km); }
-	while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed));
-}
-static inline void BandsSetKmin(size_t km) noexcept {
-	uint64_t cur = g_bands.load(std::memory_order_relaxed), next;
-	do { next = BandPut(cur, kBandKmin, km); }
-	while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed));
-}
-// THE SCALING RANGE, BOTH ENDS FROM ONE LOAD. `max > min` is the ONLY predicate that means "the
-// controller may move K" -- MaybeAdjustHotWorkers gates on it, and so does the worker's observer.
-// Two readers asking it of two different loads is how the observer ends up off while the controller
-// runs, which starves it and makes K shed every window.
-static inline bool BandsScaling(uint64_t w) noexcept {
-	return BandField(w, kBandKmax) > BandField(w, kBandKmin);
-}
-
-// F WRITER. Clamped to [Fbase, N-K] -- never below the configured base, never into the reserved band
-// or past the pool. Returns the previous F.
-static inline size_t BandsSetF(size_t f, size_t n) noexcept {
-	// THE MOST CONTENDED CAS IN THE SCHEDULER, structurally: g_bands is ONE global word and every
-	// floor change -- push-side growth, the collapse, K moves -- goes through it. If a retry storm
-	// exists anywhere, this is the first place to look.
-	JLib::RetryProbe bandsProbe(JLib::RetrySite::Bands);
-	uint64_t cur = g_bands.load(std::memory_order_relaxed), next;
-	size_t prev;
-	do {
-		prev = BandField(cur, kBandF);
-		const size_t k  = BandField(cur, kBandK);
-		const size_t fb = BandField(cur, kBandFbase);
-		size_t want = (f < fb) ? fb : f;                      // F >= Fbase
-		// DEGENERATE POOL: with fewer than two workers there is nobody to keep a slot parkable FOR,
-		// and forcing F to 0 there is not conservatism -- it flips the only worker from never-park to
-		// parkable and hands it the single-worker lost-wakeup path. Leave the bands alone below 2.
-		if (n >= 2) { const size_t room = (n > k + 1) ? n - k - 1 : 0;   // K + F <= N, one left parkable
-		              if (want > room) want = room; }
-		next = BandPut(cur, kBandF, want);
-		// The Miss() is only reached when the CAS FAILED -- && short-circuits on success -- so the
-		// loop keeps its exact shape and the probe counts exactly the retries.
-	} while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed)
-	         && (bandsProbe.Miss(), true));
-	return prev;
-}
-// Conditional F write for the collapse: succeeds only if F is still `expected`, and preserves
-// whatever K did meanwhile.
-static inline bool BandsCasF(size_t expected, size_t desired) noexcept {
-	uint64_t cur = g_bands.load(std::memory_order_relaxed);
-	for (;;) {
-		if (BandField(cur, kBandF) != expected) return false;
-		const uint64_t next = BandPut(cur, kBandF, desired);
-		if (g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed))
-			return true;
-	}
-}
-
-// K WRITER. Refused -- not accommodated -- if it would break K+F <= N. F is NEVER decremented here.
-// Returns the previous K. `k` is also capped at Kmax when one has been set.
-static inline size_t BandsSetK(size_t k, size_t n) noexcept {
-	uint64_t cur = g_bands.load(std::memory_order_relaxed), next;
-	size_t prev;
-	do {
-		prev = BandField(cur, kBandK);
-		const size_t f    = BandField(cur, kBandF);
-		const size_t kmax = BandField(cur, kBandKmax);
-		size_t want = k;
-		if (kmax && want > kmax) want = kmax;                 // K <= Kmax
-		if (n >= 2) { const size_t room = (n > f + 1) ? n - f - 1 : 0;   // K + F <= N, one left parkable
-		              if (want > room) want = room; }
-		next = BandPut(cur, kBandK, want);
-	} while (!g_bands.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed));
-	return prev;
-}
 
 // ---- BASE vs CURRENT, AND WHY THERE HAS TO BE A BASE -----------------------------------------
 //
@@ -1572,6 +1477,15 @@ void TaskScheduler::SetSpinYieldMask(unsigned mask) noexcept {
 }
 unsigned TaskScheduler::GetSpinYieldMask() noexcept { return g_spinYieldMask.load(std::memory_order_relaxed); }
 
+// ---- SchedulerMutex::Lock's PRE-SUSPEND RETRY ------------------------------------------------
+// DEFAULT 0, so this ships inert and the fiber Lock path is unchanged until a sweep says otherwise.
+// See the loop in SchedulerMutex::Lock for why this is a different question from SetFastSpinTries.
+static std::atomic<int> g_mutexSpinTries{ 0 };
+void TaskScheduler::SetMutexSpinTries(int n) noexcept {
+	g_mutexSpinTries.store((n < 0) ? 0 : n, std::memory_order_relaxed);
+}
+int TaskScheduler::GetMutexSpinTries() noexcept { return g_mutexSpinTries.load(std::memory_order_relaxed); }
+
 // THE FLOOR SIZE BELOW WHICH A FLOOR WORKER NEVER YIELDS. See the header for why it exists; the
 // short version is that yield() is politeness aimed at a WIDE spinning set, and on a two-bit steer
 // set it is a coin flip that a push lands on the core that just stepped off.
@@ -1682,11 +1596,11 @@ size_t TaskScheduler::GetAwakeFloor() noexcept         { return BandsF(); }
 
 // When the last growth happened. Read by the collapse so a wave is not sheared off mid-flight by an
 // overflow worker that happens to find one idle instant between two tasks.
-static std::atomic<long long> g_lastFloorGrowNs{ 0 };
+// g_lastFloorGrowNs MOVED to TaskScheduler.h as a static inline member (initialiser included).
 
 // High-water mark of the CURRENT floor since the last reset -- see NoteFloorCrowding for why a
 // transient needs one. Not reset by the collapse: the whole point is that it outlives the shed.
-static std::atomic<size_t> g_awakeFloorPeak{ 0 };
+ std::atomic<size_t> g_awakeFloorPeak{ 0 };
 
 size_t TaskScheduler::GetAwakeFloorPeak() noexcept {
 	return g_awakeFloorPeak.load(std::memory_order_relaxed);
@@ -1859,7 +1773,20 @@ bool TaskScheduler::CollapseAwakeFloorToBase() noexcept {
 	const uint64_t w0 = BandsWord();
 	const size_t base = BandField(w0, kBandFbase);
 	const size_t cur  = BandField(w0, kBandF);
-	if (cur <= base) { g_cNoGrow.fetch_add(1, std::memory_order_relaxed); return false; }
+	// `==`, NOT `<=`. F BELOW ITS BASE IS A STATE TO REPAIR, NOT ONE TO ACCEPT.
+	//
+	// BandsSetF enforces `want = max(f, fb)` and THEN applies the room clamp (K + F <= N), so a
+	// call made while the pool is still being built -- StartPool fills `workers` one at a time --
+	// can pull F under its base: at n=2, k=0 the room is 1 and a base of 2 comes out as F=1.
+	// Correct at that instant; the pool really is that small.
+	//
+	// But nothing raised it afterwards. This guard read `cur <= base` and treated "below base" as
+	// "already collapsed", so the one function that restores F = Fbase declined to run, and the
+	// floor stayed one worker short for the life of the process. Measured directly: a park-time
+	// table showed F=1 beside base=2 with N=31 and K=0 -- the pool was long since full, and the
+	// stuck value was still there. A grown floor recovered by accident, because growth lifts F
+	// above base and the collapse then sheds it back to base.
+	if (cur == base) { g_cNoGrow.fetch_add(1, std::memory_order_relaxed); return false; }
 
 	// ---- ASK ABOUT THE OVERFLOW RANGE, NOT ABOUT THE POOL ------------------------------------
 	//
@@ -1918,20 +1845,17 @@ bool TaskScheduler::CollapseAwakeFloorToBase() noexcept {
 // Rates are asymmetric by design -- see MaybeAdjustAwakeFloor in the header for why.
 // g_wakeMisses / g_floorPushes REMOVED -- the promote ratio they fed was retired and nothing ever
 // loaded either one. See the note above NoteFloorCrowding's demote section.
-static std::atomic<long long> g_floorMissWindowNs{ 0 };
-static std::atomic<long long> g_floorWindowNs{ 0 };   // demote observation window
-static std::atomic<long long> g_lastFloorUpNs{ 0 };
-static std::atomic<long long> g_lastFloorDownNs{ 0 };
-static std::atomic<unsigned>  g_quietWindows{ 0 };
+std::atomic<long long> TaskScheduler::g_floorMissWindowNs{ 0 };
+ std::atomic<long long> TaskScheduler::g_floorWindowNs{ 0 };   // demote observation window
+ std::atomic<long long> TaskScheduler::g_lastFloorUpNs{ 0 };
+ std::atomic<long long> TaskScheduler::g_lastFloorDownNs{ 0 };
+ std::atomic<unsigned>  TaskScheduler::g_quietWindows{ 0 };
 
-static constexpr long long kFloorMissWindowNs   = 1'000'000;    // 1 ms
-static constexpr long long kFloorWindowNs  = 10'000'000;   // 10 ms
 static constexpr long long kFloorUpNs      = 200'000;      // promote at most every 0.2 ms
 static constexpr long long kFloorDownNs    = 20'000'000;   // demote at most every 20 ms
 static constexpr unsigned  kQuietToDemote  = 3;
 static constexpr unsigned  kMissRatio      = 4;    // promote above 1 miss per 4 pushes (25%)
 static constexpr unsigned  kMinPushSamples = 8;    // enough to exclude noise, not enough to exclude a burst
-static constexpr unsigned  kQuietBusyPct   = 20;   // marginal worker under 20% busy = sheddable
 
 // ---- LANE STRAND ACCOUNTING: WOULD A SHARED MPMC LANE WIN ANYTHING? ---------------------------
 //
@@ -1963,9 +1887,9 @@ static constexpr unsigned  kQuietBusyPct   = 20;   // marginal worker under 20% 
 // THE LIVE FLOOR, NOT THE BASE. Growth wakes workers into [K, K+F) and those are genuinely
 // available while they are up, so the set a pull queue could draw on is whatever is awake at that
 // instant. It moves under the measurement; that is a property of the pool, not an error.
-static std::atomic<unsigned long long> g_laneStrandEvents{ 0 };
-static std::atomic<unsigned long long> g_laneStrandIdleK{ 0 };
-static std::atomic<unsigned long long> g_laneStrandIdleKF{ 0 };
+ std::atomic<unsigned long long> TaskScheduler::g_laneStrandEvents{ 0 };
+ std::atomic<unsigned long long> TaskScheduler::g_laneStrandIdleK{ 0 };
+ std::atomic<unsigned long long> TaskScheduler::g_laneStrandIdleKF{ 0 };
 
 void TaskScheduler::NoteLaneStrand(size_t ownerIndex) noexcept {
 	TaskScheduler* inst = instance;
@@ -2266,7 +2190,7 @@ static constexpr bool kWakeOnRangePublish = false;
 // See SetAwakeFloorMax in the header for why a CEILING is a different and far cheaper thing than
 // SetAwakeFloor's permanent base, and for why the old wide-floor objection was the spin rather than
 // the width.
-static std::atomic<size_t> g_floorGrowCap{ 0 };
+// g_floorGrowCap MOVED to TaskScheduler.h as a static inline member (initialiser included).
 void   TaskScheduler::SetAwakeFloorMax(size_t n) noexcept { g_floorGrowCap.store(n, std::memory_order_relaxed); }
 size_t TaskScheduler::GetAwakeFloorMax() noexcept { return g_floorGrowCap.load(std::memory_order_relaxed); }
 
@@ -2303,7 +2227,7 @@ static constexpr unsigned kStreakToSpill = 2;
 // Runtime, not constexpr, so ONE binary can A/B the whole growth controller on the machine that has
 // the baseline. `nogrow` on the bench command line sets this to 0 and pins the floor at its base:
 // no push-side spill, no completion-side growth, no redistribute. See SetFloorGrowthEnabled.
-static std::atomic<unsigned> g_streakSpillMax{ 64 };
+// g_streakSpillMax MOVED to TaskScheduler.h as a static inline member (initialiser included).
 #define kStreakSpillMax (g_streakSpillMax.load(std::memory_order_relaxed))
 
 // OFF: measured worse on the one row it was written for -- see the comment at the gate. Left in
@@ -2778,73 +2702,6 @@ static std::atomic<size_t> g_hotWorkersRequested{ 0 };
 //
 // A SECOND DECODE OF THE SAME WORD IS THE SAME BUG AS A SECOND RECIPE FOR THE BAND. There is one
 // field extractor and everything goes through it.
-TaskScheduler::Bands TaskScheduler::GetBands() noexcept {
-	const uint64_t w = BandsWord();
-	Bands b{ BandField(w, kBandK),    BandField(w, kBandF), BandField(w, kBandFbase),
-	         BandField(w, kBandKmin), BandField(w, kBandKmax) };
-
-	// ---- THE INVARIANT HOLDS IN RELEASE, NOT ONLY UNDER assert ------------------------------
-	//
-	// The asserts below are diagnosis. They are not protection, because they compile out in exactly
-	// the build where the k=514 decode actually hung the pool -- and this file already states that
-	// rule elsewhere: an assert guarding a silent hang is a guard in the one build nobody is
-	// watching. So K+F <= N is ENFORCED here, on every read, in every build.
-	//
-	// CLAMPING RATHER THAN ABORTING because the failure this catches is a band that is merely
-	// unusable, and a pool that keeps running with a sane band can still be debugged; one that is
-	// livelocked on `q < 514` cannot. The debug asserts fire first and name the real cause.
-	//
-	// N <= 1 IS LEFT ALONE, deliberately -- see BandsSetF. With fewer than two workers there is
-	// nobody to keep a slot parkable for, and forcing F to 0 flips the only worker from never-park
-	// to parkable, which hands it the single-worker lost-wakeup path.
-	const Bands raw = b;   // what the word ACTUALLY said -- the asserts below judge this, not the clamp
-	{
-		const size_t nw = instance ? instance->workers.size() : 0;
-		if (nw > 1) {
-			if (b.k > nw - 1) b.k = nw - 1;              // K alone can never swallow the pool
-			if (b.k + b.f > nw) b.f = nw - b.k;          // K + F <= N
-		}
-		else if (nw == 1) {
-			// ---- A ONE-WORKER POOL IS ALL FLOOR: K=0, F=N, NEVER PARKS --------------------
-			//
-			// The usual rule keeps one worker parkable so the pool always has somewhere to put a
-			// thread that has genuinely run out of work. At N=1 that rule inverts: the ONLY worker
-			// becomes parkable, and a single worker that parks is the lost-wakeup path -- there is
-			// no second thread to notice the work it missed and no thief to drain its inbox.
-			//
-			// It also used to depend on luck. BandsSetF skips its clamp entirely below N=2, so the
-			// worker was saved only by Fbase defaulting to 2, which put q0 inside [0,2) and made it
-			// floor by accident. `floor=0` removed that accident and armed the hang.
-			//
-			// K=0 for the same reason from the other side: a reserved band on a one-worker pool
-			// reserves the entire pool, so ordinary work has nowhere to run at all.
-			b.k = 0;
-			b.f = 1;
-		}
-	}
-#ifndef NDEBUG
-	// ---- THE DECODE MUST BE SANE, AND A WRONG ONE IS NOT A SUBTLE BUG -------------------------
-	//
-	// This function open-coded the old 16-bit layout after the word was re-laid out to 8-bit
-	// fields, and returned k = (F | Fbase<<8) = 514. Consequences, none of which look like a
-	// decode bug from the outside:
-	//   q < k is true for EVERY worker  -> the whole pool believes it is reserved
-	//   the notify skip uses that k     -> wakes are dropped
-	//   the floor window [514, 514+F)   -> empty, so F membership is nonsense
-	// A producer waiting on a slot plus a dropped wake is exactly a hang, at ANY pool size -- not
-	// only at N=1. Assert it here rather than diagnosing the symptom three layers away.
-	// JUDGED ON `raw`, NOT ON `b`. Asserting the clamped value would be asserting that the clamp
-	// ran -- it always does -- and would never fire on the bug it was written for. The clamp keeps
-	// Release alive; these say WHY it had to.
-	const size_t nw = instance ? instance->workers.size() : 0;
-	assert((!nw || raw.k + raw.f <= nw || nw <= 1) && "GetBands: K+F exceeds the pool -- bad decode or a clamp that did not hold");
-	assert((!nw || raw.k <= nw) && "GetBands: K exceeds the pool -- bad decode");
-	assert((!nw || raw.f <= nw || nw <= 1) && "GetBands: F exceeds the pool -- bad decode");
-	assert((!raw.kmax || raw.k <= raw.kmax) && "GetBands: K exceeds Kmax");
-	assert((raw.kmax >= raw.kmin || !raw.kmax) && "GetBands: scaling range inverted (Kmax < Kmin)");
-#endif
-	return b;
-}
 size_t TaskScheduler::GetFloorBase() noexcept { return GetHotWorkers(); }
 
 unsigned TaskScheduler::GetWorkerParkCount(size_t q) noexcept {
@@ -2856,7 +2713,17 @@ void TaskScheduler::ResetWorkerParkCounts() noexcept {
 	TaskScheduler* inst = instance;
 	if (!inst) return;
 	for (auto& w : inst->workers)
-		if (w) w->parkCount.store(0, std::memory_order_relaxed);
+		if (w) {
+			w->parkCount.store(0, std::memory_order_relaxed);
+			// Cleared WITH the count, or the table would report a band from a park that no longer
+			// has a count behind it -- the construction-window parks this reset exists to discard.
+			w->lastParkBands.store(0, std::memory_order_relaxed);
+		}
+}
+unsigned long long TaskScheduler::GetWorkerLastParkBands(size_t q) noexcept {
+	TaskScheduler* inst = instance;
+	if (!inst || q >= inst->workers.size() || !inst->workers[q]) return 0;
+	return inst->workers[q]->lastParkBands.load(std::memory_order_relaxed);
 }
 
 void TaskScheduler::SetHotWorkers(size_t k) {
@@ -3296,8 +3163,8 @@ bool TaskScheduler::GetHotWorkerPin() { return g_hotPin.load(std::memory_order_r
 //
 // This is the userspace approximation of isolcpus. It cannot exclude OTHER PROCESSES, which is
 // exactly where it stops being equivalent.
-static std::atomic<bool> g_hotExclusive{ false };
-static std::atomic<unsigned long long> g_hotCpuMask{ 0 };
+// g_hotExclusive MOVED to TaskScheduler.h as a static inline member.
+// g_hotCpuMask MOVED to TaskScheduler.h as a static inline member.
 void TaskScheduler::SetHotWorkerExclusive(bool on) { g_hotExclusive.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::GetHotWorkerExclusive() { return g_hotExclusive.load(std::memory_order_relaxed); }
 void TaskScheduler::SetHotCpuMask(unsigned long long m) { g_hotCpuMask.store(m, std::memory_order_relaxed); }
@@ -3737,17 +3604,18 @@ bool TaskScheduler::GetMeasuredWidth() noexcept { return g_measuredWidth.load(st
 // is correct once keyed correctly and the next attempt should start from this result rather than
 // rediscover it.
 static std::atomic<bool> g_rememberedCost{ false };
+std::atomic<bool> TaskScheduler::g_rangeRecruit{ true };
+
 void TaskScheduler::SetRememberedCost(bool on) noexcept { g_rememberedCost.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::GetRememberedCost() noexcept { return g_rememberedCost.load(std::memory_order_relaxed); }
 
-static std::atomic<bool> g_rangeRecruit{ true };
 void TaskScheduler::SetRangeRecruit(bool on) noexcept { g_rangeRecruit.store(on, std::memory_order_relaxed); }
 bool TaskScheduler::RangeRecruitEnabled() noexcept { return g_rangeRecruit.load(std::memory_order_relaxed); }
 
 // 3000 ns: the measured OS wake on this machine (8.0 us resume with a 1 ms hold-off against 5.0 us
 // with none). A knob and not a constant -- it is a property of the box, and every recruitment
 // decision is a ratio against it, so a wrong value here biases the whole mechanism one way.
-static std::atomic<unsigned> g_wakeCostNs{ 3000 };
+ std::atomic<unsigned> TaskScheduler::g_wakeCostNs{ 3000 };
 void TaskScheduler::SetWakeCostNs(unsigned ns) noexcept {
 	// ZERO WOULD DIVIDE, and worse it would mean "wakes are free", which recruits the whole pool for
 	// any leaf at all. Clamp to something a wake cannot be cheaper than.
@@ -4722,10 +4590,11 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	stealHintLane.store(0, std::memory_order_relaxed);
 	laneInboxes.clear();
 	workers.reserve(num_workers);
-	// +1 for the NON-WORKER LANE (see nonWorkerLane's declaration). Only the deques get it --
-	// inboxes stay worker-indexed, because nothing ever pushes to a
-	// non-worker's inbox or pins a core to it.
-	deques.reserve(num_workers + 1);
+	// +2 for the NON-WORKER LANE and the MAIN PUBLISH LANE (see their declarations). Only the
+	// deques get them -- inboxes stay worker-indexed, because nothing ever pushes to a
+	// non-worker's inbox or pins a core to it. The reserve is what keeps the two push_backs below
+	// from reallocating; a reader walking `deques` concurrently is the race they exist to avoid.
+	deques.reserve(num_workers + 2);
 	normalInboxes.reserve(num_workers);
 	laneInboxes.reserve(num_workers);
 	resumedInboxes.reserve(num_workers);
@@ -4765,6 +4634,15 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	deques.push_back(std::make_unique<TaskDeque>());
 	deques[nonWorkerLane]->SetOwnerTag(nonWorkerLane, "loPri/non-worker");
 	nonWorkerLaneClaimed.store(false, std::memory_order_relaxed);
+
+	// THE MAIN PUBLISH LANE, one past it. Eager for the same reason the line above is: the steal
+	// sweep reads `deques` on every pass and must never see the vector being grown underneath it.
+	// Allocated whether or not SetMainPublishDeque is on -- one empty ring is cheaper than making
+	// the flag able to grow the vector at runtime, which is the race this whole block avoids.
+	mainPubLane = num_workers + 1;
+	deques.push_back(std::make_unique<TaskDeque>());
+	deques[mainPubLane]->SetOwnerTag(mainPubLane, "main-publish");
+	mainPubClaimed.store(false, std::memory_order_relaxed);
 	stealHintLane.store(0, std::memory_order_relaxed);
 
 	// TWO PASSES, and the split is load-bearing. Creating a worker and STARTING it in the same
@@ -4790,6 +4668,29 @@ void TaskScheduler::StartPool(size_t poolSize) {
 		Thread* worker = new Thread(*this);
 		worker->SetQueueIndex(i);
 		workers.push_back(worker);
+	}
+
+	// ---- SCHEDULER-SIDE STATE HANDED TO EACH WORKER, BEFORE ANY OF THEM RUNS ------------------
+	//
+	// THIS LOOP USED TO SIT AFTER StartWorker AND AFTER THE Ready() HANDSHAKE, which is a race, not
+	// a handshake: Ready() means the worker is already inside Worker() -- already reading these. A
+	// worker that reached the steal-hint update before the assignment landed indexed a NULL
+	// stealHintBacklog and faulted, and because the crash beat stdout's first flush the bench
+	// printed nothing at all rather than a stack.
+	//
+	// IT CANNOT MOVE INTO SetQueueIndex, and that is why it is a separate loop here rather than
+	// three more lines up there with myDeque and friends: g_hotExclusive and g_hotCpuMask are
+	// file-scope statics in THIS .cpp, so Thread.cpp cannot see them. Everything else it copies is
+	// either a compile-time constant or a member array of *this, all valid from long before now.
+	//
+	// ANYWHERE IN THIS SPAN WOULD DO -- after `workers` is populated, before StartWorker. Directly
+	// after construction is chosen so the two places a worker is handed state sit together.
+	for (auto w : workers) {
+		w->g_hotExclusive = &g_hotExclusive;
+		w->g_hotCpuMask = &g_hotCpuMask;
+		w->kMaxHintQueues = kMaxHintQueues;
+		w->stealHintBacklog = stealHintBacklog;
+		w->kStealHintDepth = kStealHintDepth;
 	}
 	// HALF of each worker's fair share of the standard fiber pool.
 	//
@@ -4895,12 +4796,28 @@ void TaskScheduler::StartPool(size_t poolSize) {
 	}
 	thread_id = thread_counter.fetch_add(1);
 	poolActive.store(true, std::memory_order_release);
-
 	// BUILT HERE, not lazily, because lazily is a race with this very function. The hazard table is
 	// sized from the fiber pool and the worker count -- and a worker that reaches its sleep path
 	// flushes its retire bag, which lands in the domain, WHILE this is still running. Left to build
 	// on first touch it would bake in a table of zero fibers, and every poolIndex afterwards would
 	// be out of range. Workers are up and Ready() by this point, so the sizes are final.
+
+	// ---- RE-ASSERT THE CONFIGURED FLOOR, NOW THAT N IS FINAL --------------------------------
+	//
+	// BandsSetF enforces F >= Fbase and THEN applies the room clamp (K + F <= N), so the clamp
+	// wins when the pool is small -- and `workers` is filled one entry at a time above, so any
+	// band write during construction sees a short N. At n=2, k=0 the room is 1, so a configured
+	// base of 2 is written as F=1: correct for a two-worker pool, wrong the moment the third
+	// worker exists.
+	//
+	// Nothing raised it again. CollapseAwakeFloorToBase is the only path back to F = Fbase and it
+	// used to decline whenever F was <= base, so the floor stayed one worker short for the life of
+	// the process -- measured as F=1 beside base=2 with N=31 in a park-time band dump. That guard
+	// is now `== base` so it repairs upward too; this line closes the window in the first place.
+	//
+	// Idempotent and free: with the full N the room clamp no longer binds, so on a healthy start
+	// this writes the value that is already there.
+	BandsSetF(BandsFb(), workers.size());
 
 	poolMutex.unlock();
 }
@@ -5261,9 +5178,9 @@ bool TaskScheduler::Push(uint8_t cpu_affinity, Task* task) {
 	return PushTarget(task, cpu_affinity);
 }
 
-static std::atomic<long long> g_ioLastPushNs{ 0 };
-static std::atomic<unsigned>  g_ioQuietUs{ 500 };
-static std::atomic<bool>      g_reservedSteal{ true };
+std::atomic<long long> TaskScheduler::g_ioLastPushNs{ 0 };
+std::atomic<unsigned>  TaskScheduler::g_ioQuietUs{ 500 };
+std::atomic<bool>     TaskScheduler::g_reservedSteal{ true };
 
 // ---- THE SHARED LANE INTAKE ------------------------------------------------------------------
 bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
@@ -5290,10 +5207,46 @@ bool TaskScheduler::PushLaneIntake(Task** tasks, size_t n) noexcept {
 	// PUSH FIRST, NOTIFY SECOND, the same order as every other producer here. The reverse loses the
 	// wake outright -- the target observes an empty intake, eats its permit, and parks with the
 	// work arriving just behind it.
+	// ---- ONE NOTIFY PER TASK, AND NOT ALWAYS THE SAME WORKER ----------------------------------
+	//
+	// THIS LOOP USED TO `break` UNCONDITIONALLY on the first non-null worker, so every lane push in
+	// the process notified workers[0] and no other reserved worker was ever told anything. The
+	// intake has K legal consumers by construction -- that is the whole reason it is shared rather
+	// than an inbox -- but only one of them was reachable. No round-robin, no busy check.
+	//
+	// MEASURED 2026-09-04 on io-pipe/ovl, 8 in flight: parked `hot=2` was indistinguishable from
+	// `hot=1` (p50 9.50 vs 9.30 us, p90 16.5 vs 16.4). workers[1] parked at row start and slept
+	// through all 4000 completions, because a parked worker only re-evaluates its
+	// `!LaneIntakeIdle()` predicate when something notifies it and nothing ever did. So K=2 was K=1
+	// holding an extra core out of the pool -- and it read WORSE at the tail (p99 41.5 vs 16.7) for
+	// exactly that reason. After this fix the parked band gets it: p50 4.40, p90 7.20.
+	//
+	// NOT-BUSY FIRST, the same predicate and the same argument as HiPriSpillTarget: a worker between
+	// tasks is one pass from the intake, so telling it costs a store nobody sleeps through, while a
+	// worker inside a body cannot look at the intake until that body returns. Notifying only busy
+	// workers is precisely how the original bug presented, which is why the fallback exists.
+	//
+	// AT MOST min(n, K) NOTIFIES. n tasks cannot occupy more than n consumers, and the band is the
+	// hard ceiling on where a completion may go.
 #if !defined(JLIB_LANEINTAKE_CTL_NO_NOTIFY)
-	const size_t k = GetHotWorkers();
-	for (size_t w = 0; w < k && w < s->workers.size(); ++w) {
-		if (s->workers[w]) { s->workers[w]->MarkQueuedWork(); s->workers[w]->NotifyWorker(); break; }
+	const size_t k    = GetHotWorkers();
+	const size_t nw   = s->workers.size();
+	const size_t lim  = (k < nw) ? k : nw;
+	const size_t want = (n < lim) ? n : lim;
+	size_t woke = 0;
+	for (size_t w = 0; w < lim && woke < want; ++w) {
+		Thread* t = s->workers[w];
+		if (!t || t->busy.load(std::memory_order_acquire)) continue;
+		t->MarkQueuedWork();
+		t->NotifyWorker();
+		++woke;
+	}
+	// EVERY RESERVED WORKER IS BUSY. Tell one anyway: it will see the intake on the pass after its
+	// body returns, and a notify to a running worker is a store, not a syscall.
+	if (woke == 0) {
+		for (size_t w = 0; w < lim; ++w) {
+			if (s->workers[w]) { s->workers[w]->MarkQueuedWork(); s->workers[w]->NotifyWorker(); break; }
+		}
 	}
 #else
 	// NEGATIVE CONTROL: compile the notify out. lane_intake_wake_test MUST fail under this -- the
@@ -5332,6 +5285,111 @@ void TaskScheduler::SetIoQuietWindowUs(unsigned us) noexcept {
 }
 unsigned TaskScheduler::IoQuietWindowUs() noexcept {
 	return g_ioQuietUs.load(std::memory_order_relaxed);
+}
+
+// ---- THE MAIN PUBLISH LANE -------------------------------------------------------------------
+//
+// See mainPubLane for the design. This is the push half: one push_bottom, one notify, no picker.
+
+// ONE CLAIMANT FOR THE LIFE OF THE POOL, not for the life of a call. The non-worker lane above
+// claims and releases around a single ParallelFor because the splitter needs it only that long.
+// Here the claim identifies the ONE thread allowed to write bottom_, so it must not be handed to a
+// second thread while the first still has tasks in flight -- Chase-Lev has exactly one pusher by
+// construction, and two would corrupt the ring rather than merely interleave. A losing thread
+// simply takes ordinary placement, which is the behaviour it had before this lane existed.
+static thread_local bool t_ownsMainPubLane = false;
+
+bool TaskScheduler::PushMainPublish(Task* task) noexcept {
+	if (!mainPubOn.load(std::memory_order_relaxed)) return false;
+	if (!task || !poolActive) return false;
+
+	// WORKERS ALREADY HAVE ONE. A worker pushing here would be giving up its own deque -- the
+	// locality this lane exists to recover for main -- and paying a foreign cache line for it.
+	if (Thread::GetCurrent() != nullptr) return false;
+
+	// PLACEMENT PREFERENCES ARE A PLACEMENT DECISION, and this path makes none. A task that asked
+	// for a P core, an E core, or a specific tier is asking to be AIMED; publishing it to a lane
+	// every worker steals from answers a different question. Those keep the picker.
+	if (task->corePref != CorePref::Default) return false;
+
+	if (mainPubLane == 0 || mainPubLane >= deques.size()) return false;
+
+	if (!t_ownsMainPubLane) {
+		bool expected = false;
+		if (!mainPubClaimed.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel, std::memory_order_relaxed))
+			return false;                       // another app thread owns it: ordinary placement
+		t_ownsMainPubLane = true;
+	}
+
+	if (!deques[mainPubLane]->push_bottom(task)) return false;
+
+	// THE WAKE, AND IT IS THE ONE COST THIS PATH CANNOT DROP. push_bottom wakes nobody. With an
+	// awake floor there is already a worker running passes that will see the lane advertised on its
+	// next steal scan, but the floor can be 0 and every worker parked, and then a silent publish is
+	// a task in a deque no one will ever look at.
+	//
+	// NOT MarkQueuedWork: that flag says "this worker's own queue has work" and is read by the
+	// picker. The work is not in anybody's queue, and saying otherwise would steer later pushes at
+	// a worker with an empty inbox. NotifyWorker alone is right -- it is an exchange on an awake
+	// target and a syscall only on a parked one.
+	//
+	// SKIPS THE RESERVED BAND. Under ReservedNeverParks a notify to [0,K) is a store nobody is
+	// waiting on; K will find this lane through the ordinary steal scan, which is the entire point
+	// of publishing rather than placing.
+	const size_t n = workers.size();
+	const size_t k = GetHotWorkers();
+	if (n > k) {
+		const size_t rr = (size_t)nextWorker.fetch_add(1, std::memory_order_relaxed);
+		workers[k + (rr % (n - k))]->NotifyWorker();
+	}
+	return true;
+}
+
+bool TaskScheduler::PushLazy(Task** tasks, size_t count) noexcept {
+	if (!tasks || count == 0) return false;
+	if (!mainPubOn.load(std::memory_order_relaxed)) return false;
+	if (!poolActive) return false;
+	if (Thread::GetCurrent() != nullptr) return false;
+	if (mainPubLane == 0 || mainPubLane >= deques.size()) return false;
+
+	// EVERY TASK, OR NONE. A batch is published as one unit, so a single pinned task in it cannot
+	// be honoured without splitting the batch -- and silently ignoring its corePref would break a
+	// contract Task.h says is enforced at push placement. Checking is O(count) over pointers this
+	// call is about to write anyway.
+	for (size_t i = 0; i < count; ++i) {
+		if (!tasks[i] || tasks[i]->corePref != CorePref::Default) return false;
+		if (IsLowLatency(tasks[i]->lane) && HiPriLaneActive()) return false;
+	}
+
+	if (!t_ownsMainPubLane) {
+		bool expected = false;
+		if (!mainPubClaimed.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel, std::memory_order_relaxed))
+			return false;
+		t_ownsMainPubLane = true;
+	}
+
+	// ALL-OR-NOTHING, WHICH IS WHY THE CALLER CAN FALL BACK. push_bottom_batch either takes the
+	// whole run or takes none of it (it grows first if it has to), so a false here leaves the array
+	// exactly as the caller passed it and PushBatch can have it instead. A partial publish would
+	// leave the caller unable to tell which half it still owns.
+	if (!deques[mainPubLane]->push_bottom_batch(tasks, count)) return false;
+
+	// ONE WAKE FOR THE WHOLE BATCH -- the same choice RunLazyRange makes, and for the same reason:
+	// the wake we want is one per PUBLICATION, not one per item. WakeOneForSteal is already spaced
+	// so a burst of publishes cannot turn into a burst of syscalls, and the workers it does not
+	// wake will find the lane on their next steal scan, where it advertises itself out of
+	// !empty().
+	WakeOneForSteal();
+	return true;
+}
+
+void TaskScheduler::SetMainPublishDeque(bool on) noexcept {
+	mainPubOn.store(on, std::memory_order_relaxed);
+}
+bool TaskScheduler::MainPublishDeque() noexcept {
+	return mainPubOn.load(std::memory_order_relaxed);
 }
 
 void TaskScheduler::SetReservedStealing(bool on) noexcept {
@@ -6516,6 +6574,16 @@ bool TaskScheduler::PushTarget(Task* task, uint8_t cpuaffinity) {
 		if (IsLowLatency(useHi) && LaneIntakeEnabled() && PushLaneIntake(&task, 1))
 			return true;
 
+		// THE MAIN PUBLISH LANE, and it sits here for the same reason the intake above does: both
+		// are "this task has a cheaper route than the picker", and both have to be asked BEFORE the
+		// picker runs, since the picker's cost is the thing being avoided. Ordinary lane only -- a
+		// low-latency task wants to be AIMED at the reserved band, not discovered by a thief.
+		//
+		// ONE TASK AT A TIME IS THE WEAK CASE and is not why this exists: a single push_bottom plus
+		// a notify is about what the inbox path costs, so a per-task Push here buys little beyond
+		// skipping the picker. The lane pays off in bulk -- see PushLazy.
+		if (!IsLowLatency(useHi) && PushMainPublish(task)) return true;
+
 		uint8_t chosen = (uint8_t)PickNextWorker(task->corePref, useHi);
 
 		// ---- DO NOT COMMIT ORDINARY WORK TO A WORKER THAT CANNOT REACH IT -------------------
@@ -7648,6 +7716,30 @@ void SchedulerMutex::Lock() {
 	if (current != nullptr) {
 		// Fiber context: suspend on contention instead of blocking thread
 		Task* callerTask = (TaskScheduler::IsInitialized()) ? TaskScheduler::Instance().GetCurrentTask() : nullptr;
+		// ---- BOUNDED RETRY BEFORE COMMITTING TO A SUSPEND ---------------------------------------
+		//
+		// This path took ONE look at `locked` and, on contention, suspended: ContextSwitch out,
+		// requeue, Signal, requeue, ContextSwitch back. The signal half alone measures ~0.70 us in
+		// the event/resume row, against critical sections of tens of nanoseconds -- an unconditional
+		// three-orders-of-magnitude overshoot whenever the holder was about to release.
+		//
+		// NOT THE SWEEP THAT WAS ALREADY REJECTED. The 2026-08-23 result (spin=0 optimal, monotonic)
+		// measured SpinThenHelp around the BARE-THREAD Try_Lock in the else branch below -- see its
+		// comment, which scopes itself that way. That arm was racing a cache line; this one is
+		// racing a suspend/resume round trip, and nothing has measured it.
+		//
+		// TEST-AND-TEST-AND-SET, deliberately: the retry only READS `locked` relaxed and never takes
+		// spinLock, because Unlock needs that line to clear `locked` and pop a waiter. Hammering the
+		// guard is what starved the holder in the bare-thread sweep, and repeating it here would
+		// reproduce that result rather than test this question.
+		//
+		// DEFAULT 0 = INERT. At zero this loop does not execute and the path is byte-for-byte what
+		// shipped. The knob exists so the answer stays reproducible -- same reason
+		// JLIBSCHED_FAST_SPIN_TRIES is still in the tree after losing.
+		for (int s = TaskScheduler::GetMutexSpinTries(); s > 0; --s) {
+			if (!locked.load(std::memory_order_relaxed)) break;   // looks free: go take the guard
+			platform::CpuRelax();
+		}
 		{
 			while (spinLock.test_and_set(std::memory_order_acquire)) { platform::CpuRelax(); }
 			if (!locked) {
@@ -8613,12 +8705,10 @@ void TaskScheduler::ParallelFor(int begin, int end, std::function<void(int, int)
 // for it. Read on the submit path and on the drain, both gated on this being non-zero, so a process
 // that never calls SetSubmitLimit pays one relaxed load of a line that is read-shared and never
 // written.
-static std::atomic<size_t> g_submitLimit{ 0 };
 
-// QUEUED-BUT-NOT-YET-STARTED, across every inbox. Maintained ONLY while a limit is set, which is
-// why the limit must be set before Init: enabling it mid-run would start counting from a base that
-// already has tasks in flight, and the number would be wrong for the life of the process.
-static std::atomic<size_t> g_inboxDepth{ 0 };
+std::atomic<size_t> TaskScheduler::g_submitLimit{ 0 };
+std::atomic<size_t> TaskScheduler::g_inboxDepth{ 0 };
+// (duplicate definition removed -- already defined at line 3665)
 
 void TaskScheduler::SetSubmitLimit(size_t maxQueued) {
 	g_submitLimit.store(maxQueued, std::memory_order_relaxed);
@@ -8663,4 +8753,40 @@ void TaskScheduler::ApplyIngressBackpressure() {
 	// pool's deques. Safe here -- a submit limit can only be set before Init, so by the time any
 	// submission reaches this line the scheduler exists.
 	if (!Instance().TryRunStolenNativeTask()) std::this_thread::yield();
+}
+
+// ---- Thread's and Fiber's scheduler entry points ----------------------------------------------
+//
+// ALL FOUR HERE: the only place both Thread and TaskScheduler are complete. Thread.h forward-
+// declares TaskScheduler and cannot call through it; TaskScheduler.h cannot include Thread.h back,
+// because Thread.h reaches TaskDAG.h and ThreadLocalCache.h which both include TaskScheduler.h --
+// the guard makes the re-entry a no-op and they then use types still mid-parse. No ordering fixes
+// it. Fiber::Resume and RequeueResumedBatch were in Fiber.cpp before that file folded into the
+// header; this is the same code relocated.
+//
+// THE `instance` TEST IS NOT DEFENSIVE. Of the five callers of Resume()/ResumeQueueless(), three
+// are public entry points reachable from ANY thread: Event::Signal, DirectEvent::Signal -- whose
+// comment says "called by the external signaler (e.g. a GPU-fence Win32 callback)" -- and WaitGroup
+// completion. `instance` is a thread_local and is null on all of them. Without the test it is a
+// null deref on the primitive's advertised use: it took out 18 tests and froze the event/resume
+// bench row, which signals from main.
+
+void Fiber::Resume() {
+	// TaskScheduler::Requeue, not Thread::Requeue -- the saved body predates the move and
+	// Thread::Requeue no longer exists. Requeue is where pinned routing is decided (see the
+	// !FibersMigrate() gate), so going through it is what keeps FiberMode::Pin honest.
+	if (ResumeQueueless()) TaskScheduler::Instance().Requeue(this->owningTask);
+}
+
+// PER-TASK Requeue, NOT QueueBatch/PushBatch. Every task here holds a fiber whose destination is
+// already decided -- home worker when pinned, resuming worker when migratable -- so Requeue goes
+// straight there, while PushBatch re-derives one through PickNextWorker and cannot express "N wakes
+// to up to N different queues". Routed through PushBatch(minPerSegment=1) once and measured:
+// event/resume 8-waiter 21.9 -> 32.2 us, Event 1-waiter/1ms 6.9 -> 14.7, and it bypassed the
+// routing entirely. To batch these, group by DESTINATION first and push once per group.
+void Fiber::RequeueResumedBatch(Task** tasks, size_t n, Lane lane) {
+	if (n == 0) return;
+	(void)lane;   // Requeue decides routing from the task's own tag
+	TaskScheduler& s = TaskScheduler::Instance();
+	for (size_t i = 0; i < n; ++i) s.Requeue(tasks[i]);
 }

@@ -52,6 +52,21 @@ static thread_local void* t_tls = nullptr;
 JLIB_NOINLINE static void  TlsSet(void* v) { t_tls = v; }
 JLIB_NOINLINE static void* TlsGet()        { return t_tls; }
 
+// THE WORKER-INDEX READ IS noinline FOR THE SAME REASON THE TLS ACCESSOR ABOVE IS. The bodies read
+// it either side of the wait and compare the two; with whole-program optimisation the two
+// Thread::GetCurrent() calls fold into one, so workerAfter can only ever equal workerBefore and
+// this file reports "0 of 64 migrated" on a run where the non-WPO build of the same source reports
+// 45-52. A migration count that depends on the optimiser is measuring the compiler.
+//
+// THIS HID A REAL BUG BEHIND ITS OWN VACUITY GUARD. The zero tripped "at least one fiber MIGRATED"
+// first, which reads as "the scenario did not happen" rather than "the instrument folded" -- while
+// the genuine failure underneath it, fiber-local storage resolving through a stale Thread*, was a
+// separate defect in the library that the same folding also caused.
+JLIB_NOINLINE static int WorkerIndexNow() {
+    JLib::Thread* t = JLib::Thread::GetCurrent();
+    return t ? t->qIndex : -1;
+}
+
 static constexpr int kFibers = 64;
 
 // Arm 4 slots. FILE SCOPE so the task lambdas can name them without an explicit capture, and
@@ -108,8 +123,7 @@ struct MigrateCtx {
 static void MigrateBody(void* p) {
     auto& c = *static_cast<MigrateCtx*>(p);
     Rec* r = c.rec;
-    JLib::Thread* th = JLib::Thread::GetCurrent();
-    r->workerBefore = th ? th->qIndex : -1;
+    r->workerBefore = WorkerIndexNow();
 
     // Both stores happen HERE, on the pre-suspend worker.
     JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel) = r->sentinel;
@@ -119,8 +133,7 @@ static void MigrateBody(void* p) {
     JLib::TaskScheduler::Instance().WaitOnEvent(*c.gate);
 
     // ...and both loads happen here, wherever we resumed.
-    JLib::Thread* th2 = JLib::Thread::GetCurrent();
-    r->workerAfter = th2 ? th2->qIndex : -1;
+    r->workerAfter = WorkerIndexNow();
     r->flsAfter    = JLib::TaskScheduler::FiberLocal((size_t)Fls::Sentinel);
     r->tlsAfter    = TlsGet();
     r->done        = true;
@@ -155,16 +168,14 @@ struct TypedCtx {
 };
 static void TypedFlsBody(void* p) {
     auto& c = *static_cast<TypedCtx*>(p);
-    JLib::Thread* th = JLib::Thread::GetCurrent();
-    *c.wBefore  = th ? th->qIndex : -1;
+    *c.wBefore  = WorkerIndexNow();
     *c.idBefore = (int)JLib::FiberRegistry::GetID();
 
     g_tls.set(c.obj);
     c.started->fetch_add(1, std::memory_order_release);
     JLib::TaskScheduler::Instance().WaitOnEvent(*c.gate);
 
-    JLib::Thread* th2 = JLib::Thread::GetCurrent();
-    *c.wAfter  = th2 ? th2->qIndex : -1;
+    *c.wAfter  = WorkerIndexNow();
     *c.idAfter = (int)JLib::FiberRegistry::GetID();
     *c.gotMagic = g_tls ? g_tls->magic : -1;    // operator bool + operator->
     c.done->fetch_add(1, std::memory_order_release);

@@ -43,13 +43,34 @@
 //   pool size         command line; run the binary twice to cover two worker counts
 //
 // THE TWO CONTROLS, without which this measures nothing:
-//   '64' and '64ctl' are the SAME VALUE run twice per round. Their gap is pure noise and is printed
-//   per scenario as that scenario's floor. An arm that does not move further than 64ctl did has not
+//   'm0' and 'm0ctl' are the SAME VALUE run twice per round. Their gap is pure noise and is printed
+//   per scenario as that scenario's floor. An arm that does not move further than m0ctl did has not
 //   shown an effect, however good its number looks.
 //
-//   The FIBER rows contend from fibers, which suspend and never enter SpinThenHelp at all. They
-//   must stay flat across arms. If they do not, the harness is reading the machine and no
-//   bare-thread delta in this file can be believed.
+//   The BARE rows contend from bare threads, which take the else branch of SchedulerMutex::Lock and
+//   never reach the pre-suspend retry. They must stay flat across arms. If they do not, the harness
+//   is reading the machine and no fiber delta in this file can be believed.
+//
+// ---- 2026-09-05: THE ARMS NOW SWEEP THE FIBER KNOB, AND THE CONTROLS SWAPPED ------------------
+//
+// Everything above describes the ORIGINAL experiment: SetFastSpinTries, a bounded plain spin in
+// front of the BARE-THREAD contended path. That is settled -- 0, monotonic, see RESULTS -- and the
+// arms now sweep SetMutexSpinTries instead, with fastSpin pinned at 0 in every arm.
+//
+// THE FIBER PATH HAD NO RETRY AT ALL. SchedulerMutex::Lock took one look at `locked` and, on
+// contention, suspended: ContextSwitch out, requeue, Signal, requeue, ContextSwitch back. The
+// signal half alone is ~0.70 us in bench.cpp's event/resume row, paid unconditionally against
+// critical sections of tens of nanoseconds. The new knob puts a bounded test-and-test-and-set in
+// front of that suspend.
+//
+// SO THE CONTROLS INVERT. The fiber rows were the negative control BECAUSE nothing touched them;
+// they are now the treatment, and the bare rows -- which never reach the new retry -- are the
+// noise floor. Do not read the old sentence above as still applying to the fiber rows.
+//
+// The backoff finding still constrains the design and is why the retry reads `locked` relaxed
+// instead of re-taking spinLock: Unlock needs that line, and hammering it starves the holder. That
+// is the mechanism the fast-spin sweep exposed, and repeating it here would reproduce that result
+// rather than answer this question.
 //
 // The background-load axis separates two genuinely different regimes. With nothing to steal,
 // ContendedSpinStep's steal attempt is pure waste and the fast spin can only help. With a saturated
@@ -106,6 +127,36 @@
 // CAVEAT: one machine, one OS. The backoff explanation is inferred from the shape of the result, not
 // separately instrumented -- nothing here counts cache-line transfers. What IS directly measured is
 // that raising the bound is never better on this hardware, in any of the regimes swept.
+//
+// RESULTS 2026-09-05 -- THE FIBER PRE-SUSPEND RETRY (SetMutexSpinTries). ALSO A REGRESSION, 0 SHIPS.
+//
+// The question was whether the fiber path deserves the spin the bare-thread path did not. It had no
+// retry at all: one look at `locked`, then suspend -- ContextSwitch out, requeue, Signal, requeue,
+// ContextSwitch back, ~0.70 us for the signal half alone, paid unconditionally against a critical
+// section of tens of nanoseconds. That looked like an obvious overshoot. It is not.
+//
+//   tiny critical section, 8 FIBER contenders, NO background load, 31 workers
+//     arm        p50          p99            acq/s
+//     m0            3,200 ns      4,100 ns   2,241,633
+//     m0ctl         3,200 ns      4,000 ns   2,268,162    [A/A floor: 1.2%]
+//     m16           4,300 ns      6,200 ns   1,694,149     -25%
+//     m64          10,300 ns     17,900 ns     736,217     -67%
+//     m256         34,300 ns     72,700 ns     225,225     -90%
+//     m1024       129,700 ns    205,100 ns      60,433     -97%
+//
+// Monotonic again, and steeper than the bare-thread sweep: 40x on p50, 37x on throughput.
+//
+// WHY IT IS WORSE HERE THAN FOR BARE THREADS, and this is the part worth keeping: a bare thread that
+// spins wastes its own core. A FIBER that spins holds a WORKER -- and the pool needs that worker to
+// make progress, including on whatever the holder is about to do. Suspending is not politeness on
+// this path, it is RELEASING A SCHEDULING RESOURCE. The suspend "overshoot" buys back a worker, and
+// that is worth far more than the round trip costs.
+//
+// The bg=on rows are flat across every arm and are NOT evidence either way: acq/s there is ~10k
+// against 2.2M with the load off, so the background work dominates and the lock is noise in them.
+//
+// NOTE ON THE CONTROLS FOR THIS SWEEP: the fiber rows are the TREATMENT here, not the negative
+// control they were in the 08-23 experiment -- see the section above the scenario table.
 
 #include "TaskScheduler.h"
 
@@ -253,17 +304,24 @@ struct Scenario {
     bool bgLoad;
 };
 
-struct ArmSpec { const char* label; int spin; };
+// `spin` is the BARE-THREAD Try_Lock retry (SetFastSpinTries) -- settled at 0 on 2026-08-23, see
+// RESULTS above. `mutexSpin` is the FIBER pre-suspend retry (SetMutexSpinTries), which is what this
+// table now sweeps: fastSpin is pinned at 0 in every arm so the two knobs cannot confound, and the
+// fiber scenarios below are the ones that reach it. The old fast-spin arm table is in the RESULTS
+// block and in git history; re-running it means setting `spin` and pinning `mutexSpin` instead.
+struct ArmSpec { const char* label; int spin; int mutexSpin; };
 
 // '64' and '64ctl' are deliberately identical -- the A/A control. Everything else brackets it,
 // including 0, which restores the pre-2.7.0 behaviour of attempting a steal on the first failed try.
+// 'm0' and 'm0ctl' are deliberately identical -- the A/A control, and 0 is also the shipped default,
+// so any arm that does not beat BOTH of them is noise. Everything else brackets it.
 static const ArmSpec kArms[] = {
-    { "0",     0 },
-    { "16",    16 },
-    { "64",    64 },
-    { "64ctl", 64 },
-    { "256",   256 },
-    { "1024",  1024 },
+    { "m0",    0, 0    },
+    { "m0ctl", 0, 0    },
+    { "m16",   0, 16   },
+    { "m64",   0, 64   },
+    { "m256",  0, 256  },
+    { "m1024", 0, 1024 },
 };
 static constexpr size_t kNumArms = sizeof(kArms) / sizeof(kArms[0]);
 
@@ -286,6 +344,18 @@ struct RunState {
 // Identical body for both caller kinds, which is the point: the only difference between the arms is
 // the CONTEXT it runs in (bare thread vs fiber), because that is what selects the suspend path over
 // the spin path inside SchedulerMutex::Lock.
+// RAW ENTRY POINT FOR THE FIBER CONTENDERS. The lambda CreateTask overload is TaskType::Native
+// UNCONDITIONALLY as of 2026-09-02 -- a slab closure cannot own a fiber row -- so the fiber arm can
+// no longer be spelled as a lambda. Written as a lambda it would still COMPILE (the TaskType
+// parameter is simply gone from that overload) and then abort at runtime, because a Native task that
+// reaches SchedulerMutex::Lock's contended path has no fiber to suspend. Hence void(*)(void*).
+struct ContendArg { struct RunState* st; std::vector<uint32_t>* lat; };
+static void ContendLoop(RunState& st, std::vector<uint32_t>& latOut);
+static void ContendEntry(void* p) {
+    auto* a = static_cast<ContendArg*>(p);
+    ContendLoop(*a->st, *a->lat);
+}
+
 static void ContendLoop(RunState& st, std::vector<uint32_t>& latOut) {
     while (!st.go.load(std::memory_order_acquire)) std::this_thread::yield();
 
@@ -333,9 +403,12 @@ static RunResult RunOne(JLib::TaskScheduler& sched, const Scenario& sc,
     JLib::WaitGroup wg;
     if (sc.fiberCallers) {
         wg.n.store(sc.contenders, std::memory_order_relaxed);
+        // Outlives every task: WaitFor(wg) below joins them all before this returns.
+        std::vector<ContendArg> args(static_cast<size_t>(sc.contenders));
         for (int i = 0; i < sc.contenders; ++i) {
+            args[static_cast<size_t>(i)] = ContendArg{ &st, &lat[static_cast<size_t>(i)] };
             auto* t = sched.CreateTask(
-                [&st, &lat, i] { ContendLoop(st, lat[static_cast<size_t>(i)]); },
+                &ContendEntry, &args[static_cast<size_t>(i)],
                 /*lane*/ JLib::Lane::Normal, JLib::TaskType::Fiber);
             if (!t) {
                 std::fprintf(stderr, "FATAL: could not allocate fiber contender task\n");
@@ -429,8 +502,23 @@ int main(int argc, char** argv) {
         { "moderate-cs(2us)", 2000,  8, false, true  },
         { "long-cs(50us)",    50000, 8, false, false },
         { "long-cs(50us)",    50000, 8, false, true  },
-        // fiber control -- suspends instead of spinning, must be flat.
+        // ---- FIBER ROWS: THE TREATMENT FOR THE MUTEX-SPIN SWEEP, NOT THE CONTROL ---------------
+        //
+        // These were the negative control for the fast-spin experiment precisely because a fiber
+        // SUSPENDS and never enters SpinThenHelp. SetMutexSpinTries puts a bounded retry in front of
+        // that suspend, so for THIS sweep the roles invert: these rows are where the knob acts, and
+        // the BARE rows above (which never reach it) are the noise floor. Reading the fiber rows as
+        // a control while sweeping a knob that only moves them would be circular.
+        //
+        // Three critical-section lengths, because the whole question is where the retry stops paying:
+        // the thing it is racing is a suspend/resume round trip (~0.70 us for the signal half alone,
+        // per bench.cpp's event/resume row), so 0ns should win, 2us should be hopeless, and 200ns is
+        // where the answer is not obvious.
         { "tiny-cs(0ns)",     0,     8, true,  true  },
+        { "tiny-cs(0ns)",     0,     8, true,  false },
+        { "short-cs(200ns)",  200,   8, true,  true  },
+        { "moderate-cs(2us)", 2000,  8, true,  true  },
+        { "long-cs(50us)",    50000, 8, true,  true  },
     };
     const size_t kNumScenarios = sizeof(scenarios) / sizeof(scenarios[0]);
 
@@ -455,6 +543,8 @@ int main(int argc, char** argv) {
                 const size_t ai = (k + static_cast<size_t>(round)) % kNumArms;
                 JLib::detail::SetFastSpinTries(kArms[ai].spin);
 
+                JLib::TaskScheduler::SetMutexSpinTries(kArms[ai].mutexSpin);
+
                 const RunResult lat = RunOne(sched, sc, windowMs, /*measureLatency*/ true,  bg);
                 const RunResult thr = RunOne(sched, sc, windowMs, /*measureLatency*/ false, bg);
 
@@ -466,7 +556,9 @@ int main(int argc, char** argv) {
         }
 
         if (sc.bgLoad) bg.Stop(sched);
-        JLib::detail::SetFastSpinTries(64);   // leave the default in place between scenarios
+        JLib::detail::SetFastSpinTries(0);    // the SHIPPED default -- 64 was the pre-2026-08-23 guess
+
+        JLib::TaskScheduler::SetMutexSpinTries(0);   // shipped default: inert
 
         // ---- report ----
         std::printf("%s  contenders=%d  caller=%s  bg=%s\n",

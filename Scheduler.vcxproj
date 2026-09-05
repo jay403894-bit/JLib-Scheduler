@@ -103,7 +103,6 @@
     <ClCompile Include="src\CancelToken.cpp" />
     <ClCompile Include="src\Timer.cpp" />
     <ClCompile Include="src\Epochs.cpp" />
-    <ClCompile Include="src\Fiber.cpp" />
     <ClCompile Include="src\GlobalFiberPool.cpp" />
     <ClCompile Include="src\WaitGroup.cpp" />
     <ClCompile Include="src\TaskDAG.cpp" />
@@ -129,7 +128,7 @@
          translation unit and colliding at link time. This project only ever builds Windows, so it
          names src\win32 and never mentions src\posix. -->
     <ClCompile Include="src\win32\Topology.cpp" />
-    <ClCompile Include="src\win32\FiberInit.cpp" />
+    <ClCompile Include="src\win32\AvxGate.cpp" />
     <ClCompile Include="src\win32\IoReactor.cpp" />
   </ItemGroup>
   <ItemGroup>

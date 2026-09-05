@@ -194,8 +194,13 @@ static void PrintBandVerdict() {
     const size_t K = JLib::TaskScheduler::GetHotWorkers();
     const size_t F = JLib::TaskScheduler::GetAwakeFloor();
     const size_t Fb = JLib::TaskScheduler::GetAwakeFloorBase();
-    // BANDS CANNOT MOVE: K is static, so no verdict below can be invalidated by a mid-run
-    // band change. This read GetHotWorkerRange and compared kmax > kmin.
+    // BANDS CANNOT MOVE *ACROSS THE MEASURED ROWS*: K is static, so no verdict below can be
+    // invalidated by a mid-run band change. This read GetHotWorkerRange and compared kmax > kmin.
+    //
+    // THE PREMISE IS ONLY TRUE BECAUSE PARK COUNTS ARE RESET AFTER THE WARMUP. It is false during
+    // pool construction -- K starts at 0 and GetBands() clamps F against the live worker count --
+    // and while the counters still included that window this constant made the JUNK RUN check
+    // below fire on parks that were correct when they were taken. See the reset call.
     const bool bandsMoved = false;
 
     const size_t bandF = Fb;
@@ -241,6 +246,50 @@ static void PrintBandVerdict() {
     }
     printf("        observed parks: reserved %u | floor %u | parkable %u (on %zu of %zu parkable workers)\n",
            resvP, floorP, parkP, parkWho, (n > K + Fb) ? n - (K + Fb) : 0);
+
+    // ---- WHAT THE BAND WAS AT PARK TIME, NOT AT REPORT TIME -------------------------------
+    //
+    // The three counters above bin by the FINAL layout, which cannot tell a floor member that
+    // slept from an overflow worker whose index later became floor. This decodes the band each
+    // worker actually saw at the moment it committed, so the only column that matters is the
+    // last one: a `YES` there is a floor member that completed a park, which is the violation.
+    // Anything else is a worker that was correctly outside the floor when it slept.
+    size_t inFloorAtPark = 0;   // hoisted: the JUNK RUN verdict below is gated on THIS, not on the bin
+    {
+        // (declared above so the verdict can use it)
+        bool   header = false;
+        for (size_t q = 0; q < n; ++q) {
+            const unsigned p = JLib::TaskScheduler::GetWorkerParkCount(q);
+            if (!p) continue;
+            const unsigned long long w = JLib::TaskScheduler::GetWorkerLastParkBands(q);
+            const size_t pfb = (size_t)((w >> 48) & 0xFFull);
+            const size_t pnw = (size_t)((w >> 40) & 0xFFull);
+            const size_t pk = (size_t)((w >> 32) & 0xFFull), pf = (size_t)(w & 0xFFFFFFFFull);
+            const bool reservedAtPark = q < pk;
+            const bool floorAtPark    = (q >= pk) && (q < pk + pf);
+            if (floorAtPark) ++inFloorAtPark;
+            // Also show anything the FINAL layout files as reserved or floor, even if it was
+            // plain overflow when it slept -- that gap is exactly what the table is for.
+            const bool binnedNonParkable = q < K + Fb;
+            if (floorAtPark || reservedAtPark || binnedNonParkable) {
+                if (!header) {
+                    printf("        park-time bands (only rows that were NOT plain overflow).\n"
+                           "        N@park is what GetBands()'s clamp saw -- F below base with N at\n"
+                           "        full pool size means the WORD held it, not the clamp. base@park\n"
+                           "        then says which: F<base is a writer bypassing max(f,fb).\n"
+                           "          q  parks   K@park F@park base@park N@park  reserved?  INSIDE FLOOR?\n");
+                    header = true;
+                }
+                printf("         %2zu  %5u   %6zu %6zu %9zu %6zu  %-9s  %s%s\n",
+                       q, p, pk, pf, pfb, pnw, reservedAtPark ? "yes" : "no",
+                       floorAtPark ? "*** YES ***" : "no",
+                       (pf < pfb) ? "   <== F BELOW BASE" : "");
+            }
+        }
+        printf("        floor members that COMPLETED a park: %zu  <- the only violation count;\n"
+               "        the `floor` bin above is by FINAL layout and includes workers that were\n"
+               "        outside [K, K+F) when they actually slept\n", inFloorAtPark);
+    }
     // ATTRIBUTION BY BAND IS ONLY MEANINGFUL IF THE BANDS HELD STILL. Parks are counted per WORKER
     // and binned here by the FINAL layout, so when K moved during the run a worker that was reserved
     // at the moment it parked gets filed under whatever band its index sits in now. A run with
@@ -258,10 +307,20 @@ static void PrintBandVerdict() {
                "            SetReservedNeverParks(true) so the band is real, or stop calling it\n"
                "            reserved. lane still routes and runs; it just is not RESERVED. ***\n",
                K - observedK, K, K, observedK);
-    if (floorP && !bandsMoved)
-        printf("        *** JUNK RUN: %u parks on %zu FLOOR worker(s) -- the floor is defined as\n"
+    // GATED ON THE PARK-TIME COUNT, NOT THE BIN. `floorP` bins by the FINAL layout and cannot tell
+    // a floor member that slept from an overflow worker whose index later became floor -- so it
+    // fired on runs where the park-time table reported ZERO violations, and the banner contradicted
+    // itself two lines apart. inFloorAtPark is judged against the same clamped GetBands() the last
+    // gate used, at the moment of the commit, which is the only thing that can make this claim.
+    if (inFloorAtPark && !bandsMoved)
+        printf("        *** JUNK RUN: %zu of the %u parks binned to the floor were taken by a worker\n"
+               "            that was INSIDE [K, K+F) at the moment it slept -- the floor is defined as\n"
                "            never-parking, so the rows above were measured on a different pool than\n"
-               "            the banner claims ***\n", floorP, floorWho);
+               "            the banner claims. See the park-time table above ***\n",
+               inFloorAtPark, floorP);
+    else if (floorP)
+        printf("        (the %u parks binned to the floor were all taken while the worker was OUTSIDE\n"
+               "        [K, K+F) -- correct parks, filed under the floor by the final layout)\n", floorP);
     // MEANING CHANGED WITH THE LAST-GATE GUARD in the worker's park path. This used to count
     // COMPLETED parks by live-floor members -- a genuine violation, and the precursor to a stuck F.
     // The worker now re-reads the band word AFTER the sleep commit and turns around if it has
@@ -4186,6 +4245,25 @@ int main(int argc, char** argv) {
         }
         sched.WaitFor(wg);
     }
+
+    // ---- COUNT PARKS FROM HERE, NOT FROM PROCESS START -------------------------------------
+    //
+    // StartPool fills `workers` one thread at a time, and GetBands() clamps against the LIVE
+    // worker count -- at nw == 1 it returns K=0, F=1 by design (see the one-worker branch: a
+    // single worker that parks is the lost-wakeup path). So while the pool is being built the
+    // band is legitimately narrow, and a worker whose index is outside that narrow band parks
+    // correctly. K also starts at 0 and only becomes `hot=N` once it is configured.
+    //
+    // Those parks are real and harmless -- the first push wakes them -- but the loop below bins
+    // parkCount by the FINAL layout, so they get filed against whatever band their index sits in
+    // at the end. That is what produced `JUNK RUN: N parks on 1 FLOOR worker(s)` with F=1 in the
+    // worker's own diagnostic and every gate behaving correctly: always exactly Fbase-1 workers,
+    // because nw==1 pins F to 1 and leaves the rest of the configured floor parkable.
+    //
+    // Resetting here makes the counters mean "parks during the measured rows", which is what
+    // every verdict below actually wants -- and it restores the premise of `bandsMoved`: after
+    // this point K IS static and F only moves between base and grown.
+    JLib::TaskScheduler::ResetWorkerParkCounts();
 
     // Every section announces itself so the watchdog can name the one that hangs. Twice the macOS
     // job has been killed by the 30-minute job timeout knowing only that "the benchmark step" hung.

@@ -16,6 +16,8 @@
 #include "ThreadLocalCache.h"
 #include "TsanFiber.h"   // fiber annotations for ThreadSanitizer; no-ops without it
 #include "GlobalFiberPool.h"
+#include "TaskDAG.h"
+#include "TaskAllocator.h"
 namespace JLib {
 	class TaskScheduler;
 
@@ -374,6 +376,17 @@ namespace JLib {
         bool isImmediate;
     };
     class Thread {
+        enum class RetrySite : unsigned {
+            Bands = 0,        // the global band word (K/F). ONE word, CASed by every floor change.
+            WaitGroupPush,    // WaitGroup's direct-waiter stack push
+            Count
+        };
+        struct RetryProbe {
+            explicit RetryProbe(RetrySite) noexcept {}
+            RetryProbe(const RetryProbe&) = delete;
+            RetryProbe& operator=(const RetryProbe&) = delete;
+            inline void Miss() noexcept {}
+        };
         // MUTUAL FRIENDSHIP, and both directions are load-bearing.
         //
         // TaskScheduler already declares `friend class Thread`, which is how Worker() reaches the
@@ -413,7 +426,7 @@ namespace JLib {
         // EpochManager documents for devRetiredNeverSwept -- and only the CODE is conditional.
         std::atomic<std::uint64_t> fiberAcquires{ 0 };
         std::atomic<std::uint64_t> fiberRecycles{ 0 };
-
+   
         // THE BALANCE IS POOL-WIDE, NEVER PER-WORKER, and getting that wrong would make the whole
         // instrument lie. In Migrate mode the worker that calls AcquireFiber is frequently NOT the
         // worker that runs the fiber to DEAD -- that is what migration IS -- so an individual
@@ -479,6 +492,37 @@ namespace JLib {
         Fiber* currentFiber = nullptr;
         Task* currentRunningTask = nullptr;
         int qIndex = 0;
+
+        // ---- THIS WORKER'S OWN QUEUES, RESOLVED ONCE ------------------------------------------
+        //
+        // Reaching them as `scheduler->deques[qIndex]` is THREE dependent loads every time: the
+        // scheduler pointer, the vector's data pointer, then the unique_ptr's raw pointer -- and only
+        // then the inlined body. The compiler cannot hoist that out of the loop because it cannot
+        // prove the vectors did not change, so it repeats all three on every access. 34 of the 35
+        // sites in Thread.cpp are this worker's own index.
+        //
+        // LOOP-INVARIANT BY CONSTRUCTION, not by luck: qIndex is set by SetQueueIndex before
+        // StartWorker and never changes, scheduler is set in the constructor, and the vectors are
+        // built before any worker exists. Same argument that makes the awake-bit word cacheable.
+        //
+        // THE STEAL PATH IS NOT AFFECTED -- it reaches ANOTHER worker's deque by a different index
+        // and still goes through the vector, which is correct: that one is not invariant.
+        TaskDeque*     myDeque   = nullptr;   // deques[qIndex]
+        TaskMPSCQueue* myInbox   = nullptr;   // normalInboxes[qIndex]
+        TaskMPSCQueue* myLane    = nullptr;   // laneInboxes[qIndex]
+        TaskMPSCQueue* myResumed = nullptr;   // resumedInboxes[qIndex]
+
+        // ---- THE STEAL PATH REACHES ANOTHER WORKER'S DEQUE, so it cannot cache one pointer -----
+        //
+        // But it can skip two of the three loads. `scheduler->deques[target]` is: the scheduler
+        // pointer, the vector's data pointer, then the unique_ptr's raw pointer. Holding .data()
+        // leaves only the last, and the steal scan walks victims in a loop, so it pays this per
+        // probe rather than once.
+        //
+        // STABLE BY CONSTRUCTION: StartPool reserve()s then fills these before any worker exists,
+        // and SetQueueIndex runs after the fill -- so no reallocation can move the buffer while a
+        // worker holds it. Teardown clears the vectors, but only after Join has stopped the workers.
+        std::vector<std::unique_ptr<TaskDeque>>*myDequeArray = nullptr;   // scheduler->deques.data()
         // WS_AWAKE(0) / WS_GOING_TO_SLEEP(1) / WS_SLEEPING(2). NO LONGER READ BY THE PLACEMENT PATH:
         // that read existed only to decide whether to bump NoteWakeMiss, a counter nothing loaded,
         // and it touched this line on every push while the owning worker was RMW-ing it. NotifyWorker
@@ -622,7 +666,7 @@ namespace JLib {
         // drain. tests/verify/sleepwake_model.c reports that as a safety violation; it passes with
         // seq_cst. Note it would still run correctly on x86 either way, because `lock cmpxchg`
         // incidentally drains the store buffer -- AArch64 is where the weaker version breaks.
-        void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
+        inline void MarkQueuedWork() { hasQueuedWork.store(true, std::memory_order_seq_cst); }
 
         // THE FOURTH PREDICATE INPUT. Set by TaskScheduler::WakeForLane when a HOT worker publishes
         // a lane backlog, to pull a parked ordinary worker up to come and steal it.
@@ -633,7 +677,7 @@ namespace JLib {
         // The 1.2.0 hang was a predicate input left at release/acquire while its neighbour was
         // promoted. tests/verify/sleepwake_model.c carries this flag and a -DWEAK_LANEWAKE negative
         // control that MUST fail.
-        void MarkLaneWake() { laneWake.store(true, std::memory_order_seq_cst); }
+        inline void MarkLaneWake() { laneWake.store(true, std::memory_order_seq_cst); }
 
         // Is this worker parked or on its way there? Used to aim a lane wake at a worker that will
         // actually pay for one -- NotifyWorker already skips an awake worker for free, but a wake
@@ -642,7 +686,22 @@ namespace JLib {
         // latched for a worker that is NOT parked -- it is running, or about to consume the permit
         // and go round again. Treating that as parked would spend a wake budget on somebody who
         // needs no syscall, which is the opposite of what this predicate is for.
-        bool Parked() const { return workerState.load(std::memory_order_seq_cst) == WS_PARKED; }
+        inline bool Parked() const { return workerState.load(std::memory_order_seq_cst) == WS_PARKED; }
+        // ---- THE RESUME PATH'S TWO ENTRY POINTS ---------------------------------------------
+        //
+        // DECLARED HERE, DEFINED AT THE BOTTOM OF TaskScheduler.h. Thread.h only forward-declares
+        // TaskScheduler (line 20), which is enough to hold a TaskScheduler* member but NOT to call
+        // through one -- so the bodies cannot live here. They are still inline for every caller
+        // that has TaskScheduler.h, which is every caller that can reach a scheduler anyway.
+        //
+        // THEY READ `instance` DIRECTLY rather than calling Thread::GetCurrent(), which is the
+        // same thread_local behind an out-of-line call in Thread.cpp. On the resume path that call
+        // was one of four; this removes it.
+        //
+        // QueueBatch passes minPerSegment = 1 deliberately: it replaces N individual pushes, which
+        // already notify N times, so any segmenting strictly REDUCES notifies. The default of 64
+        // is tuned for the opposite caller -- a big fire-and-forget batch where the alternative is
+        // one push. See PushBatch's declaration; getting it backwards regresses both directions.
 
         bool Ready();
 
@@ -686,13 +745,23 @@ namespace JLib {
         // Worker() so a bound main thread can run the identical state machine rather than a second
         // copy of it. See the definition in Thread.cpp for the three outcomes and their traps.
         void OnFiberReturned(Fiber* f, Task* task) noexcept;
-        uint32_t FastRand();
+        inline uint32_t FastRand() {
+            static thread_local uint32_t x = []() {
+                auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+                uint32_t seed = static_cast<uint32_t>(now);
+                seed ^= (std::hash<std::thread::id>{}(std::this_thread::get_id()) << 1);
+                return seed == 0 ? 1 : seed;
+                }();
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            return x;
+        }
         void WaitBackoff(int& spin_count);
         void ExecuteTask(Task* task);
         Task* AcquireWork(bool& isFork);   // inbox drain + localQ + pop_bottom + steal
         void  RunTask(Task* task, bool isFork);  // acquire/resume fiber, switch, handle DEAD/YIELD/SUSPEND
         void Worker();
-
         // Called from BOTH completion arms after a task ends. Grows the awake floor and hands this
         // worker.s backlog to overflow workers when the body that just ended was long enough that
         // queueing behind it is expensive. Factored out because it lived in the two arms
@@ -720,34 +789,7 @@ namespace JLib {
         }
         static thread_local Thread* instance;
 
-        // Set by MarkQueuedWork() (see its comment) whenever THIS worker's own inbox/deque
-        // receives a task; cleared once per Worker() loop iteration right before that
-        // iteration's local-queue/steal/inbox-drain search, so a push that lands between one
-        // clear and the next always either (a) gets found directly by that same iteration's
-        // search, or (b) re-arms this flag for the next predicate check. Deliberately NOT a
-        // pool-wide counter (that was the old `queuedTasks` design) -- a worker that's
-        // genuinely asleep only needs to know about work landing on ITSELF; stealable work on
-        // OTHER workers' deques is already found for free by the unconditional steal-attempt
-        // phase every awake worker runs each loop pass, with no predicate involved at all.
-        // Tasks pushed into THIS worker.s inbox and not yet drained. Per-worker rather than
-        // pool-wide so producers aiming at different workers do not share a cache line, and
-        // maintained unconditionally -- the pool-wide g_inboxDepth only counts when a submit limit
-        // is set, so it reads zero in every default configuration and cannot steer anything.
-        //
-        // EXISTS TO ANSWER "HOW MUCH", NOT "ANY". hasQueuedWork is a bool, and a bool cannot tell a
-        // 16-task wave queued behind two workers from a 6-node graph doing the same -- which is
-        // exactly the distinction the floor growth rule got wrong.
-        // ---- CONDVAR PARK ARM (A/B against WaitOnAddress/futex) ---------------------------
-        //
-        // Per-worker, so the sleep is one-waiter-one-address either way and there is no herd for
-        // either primitive to avoid. Only one of the two arms is ever used in a run; see
-        // TaskScheduler::ParkPrimitive.
-        //
-        // WHY THIS IS WORTH MEASURING IN THE SCHEDULER rather than in isolation: the isolated
-        // ping-pong says condvar has tighter wake variance, but it cannot see the two things that
-        // actually differ here -- the mutex condvar puts back on the NOTIFY path, and the fact
-        // that the WaitOnAddress arm re-reads three inboxes and four seq_cst flags before it ever
-        // blocks, work the condvar arm does under its predicate lock instead.
+
         std::mutex              parkMx;
         std::condition_variable parkCv;
 
@@ -756,8 +798,13 @@ namespace JLib {
         // printing the same atomics the scheduler already steers by, which agrees with itself
         // whatever the wiring does. See the park site in Worker().
         std::atomic<unsigned> parkCount{ 0 };
+        // THE BAND WORD THIS WORKER SAW WHEN IT LAST COMMITTED A PARK -- the SAME load the last
+        // gate used, not a fresh one. Reporting decodes K/F from this, so the table answers "was q
+        // inside [K, K+F) AT PARK TIME", which a read at report time cannot: the band moves, and a
+        // worker filed under the floor now may have been overflow when it slept. One relaxed store
+        // on a path that already does two CASes and a syscall.
+        std::atomic<std::uint64_t> lastParkBands{ 0 };
 
-        std::atomic<int> inboxDepth{ 0 };
 
         // MonotonicNs at which this worker entered its CURRENT task, or 0 when it is not in one.
         // Published so a PUSHER can ask "has this worker been busy longer than a trivial body?",
@@ -815,8 +862,61 @@ namespace JLib {
         // for a pinned resume, which nobody else may drain, and starvation for a yield loop, which
         // re-arms that check forever. See the push site in Thread::OnFiberReturned and
         // tests/yield_starvation_test.cpp.
-        bool yieldedLastPass = false;
+ 
 
+        bool yieldedLastPass = false;
+        std::atomic<bool>* g_hotExclusive{ nullptr };
+        std::atomic<unsigned long long>* g_hotCpuMask{ nullptr };
+        size_t kMaxHintQueues{ 0 };
+        std::atomic<unsigned long long>* stealHintBacklog{ nullptr };
+        std::atomic<unsigned long long>* stealHintLane{ nullptr };
+        std::atomic<int>* laneClearDepth{ nullptr };
+        std::atomic<unsigned long long>* stealHintParallel{ nullptr };
+        static inline std::atomic<int>* laneSetDepth{ nullptr };
+		TaskAllocator* allocator{ nullptr };
+        size_t kStealHintDepth{ 0 };
+        std::atomic<unsigned>* g_streakSpillMax{ nullptr };
+        std::atomic<size_t>* g_floorGrowCap{ nullptr };
+        std::atomic<long long>* g_lastFloorGrowNs{ nullptr };
+        std::atomic<size_t>* g_awakeFloorPeak{ nullptr };
+        std::atomic<size_t>* g_submitLimit{ nullptr };
+        std::atomic<bool>* g_rangeRecruit{ nullptr };
+        std::atomic<unsigned>* g_wakeCostNs{ nullptr };
+        std::atomic<int>* nextWorker{ nullptr };
+        std::atomic<bool>* stealHintOn{ nullptr };
+         std::atomic<long long>* g_ioLastPushNs{ nullptr };
+         std::atomic<unsigned>*  g_ioQuietUs{ nullptr };
+         std::atomic<bool>*      g_reservedSteal{ nullptr };
+         std::vector<std::vector<int>>* clusterMates{ nullptr };
+         std::atomic<size_t>* g_inboxDepth{ nullptr };
+         std::vector<std::unique_ptr<TaskMPSCQueue>>* normalInboxes;
+        std::vector<Thread*>* workers;
+         std::atomic<int> inboxDepth{ 0 };
+         std::atomic<unsigned> laneCyclesTotal{ 0 };
+         std::atomic<unsigned> laneCyclesBusy{ 0 };
+         std::vector<std::vector<int>>* matesSameClass{ nullptr };
+         std::vector<std::vector<int>>* matesOtherClass{ nullptr };
+          std::atomic<long long>* g_floorMissWindowNs{ nullptr };
+          std::atomic<long long>* g_floorWindowNs{ nullptr };   // demote observation window
+          std::atomic<long long>* g_lastFloorUpNs{ nullptr };
+          std::atomic<long long>* g_lastFloorDownNs{ nullptr };
+          std::atomic<unsigned>*  g_quietWindows{ nullptr };
+           std::atomic<unsigned long long>* g_laneStrandEvents {nullptr };
+          std::atomic<unsigned long long>* g_laneStrandIdleK{ nullptr };
+          std::atomic<unsigned long long>* g_laneStrandIdleKF{ nullptr };
+          moodycamel::ConcurrentQueue<Task*>* laneIntake{ nullptr };
+
+        // QUEUED-BUT-NOT-YET-STARTED, across every inbox. Maintained ONLY while a limit is set, which is
+        // why the limit must be set before Init: enabling it mid-run would start counting from a base that
+        // already has tasks in flight, and the number would be wrong for the life of the process.
+        static void OnTaskFinishedWrapper(void* data) {
+            auto* node = static_cast<TaskNode*>(data);
+            TaskDAG* owner = node->owner;
+            node->origFn(node->origData);   // the node's actual task
+            // Ran to the end, so the outcome is Completed. A node that is CANCELLED never reaches
+            // here at all -- it is never dispatched, so its payload never runs.
+            owner->OnTaskFinished(node, TaskNode::Outcome::Completed);
+        }
         // ---- LANE DUTY CYCLE, sampled BY THE WORKER ITSELF ------------------------------------
         // How often this worker actually has lane work, counted on its own loop at its own rate.
         //
@@ -833,8 +933,7 @@ namespace JLib {
         // Public because the controller in TaskScheduler.cpp reads and resets them; nothing else
         // should touch them.
     public:
-        std::atomic<unsigned> laneCyclesTotal{ 0 };
-        std::atomic<unsigned> laneCyclesBusy{ 0 };
+ 
         // Nanoseconds spent executing LANE tasks. Time, not passes: the loop alternates an execute
         // pass with a search pass, so a fully occupied worker tops out at exactly 50%% of passes --
         // measured as 32/64, 18/36, 14/28, structurally rather than statistically. A pass is not a
@@ -979,9 +1078,8 @@ namespace JLib {
     // THE FIBER SLOT WAS NEVER PROTECTING THE FIBER; it was making an unchecked violation harmless.
     // Deleting it is only safe because the violation is now checked -- see the block above
     // EpochGuardSuspendCheck for why that trade is the same one counted epochs made.
-    inline std::atomic<size_t>* CurrentEpochSlot() {
-        return EpochManager::Instance().ThreadSlot(thread_id);
-    }
+    // CurrentEpochSlot MOVED TO Epochs.h -- it needs nothing from Thread, and living here forced
+    // TaskDAG.h to include Thread.h for it. See the note beside the definition.
 
     // TRUE when the caller is a coroutine task: on a worker, but with no fiber, which is what a
     // Coroutine-type task looks like (they ride the Native path and never take one).
@@ -1031,16 +1129,5 @@ namespace JLib {
     // SlotEpochGuard or CountedEpochGuard directly; this spelling is the correct one everywhere,
     // so it gets the obvious name and the two mechanisms get the qualified ones.
     // ------------------------------------------------------------------------------------------
-    class EpochGuard {
-    public:
-        // ONE MECHANISM, SO NO CHOICE LEFT TO MAKE. This used to branch on OnCoroutineTask() and
-        // route coroutines through a counted guard -- a TLS read, a null check and a task-type load
-        // on EVERY guard, on the path measured at 2.52 billion guards/sec. The counted ring is gone
-        // (see Epochs.h), so this is one slot guard and the branch with it.
-        EpochGuard() : slotted_(CurrentEpochSlot()) {}
-        EpochGuard(const EpochGuard&) = delete;
-        EpochGuard& operator=(const EpochGuard&) = delete;
-    private:
-        SlotEpochGuard slotted_;
-    };
+
 };

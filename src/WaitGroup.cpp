@@ -4,6 +4,7 @@
 #include "../include/WaitGroup.h"
 #include "../include/Fiber.h"
 #include "../include/DirectEvent.h"   // full definition needed here for Signal()
+#include "../include/TaskScheduler.h"   // Fiber::Resume is defined there (needs Thread + TaskScheduler)
 
 using namespace JLib;
 

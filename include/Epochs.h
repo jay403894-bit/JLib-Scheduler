@@ -17,6 +17,7 @@ namespace JLib {
 	struct EpochParticipant {
 		std::atomic<size_t> localEpoch{ SIZE_MAX };
 	};
+
 	using DeleterFunc = void(*)(void*);
 	struct LNodeBase;
 	struct LMarkableReference;
@@ -719,38 +720,6 @@ namespace JLib {
 // The ambiguous site -- see EpochGuardExitCheck. Warns once, never aborts.
 #define JLIB_EPOCH_CHECK_NO_GUARD_AT_EXIT(where) JLib::EpochGuardExitCheck(where)
 
-// ==================================================================================================
-// THE TWO MECHANISMS. NEITHER OF THESE IS THE ONE YOU WANT AT A CALL SITE.
-//
-// >>> USE JLib::EpochGuard, WHICH IS DEFINED IN Thread.h, NOT IN THIS FILE. <<<
-//
-// It is a tiny RAII wrapper that picks between the two below by asking WHO IS RUNNING, and it is
-// the only place that decision is allowed to be made. It lives in Thread.h and not next to these
-// definitions for one hard reason: picking requires OnCoroutineTask() -> Thread::GetCurrent(), and
-// Thread.h already includes Epochs.h. Epochs.h cannot see Thread without a cycle. Forward-declaring
-// it here would compile and then fail silently in any TU that did not also include Thread.h, which
-// is precisely the mistake -- handing a coroutine a borrowed slot -- that the class exists to make
-// impossible. The long version of this argument sits above the class in Thread.h.
-//
-// So: this file owns the mechanisms and knows nothing about the caller. Thread.h owns the choice.
-// Name these two directly only in code that is provably one kind of reader forever (the benchmark
-// that measures one against the other, for instance).
-// ==================================================================================================
-
-// THE COUNTED GUARD WAS HERE. It announced by incrementing an epoch's counter rather than writing a
-// slot, so protection travelled in a token in the coroutine's own frame and survived a migration.
-// Removed with the ring: it insured against suspending inside a guard, which
-// CoroEpochGuardSuspendCheck already forbids and now asserts in RELEASE as well as dev builds. A
-// coroutine that genuinely needs reclamation across a suspend uses hazard pointers, which support
-// it by design.
-//
-// THERE IS NOW ONE MECHANISM, so this file no longer owns a choice and Thread.h's EpochGuard no
-// longer makes one -- it is an alias for the slot guard over CurrentEpochSlot().
-
-// THE SLOT GUARD -- for a reader that owns a stable slot for the guard's whole life: a fiber, or a
-// bare thread. Two uncontended stores, which is why it stays the default for those. Named
-// SlotEpochGuard, not EpochGuard, because it is a mechanism and not a call-site choice; see the
-// block above, and use JLib::EpochGuard from Thread.h.
 struct SlotEpochGuard {
 	std::atomic<size_t>* slot;
 
@@ -773,3 +742,42 @@ struct SlotEpochGuard {
 		JLIB_EPOCH_GUARD_LEAVE();
 	}
 };
+// ---- THIS WORKER'S EPOCH SLOT -- DEFINED HERE, WHERE EVERYTHING IT NEEDS ALREADY LIVES -------
+//
+// It was in Thread.h, which is why TaskDAG.h had to include Thread.h ("CurrentEpochSlot, for the
+// epoch-guarded dependent walk") -- and Thread.h includes TaskDAG.h back. That mutual include is
+// what makes EpochGuard awkward to use from Thread.h and blocks anything else that wants a guard.
+//
+// IT NEVER NEEDED Thread. The body is `EpochManager::Instance().ThreadSlot(thread_id)`, and all
+// three of those are declared in THIS header -- thread_id at line 28, EpochManager and ThreadSlot
+// above. Epochs.h reaches only Task.h, platform.h and concurrentqueue.h, none of which touch
+// Thread. The same expression is already written out twice below, at the counted-epoch sites.
+//
+// EpochGuard's constructor two lines down already calls this, so it had to be declared by the
+// time Epochs.h was parsed anyway; it was resolving through Thread.h only because Thread.h
+// includes Epochs.h and then defines it. Defining it here removes that ordering dependency.
+// IN namespace JLib, like everything that uses it. Moving these out of Thread.h dropped them at
+// GLOBAL scope, which compiled here (the JLib:: qualifiers below made the body resolve) and broke
+// every consumer that spells them JLib::CurrentEpochSlot / JLib::EpochGuard -- epoch_mechanisms.cpp
+// and epoch_vs_mutex.cpp both fail with "is not a member of 'JLib'". Neither bench is in the build
+// the flattening was measured against, which is why it survived to the suite.
+namespace JLib {
+
+inline std::atomic<size_t>* CurrentEpochSlot() {
+	return JLib::EpochManager::Instance().ThreadSlot(JLib::thread_id);
+}
+
+class EpochGuard {
+public:
+	// ONE MECHANISM, SO NO CHOICE LEFT TO MAKE. This used to branch on OnCoroutineTask() and
+	// route coroutines through a counted guard -- a TLS read, a null check and a task-type load
+	// on EVERY guard, on the path measured at 2.52 billion guards/sec. The counted ring is gone
+	// (see Epochs.h), so this is one slot guard and the branch with it.
+	EpochGuard() : slotted_(CurrentEpochSlot()) {}
+	EpochGuard(const EpochGuard&) = delete;
+	EpochGuard& operator=(const EpochGuard&) = delete;
+private:
+	SlotEpochGuard slotted_;
+};
+
+}   // namespace JLib

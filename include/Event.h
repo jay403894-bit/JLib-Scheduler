@@ -134,10 +134,10 @@ namespace JLib {
             if (!t->assignedFiber->ResumeQueueless()) return;
             if (IsLowLatency(t->lane)) {
                 hi[nhi++] = t;
-                if (nhi == cap) { RequeueResumedBatch(hi, nhi, Lane::LowLatency); nhi = 0; }
+                if (nhi == cap) { Fiber::RequeueResumedBatch(hi, nhi, Lane::LowLatency); nhi = 0; }
             } else {
                 lo[nlo++] = t;
-                if (nlo == cap) { RequeueResumedBatch(lo, nlo, Lane::Normal); nlo = 0; }
+                if (nlo == cap) { Fiber::RequeueResumedBatch(lo, nlo, Lane::Normal); nlo = 0; }
             }
         }
 
@@ -263,8 +263,8 @@ namespace JLib {
                     }
                 }
             }
-            RequeueResumedBatch(hi, nhi, Lane::LowLatency);
-            RequeueResumedBatch(lo, nlo, Lane::Normal);
+            Fiber::RequeueResumedBatch(hi, nhi, Lane::LowLatency);
+            Fiber::RequeueResumedBatch(lo, nlo, Lane::Normal);
         }
 
         // Wake everyone waiting on this event.
@@ -310,8 +310,8 @@ namespace JLib {
                         WakeOne(t, hi, nhi, lo, nlo, kBuf);
                 }
             }
-            RequeueResumedBatch(hi, nhi, Lane::LowLatency);
-            RequeueResumedBatch(lo, nlo, Lane::Normal);
+            Fiber::RequeueResumedBatch(hi, nhi, Lane::LowLatency);
+            Fiber::RequeueResumedBatch(lo, nlo, Lane::Normal);
         }
 
         // Wake AT MOST ONE waiter. Returns whether one was woken.
@@ -338,7 +338,7 @@ namespace JLib {
                     if (old & m) {
                         if (Task* t = TakeSlot(tb, (w << 6) + b)) {
                             if (t->assignedFiber->ResumeQueueless())
-                                RequeueResumedBatch(&t, 1, t->lane);
+                                Fiber::RequeueResumedBatch(&t, 1, t->lane);
                             return true;
                         }
                     }

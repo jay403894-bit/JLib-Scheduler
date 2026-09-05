@@ -350,19 +350,54 @@ namespace JLib {
 		return s;
 	}
 
+	// ---- SELF, WITHOUT THE THREAD -------------------------------------------------------------
+	//
+	// THE FIBER IS WHAT SURVIVES A SUSPEND. The worker running it is not: a migratable fiber
+	// resumes on whichever worker was free, so anything derived from `thread_local Thread*
+	// instance` before a wait names the worker the fiber LEFT.
+	//
+	// THESE THREE FUNCTIONS USED TO DO EXACTLY THAT -- Thread::GetCurrent() -> currentFiber ->
+	// local[slot] -- and were safe only by ACCIDENT: GetCurrent() is defined in Thread.cpp, so a
+	// translation-unit boundary was what stopped the compiler folding two calls into one. Nothing
+	// in the code said so. Whole-program optimisation removes the boundary and the hazard goes
+	// live. MEASURED 2026-09-04, same source both ways, in fiber_local_test:
+	//
+	//     no WPO   47-52 of 64 fibers migrated,  64 held the sentinel,   0 lost
+	//     WPO       0 of 64 "migrated",           7-15 held,            49-57 LOST
+	//
+	// -- and the zero is the same bug seen twice: the test's own two GetCurrent() calls folded into
+	// one, so workerAfter could only ever equal workerBefore. The ~15 that "held" were the ones
+	// that genuinely had not migrated, where a stale Thread* happens to be the right one.
+	//
+	// A COMPILER FENCE AFTER ContextSwitch WAS TRIED AND DOES NOT FIX IT -- measured, still 0/64
+	// and ~50 lost. Nor could it: there are eleven ContextSwitch sites, so a fence is a per-site
+	// defence against a structural hazard and the twelfth site reopens it silently.
+	//
+	// PINNING IS NOT A FIX EITHER. It would make the stale-Thread* path accidentally correct and
+	// hide the next failure of the same kind.
+	//
+	// SO ASK THE STACK. The caller stands on its own fiber's stack, and each stack class is one
+	// contiguous reservation at a constant stride, so an address on that stack determines the fiber
+	// by arithmetic. Nothing to invalidate on a migration: the answer is a property of the memory
+	// the caller occupies, not of the thread occupying it. `probe` must be a real local -- its
+	// ADDRESS is the input and its value is never read.
+	static inline Fiber* SelfFiber() noexcept {
+		char probe;
+		GlobalFiberPool* p = FiberRegistry::Instance().Pool();
+		return p ? p->FiberForStack(&probe) : nullptr;
+	}
+
 	void* FiberRegistry::FlsGet(uint16_t slot) noexcept {
 		if (slot >= (uint16_t)Fiber::kLocalSlots) return nullptr;   // kNoSlot included
-		Thread* t = Thread::GetCurrent();
-		Fiber*  f = t ? t->currentFiber : nullptr;
 		// NULL OFF A FIBER. A Native task and a bare thread have none, which is a legitimate state
 		// for library code that may run in either context -- so it answers rather than asserting.
+		Fiber* f = SelfFiber();
 		return f ? f->local[slot] : nullptr;
 	}
 
 	void FiberRegistry::FlsSet(uint16_t slot, void* p) noexcept {
 		if (slot >= (uint16_t)Fiber::kLocalSlots) return;
-		Thread* t = Thread::GetCurrent();
-		if (Fiber* f = (t ? t->currentFiber : nullptr)) f->local[slot] = p;
+		if (Fiber* f = SelfFiber()) f->local[slot] = p;
 		// SILENTLY DROPPED off a fiber, and that asymmetry with get() is deliberate: a get can
 		// report "nothing here" honestly, but there is nowhere to PUT a value, and the caller
 		// storing one has already decided it is running on a fiber. Making this loud would fire on
@@ -374,8 +409,7 @@ namespace JLib {
 	}
 
 	size_t FiberRegistry::GetID() noexcept {
-		Thread* t = Thread::GetCurrent();
-		return GetID(t ? t->currentFiber : nullptr);
+		return GetID(SelfFiber());
 	}
 
 	static std::atomic<bool> g_reclaimQueued{ false };

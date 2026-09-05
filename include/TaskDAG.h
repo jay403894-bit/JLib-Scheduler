@@ -12,7 +12,10 @@
 #include "TaskNode.h"
 #include "Epochs.h"
 #include "TaskAllocator.h"
-#include "Thread.h"   // CurrentEpochSlot, for the epoch-guarded dependent walk
+// Thread.h NO LONGER INCLUDED. It was here for CurrentEpochSlot, which moved to Epochs.h (already
+// included above) -- and this include was one half of a Thread.h <-> TaskDAG.h cycle that stopped
+// Thread.h from using TaskDAG at all, and stopped TaskScheduler.h from including Thread.h.
+// EpochGuard at line 228 is the only thing this header needed, and Epochs.h provides it.
 
 static constexpr uint8_t NONE = 255;
 

@@ -290,18 +290,22 @@ endif()
 #
 # Linux/x86-64 and Linux/AArch64 share everything that is not the context switch -- sysfs topology,
 # affinity, the mmap arena -- so src/posix/*.cpp is common and only src/posix/<arch>/ differs.
-# win32/ is HALF split, and deliberately so. The x86-64 switch and FiberInit stay flat at
-# src/win32/ because Scheduler.vcxproj hard-codes those paths and MSBuild is the build that actually
-# ships; only the ARM64 switch got a src/win32/aarch64/ subdirectory. The asymmetry is ugly but
-# contained -- see the REMOVE_ITEM in the WIN32 branch below, which is what keeps the flat x86-64
-# FiberInit from being globbed into an ARM64 build alongside the AAPCS64 one.
+# win32/ is HALF split, and deliberately so. The x86-64 switch stays flat at src/win32/ because
+# Scheduler.vcxproj hard-codes that path and MSBuild is the build that actually ships; only the
+# ARM64 switch got a src/win32/aarch64/ subdirectory.
+#
+# THE ASYMMETRY NO LONGER NEEDS POLICING. Fiber::Init used to be three .cpp files, one per ABI, and
+# keeping exactly one of them in the archive cost a REMOVE_ITEM here, a cross-directory APPEND, and
+# a configure-time guard -- all against the same hazard, two definitions landing in the archive and
+# static linking silently taking whichever came first. Init now lives in include/Fiber.h behind an
+# #if, so the arch is chosen by the compiler and there is nothing left to get wrong at link time.
 file(GLOB JLIBSCHED_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
 # A leftover arch file directly under src/posix/ is not a harmless stray. Both it and the real
 # arch directory's file define Fiber::Init, both land in libScheduler.a, and static-archive
 # linking resolves that silently by taking whichever member comes first -- no duplicate-symbol
 # error. That produced an AArch64 build seeding an x86-64 stack frame. Refuse to configure.
-foreach(_stale ContextSwitch.s ContextSwitch.S FiberInit.cpp)
+foreach(_stale ContextSwitch.s ContextSwitch.S)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/${_stale}")
         message(FATAL_ERROR
             "Stale src/posix/${_stale} found. Arch-specific sources moved into src/posix/<arch>/; "
@@ -314,24 +318,15 @@ if(WIN32)
     file(GLOB JLIBSCHED_PLAT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/*.cpp")
 
     if(JLIBSCHED_ARCH STREQUAL "aarch64")
-        # win32/ is NOT arch-split the way posix/ is: FiberInit.cpp and ContextSwitch.asm sit
-        # directly in src/win32/ and are x86-64, because Scheduler.vcxproj hard-codes those paths
-        # and moving them would break the MSBuild build for the one platform that actually ships.
-        # So the ARM64 build subtracts rather than restructures.
-        #
-        # THIS REMOVE IS LOAD-BEARING, and it is the same hazard the src/posix/ stale-file guard
-        # above exists for: src/win32/FiberInit.cpp and src/posix/aarch64/FiberInit.cpp BOTH define
-        # Fiber::Init. Leave both in and they both land in Scheduler.lib, where static-archive
-        # linking picks whichever member comes first WITHOUT a duplicate-symbol error -- an ARM64
-        # build seeding an x86-64 stack frame, which would fault on the first switch-in with
-        # nothing pointing at the cause.
-        list(REMOVE_ITEM JLIBSCHED_PLAT "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/FiberInit.cpp")
+        # ONLY THE ASSEMBLER DIFFERS NOW. src/win32/*.cpp is arch-neutral -- AvxGate.cpp compiles
+        # to an inert zero on ARM64 -- and Fiber::Init is in include/Fiber.h behind an #if, so no
+        # source list surgery is needed here any more. Windows-ARM64 and AAPCS64 agree on the
+        # callee-saved set (x19-x28, x29, x30, low 64 bits of v8-v15), so they share that arm.
 
         # Reused verbatim, not copied: Windows ARM64 and AAPCS64 agree on the callee-saved set
         # (x19-x28, x29, x30, low 64 bits of v8-v15) and therefore on the frame layout, so this file
         # is ABI-common and only the ASSEMBLER differs. A duplicate would be two files that must
         # stay in step forever -- exactly the trap the two-tree sync keeps producing.
-        list(APPEND JLIBSCHED_PLAT "${CMAKE_CURRENT_SOURCE_DIR}/src/posix/aarch64/FiberInit.cpp")
 
         set(JLIBSCHED_ASM "${CMAKE_CURRENT_SOURCE_DIR}/src/win32/aarch64/ContextSwitch.asm")
     else()
@@ -965,6 +960,14 @@ target_compile_features(SchedulerTeardownDestroyTest PRIVATE cxx_std_17)
 add_executable(SchedulerReservedLoPriPlacementTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/reserved_lopri_placement_test.cpp")
 target_link_libraries(SchedulerReservedLoPriPlacementTest PRIVATE Scheduler)
 target_compile_features(SchedulerReservedLoPriPlacementTest PRIVATE cxx_std_17)
+
+# THE MAIN PUBLISH LANE -- one push_bottom_batch for a whole batch, found by stealing. The lane has
+# no owning thread, so it advertises itself by being READ on each steal scan, and that advertise can
+# fail in two opposite and equally silent ways: never set (the pool parks on live work -- a hang) or
+# never cleared (the pool never parks again -- which looks like success). Arm 3 is the second one.
+add_executable(SchedulerMainPublishLaneTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/main_publish_lane_test.cpp")
+target_link_libraries(SchedulerMainPublishLaneTest PRIVATE Scheduler)
+target_compile_features(SchedulerMainPublishLaneTest PRIVATE cxx_std_17)
 
 # K RUNS FIBER JOBS, THE FLOOR STAYS FIBERLESS. The reserved lane carries I/O completions, which are
 # Native (CreateInternalTask) and want to suspend -- so K binds a fiber. The FLOOR arm is the control

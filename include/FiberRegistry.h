@@ -71,6 +71,10 @@ namespace JLib {
 		// while a holder is reading its own chain head. StartPool calls it once the pool is built
 		// and num_workers is fixed, which is the first point both bounds are known.
 		void Build(GlobalFiberPool* pool, size_t workerCount);
+
+		// The pool this registry was built over, or null before Build. Read by the fiber-local
+		// path to answer "which fiber am I" from a stack address -- see SelfFiber in the .cpp.
+		GlobalFiberPool* Pool() const noexcept { return pool; }
 		void Reset();
 
 		size_t Count() const { return table.size(); }

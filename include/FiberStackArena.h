@@ -16,6 +16,16 @@ class FiberStackArena {
     std::atomic<size_t> offset;
 
 public:
+    // ---- GEOMETRY, so a fiber can find ITSELF from its own stack pointer ----------------------
+    //
+    // The reservation is one contiguous range and stacks are handed out at a constant stride, so
+    // "which fiber is running" is answerable from an address on that stack -- with no reference to
+    // the thread. That is what makes fiber-local storage correct across a migration: the FIBER is
+    // what survives a suspend, the worker running it is not. See GlobalFiberPool::FiberForStack.
+    const void* Base() const noexcept { return base; }
+    size_t      TotalSize() const noexcept { return totalSize; }
+    size_t      PageSize() const noexcept { return pageSize; }
+
     FiberStackArena(size_t capacity)
         : pageSize(JLib::platform::PageSize()) {
         // One large reservation with no backing; stacks are committed out of it as they are handed

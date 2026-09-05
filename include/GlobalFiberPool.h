@@ -150,6 +150,23 @@ namespace JLib {
         // parked task holds a fiber -- Event sizes its waiter index by it.
         size_t TotalCount() const { return size; }
 
+        // ---- WHICH FIBER OWNS THIS STACK ADDRESS? Null if the address is not on a fiber stack.
+        //
+        // THE READ PATH FOR FIBER-LOCAL STORAGE, and it deliberately does not consult the thread.
+        // A fiber is what survives a suspend; the worker running it is not, so any identity taken
+        // from `thread_local Thread* instance` before a wait names the worker the fiber LEFT --
+        // Thread.cpp says exactly that where it writes homeWorker, and FiberRegistry::FlsGet used
+        // to do exactly that.
+        //
+        // WHY IT IS ANSWERABLE: each class's stacks come out of ONE contiguous reservation at a
+        // CONSTANT stride, so an address on a stack determines its index by arithmetic. Callers
+        // pass the address of one of their own locals, which lives on the stack of whichever fiber
+        // is running -- nothing to thread through, and nothing to invalidate on migration, because
+        // the answer is a property of the memory the caller stands on rather than of the thread
+        // standing there.
+        const Fiber* FiberForStack(const void* addr) const noexcept;
+        Fiber*       FiberForStack(const void* addr) noexcept;
+
         // THE FIBER AT A GIVEN poolIndex, or null if out of range.
         //
         // SUPPLY, NOT ACCOUNTING. This exists so FiberRegistry can build its address table; the

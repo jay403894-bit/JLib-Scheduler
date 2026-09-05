@@ -16,6 +16,7 @@
 
 #include "TaskScheduler.h"
 #include "fiber_body.h"
+#include "Thread.h"   // Thread::CoYield -- TaskDAG.h no longer pulls this in (the include cycle it formed with Thread.h was broken)
 #include "TaskDAG.h"
 
 #include <new>
