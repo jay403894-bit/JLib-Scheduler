@@ -230,7 +230,26 @@ int main() {
         // the offender actually has to meet.
         Event& hold = sched.GetEvent("mutex_block_policy_hold");
         HoldOnEventCtx ectx{ &sched, &m, &hold, &held };
+
+        // COUNTED, BECAUSE THIS SCOPE OWNS EVERYTHING THE HOLDER TOUCHES. ectx, m, held and
+        // gotLock are all locals here, and the holder reads ectx -- and therefore m -- AFTER it
+        // resumes from WaitOnEvent. SignalAll only wakes it; it does not wait for it. Pushing this
+        // uncounted let the scope close while the holder was still on its way back, so it read a
+        // dead frame and called Unlock() on it.
+        //
+        // MakeCtxTask's own header states the rule: "the context's scope must cover the wait.
+        // Declare-then-join in the same function satisfies that structurally." This site declared
+        // and never joined.
+        //
+        // THE SYMPTOM WAS A ~2-IN-20 SEGFAULT AFTER "PASSED" ALREADY PRINTED, on Windows and Linux
+        // both, with the crash landing in whatever reused main's stack -- usually TaskScheduler's
+        // teardown Join(). Green test, dead process, exit 139. Found with ASan in WSL: a
+        // stack-buffer-overflow READ at HoldOnEventBody, reported against a LIVE Join() frame,
+        // which is what "this address used to be ours" looks like.
+        WaitGroup holderWg;
+        holderWg.n.store(1, std::memory_order_relaxed);
         auto* holder = JLibTest::MakeCtxTask(sched, &HoldOnEventBody, &ectx);
+        holder->waitGroup = &holderWg;
         sched.Push(holder);
         while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
 
@@ -259,6 +278,10 @@ int main() {
               "a NATIVE task blocking on a contended mutex is REFUSED (it would strand its worker)");
 
         hold.SignalAll();
+
+        // THE JOIN. SignalAll wakes the holder; this is what waits for it to finish reading ectx
+        // and to release m. Without it the closing brace below races the holder's Unlock().
+        sched.WaitFor(holderWg);
     }
 
     SchedulerMutex::s_blockViolationHook.store(nullptr, std::memory_order_release);
