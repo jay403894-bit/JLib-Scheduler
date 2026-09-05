@@ -828,9 +828,26 @@ endif()
 
 # ---- samples -------------------------------------------------------------------------------------
 # udp_rect is the receive-LOOP counterpart to io_socket_test's single datagram: one binary that is
-# both ends of a UDP link on loopback, so there is nothing to configure to try it. C++20 because it
-# co_awaits the reactor. WIN32 executable would hide the console the sender needs, so it stays a
-# console app and creates its window by hand.
+# both ends of a UDP link on loopback, so there is nothing to configure to try it. WIN32 executable
+# would hide the console the sender needs, so it stays a console app and creates its window by hand.
+#
+# C++17, NOT C++20 ANY MORE. It used to co_await the reactor, which is why it left the build when
+# the runtime went fibers-only and the coroutine layer moved to extras/abandoned. The receive loop
+# is now a fiber task calling Fib::RecvFrom -- the same wait, no language feature -- so the sample
+# builds in the default configuration again instead of needing a tier that is off by default.
+# The C++20 version is still in extras/abandoned as the record of that path.
+#
+# WINDOWS ONLY, and not because the reactor is: it opens a Win32 window and reads arrow keys with
+# _getch. The porting job here is the UI, not the I/O.
+if(WIN32)
+    add_executable(SchedulerUdpRect "${CMAKE_CURRENT_SOURCE_DIR}/samples/udp_rect.cpp")
+    target_link_libraries(SchedulerUdpRect PRIVATE Scheduler ws2_32)
+    target_compile_features(SchedulerUdpRect PRIVATE cxx_std_17)
+    # A SAMPLE, NOT A TEST -- it waits on a Win32 message pump and a human. The auto-registration
+    # loop near the end of this file picks up every Scheduler* EXECUTABLE target, so the exclusion
+    # lives in JLIBSCHED_NOT_TESTS there. It cannot be appended here: that list is `set()` after this
+    # point and would overwrite the append.
+endif()
 
 # Staged-timestamp latency bench for the udp_rect pipeline. --plain runs the same pipeline with a
 # blocking recvfrom thread instead of the reactor, which is the control the numbers are read against.
@@ -1282,7 +1299,11 @@ set(JLIBSCHED_NOT_TESTS
     SchedulerBench SchedulerLaneBench SchedulerDagBench SchedulerRuntimeBench
     SchedulerContextSwitchBench SchedulerEpochMechBench SchedulerEpochVsMutex
     SchedulerLockBench SchedulerSpinTax SchedulerFutexVariance
-    SchedulerRowProbe)
+    # SchedulerUdpRect is a SAMPLE: it waits on a Win32 message pump and a human with arrow keys, so
+    # as a test it would hang until the runner killed it. Listed here even on non-Windows, where the
+    # target does not exist -- a name that matches nothing is harmless, and conditioning the list
+    # would put the reason two hundred lines from the exclusion.
+    SchedulerRowProbe SchedulerUdpRect)
 
 get_property(JLIBSCHED_ALL_TARGETS DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
              PROPERTY BUILDSYSTEM_TARGETS)
