@@ -61,7 +61,32 @@ namespace JLib {
 		void HandOffFiberDebts(FiberDebt* head) noexcept;
 	}
 
-	struct alignas(16) Fiber {
+	// ONE CACHE LINE PER FIBER BOUNDARY, NOT SIXTEEN BYTES.
+	//
+	// GlobalFiberPool holds `std::vector<Fiber> fibers[kClassCount]`, so fibers are CONTIGUOUS and
+	// the stride is sizeof(Fiber). At alignas(16) that stride was 240 -- 3.75 cache lines -- and a
+	// stride that is not a multiple of 64 guarantees neighbours share a line. The collision is not
+	// theoretical and it is on the worst possible pair: fiber k's tail holds owedKinds, status and
+	// localEpoch (offsets 216-232), and fiber k+1 begins with `ctx` at 240, all inside the single
+	// 64-byte line [192, 256).
+	//
+	//   `status` is written by whichever worker suspends or resumes fiber k -- often not its own.
+	//   `ctx` is the saved RSP, written by ContextSwitch on EVERY switch of fiber k+1.
+	//
+	// So two unrelated fibers ping-pong one line between two cores, on the hottest word the runtime
+	// has, for no reason but the size of the struct.
+	//
+	// THE COST IS NOT THE 16 BYTES OF PADDING. 240 -> 256 is +6.7% on the struct and reads badly
+	// until it is measured against what a fiber ACTUALLY costs: a Standard fiber carries a 64 KiB
+	// stack region (60 KiB usable + one guard page), so the struct is 0.37% of it and the padding
+	// is 0.024%. Two ten-thousandths of a fiber to stop a false-sharing pair.
+	//
+	// This also matches every other hot structure in the tree -- TaskDeque, SlabPool's counters,
+	// RetryStats -- which already align on platform::kCacheLine. Fiber was the outlier.
+	//
+	// The 16 was never about the struct anyway: stack tops are aligned explicitly at the three
+	// InitStack sites (`& ~(uintptr_t)0xF`), so nothing here depended on alignas(16).
+	struct alignas(platform::kCacheLine) Fiber {
 		Context ctx;
 		uint64_t id;
 		void* stackBase;
