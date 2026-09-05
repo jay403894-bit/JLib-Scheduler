@@ -24,8 +24,19 @@
 #include <unistd.h>
 #include <linux/futex.h>        // FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE -- the worker park
 #include <cerrno>
-std::vector<std::unique_ptr<TaskMPSCQueue>>* Thread::normalInboxes = nullptr;
-std::vector<Thread*>* Thread::workers = nullptr;
+// COMMENTED OUT, NOT DELETED -- these are the shape of a static-member definition, but
+// normalInboxes and workers are ORDINARY INSTANCE MEMBERS of Thread (Thread.h, beside
+// g_reservedSteal and the rest of the per-worker cached pointers). So there is no configuration in
+// which these two lines compile: on Linux they are `Thread::x` naming a non-static member at
+// namespace scope, and they are additionally unqualified at global scope, where neither Thread nor
+// TaskMPSCQueue is visible. Nothing in the tree reads them -- they are their own only reference.
+//
+// WINDOWS NEVER SEES THEM, which is the whole reason they survived: they sit inside
+// #if JLIB_PLATFORM_LINUX, so the only compiler that has ever looked at this block is the one
+// nobody runs. Found by building in WSL.
+//
+// std::vector<std::unique_ptr<TaskMPSCQueue>>* Thread::normalInboxes = nullptr;
+// std::vector<Thread*>* Thread::workers = nullptr;
 // THE WORKER PARK ON LINUX. Windows has WaitOnAddress/WakeByAddressSingle; this is the same
 // protocol with the same word, which is the part that matters -- a park and a wake that do not
 // agree on the address are not a handshake, they are a hang.
