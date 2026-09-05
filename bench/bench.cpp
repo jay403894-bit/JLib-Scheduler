@@ -583,6 +583,126 @@ static void ProducerBody(void* p) {
 // task. Given that the per-push wake turned out to dominate single-producer submission, this is the
 // API-level answer to the same problem the fan-out cap addresses by policy, and it has been in the
 // scheduler the whole time. It was never benchmarked, which is part of why the cost stayed hidden.
+// ------------------------------------------------- 1d. publish lane vs PushBatch
+//
+// THE QUESTION. PushBatch links a run of tasks and hands the chain to ONE worker's inbox. PushLazy
+// hands the WHOLE array to a deque nobody owns and lets every worker steal from it. Both submit the
+// same tasks; they differ in who does the placing and who does the finding.
+//
+// INTERLEAVED, ONE REP EACH, ALTERNATING. Running all of arm A and then all of arm B measures the
+// machine's drift as much as the code -- clock ramp, another process waking up, the pool's own warm
+// state. Alternating puts both arms through the same drift, so the RATIO survives what neither
+// absolute number does. Best-of is then taken per arm.
+//
+// SAME BODY, SAME COUNT, SAME WAITGROUP, and the task array is allocated ONCE outside the timing so
+// neither arm is charged for a vector grow the other did not pay.
+//
+// THE TWO NUMBERS THAT MATTER ARE NOT THE SAME NUMBER. `submit` is what the producer pays -- this is
+// where a publish should win outright, since it is one push_bottom_batch against 3,125 chained
+// inbox pushes. `total` includes the drain, and that is where it can LOSE: work handed to a named
+// worker is already placed, work on the publish lane has to be discovered. A row where submit falls
+// and total rises is the trade working exactly as designed and not being worth it.
+//
+// WAKES ARE REPORTED because they are the third possibility: a publish that wins on submit and
+// total by waking nothing is a publish that got lucky with an already-hot pool, and the same arm on
+// a cold one will read differently. See the awake floor rows.
+static void BenchPublishLane(JLib::TaskScheduler& sched) {
+    constexpr int kChunk = 64;
+    const bool wasOn = JLib::TaskScheduler::MainPublishDeque();
+
+    std::vector<JLib::Task*> arr;
+    arr.reserve((size_t)kThroughputTasks);
+    JLib::Task* chunk[kChunk];
+
+    double bestBatch = 1e300, bestBatchSubmit = 0.0;
+    double bestPub   = 1e300, bestPubSubmit   = 0.0;
+    Spread spBatch, spPub;
+    unsigned long long wakesBatch = 0, wakesPub = 0;
+    int pubRefused = 0;
+
+    for (int run = 0; run < kThroughputRuns; ++run) {
+        // ---- ARM A: PushBatch, the control -------------------------------------------------
+        JLib::TaskScheduler::SetMainPublishDeque(false);
+        {
+            JLib::WaitGroup wg;
+            wg.n.store(kThroughputTasks, std::memory_order_relaxed);
+            JLib::TaskScheduler::ResetWakeCount();
+            auto t0 = Clock::now();
+            int made = 0;
+            for (int i = 0; i < kThroughputTasks; ++i) {
+                JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
+                if (!t) { printf("publish: ERROR -- CreateTask returned null\n"); return; }
+                t->waitGroup = &wg;
+                chunk[made++] = t;
+                if (made == kChunk) { sched.PushBatch(chunk, (size_t)made, 0); made = 0; }
+            }
+            if (made) sched.PushBatch(chunk, (size_t)made, 0);
+            auto t1 = Clock::now();
+            sched.WaitFor(wg);
+            auto t2 = Clock::now();
+            const double total = MsBetween(t0, t2);
+            spBatch.add(total);
+            if (total < bestBatch) {
+                bestBatch = total;
+                bestBatchSubmit = MsBetween(t0, t1);
+                wakesBatch = JLib::TaskScheduler::GetWakeCount();
+            }
+        }
+
+        // ---- ARM B: PushLazy, one publish for the whole array -------------------------------
+        JLib::TaskScheduler::SetMainPublishDeque(true);
+        {
+            JLib::WaitGroup wg;
+            wg.n.store(kThroughputTasks, std::memory_order_relaxed);
+            JLib::TaskScheduler::ResetWakeCount();
+            auto t0 = Clock::now();
+            arr.clear();
+            for (int i = 0; i < kThroughputTasks; ++i) {
+                JLib::Task* t = sched.CreateTask(&EmptyBody, nullptr);
+                if (!t) { printf("publish: ERROR -- CreateTask returned null\n"); return; }
+                t->waitGroup = &wg;
+                arr.push_back(t);
+            }
+            // REFUSAL IS NOT A ZERO, IT IS A DIFFERENT ROW. PushLazy declines rather than
+            // half-publishing, so the array is still ours -- push it the ordinary way and COUNT the
+            // refusal, because an arm that silently fell back to PushBatch would print a ratio of
+            // 1.00 and look like "no difference" instead of "never ran".
+            if (!sched.PushLazy(arr.data(), arr.size())) {
+                ++pubRefused;
+                for (JLib::Task* t : arr) sched.Push(t);
+            }
+            auto t1 = Clock::now();
+            sched.WaitFor(wg);
+            auto t2 = Clock::now();
+            const double total = MsBetween(t0, t2);
+            spPub.add(total);
+            if (total < bestPub) {
+                bestPub = total;
+                bestPubSubmit = MsBetween(t0, t1);
+                wakesPub = JLib::TaskScheduler::GetWakeCount();
+            }
+        }
+    }
+
+    JLib::TaskScheduler::SetMainPublishDeque(wasOn);
+
+    printf("publish      : PushLazy (one publish, stolen) vs PushBatch x%d (chained to an inbox)\n", kChunk);
+    printf("               PushBatch  total %.2f ms (%.2f M/s)  submit %.2f ms (%.2f M/s)  wakes %llu\n",
+        bestBatch, kThroughputTasks / bestBatch / 1000.0,
+        bestBatchSubmit, kThroughputTasks / bestBatchSubmit / 1000.0, wakesBatch);
+    printf("               PushLazy   total %.2f ms (%.2f M/s)  submit %.2f ms (%.2f M/s)  wakes %llu\n",
+        bestPub, kThroughputTasks / bestPub / 1000.0,
+        bestPubSubmit, kThroughputTasks / bestPubSubmit / 1000.0, wakesPub);
+    printf("               ratio batch/lazy: total %.2fx, submit %.2fx  (>1.00 means the LANE wins)\n",
+        bestBatch / bestPub, bestBatchSubmit / bestPubSubmit);
+    if (pubRefused)
+        printf("               *** PushLazy REFUSED %d of %d reps and fell back -- the lazy row is\n"
+               "                   NOT measuring the lane. Check SetMainPublishDeque and that this\n"
+               "                   thread is not a worker.\n", pubRefused, kThroughputRuns);
+    PrintSpread("PushBatch", spBatch, kThroughputTasks);
+    PrintSpread("PushLazy",  spPub,   kThroughputTasks);
+}
+
 static void BenchThroughputBatched(JLib::TaskScheduler& sched) {
     constexpr int kChunk = 64;               // 200,000 divides evenly by this
     double best = 1e300, bestPush = 0.0, bestDrain = 0.0;
@@ -4269,6 +4389,7 @@ int main(int argc, char** argv) {
     // job has been killed by the 30-minute job timeout knowing only that "the benchmark step" hung.
     Section("throughput/1p");  BenchThroughputSingleProducer(sched);
     Section("throughput/bt");  BenchThroughputBatched(sched);
+    Section("publish");        BenchPublishLane(sched);
     Section("throughput/mp");  BenchThroughputMultiProducer(sched);
     Section("latency");        BenchLatency(sched);
     Section("ParallelFor");    BenchParallelFor(sched);
